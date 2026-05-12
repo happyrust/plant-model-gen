@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CanonicalRawTable {
+    // ===== Phase 1 (raw model generation persistence) =====
     RawInstInfo,
     RawInstRelate,
     RawInstGeo,
@@ -19,6 +20,14 @@ pub enum CanonicalRawTable {
     RawVec3,
     RawInstRelateAabb,
     RawRefnoAssocIndex,
+    // ===== Phase 2 (boolean result tables, v4 §2.1 scaffold) =====
+    // mission docs/00 §Scope (Phase 2) + docs/08 §Phase 5 explicitly
+    // call these out as Phase 2 work. v3 backends skip them; v4 §2.1
+    // introduces the canonical record schemas so future v5+ work can
+    // wire the boolean worker to emit per-row canonical records via
+    // these tables. No backend writes them yet.
+    RawInstRelateBool,
+    RawInstRelateCataBool,
 }
 
 impl CanonicalRawTable {
@@ -37,6 +46,8 @@ impl CanonicalRawTable {
             Self::RawVec3 => "raw_vec3",
             Self::RawInstRelateAabb => "raw_inst_relate_aabb",
             Self::RawRefnoAssocIndex => "raw_refno_assoc_index",
+            Self::RawInstRelateBool => "raw_inst_relate_bool",
+            Self::RawInstRelateCataBool => "raw_inst_relate_cata_bool",
         }
     }
 
@@ -44,6 +55,23 @@ impl CanonicalRawTable {
         match self {
             Self::RawRefnoAssocIndex => Some(
                 "Phase 1 retains refno_assoc_index as a raw table for delete/index parity, but runtime materialization is intentionally disabled.",
+            ),
+            _ => None,
+        }
+    }
+
+    /// v4 §2.1 (scaffold): per-table notes for Phase 2 boolean tables.
+    /// These tables are NOT yet emitted by any backend (the boolean worker
+    /// currently writes directly to SurrealDB via SQL); the limitation
+    /// strings document the expected pivot when v5+ wires the worker output
+    /// through a canonical capture layer.
+    pub fn phase2_limitation(self) -> Option<&'static str> {
+        match self {
+            Self::RawInstRelateBool => Some(
+                "Phase 2 scaffold (v4 §2.1): no backend emits raw_inst_relate_bool yet. Boolean worker writes directly to SurrealDB; v5+ will wire per-row capture through the canonical layer.",
+            ),
+            Self::RawInstRelateCataBool => Some(
+                "Phase 2 scaffold (v4 §2.1): no backend emits raw_inst_relate_cata_bool yet. Boolean worker writes RELATION rows directly via SQL; v5+ will wire per-row capture.",
             ),
             _ => None,
         }
@@ -66,6 +94,13 @@ impl CanonicalRawTable {
             Self::RawRefnoAssocIndex,
         ]
     }
+
+    /// v4 §2.1 (scaffold): Phase 2 boolean table inventory.
+    /// Currently empty in production data — no backend emits these yet.
+    /// See `phase2_limitation()` on each variant for the v5+ pivot plan.
+    pub const fn all_phase2() -> &'static [Self] {
+        &[Self::RawInstRelateBool, Self::RawInstRelateCataBool]
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -77,10 +112,15 @@ pub struct CanonicalRawRowCounts {
 impl CanonicalRawRowCounts {
     pub fn set(&mut self, table: CanonicalRawTable, count: usize) {
         self.counts.insert(table.as_str().to_owned(), count);
-        self.limitations.insert(
-            table.as_str().to_owned(),
-            table.phase1_limitation().map(str::to_owned),
-        );
+        // v4 §2.1: Phase 2 boolean tables ship a `phase2_limitation`
+        // explaining why no backend writes them yet; fall back to
+        // `phase1_limitation` for the Phase 1 tables.
+        let limitation = table
+            .phase1_limitation()
+            .or_else(|| table.phase2_limitation())
+            .map(str::to_owned);
+        self.limitations
+            .insert(table.as_str().to_owned(), limitation);
     }
 
     pub fn get(&self, table: CanonicalRawTable) -> usize {
@@ -222,6 +262,48 @@ pub struct RawRefnoAssocIndexRecord {
     pub pending_phase2_inst_relate_cata_bool_ids: Vec<String>,
     pub unsupported_inst_relate_booled_aabb_ids: Vec<String>,
     pub limitation: Option<String>,
+}
+
+// =====================================================================
+//  Phase 2 boolean canonical records (v4 §2.1 scaffold)
+// =====================================================================
+//
+// Schemas derived from the SQL the boolean worker currently emits in
+// `manifold_bool.rs::build_inst_relate_bool_upsert_sql` and
+// `build_cata_status_sql`. Fields chosen to be backend-agnostic
+// (no SurrealDB record-id syntax, plain strings for foreign keys).
+//
+// NOTE: no backend writes these yet. v5+ will lift the boolean worker
+// output into a per-row capture channel and route it through the trait.
+
+/// `inst_relate_bool` — one row per `refno` summarising the boolean
+/// computation outcome. v3 schema (from Surreal SQL):
+///   UPSERT inst_relate_bool:⟨refno⟩ CONTENT {
+///       refno: pe:⟨refno⟩, mesh_id, status, source, updated_at }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawInstRelateBoolRecord {
+    pub refno: String,
+    /// SurrealDB `inst_geo:⟨mesh_id⟩` foreign key (plain stringified hash here).
+    pub mesh_id: Option<String>,
+    /// Worker-emitted status string (e.g. "ok" / "skipped" / "failed").
+    pub status: String,
+    /// Origin tag for the row (worker pipeline name, e.g. "memory_tasks" / "db_legacy").
+    pub source: String,
+}
+
+/// `inst_relate_cata_bool` — RELATION-style edge between an `inst_info`
+/// row and an `inst_geo` row, recording the boolean status. v3 SQL:
+///   INSERT RELATION INTO inst_relate_cata_bool [{
+///       in: inst_info:⟨...⟩, out: inst_geo:⟨mesh_id⟩,
+///       status, source, updated_at }]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawInstRelateCataBoolRecord {
+    /// Stringified `inst_info` id (the `in` side of the SurrealDB RELATION).
+    pub inst_info_id: String,
+    /// Stringified `inst_geo` / mesh id (the `out` side of the RELATION).
+    pub mesh_id: String,
+    pub status: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

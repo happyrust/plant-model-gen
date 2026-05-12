@@ -13,7 +13,8 @@
 //! these six methods without re-validating that the baseline IO-skip semantic
 //! is preserved (see `orchestrator.rs` `DrainOnly` fast-path comment).
 
-use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aios_core::geometry::ShapeInstancesData;
@@ -104,19 +105,83 @@ pub async fn run_drain_only_sink(
     Ok(stats)
 }
 
-#[derive(Debug)]
-pub struct DrainOnlyModelWriterBackend {
-    stats: Mutex<DrainOnlyStats>,
-    started: Mutex<Option<Instant>>,
+/// Lock-free DrainOnly stats accumulator for the trait-routed path
+/// (mock/verify binary, NOT the production fast-path).
+///
+/// v4 §2.3: replaces the previous `Mutex<DrainOnlyStats>` with independent
+/// `AtomicU64` counters. The architectural invariant is unchanged
+/// (production orchestrator skips the middle 6 trait methods entirely;
+/// `run_drain_only_sink` still owns a stack-allocated `DrainOnlyStats`
+/// with no atomic overhead). This struct only matters when something
+/// _does_ drive the trait — primarily the verify binary asserting that
+/// `add_batch` counters fire as expected.
+#[derive(Debug, Default)]
+struct DrainOnlyAtomicStats {
+    batches: AtomicU64,
+    instances: AtomicU64,
+    inst_info: AtomicU64,
+    inst_tubi: AtomicU64,
+    geo_keys: AtomicU64,
+    geo_instances: AtomicU64,
+    neg_relations: AtomicU64,
+    ngmr_relations: AtomicU64,
+    mesh_result_batches: AtomicU64,
+    mesh_results: AtomicU64,
+    inst_relate_aabb_batches: AtomicU64,
 }
 
-impl Default for DrainOnlyModelWriterBackend {
-    fn default() -> Self {
-        Self {
-            stats: Mutex::new(DrainOnlyStats::default()),
-            started: Mutex::new(None),
+impl DrainOnlyAtomicStats {
+    fn add_batch(&self, batch: &ShapeInstancesData) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.instances
+            .fetch_add(batch.inst_cnt() as u64, Ordering::Relaxed);
+        self.inst_info
+            .fetch_add(batch.inst_info_map.len() as u64, Ordering::Relaxed);
+        self.inst_tubi
+            .fetch_add(batch.inst_tubi_map.len() as u64, Ordering::Relaxed);
+        self.geo_keys
+            .fetch_add(batch.inst_geos_map.len() as u64, Ordering::Relaxed);
+        let geo_instances: usize = batch
+            .inst_geos_map
+            .values()
+            .map(|geos| geos.insts.len())
+            .sum();
+        self.geo_instances
+            .fetch_add(geo_instances as u64, Ordering::Relaxed);
+        let neg: usize = batch.neg_relate_map.values().map(Vec::len).sum();
+        self.neg_relations
+            .fetch_add(neg as u64, Ordering::Relaxed);
+        let ngmr: usize = batch.ngmr_neg_relate_map.values().map(Vec::len).sum();
+        self.ngmr_relations
+            .fetch_add(ngmr as u64, Ordering::Relaxed);
+    }
+
+    /// Atomic snapshot into a regular `DrainOnlyStats` so we can reuse the
+    /// canonical `print_summary` format.
+    fn snapshot(&self, elapsed: Duration) -> DrainOnlyStats {
+        DrainOnlyStats {
+            batches: self.batches.load(Ordering::Relaxed) as usize,
+            instances: self.instances.load(Ordering::Relaxed) as usize,
+            inst_info: self.inst_info.load(Ordering::Relaxed) as usize,
+            inst_tubi: self.inst_tubi.load(Ordering::Relaxed) as usize,
+            geo_keys: self.geo_keys.load(Ordering::Relaxed) as usize,
+            geo_instances: self.geo_instances.load(Ordering::Relaxed) as usize,
+            neg_relations: self.neg_relations.load(Ordering::Relaxed) as usize,
+            ngmr_relations: self.ngmr_relations.load(Ordering::Relaxed) as usize,
+            mesh_result_batches: self.mesh_result_batches.load(Ordering::Relaxed) as usize,
+            mesh_results: self.mesh_results.load(Ordering::Relaxed) as usize,
+            inst_relate_aabb_batches: self
+                .inst_relate_aabb_batches
+                .load(Ordering::Relaxed) as usize,
+            elapsed,
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct DrainOnlyModelWriterBackend {
+    stats: DrainOnlyAtomicStats,
+    started: OnceLock<Instant>,
 }
 
 #[async_trait]
@@ -133,7 +198,9 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
             context.defer_db_write,
             context.mode.as_str()
         );
-        *self.started.lock().expect("drain-only started lock") = Some(Instant::now());
+        // Second init keeps the original Instant (OnceLock is set-once); this
+        // preserves the v3 verify-binary "second init is safe" assertion.
+        let _ = self.started.set(Instant::now());
         Ok(())
     }
 
@@ -154,10 +221,7 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     ) -> anyhow::Result<WriteBaseReport> {
         // architectural-invariant: not called by orchestrator main pipeline
         // when ModelWriterMode::DrainOnly is selected (baseline fast path).
-        {
-            let mut stats = self.stats.lock().expect("drain-only stats lock");
-            stats.add_batch(batch.shape_insts);
-        }
+        self.stats.add_batch(batch.shape_insts);
         println!(
             "[model-writer:drain-only] stage=base batch={} inst_info={} inst_tubi={} geo_keys={}",
             batch.batch_id,
@@ -175,11 +239,12 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
         // architectural-invariant: not called by orchestrator main pipeline
         // when ModelWriterMode::DrainOnly is selected (baseline fast path).
         let count = batch.mesh_results.len();
-        {
-            let mut stats = self.stats.lock().expect("drain-only stats lock");
-            stats.mesh_result_batches += 1;
-            stats.mesh_results += count;
-        }
+        self.stats
+            .mesh_result_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .mesh_results
+            .fetch_add(count as u64, Ordering::Relaxed);
         println!(
             "[model-writer:drain-only] stage=mesh_results batch={} mesh_results={}",
             batch.batch_id, count
@@ -190,10 +255,9 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     async fn write_inst_relate_aabb(&self, batch: InstRelateAabbBatch<'_>) -> anyhow::Result<()> {
         // architectural-invariant: not called by orchestrator main pipeline
         // when ModelWriterMode::DrainOnly is selected (baseline fast path).
-        {
-            let mut stats = self.stats.lock().expect("drain-only stats lock");
-            stats.inst_relate_aabb_batches += 1;
-        }
+        self.stats
+            .inst_relate_aabb_batches
+            .fetch_add(1, Ordering::Relaxed);
         println!(
             "[model-writer:drain-only] stage=inst_relate_aabb batch={} mesh_results={} aabb_keys={}",
             batch.batch_id,
@@ -235,15 +299,11 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
     async fn finalize(&self, request: FinalizeRequest) -> anyhow::Result<FinalizeSummary> {
         let elapsed = self
             .started
-            .lock()
-            .expect("drain-only started lock")
+            .get()
             .map(|t| t.elapsed())
             .unwrap_or_default();
-        {
-            let mut stats = self.stats.lock().expect("drain-only stats lock");
-            stats.elapsed = elapsed;
-            stats.print_summary();
-        }
+        let snapshot = self.stats.snapshot(elapsed);
+        snapshot.print_summary();
         println!(
             "[model-writer:drain-only] stage=finalize total_batches={} completed_batches={} mesh_cache_hits={} mesh_new_generated={} missing_neg_candidates={}",
             request.total_batches,

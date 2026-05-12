@@ -1314,9 +1314,13 @@ async fn load_task_for_workflow(form_id: &str) -> Result<ReviewTask, WorkflowSyn
     })?;
 
     let Some(form) = form else {
-        return Err(WorkflowSyncActionError::plain(
+        return Err(WorkflowSyncActionError::blocked(
             StatusCode::NOT_FOUND,
             format!("form_id={} 未找到 review form", form_id),
+            None,
+            Some("blank".to_string()),
+            None,
+            "block",
         ));
     };
 

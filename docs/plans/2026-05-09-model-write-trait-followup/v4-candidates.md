@@ -62,7 +62,25 @@
 
 ## 2. 中优先级
 
-### 2.1 `inst_relate_bool` / `inst_relate_cata_bool` Phase 2 boolean canonical records
+### 2.1 `inst_relate_bool` / `inst_relate_cata_bool` Phase 2 boolean canonical records ⚠️ PARTIAL (PR #22 schema scaffold only)
+
+**Status**: 2026-05-12 schema-only 部分完成。PR #22 (`feat/phase2-boolean-canonical-schema`)，base = `docs/async-fn-in-trait-research` (PR #21)，单文件 `canonical_records.rs` ~70 行。
+
+实施时发现 `manifold_bool.rs` 的 boolean worker 直接 emit SQL 进 SurrealDB，`BoolWorkerReport` 只有聚合计数没有 per-row data；让所有 backend `run_boolean_bridge` 落 canonical 需要先重构 worker 暴露 per-row 输出，超出 ~250 行预算。
+
+**实际落地**（PR #22）：
+- 加 `CanonicalRawTable::RawInstRelateBool` / `RawInstRelateCataBool` 枚举变体
+- 加 `RawInstRelateBoolRecord` / `RawInstRelateCataBoolRecord` struct（字段从 v3 Surreal SQL 反推）
+- 加 `phase2_limitation()` + `all_phase2()` 方法
+- `CanonicalRawRowCounts::set` 回退到 phase2_limitation
+- `CanonicalRawBatch` **不动**（不加 Vec 字段，否则强迫所有 backend flush 实际行）
+
+**留到 v5+**（PR 拆分清单）：
+1. 给 `CanonicalRawBatch` 加 `inst_relate_bool` / `inst_relate_cata_bool` Vec 字段
+2. 重构 `manifold_bool.rs` 把 worker per-row 输出 expose 为 channel 或 BoolWorkerReport 扩展
+3. Surreal/Parquet/Compare 三个 backend 收集 boolean rows + finalize flush
+4. `scripts/sql/model-writer-parity-phase2/` 新建 + 4 个 SQL
+5. verify binary 加 Phase 2 fixture
 
 **Why now**：mission `00` + `08` 把 boolean 表明确推到 Phase 2；v3 所有 backend 的 `run_boolean_bridge` 现在都跳过这两张表（Parquet/Compare 返回 `phase2_boolean_not_supported` skip log）。
 

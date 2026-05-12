@@ -499,6 +499,10 @@ fn evaluate_annotation_gate_decision(
         ));
     }
 
+    if summary.total == 0 {
+        return Ok((true, "proceed", "无批注，直接放行".to_string()));
+    }
+
     let has_open = summary.open > 0;
     let has_pending_review = summary.pending_review > 0;
     let has_rejected = summary.rejected > 0;

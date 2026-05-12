@@ -2,15 +2,7 @@ name: Deploy Web Server To Ubuntu
 
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.cursor/**'
-      - '.factory/**'
-      - 'design/**'
-      - 'goals/**'
+    tags: ['v*.*.*']
   workflow_dispatch:
     inputs:
       git_ref:

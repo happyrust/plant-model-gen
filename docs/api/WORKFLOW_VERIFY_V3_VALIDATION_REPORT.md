@@ -43,8 +43,8 @@ v3 重构（verify 路径瘦身 + annotation_check 按 action 分化 + sync retu
 | A1 | sj+0 批注 | verify(active) | passed=true, proceed | ✓ |
 | A2 | sj+1 条 open 批注 | verify(active) | passed=false, block, reason="存在未处理批注..." | ✓ |
 | A3 | sj+pending+approved+rejected 共存 | verify(active) | passed=true, proceed | ✓ |
-| A4 | sj 节点 | verify(agree) | passed=false, block, reason="agree 仅允许在 jd/sh/pz" | ✓ |
-| A5 | sj 节点 | verify(stop) | passed=false, block, reason="stop 仅允许在 jd/sh/pz" | ✓ |
+| A4 | sj 节点 | verify(agree) | passed=false, block, reason="agree 仅在 form 当前节点为 jd/sh/pz 时允许" | ✓ |
+| A5 | sj 节点 | verify(stop) | passed=false, block, reason="stop 仅在 form 当前节点为 jd/sh/pz 时允许" | ✓ |
 
 ### 组 B · jd 节点（10 case）
 
@@ -52,7 +52,7 @@ v3 重构（verify 路径瘦身 + annotation_check 按 action 分化 + sync retu
 
 | # | 设置 | 调用 | 期望 | 实测 |
 |---|---|---|---|---|
-| B1 | jd 节点 | verify(active) | passed=false, block, reason="active 仅允许从 sj" | ✓ |
+| B1 | jd 节点 | verify(active) | passed=false, block, reason="active 仅在 form 当前节点为 sj（编制）时允许" | ✓ |
 | B2 | jd+0 批注 | verify(agree) | passed=true, proceed | ✓ |
 | B3 | jd+1 pending | verify(agree) | passed=false, block, reason="待确认批注" | ✓ |
 | B4 | jd+1 rejected | verify(agree) | passed=false, **return**, reason="已驳回" | ✓ |

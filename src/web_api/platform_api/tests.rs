@@ -250,7 +250,10 @@ async fn insert_review_record_with_state(
 
     project_primary_db()
         .query(sql)
-        .bind(("id", format!("record-{}-{}", form_id.to_lowercase(), record_label)))
+        .bind((
+            "id",
+            format!("record-{}-{}", form_id.to_lowercase(), record_label),
+        ))
         .bind(("task_id", task_id.to_string()))
         .bind(("form_id", form_id.to_string()))
         .bind(("annotation_id", annotation_id.to_string()))
@@ -945,7 +948,7 @@ async fn test_workflow_verify_active_on_non_sj_node_returns_soft_block() {
     assert_eq!(data.task_status.as_deref(), Some("submitted"));
     assert_eq!(data.next_step.as_deref(), Some("jd"));
     assert_eq!(data.recommended_action, "block");
-    assert!(data.reason.contains("active 仅允许从 sj 发起"));
+    assert!(data.reason.contains("active 仅在 form 当前节点为 sj"));
 
     let task_after = super::review_form::find_task_by_form_id(form_id)
         .await

@@ -504,21 +504,13 @@ fn evaluate_annotation_gate_decision(
     let has_rejected = summary.rejected > 0;
 
     match intent {
-        AnnotationCheckIntent::ActiveSubmit => evaluate_active_submit_gate(
-            current_node,
-            has_open,
-        ),
-        AnnotationCheckIntent::AgreeAdvance => evaluate_agree_advance_gate(
-            current_node,
-            has_open,
-            has_pending_review,
-            has_rejected,
-        ),
-        AnnotationCheckIntent::ReturnReject => evaluate_return_reject_gate(
-            current_node,
-            has_open,
-            has_rejected,
-        ),
+        AnnotationCheckIntent::ActiveSubmit => evaluate_active_submit_gate(current_node, has_open),
+        AnnotationCheckIntent::AgreeAdvance => {
+            evaluate_agree_advance_gate(current_node, has_open, has_pending_review, has_rejected)
+        }
+        AnnotationCheckIntent::ReturnReject => {
+            evaluate_return_reject_gate(current_node, has_open, has_rejected)
+        }
         AnnotationCheckIntent::SubmitNext => {
             evaluate_submit_next_gate(current_node, has_open, has_pending_review, has_rejected)
         }
@@ -536,7 +528,7 @@ fn evaluate_active_submit_gate(
             false,
             "block",
             format!(
-                "active 仅允许从 sj 发起，当前节点为 {}",
+                "active 仅在 form 当前节点为 sj（编制）时允许；当前 form 节点为 {}。若需重新送审，请先 return 驳回到 sj。",
                 current_node
             ),
         ));
@@ -563,7 +555,7 @@ fn evaluate_agree_advance_gate(
             false,
             "block",
             format!(
-                "agree 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                "agree 仅在 form 当前节点为 jd/sh/pz 时允许；当前 form 节点为 {}。",
                 current_node
             ),
         ));
@@ -603,7 +595,7 @@ fn evaluate_return_reject_gate(
             false,
             "block",
             format!(
-                "return 仅允许在 jd/sh/pz 节点执行，当前节点为 {}",
+                "return 仅在 form 当前节点为 jd/sh/pz 时允许；当前 form 节点为 {}。",
                 current_node
             ),
         ));
@@ -1007,7 +999,12 @@ mod gate_decision_tests {
         parse_annotation_check_intent,
     };
 
-    fn summary(open: usize, pending: usize, approved: usize, rejected: usize) -> AnnotationCheckSummary {
+    fn summary(
+        open: usize,
+        pending: usize,
+        approved: usize,
+        rejected: usize,
+    ) -> AnnotationCheckSummary {
         AnnotationCheckSummary {
             total: open + pending + approved + rejected,
             open,
@@ -1059,7 +1056,7 @@ mod gate_decision_tests {
                 .unwrap();
         assert!(!passed);
         assert_eq!(action, "block");
-        assert!(msg.contains("active 仅允许从 sj 发起"));
+        assert!(msg.contains("active 仅在 form 当前节点为 sj"));
     }
 
     #[test]
@@ -1104,7 +1101,7 @@ mod gate_decision_tests {
             evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::AgreeAdvance, &summary)
                 .unwrap();
         assert!(!passed);
-        assert!(msg.contains("agree 仅允许在 jd/sh/pz"));
+        assert!(msg.contains("agree 仅在 form 当前节点为 jd/sh/pz"));
     }
 
     #[test]
@@ -1159,7 +1156,7 @@ mod gate_decision_tests {
             evaluate_annotation_gate_decision("sj", AnnotationCheckIntent::ReturnReject, &summary)
                 .unwrap();
         assert!(!passed);
-        assert!(msg.contains("return 仅允许在 jd/sh/pz"));
+        assert!(msg.contains("return 仅在 form 当前节点为 jd/sh/pz"));
     }
 
     #[test]

@@ -100,7 +100,9 @@
 
 ---
 
-### 2.3 DrainOnly stats `Mutex` → atomic
+### 2.3 DrainOnly stats `Mutex` → atomic ✅ DONE (PR #20)
+
+**Status**: 2026-05-12 完成。PR #20 (`refactor/drain-only-stats-atomic`)，base = `refactor/bridge-context` (PR #19)，单文件改动 `drain_only.rs`，cargo check + verify-mock 均 PASS。`run_drain_only_sink` 主路径未动（仍 stack stats + plain usize +=），仅 trait-routed 那条路改 atomic。
 
 **Why now**：v2 N-5；DrainOnly 是 baseline，stats 走 `Mutex<DrainOnlyStats>`，hot path 上 lock 开销稍大。
 

@@ -1140,13 +1140,18 @@ fn current_node_owner_for_task_row<'a>(
     }
 }
 
-/// 把"当前操作人 user_id 与节点指定负责人 user_id 不一致"翻译成调用方能直接定位
-/// 集成 bug 的中文消息。
+/// 当 JWT user_id 与节点指定的 owner_id 不一致时，给调用方一条能定位真正问题的错误消息。
 ///
-/// 这条错误在外部驱动场景（PMS 嵌入态）下，几乎只可能因为「PMS 创建 task
-/// 时填的 owner id」和「PMS 嵌入页签 JWT 时给的 user_id」用了两套不同的 ID 命名
-/// 空间（典型例子：task.checker_id=`U011`，但嵌入页 user_id=`JH`）。把双方实际
-/// 值打出来，让 PMS 集成方一眼能看清两套 id 的差异。
+/// 设计前提（外部驱动模式 / PMS 集成）：
+/// - 创建 task 时 PMS **不需要** 显式传 checker_id / approver_id；
+/// - 节点 owner 由 PMS 在每次 `POST /api/review/workflow/sync` 调用时通过
+///   `next_step.assignee_id` 显式同步给 plant3d；
+/// - plant3d 只负责按 next_step 记录与校验，不维护任何 owner 命名空间。
+///
+/// 因此能撞到这条错误的真实场景几乎只有一种：调用方走了**内部**
+/// `/api/review/tasks/{id}/{submit,return,approve,reject}` 路径，而那条路径
+/// 要求 `claims.user_id == task.<owner>_id` 完全相等（按内部 mode 设计）。
+/// 把当前实际值打出来 + 指引切到 `/workflow/sync` 才是有用的诊断。
 fn format_owner_mismatch_error(
     operator_user: &str,
     current_node: &str,
@@ -1156,17 +1161,19 @@ fn format_owner_mismatch_error(
     let node_name = get_node_display_name(current_node);
     if owner_id.is_empty() {
         return format!(
-            "权限不足：当前节点「{}」({}) 未指定 {} 负责人，无法识别操作权限；当前 JWT user_id={}。\
-             外部驱动模式下，请确认 PMS 在创建 task 时正确填了对应字段（checker_id/approver_id），\
-             或改走 POST /api/review/workflow/sync 由 PMS 后端统一驱动。",
+            "权限不足：当前节点「{}」({}) 的 {} 字段为空，无法识别本节点负责人；\
+             当前 JWT user_id={}。外部驱动模式下节点负责人由 PMS 在 \
+             sync(active/agree/return) 调用时通过 next_step.assignee_id 显式同步给 plant3d；\
+             若该 task 尚未经过对应 sync，请改用 POST /api/review/workflow/sync 推进流程。",
             node_name, current_node, owner_source, operator_user
         );
     }
     format!(
         "权限不足：用户 {} 不是「{}」({}) 节点的负责人（节点指定的 {} = {}）。\
-         外部驱动模式下，请确认 PMS 在创建 task（填 {}_id）和申请嵌入页（填 user_id）时\
-         使用同一个 user_id 命名空间；状态变更应由 PMS 后端调 POST /api/review/workflow/sync\
-         完成，浏览器侧的 /tasks/{{id}}/{{submit,return,approve,reject}} 不适用于外部驱动场景。",
+         该接口仅供内部模式使用，要求 JWT user_id 与 task.{}_id 完全一致。\
+         外部驱动模式（PMS 嵌入态）下，状态变更必须经过 \
+         POST /api/review/workflow/sync，由 PMS 显式声明 actor 并通过 next_step 推进；\
+         浏览器侧的 /tasks/{{id}}/{{submit,return,approve,reject}} 不适用于外部驱动场景。",
         operator_user, node_name, current_node, owner_source, owner_id, owner_source
     )
 }

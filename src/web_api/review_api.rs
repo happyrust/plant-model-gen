@@ -442,6 +442,8 @@ pub struct TaskListQuery {
     pub checker_id: Option<String>,
     pub approver_id: Option<String>,
     pub reviewer_id: Option<String>,
+    #[serde(alias = "formId")]
+    pub form_id: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -1743,6 +1745,13 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
     if let Some(ref reviewer_id) = query.reviewer_id {
         conditions.push("(reviewer_id = $reviewer_id OR checker_id = $reviewer_id)");
         bindings.push(("reviewer_id", reviewer_id.clone()));
+    }
+    if let Some(ref form_id) = query.form_id {
+        let trimmed = form_id.trim();
+        if !trimmed.is_empty() {
+            conditions.push("form_id = $form_id");
+            bindings.push(("form_id", trimmed.to_string()));
+        }
     }
 
     let where_clause = format!("WHERE {}", conditions.join(" AND "));

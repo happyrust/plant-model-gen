@@ -3,10 +3,12 @@ use once_cell::sync::OnceCell;
 use surrealdb::Surreal;
 use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::opt::auth::Root;
+use tokio::time::{Duration, timeout};
 
 use aios_core::options::{DbConnMode, DbOption};
 
 static REVIEW_PRIMARY_DB: OnceCell<Surreal<Client>> = OnceCell::new();
+static REVIEW_QUERY_INDEXES_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_some() {
@@ -90,6 +92,8 @@ pub async fn ensure_review_primary_db_context() -> Result<()> {
     )
     .await?;
 
+    ensure_review_query_indexes().await?;
+
     Ok(())
 }
 
@@ -97,6 +101,43 @@ pub fn review_primary_db() -> &'static Surreal<Client> {
     REVIEW_PRIMARY_DB
         .get()
         .expect("review_primary_db 尚未初始化")
+}
+
+async fn ensure_review_query_indexes_inner() -> Result<()> {
+    let db = fresh_review_db().await?;
+    timeout(
+        Duration::from_secs(30),
+        db.query(
+            r#"
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_form_id ON TABLE review_tasks FIELDS form_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_requester_id ON TABLE review_tasks FIELDS requester_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_checker_id ON TABLE review_tasks FIELDS checker_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_reviewer_id ON TABLE review_tasks FIELDS reviewer_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_approver_id ON TABLE review_tasks FIELDS approver_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_current_node ON TABLE review_tasks FIELDS current_node;
+            DEFINE INDEX IF NOT EXISTS idx_review_tasks_status ON TABLE review_tasks FIELDS status;
+            DEFINE INDEX IF NOT EXISTS idx_review_records_form_id ON TABLE review_records FIELDS form_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_records_task_id ON TABLE review_records FIELDS task_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_comments_annotation_id ON TABLE review_comments FIELDS annotation_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_attachment_form_id ON TABLE review_attachment FIELDS form_id;
+            DEFINE INDEX IF NOT EXISTS idx_review_form_model_form_id ON TABLE review_form_model FIELDS form_id;
+            "#,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("ensure_review_query_indexes 超时"))??
+    .check()?;
+    tracing::info!(
+        "[REVIEW_DB.schema] review 查询索引已确认（tasks/records/comments/attachments/form_model）"
+    );
+    Ok(())
+}
+
+pub async fn ensure_review_query_indexes() -> Result<()> {
+    REVIEW_QUERY_INDEXES_READY
+        .get_or_try_init(|| async { ensure_review_query_indexes_inner().await })
+        .await?;
+    Ok(())
 }
 
 // ============================================================================

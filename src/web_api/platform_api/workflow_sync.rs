@@ -574,7 +574,12 @@ pub async fn verify_workflow_handler(
                         annotation_check: None,
                     }),
                 );
-                (response, true, None::<String>, "blank_passthrough".to_string())
+                (
+                    response,
+                    true,
+                    None::<String>,
+                    "blank_passthrough".to_string(),
+                )
             }
             Err(error) => {
                 let block_code = error
@@ -610,10 +615,19 @@ pub async fn verify_workflow_handler(
 
 /// verify 路径用的 action → annotation_check intent 映射。
 /// active / return / stop 跳过批注检查：return 本身就是带问题批注退回设计。
-fn verify_action_intent(kind: WorkflowMutationKind) -> Option<AnnotationCheckIntent> {
-    match kind {
-        WorkflowMutationKind::Active | WorkflowMutationKind::Return | WorkflowMutationKind::Stop => None,
-        WorkflowMutationKind::Agree => Some(AnnotationCheckIntent::AgreeAdvance),
+fn verify_action_intent_for_node(
+    kind: WorkflowMutationKind,
+    current_node: &str,
+) -> Option<AnnotationCheckIntent> {
+    match (kind, current_node) {
+        (WorkflowMutationKind::Agree, "sj") => Some(AnnotationCheckIntent::ActiveSubmit),
+        (WorkflowMutationKind::Agree, _) => Some(AnnotationCheckIntent::AgreeAdvance),
+        (
+            WorkflowMutationKind::Active
+            | WorkflowMutationKind::Return
+            | WorkflowMutationKind::Stop,
+            _,
+        ) => None,
     }
 }
 
@@ -652,7 +666,8 @@ fn ensure_action_allowed_on_node(
 ) -> Result<(), WorkflowSyncActionError> {
     let allowed = match kind {
         WorkflowMutationKind::Active => current_node == "sj",
-        WorkflowMutationKind::Agree | WorkflowMutationKind::Return | WorkflowMutationKind::Stop => {
+        WorkflowMutationKind::Agree => matches!(current_node, "sj" | "jd" | "sh" | "pz"),
+        WorkflowMutationKind::Return | WorkflowMutationKind::Stop => {
             matches!(current_node, "jd" | "sh" | "pz")
         }
     };
@@ -669,7 +684,11 @@ fn ensure_action_allowed_on_node(
                 displayed_node, displayed_node_cn
             )
         }
-        WorkflowMutationKind::Agree | WorkflowMutationKind::Return | WorkflowMutationKind::Stop => {
+        WorkflowMutationKind::Agree => format!(
+            "agree 仅在 form 当前节点为 sj/jd/sh/pz 时允许；当前 form 节点为 {}（{}）。",
+            displayed_node, displayed_node_cn
+        ),
+        WorkflowMutationKind::Return | WorkflowMutationKind::Stop => {
             format_jd_sh_pz_only_action_message(label, current_node)
         }
     };
@@ -687,6 +706,7 @@ fn ensure_action_allowed_on_node(
 fn verify_expected_next_node(kind: WorkflowMutationKind, current_node: &str) -> Option<String> {
     match (kind, current_node) {
         (WorkflowMutationKind::Active, "sj") => Some("jd".to_string()),
+        (WorkflowMutationKind::Agree, "sj") => Some("jd".to_string()),
         (WorkflowMutationKind::Agree, "jd") => Some("sh".to_string()),
         (WorkflowMutationKind::Agree, "sh") => Some("pz".to_string()),
         _ => None,
@@ -719,7 +739,7 @@ async fn validate_workflow_for_verify(
         is_external_workflow(request),
     )?;
 
-    let intent = verify_action_intent(kind);
+    let intent = verify_action_intent_for_node(kind, &current_node);
     if let Some(intent_value) = intent {
         let context = build_annotation_check_context(
             task.id.clone(),
@@ -1302,17 +1322,8 @@ mod tests {
     #[test]
     fn internal_workflow_owner_mismatch_is_forbidden() {
         let task = review_task_with_owners("jd", "JH", "SH");
-        let err = ensure_owner_matches(
-            "agree",
-            &task,
-            "jd",
-            "OTHER",
-            None,
-            None,
-            None,
-            false,
-        )
-        .expect_err("internal mode must reject mismatched actor");
+        let err = ensure_owner_matches("agree", &task, "jd", "OTHER", None, None, None, false)
+            .expect_err("internal mode must reject mismatched actor");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert!(
             err.message.contains("权限"),
@@ -1539,6 +1550,7 @@ fn ensure_owner_matches(
 
 fn expected_agree_next_node(current_node: &str) -> Option<&'static str> {
     match current_node {
+        "sj" => Some("jd"),
         "jd" => Some("sh"),
         "sh" => Some("pz"),
         _ => None,
@@ -1684,10 +1696,14 @@ async fn validate_workflow_agree(
         .filter(|value| !value.is_empty());
     ensure_task_not_terminal(&task, &current_node, requested_next_step.clone())?;
 
-    if current_node != "jd" && current_node != "sh" && current_node != "pz" {
+    if current_node != "sj" && current_node != "jd" && current_node != "sh" && current_node != "pz"
+    {
         return Err(WorkflowSyncActionError::blocked(
             StatusCode::CONFLICT,
-            format_jd_sh_pz_only_action_message("agree", &current_node),
+            format!(
+                "agree 仅在 form 当前节点为 sj/jd/sh/pz 时允许；当前 form 节点为 {}。",
+                current_node
+            ),
             Some(current_node.clone()),
             Some(normalize_task_status(&task.status)),
             requested_next_step.clone(),
@@ -1731,7 +1747,11 @@ async fn validate_workflow_agree(
         ),
         AnnotationCheckOptions {
             current_node: Some(current_node.clone()),
-            intent: Some(AnnotationCheckIntent::AgreeAdvance.as_str().to_string()),
+            intent: Some(if current_node == "sj" {
+                AnnotationCheckIntent::ActiveSubmit.as_str().to_string()
+            } else {
+                AnnotationCheckIntent::AgreeAdvance.as_str().to_string()
+            }),
             included_types: None,
         },
     )

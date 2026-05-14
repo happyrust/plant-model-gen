@@ -453,8 +453,8 @@ fn is_external_workflow(request: &SyncWorkflowRequest) -> bool {
 /// 2. 加载 form 对应活动 task；终态拒绝
 /// 3. action 与 current_node 匹配（active 仅 sj；agree/return/stop 仅 jd/sh/pz）
 /// 4. owner 校验：actor.id == 当前节点负责人
-/// 5. annotation_check 按 action 分化（agree=AgreeAdvance
-///    / return=ReturnReject / active 和 stop 跳过）
+/// 5. annotation_check 按 action 分化（agree=AgreeAdvance；
+///    active / return / stop 跳过）
 ///
 /// 任意业务阻断走 soft block：返 200 OK + `passed=false` + 结构化诊断。
 pub async fn verify_workflow_handler(
@@ -609,12 +609,11 @@ pub async fn verify_workflow_handler(
 }
 
 /// verify 路径用的 action → annotation_check intent 映射。
-/// active 和 stop 跳过批注检查：送审阶段不存在校核批注，无需拦截。
+/// active / return / stop 跳过批注检查：return 本身就是带问题批注退回设计。
 fn verify_action_intent(kind: WorkflowMutationKind) -> Option<AnnotationCheckIntent> {
     match kind {
-        WorkflowMutationKind::Active | WorkflowMutationKind::Stop => None,
+        WorkflowMutationKind::Active | WorkflowMutationKind::Return | WorkflowMutationKind::Stop => None,
         WorkflowMutationKind::Agree => Some(AnnotationCheckIntent::AgreeAdvance),
-        WorkflowMutationKind::Return => Some(AnnotationCheckIntent::ReturnReject),
     }
 }
 
@@ -1663,38 +1662,6 @@ async fn validate_workflow_return(
         workflow_next_step_diagnostic(request.next_step.as_ref()),
         external_workflow,
     )?;
-
-    let annotation_check = evaluate_annotation_check(
-        &build_annotation_check_context(
-            task.id.clone(),
-            task.form_id.clone(),
-            task.current_node.clone(),
-        ),
-        AnnotationCheckOptions {
-            current_node: Some(current_node.clone()),
-            intent: Some(AnnotationCheckIntent::ReturnReject.as_str().to_string()),
-            included_types: None,
-        },
-    )
-    .await
-    .map_err(|(status, message)| WorkflowSyncActionError::plain(status, message))?;
-    if !annotation_check.passed {
-        let (owner_id, owner_source) = current_node_owner(&task, &current_node);
-        return Err(WorkflowSyncActionError::annotation_check_failed(
-            annotation_check,
-            Some(current_node.clone()),
-            Some(normalize_task_status(&task.status)),
-            Some(next_step.target_node.clone()),
-        )
-        .with_verify_diagnostics(
-            "ANNOTATION_CHECK_FAILED",
-            request.actor().id.trim(),
-            owner_id,
-            owner_source,
-            Some(next_step.target_node.clone()),
-            workflow_next_step_diagnostic(request.next_step.as_ref()),
-        ));
-    }
 
     Ok(WorkflowMutationPrecheck {
         task_status: normalize_task_status(&task.status),

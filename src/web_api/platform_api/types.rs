@@ -172,7 +172,7 @@ pub struct CachePreloadResponse {
 /// | `actor` | 仅 debug_token 模式必填；其他场景从 token claims 推 | 同 verify |
 /// | `next_step` | **静默忽略** | active/agree(非pz)/return 必填；stop/agree(pz) 可省 |
 /// | `comments` | 静默忽略 | 落 `review_workflow_history.comment` |
-/// | `metadata` | 静默忽略 | 静默忽略（保留兼容） |
+/// | `metadata.source` | 静默忽略 | 写入 workflow history 的 source 字段（可选） |
 ///
 /// 即 verify 在生产链路下的最小契约只需要 `form_id` + `token` + `action`。
 #[derive(Debug, Deserialize)]
@@ -195,8 +195,8 @@ pub struct SyncWorkflowRequest {
     /// 流程动作意见。仅 sync 消费，写入 `review_workflow_history.comment`，
     /// 不在响应回传。
     pub comments: Option<String>,
-    /// 透传给 PMS 的扩展数据。当前未被任何代码读取，保留兼容；
-    /// 如需扩展请明确字段名而不是塞进 metadata。
+    /// 扩展数据。sync 当前只读取 `source` 用于写入 workflow history，
+    /// 其他业务字段请明确顶层字段名而不是塞进 metadata。
     pub metadata: Option<serde_json::Value>,
     /// 从 JWT claims 注入，不从请求体读取。external 模式下平台只透传外部流程身份。
     #[serde(skip)]

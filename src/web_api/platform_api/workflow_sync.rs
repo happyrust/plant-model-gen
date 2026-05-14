@@ -261,6 +261,24 @@ fn format_beijing_datetime_millis(millis: i64) -> String {
         .to_string()
 }
 
+fn workflow_history_source(request: &SyncWorkflowRequest) -> String {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("source"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if is_external_workflow(request) {
+                "workflow_sync_external".to_string()
+            } else {
+                "workflow_sync".to_string()
+            }
+        })
+}
+
 fn load_web_public_base_url() -> Option<String> {
     WEB_PUBLIC_BASE_URL
         .get_or_init(|| {
@@ -1926,12 +1944,19 @@ async fn apply_workflow_active(
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: $target_node,
             action: 'submit',
             operator_id: $operator_id,
             operator_name: $operator_name,
+            actor_id: $operator_id,
+            actor_role: $actor_role,
+            actor_name: $operator_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            timestamp: time::now(),
+            created_at: time::now()
         }
     "#;
     let history_comment = request
@@ -1942,9 +1967,13 @@ async fn apply_workflow_active(
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
+        .bind(("form_id", request.form_id.clone()))
         .bind(("from_node", current_node))
+        .bind(("target_node", Some(next_step.target_node.clone())))
         .bind(("operator_id", request.actor().id.trim().to_string()))
         .bind(("operator_name", request.actor().name.trim().to_string()))
+        .bind(("actor_role", request.actor().roles.trim().to_string()))
+        .bind(("source", workflow_history_source(request)))
         .bind(("comment", history_comment))
         .await;
 
@@ -2055,20 +2084,31 @@ async fn apply_workflow_return(
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: $target_node,
             action: 'return',
             operator_id: $operator_id,
             operator_name: $operator_name,
+            actor_id: $operator_id,
+            actor_role: $actor_role,
+            actor_name: $operator_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            timestamp: time::now(),
+            created_at: time::now()
         }
     "#;
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
+        .bind(("form_id", request.form_id.clone()))
         .bind(("from_node", current_node))
+        .bind(("target_node", Some(next_step.target_node.clone())))
         .bind(("operator_id", request.actor().id.trim().to_string()))
         .bind(("operator_name", request.actor().name.trim().to_string()))
+        .bind(("actor_role", request.actor().roles.trim().to_string()))
+        .bind(("source", workflow_history_source(request)))
         .bind(("comment", Some(return_reason)))
         .await;
 
@@ -2204,12 +2244,19 @@ async fn apply_workflow_agree(
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: $target_node,
             action: 'approve',
             operator_id: $operator_id,
             operator_name: $operator_name,
+            actor_id: $operator_id,
+            actor_role: $actor_role,
+            actor_name: $operator_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            timestamp: time::now(),
+            created_at: time::now()
         }
     "#;
     let history_comment = request
@@ -2220,9 +2267,13 @@ async fn apply_workflow_agree(
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
+        .bind(("form_id", request.form_id.clone()))
         .bind(("from_node", current_node.clone()))
+        .bind(("target_node", Some(target_node.clone())))
         .bind(("operator_id", request.actor().id.trim().to_string()))
         .bind(("operator_name", request.actor().name.trim().to_string()))
+        .bind(("actor_role", request.actor().roles.trim().to_string()))
+        .bind(("source", workflow_history_source(request)))
         .bind(("comment", history_comment))
         .await;
 
@@ -2314,20 +2365,30 @@ async fn apply_workflow_stop(
     let history_sql = r#"
         CREATE review_workflow_history CONTENT {
             task_id: $task_id,
+            form_id: $form_id,
             node: $from_node,
+            target_node: NONE,
             action: 'stop',
             operator_id: $operator_id,
             operator_name: $operator_name,
+            actor_id: $operator_id,
+            actor_role: $actor_role,
+            actor_name: $operator_name,
+            source: $source,
             comment: $comment,
-            timestamp: time::now()
+            timestamp: time::now(),
+            created_at: time::now()
         }
     "#;
     let _ = review_primary_db()
         .query(history_sql)
         .bind(("task_id", task.id.clone()))
+        .bind(("form_id", request.form_id.clone()))
         .bind(("from_node", current_node))
         .bind(("operator_id", request.actor().id.trim().to_string()))
         .bind(("operator_name", request.actor().name.trim().to_string()))
+        .bind(("actor_role", request.actor().roles.trim().to_string()))
+        .bind(("source", workflow_history_source(request)))
         .bind(("comment", Some(stop_reason)))
         .await;
 

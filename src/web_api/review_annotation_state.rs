@@ -535,7 +535,7 @@ fn validate_action_permission(
         "agree" | "reject" => {
             if matches!(
                 role.as_str(),
-                "checker" | "reviewer" | "approver" | "jd" | "sh" | "pz"
+                "checker" | "reviewer" | "approver" | "jd" | "jh" | "sh" | "pz"
             ) {
                 Ok(())
             } else {

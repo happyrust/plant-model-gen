@@ -333,6 +333,17 @@ async fn apply_annotation_state(
         Err(_) => None,
     };
 
+    if let Err(msg) = validate_decision_precondition(&action, existing.as_ref()) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApplyAnnotationStateResponse {
+                success: false,
+                state: None,
+                error_message: Some(msg),
+            }),
+        );
+    }
+
     let mut merged_history: Vec<Value> = existing
         .as_ref()
         .and_then(|r| r.history.clone())
@@ -544,6 +555,37 @@ fn validate_action_permission(
         }
         _ => Err(format!("未知操作: {}", action)),
     }
+}
+
+fn validate_decision_precondition(
+    action: &str,
+    existing: Option<&AnnotationStateRow>,
+) -> Result<(), String> {
+    if !matches!(action, "agree" | "reject") {
+        return Ok(());
+    }
+
+    let Some(row) = existing else {
+        return Err("未找到设计处理状态，请先由设计人员标记为已修改或不需解决".to_string());
+    };
+
+    let resolution_status = row.resolution_status.as_deref().unwrap_or("open");
+    if !matches!(resolution_status, "fixed" | "wont_fix") {
+        return Err(format!(
+            "当前批注处理状态为 {}，需设计人员先标记为已修改或不需解决",
+            resolution_status
+        ));
+    }
+
+    let decision_status = row.decision_status.as_deref().unwrap_or("pending");
+    if decision_status != "pending" {
+        return Err(format!(
+            "当前批注确认状态已为 {}，不能重复同意或驳回",
+            decision_status
+        ));
+    }
+
+    Ok(())
 }
 
 async fn lookup_task_node(task_id: &str) -> Result<Option<TaskNodeRow>, String> {

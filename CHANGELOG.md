@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-05-18
+
+### Fixed — 三维校审批注状态血缘与流程历史事务化
+
+> 修复 SJ 处理后的批注在 JD/JH 同意或驳回时可能落到错误 `task_id` 维度的问题，并加固流程流转写库一致性，避免 `review_tasks` / `review_forms` 已更新但 `review_workflow_history` 丢失。
+
+- `review_annotation_state.rs`：同意/驳回批注前校验同一 `form_id/task_id` 下必须已有 `fixed/wont_fix` 处理状态，避免错误任务维度新建决策状态。
+- `workflow_sync.rs`：PMS 外部 `active/agree/return/stop` 流程改为单个 SurrealQL transaction 同时写入 `review_tasks`、`review_forms`、`review_workflow_history`；历史写入失败不再吞掉，返回明确错误码。
+- `review_api.rs`：内部 `submit_to_next_node` / `return_to_node` 同步收口到事务写入；同 `form_id` 复用任务的 `resubmit` 历史写入失败时返回错误。
+- 验证：
+  - `cargo check --bin web_server --features web_server` 通过（本机已补齐 NASM；仅既有依赖 warning）。
+
 ## 2026-05-12
 
 ### Changed — 校审内外部模式改为编译期 feature 控制

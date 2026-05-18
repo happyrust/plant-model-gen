@@ -24,7 +24,8 @@ use crate::web_api::platform_api::{
         AnnotationCheckOptions, annotation_check_failed_response, build_annotation_check_context,
         evaluate_annotation_check,
     },
-    mark_review_form_deleted, sync_review_form_with_task_status,
+    derive_review_form_status_from_task_status, mark_review_form_deleted,
+    sync_review_form_with_task_status,
 };
 use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
 use crate::web_api::review_db::{
@@ -136,6 +137,135 @@ pub fn get_node_display_name(node: &str) -> &'static str {
         "pz" => "批准",
         _ => "未知",
     }
+}
+
+struct InternalWorkflowMutationWrite {
+    task_id: String,
+    form_id: Option<String>,
+    project_id: String,
+    requester_id: String,
+    next_node: String,
+    next_status: &'static str,
+    return_reason: Option<String>,
+    history_from_node: String,
+    history_target_node: Option<String>,
+    history_action: String,
+    actor_id: String,
+    actor_role: Option<String>,
+    actor_name: String,
+    comment: Option<String>,
+}
+
+async fn apply_internal_workflow_mutation_transaction(
+    write: InternalWorkflowMutationWrite,
+) -> Result<(), (StatusCode, String)> {
+    ensure_review_workflow_history_schema().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("初始化 workflow history schema 失败: {}", e),
+        )
+    })?;
+
+    let form_id = write
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let form_status = derive_review_form_status_from_task_status(write.next_status);
+    let sql = r#"
+        BEGIN TRANSACTION;
+
+        LET $updated_task = UPDATE review_tasks SET
+            current_node = $next_node,
+            status = $status,
+            return_reason = $return_reason,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false);
+        IF array::len($updated_task) = 0 {
+            THROW "INTERNAL_WORKFLOW_TASK_NOT_FOUND";
+        };
+
+        LET $updated_form = UPDATE review_forms SET
+            project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
+            user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
+            requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+            source = 'plant3d-internal',
+            task_created = true,
+            status = $form_status,
+            deleted = false,
+            deleted_at = NONE,
+            updated_at = time::now()
+        WHERE form_id = $form_id;
+        IF string::len(string::trim($form_id)) > 0 AND array::len($updated_form) = 0 {
+            THROW "INTERNAL_REVIEW_FORM_NOT_FOUND";
+        };
+
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            form_id: $form_id,
+            node: $history_from_node,
+            target_node: $history_target_node,
+            action: $history_action,
+            operator_id: $actor_id,
+            operator_name: $actor_name,
+            actor_id: $actor_id,
+            actor_role: $actor_role,
+            actor_name: $actor_name,
+            source: 'plant3d-internal',
+            comment: $comment,
+            timestamp: time::now(),
+            created_at: time::now()
+        };
+
+        COMMIT TRANSACTION;
+    "#;
+
+    let form_id_for_error = form_id.clone();
+    review_primary_db()
+        .query(sql)
+        .bind(("task_id", write.task_id))
+        .bind(("form_id", form_id))
+        .bind(("project_id", write.project_id))
+        .bind(("requester_id", write.requester_id))
+        .bind(("next_node", write.next_node))
+        .bind(("status", write.next_status))
+        .bind(("return_reason", write.return_reason))
+        .bind(("form_status", form_status))
+        .bind(("history_from_node", write.history_from_node))
+        .bind(("history_target_node", write.history_target_node))
+        .bind(("history_action", write.history_action))
+        .bind(("actor_id", write.actor_id))
+        .bind(("actor_role", write.actor_role))
+        .bind(("actor_name", write.actor_name))
+        .bind(("comment", write.comment))
+        .await
+        .and_then(|response| response.check())
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("INTERNAL_WORKFLOW_TASK_NOT_FOUND") {
+                return (
+                    StatusCode::CONFLICT,
+                    "单据状态已变化，请刷新后重试".to_string(),
+                );
+            }
+            if message.contains("INTERNAL_REVIEW_FORM_NOT_FOUND") {
+                return (
+                    StatusCode::CONFLICT,
+                    format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
+                    message
+                ),
+            )
+        })?;
+
+    Ok(())
 }
 
 /// 组件信息
@@ -1515,8 +1645,23 @@ async fn create_task(
                     );
                     if let Err(e) = ensure_review_workflow_history_schema().await {
                         warn!(
-                            "[REVIEW_API.create_task] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
+                            "[REVIEW_API.create_task] FAIL form_id={} existing_task_id={} actor_id={} elapsed_ms={} reason=history_schema_error: {}",
+                            form_id,
+                            existing.id,
+                            claims.user_id,
+                            started.elapsed().as_millis(),
                             e
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(TaskResponse {
+                                success: false,
+                                task: None,
+                                error_message: Some(format!(
+                                    "初始化 workflow history schema 失败: {}",
+                                    e
+                                )),
+                            }),
                         );
                     }
                     let history_sql = r#"
@@ -1539,7 +1684,7 @@ async fn create_task(
                         .as_ref()
                         .map(|r| r.trim().to_string())
                         .filter(|s| !s.is_empty());
-                    let _ = review_primary_db()
+                    if let Err(e) = review_primary_db()
                         .query(history_sql)
                         .bind(("task_id", existing.id.clone()))
                         .bind(("form_id", Some(form_id.clone())))
@@ -1550,7 +1695,29 @@ async fn create_task(
                         .bind(("actor_name", requester_name.clone()))
                         .bind(("source", "plant3d-internal".to_string()))
                         .bind(("comment", Some("再次发起编校审（form_id 复用）".to_string())))
-                        .await;
+                        .await
+                        .and_then(|response| response.check())
+                    {
+                        warn!(
+                            "[REVIEW_API.create_task] FAIL form_id={} existing_task_id={} actor_id={} elapsed_ms={} reason=resubmit_history_error: {}",
+                            form_id,
+                            existing.id,
+                            claims.user_id,
+                            started.elapsed().as_millis(),
+                            e
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(TaskResponse {
+                                success: false,
+                                task: None,
+                                error_message: Some(format!(
+                                    "写入 review_workflow_history 失败: {}",
+                                    e
+                                )),
+                            }),
+                        );
+                    }
                     return (
                         StatusCode::OK,
                         Json(TaskResponse {
@@ -4325,25 +4492,32 @@ async fn submit_to_next_node(
         }
     };
 
-    // 4. 更新任务节点和状态
-    let update_sql = r#"
-        UPDATE review_tasks SET
-            current_node = $next_node,
-            status = $status,
-            return_reason = NONE,
-            updated_at = time::now()
-        WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
-    "#;
-
-    if let Err(e) = review_primary_db()
-        .query(update_sql)
-        .bind(("id", id.clone()))
-        .bind(("next_node", next_node_str.clone()))
-        .bind(("status", next_status))
+    let actor_role = claims
+        .role
+        .as_ref()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Err((status, e)) =
+        apply_internal_workflow_mutation_transaction(InternalWorkflowMutationWrite {
+            task_id: id.clone(),
+            form_id: task_row.form_id.clone(),
+            project_id: task_row.model_name.clone().unwrap_or_default(),
+            requester_id: task_row.requester_id.clone().unwrap_or_default(),
+            next_node: next_node_str.clone(),
+            next_status,
+            return_reason: None,
+            history_from_node: current_node.clone(),
+            history_target_node: Some(next_node_str.clone()),
+            history_action: action_label.to_string(),
+            actor_id: op_id.to_string(),
+            actor_role,
+            actor_name: op_name.to_string(),
+            comment: request.comment,
+        })
         .await
     {
         warn!(
-            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} next_node={} elapsed_ms={} reason=update_task_db_error: {}",
+            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} next_node={} elapsed_ms={} reason=workflow_transaction_error: {}",
             id,
             task_row.form_id.as_deref().unwrap_or(""),
             claims.user_id,
@@ -4353,78 +4527,15 @@ async fn submit_to_next_node(
             e
         );
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             Json(ActionResponse {
                 success: false,
                 message: None,
-                error_message: Some(format!("更新任务失败: {}", e)),
+                error_message: Some(e),
             }),
         )
             .into_response();
     }
-
-    if let Some(form_id) = task_row
-        .form_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Err(error) = sync_review_form_with_task_status(
-            form_id,
-            Some(task_row.model_name.as_deref().unwrap_or_default()),
-            Some(task_row.requester_id.as_deref().unwrap_or_default()),
-            "create_task_backfill",
-            next_status,
-        )
-        .await
-        {
-            warn!(
-                "Failed to sync review_forms after submit_to_next_node, form_id={}: {}",
-                form_id, error
-            );
-        }
-    }
-
-    // 5. 记录工作流历史 — schema 对齐：actor_id/actor_role/actor_name/source/created_at/target_node
-    if let Err(e) = ensure_review_workflow_history_schema().await {
-        warn!(
-            "[REVIEW_API.submit_to_next_node] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
-            e
-        );
-    }
-    let history_sql = r#"
-        CREATE review_workflow_history CONTENT {
-            task_id: $task_id,
-            form_id: $form_id,
-            node: $from_node,
-            target_node: $target_node,
-            action: $action,
-            actor_id: $actor_id,
-            actor_role: $actor_role,
-            actor_name: $actor_name,
-            source: $source,
-            comment: $comment,
-            created_at: time::now()
-        }
-    "#;
-    let actor_role = claims
-        .role
-        .as_ref()
-        .map(|r| r.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let _ = review_primary_db()
-        .query(history_sql)
-        .bind(("task_id", id.clone()))
-        .bind(("form_id", task_row.form_id.clone()))
-        .bind(("from_node", current_node.clone()))
-        .bind(("target_node", Some(next_node_str.clone())))
-        .bind(("action", action_label.to_string()))
-        .bind(("actor_id", op_id.to_string()))
-        .bind(("actor_role", actor_role))
-        .bind(("actor_name", op_name.to_string()))
-        .bind(("source", "plant3d-internal".to_string()))
-        .bind(("comment", request.comment))
-        .await;
 
     let from_name = get_node_display_name(&current_node);
 
@@ -4597,66 +4708,6 @@ async fn return_to_node(
         _ => "draft",
     };
 
-    let update_sql = r#"
-        UPDATE review_tasks SET
-            current_node = $target_node,
-            status = $status,
-            return_reason = $reason,
-            updated_at = time::now()
-        WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)
-    "#;
-
-    if let Err(e) = review_primary_db()
-        .query(update_sql)
-        .bind(("id", id.clone()))
-        .bind(("target_node", request.target_node.clone()))
-        .bind(("status", next_status))
-        .bind(("reason", request.reason.clone()))
-        .await
-    {
-        warn!(
-            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} from_node={} target_node={} elapsed_ms={} reason=update_task_db_error: {}",
-            id,
-            task_row.form_id.as_deref().unwrap_or(""),
-            claims.user_id,
-            current_node,
-            request.target_node,
-            started.elapsed().as_millis(),
-            e
-        );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ActionResponse {
-                success: false,
-                message: None,
-                error_message: Some(format!("更新任务失败: {}", e)),
-            }),
-        );
-    }
-
-    if let Some(form_id) = task_row
-        .form_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Err(error) = sync_review_form_with_task_status(
-            form_id,
-            Some(task_row.model_name.as_deref().unwrap_or_default()),
-            Some(task_row.requester_id.as_deref().unwrap_or_default()),
-            "create_task_backfill",
-            next_status,
-        )
-        .await
-        {
-            warn!(
-                "Failed to sync review_forms after return_to_node, form_id={}: {}",
-                form_id, error
-            );
-        }
-    }
-
-    // 4. 记录工作流历史
     let op_id = if claims.user_id.is_empty() {
         request
             .operator_id
@@ -4671,44 +4722,49 @@ async fn return_to_node(
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(op_id);
-    if let Err(e) = ensure_review_workflow_history_schema().await {
-        warn!(
-            "[REVIEW_API.return_to_node] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
-            e
-        );
-    }
-    let history_sql = r#"
-        CREATE review_workflow_history CONTENT {
-            task_id: $task_id,
-            form_id: $form_id,
-            node: $from_node,
-            target_node: $target_node,
-            action: 'return',
-            actor_id: $actor_id,
-            actor_role: $actor_role,
-            actor_name: $actor_name,
-            source: $source,
-            comment: $comment,
-            created_at: time::now()
-        }
-    "#;
     let actor_role_return = claims
         .role
         .as_ref()
         .map(|r| r.trim().to_string())
         .filter(|s| !s.is_empty());
-    let _ = review_primary_db()
-        .query(history_sql)
-        .bind(("task_id", id.clone()))
-        .bind(("form_id", task_row.form_id.clone()))
-        .bind(("from_node", current_node.clone()))
-        .bind(("target_node", Some(request.target_node.clone())))
-        .bind(("actor_id", op_id.to_string()))
-        .bind(("actor_role", actor_role_return))
-        .bind(("actor_name", op_name.to_string()))
-        .bind(("source", "plant3d-internal".to_string()))
-        .bind(("comment", Some(request.reason.clone())))
-        .await;
+    if let Err((status, e)) =
+        apply_internal_workflow_mutation_transaction(InternalWorkflowMutationWrite {
+            task_id: id.clone(),
+            form_id: task_row.form_id.clone(),
+            project_id: task_row.model_name.clone().unwrap_or_default(),
+            requester_id: task_row.requester_id.clone().unwrap_or_default(),
+            next_node: request.target_node.clone(),
+            next_status,
+            return_reason: Some(request.reason.clone()),
+            history_from_node: current_node.clone(),
+            history_target_node: Some(request.target_node.clone()),
+            history_action: "return".to_string(),
+            actor_id: op_id.to_string(),
+            actor_role: actor_role_return,
+            actor_name: op_name.to_string(),
+            comment: Some(request.reason.clone()),
+        })
+        .await
+    {
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} from_node={} target_node={} elapsed_ms={} reason=workflow_transaction_error: {}",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            request.target_node,
+            started.elapsed().as_millis(),
+            e
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(e),
+            }),
+        );
+    }
 
     let from_name = get_node_display_name(&current_node);
     let to_name = get_node_display_name(&request.target_node);

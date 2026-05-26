@@ -46,7 +46,7 @@ export function buildViewerUrl(
     backend,
     output_project: site.associated_project || site.project_name,
   })
-  const dbnum = site.manual_db_nums?.[0]
+  const dbnum = site.manual_db_nums?.length === 1 ? site.manual_db_nums[0] : null
   if (dbnum) params.set('show_dbnum', String(dbnum))
   if (site.export_parquet) params.set('data_source', 'parquet')
 

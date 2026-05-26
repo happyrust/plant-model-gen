@@ -10,6 +10,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::str::FromStr;
 use std::sync::Arc;
 use surrealdb::types::SurrealValue;
 use tokio::time::{Duration, timeout};
@@ -142,6 +143,12 @@ pub struct SubtreeQuery {
     pub limit: Option<i32>,
 }
 
+fn parse_refno_path(raw: &str) -> Result<RefnoEnum, StatusCode> {
+    RefU64::from_str(raw.trim())
+        .map(RefnoEnum::from)
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 async fn get_world_root(
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<NodeResponse>, StatusCode> {
@@ -209,9 +216,10 @@ async fn get_world_root(
 }
 
 async fn get_node(
-    Path(refno): Path<RefnoEnum>,
+    Path(refno): Path<String>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<NodeResponse>, StatusCode> {
+    let refno = parse_refno_path(&refno)?;
     let node = match query_node(refno).await {
         Ok(v) => v,
         Err(_) => None,
@@ -232,10 +240,11 @@ async fn get_node(
 }
 
 async fn get_children(
-    Path(parent_refno): Path<RefnoEnum>,
+    Path(parent_refno): Path<String>,
     Query(query): Query<ChildrenQuery>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<ChildrenResponse>, StatusCode> {
+    let parent_refno = parse_refno_path(&parent_refno)?;
     let limit = query.limit.unwrap_or(200).clamp(1, 2000);
 
     let parent_type = get_type_name(parent_refno).await;
@@ -473,9 +482,10 @@ fn offline_world_children_by_scan(
 }
 
 async fn get_ancestors(
-    Path(refno): Path<RefnoEnum>,
+    Path(refno): Path<String>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<AncestorsResponse>, StatusCode> {
+    let refno = parse_refno_path(&refno)?;
     // 层级查询统一走 indextree（TreeIndex）
     let ancestors = match crate::fast_model::query_provider::get_ancestors(refno).await {
         Ok(v) => v,
@@ -496,10 +506,11 @@ async fn get_ancestors(
 }
 
 async fn get_subtree_refnos(
-    Path(root_refno): Path<RefnoEnum>,
+    Path(root_refno): Path<String>,
     Query(query): Query<SubtreeQuery>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<SubtreeRefnosResponse>, StatusCode> {
+    let root_refno = parse_refno_path(&root_refno)?;
     let include_self = query.include_self.unwrap_or(true);
     let max_depth = query.max_depth.unwrap_or(64).clamp(0, 256);
     let limit = query.limit.unwrap_or(50_000).clamp(1, 200_000) as usize;
@@ -539,9 +550,10 @@ async fn get_subtree_refnos(
 }
 
 async fn get_visible_insts(
-    Path(refno): Path<RefnoEnum>,
+    Path(refno): Path<String>,
     State(state): State<E3dTreeApiState>,
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
+    let refno = parse_refno_path(&refno)?;
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
     // 层级查询统一走 indextree（TreeIndex）
     let mut candidates =
@@ -822,9 +834,10 @@ struct SceneNodeRow {
 
 /// 获取 SITE 的所有 Node 层级数据（用于前端构建 xeokit Node 层级）
 async fn get_site_nodes(
-    Path(site_refno): Path<RefnoEnum>,
+    Path(site_refno): Path<String>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<SiteNodesResponse>, StatusCode> {
+    let site_refno = parse_refno_path(&site_refno)?;
     // 1. 获取 SITE 的所有子孙节点（通过 BFS 遍历 contains 关系）
     const MAX_DEPTH: usize = 20;
     const MAX_NODES: usize = 10000;

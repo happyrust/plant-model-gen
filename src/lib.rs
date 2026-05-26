@@ -399,47 +399,86 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
 
-        // 模型生成完成后，若启用 export_parquet_after_gen，按 manual_db_nums 逐个导出 Parquet
+        // 模型生成完成后，若启用 export_parquet_after_gen：
+        // - 指定 manual_db_nums 时按指定库导出；
+        // - 全库部署时从 inst_relate 自动发现实际生成过的 DESI dbnum。
         if db_option_ext.export_parquet_after_gen {
-            if let Some(ref dbnums) = db_option_ext.inner.manual_db_nums {
-                if !dbnums.is_empty() {
-                    #[cfg(feature = "parquet-export")]
-                    {
-                        use crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
-                        use aios_core::init_surreal;
-                        use std::sync::Arc;
+            #[cfg(feature = "parquet-export")]
+            {
+                use crate::fast_model::export_model::export_dbnum_instances_parquet::{
+                    export_dbnum_instances_parquet, query_distinct_dbnums_from_inst_relate,
+                };
+                use aios_core::init_surreal;
+                use std::sync::Arc;
 
-                        init_surreal().await?;
-                        let base_output_dir =
-                            db_option_ext.get_project_output_dir().join("parquet");
-                        let db_option = Arc::new(db_option_ext.inner.clone());
-                        for &dbnum in dbnums {
-                            log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
-                            let output_dir = base_output_dir.join(dbnum.to_string());
-                            if let Err(e) = export_dbnum_instances_parquet(
-                                dbnum,
-                                &output_dir,
-                                db_option.clone(),
-                                true, // verbose
-                                None, // target_unit
-                                None, // root_refno
-                            )
-                            .await
-                            {
-                                log::error!("Parquet 导出 dbnum={} 失败: {}", dbnum, e);
-                            }
+                init_surreal().await?;
+                let mut dbnums = db_option_ext
+                    .inner
+                    .manual_db_nums
+                    .clone()
+                    .filter(|values| !values.is_empty())
+                    .unwrap_or_else(Vec::new);
+
+                let dbnum_source = if dbnums.is_empty() {
+                    match query_distinct_dbnums_from_inst_relate().await {
+                        Ok(discovered) if !discovered.is_empty() => {
+                            dbnums = discovered;
+                            "inst_relate"
+                        }
+                        Ok(_) => {
+                            log::warn!(
+                                "export_parquet_after_gen 已启用，但 inst_relate 未发现可导出的 dbnum"
+                            );
+                            "inst_relate_empty"
+                        }
+                        Err(err) => {
+                            log::error!("自动发现 Parquet 导出 dbnum 失败: {}", err);
+                            "inst_relate_error"
                         }
                     }
-                    #[cfg(not(feature = "parquet-export"))]
+                } else {
+                    "manual_db_nums"
+                };
+
+                dbnums.sort_unstable();
+                dbnums.dedup();
+
+                if dbnums.is_empty() {
+                    log::warn!(
+                        "export_parquet_after_gen 已启用，但没有可导出的 dbnum (source={})",
+                        dbnum_source
+                    );
+                } else {
+                    log::info!(
+                        "📦 自动导出 Parquet: source={}, dbnums={:?}",
+                        dbnum_source,
+                        dbnums
+                    );
+                }
+
+                let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
+                let db_option = Arc::new(db_option_ext.inner.clone());
+                for dbnum in dbnums {
+                    log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
+                    let output_dir = base_output_dir.join(dbnum.to_string());
+                    if let Err(e) = export_dbnum_instances_parquet(
+                        dbnum,
+                        &output_dir,
+                        db_option.clone(),
+                        true, // verbose
+                        None, // target_unit
+                        None, // root_refno
+                    )
+                    .await
                     {
-                        log::warn!(
-                            "export_parquet_after_gen 已启用，但 parquet-export 特性未编译，跳过 Parquet 导出"
-                        );
+                        log::error!("Parquet 导出 dbnum={} 失败: {}", dbnum, e);
                     }
                 }
-            } else {
+            }
+            #[cfg(not(feature = "parquet-export"))]
+            {
                 log::warn!(
-                    "export_parquet_after_gen 已启用，但 manual_db_nums 未设置，无法按 dbnum 导出 Parquet"
+                    "export_parquet_after_gen 已启用，但 parquet-export 特性未编译，跳过 Parquet 导出"
                 );
             }
         }

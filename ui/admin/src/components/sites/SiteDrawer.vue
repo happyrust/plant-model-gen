@@ -490,9 +490,11 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <input v-model.number="form.project_code" type="number" required min="1" :class="inputClass" />
               </div>
               <div class="space-y-2">
-                <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选)</span></label>
+                <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选，可逗号分隔)</span></label>
                 <input v-model="form.associated_project" type="text" :placeholder="form.project_name || '默认使用项目名称'" :class="inputClass" />
-                <p class="text-xs text-muted-foreground">用于解析源目录和打开 Viewer 的真实 E3D 工程名。</p>
+                <p class="text-xs text-muted-foreground">
+                  用于解析源目录和打开 Viewer 的真实 E3D 工程名。AvevaPlantSample 会自动带上同级 AvevaCatalogue 元件库。
+                </p>
               </div>
             </fieldset>
 
@@ -655,7 +657,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <div class="space-y-2">
                   <label class="text-sm font-medium">手动 DB Nums <span class="text-muted-foreground">(可选，逗号分隔)</span></label>
                   <input v-model="manualDbNumsStr" type="text" placeholder="7997, 7998, 7999" :class="inputClass" />
-                  <p class="text-xs text-muted-foreground">填写后会优先按指定 dbnum 解析目标设计库。</p>
+                  <p class="text-xs text-muted-foreground">留空表示解析并生成全部设计库；填写后才限制到指定 dbnum。</p>
                 </div>
                 <div class="grid gap-2">
                   <label
@@ -717,7 +719,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                   </span>
                 </label>
                 <p class="text-xs text-muted-foreground">
-                  推荐快速部署：SYST + DESI。需要补属性定义时加 DICT；需要补元件规格时加 CATA。
+                  默认完整部署：SYST + DESI + CATA + DICT + GLB + GLOB，用于同时补齐属性定义和元件库数据。
                 </p>
                 <p class="text-xs text-muted-foreground">
                   如果清空所有勾选，且不填写手动 DB Nums，就会退回按项目配置全量解析。

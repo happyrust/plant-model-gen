@@ -5,6 +5,18 @@ defineProps<{
   site: ManagedProjectSite | null
   runtime: ManagedSiteRuntimeStatus | null
 }>()
+
+function businessLabel(value?: boolean | null) {
+  if (value === true) return '通过'
+  if (value === false) return '失败'
+  return '未检查'
+}
+
+function businessClass(value?: boolean | null) {
+  if (value === true) return 'text-green-600'
+  if (value === false) return 'text-red-600'
+  return 'text-muted-foreground'
+}
 </script>
 
 <template>
@@ -20,6 +32,10 @@ defineProps<{
         {{ runtime?.db_running ? '运行中' : '未启动' }}
       </div>
       <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.db_pid ?? '-' }} · 端口: {{ site?.db_port }}</div>
+      <div class="mt-2 space-y-1 text-xs">
+        <div :class="businessClass(runtime?.database_connected)">业务 DB：{{ businessLabel(runtime?.database_connected) }}</div>
+        <div :class="businessClass(runtime?.surrealdb_connected)">Surreal：{{ businessLabel(runtime?.surrealdb_connected) }}</div>
+      </div>
     </div>
     <div class="rounded-lg border border-border bg-card p-4">
       <div class="text-sm text-muted-foreground">Web 服务</div>
@@ -27,6 +43,10 @@ defineProps<{
         {{ runtime?.web_running ? '运行中' : '未启动' }}
       </div>
       <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.web_pid ?? '-' }} · 端口: {{ site?.web_port }}</div>
+      <div class="mt-2 space-y-1 text-xs">
+        <div :class="businessClass(runtime?.web_status_ok)">/api/status：{{ businessLabel(runtime?.web_status_ok) }}</div>
+        <div :class="businessClass(runtime?.site_identity_ok)">站点身份：{{ businessLabel(runtime?.site_identity_ok) }}</div>
+      </div>
     </div>
     <div class="rounded-lg border border-border bg-card p-4">
       <div class="text-sm text-muted-foreground">Viewer</div>

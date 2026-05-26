@@ -12,7 +12,7 @@ use rusqlite::Row;
 use serde::Serialize;
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::web_server::admin_auth_handlers::admin_auth_middleware;
 use crate::web_server::admin_response;
@@ -27,6 +27,8 @@ use crate::web_server::wizard_handlers::open_deployment_sites_sqlite;
 const TABLE_NAME: &str = "admin_tasks";
 const ADMIN_TASK_SUBMITTED_STEP: &str = "已提交，等待站点状态更新";
 const ADMIN_TASK_TOTAL_STEPS: u32 = 7;
+const ADMIN_TASK_POLL_INTERVAL_MS: u64 = 2_000;
+const ADMIN_TASK_POLL_TIMEOUT_SECS: u64 = 30 * 60;
 
 #[derive(Clone)]
 struct StoredAdminTask {
@@ -458,6 +460,8 @@ async fn dispatch_admin_task(task_id: String) {
     let Some(mut stored) = load_task_record_by_id(&task_id).ok().flatten() else {
         return;
     };
+    let task_type_for_poll = stored.task.task_type.clone();
+    let site_id_for_poll = stored.site_id.clone();
 
     let result: Result<(), String> = match (&stored.task.task_type, stored.site_id.as_deref()) {
         (TaskType::ParsePdmsData, Some(sid)) => {
@@ -519,11 +523,66 @@ async fn dispatch_admin_task(task_id: String) {
     };
 
     match result {
-        Ok(()) => {}
+        Ok(()) => {
+            if matches!(
+                task_type_for_poll,
+                TaskType::StartManagedSite | TaskType::DeployManagedSite
+            ) {
+                if let Some(site_id) = site_id_for_poll {
+                    poll_site_task_until_terminal(task_id, site_id).await;
+                }
+            }
+        }
         Err(msg) => {
             mark_task_failed(&mut stored.task, "提交站点动作失败", &msg);
             let _ = save_task(&stored.task, stored.site_id.as_deref());
         }
+    }
+}
+
+async fn poll_site_task_until_terminal(task_id: String, site_id: String) {
+    let deadline = Instant::now() + Duration::from_secs(ADMIN_TASK_POLL_TIMEOUT_SECS);
+    loop {
+        let Some(stored) = load_task_record_by_id(&task_id).ok().flatten() else {
+            return;
+        };
+        if matches!(
+            stored.task.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return;
+        }
+
+        match reconcile_task_record(stored) {
+            Ok(updated) => {
+                if matches!(
+                    updated.task.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                ) {
+                    return;
+                }
+            }
+            Err(err) => {
+                if let Ok(Some(mut failed)) = load_task_record_by_id(&task_id) {
+                    mark_task_failed(&mut failed.task, "站点任务对账失败", &err.to_string());
+                    let _ = save_task(&failed.task, Some(site_id.as_str()));
+                }
+                return;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            if let Ok(Some(mut timed_out)) = load_task_record_by_id(&task_id) {
+                mark_task_failed(
+                    &mut timed_out.task,
+                    "站点任务轮询超时",
+                    "后台任务等待站点运行态/验收终态超时",
+                );
+                let _ = save_task(&timed_out.task, Some(site_id.as_str()));
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(ADMIN_TASK_POLL_INTERVAL_MS)).await;
     }
 }
 
@@ -699,7 +758,43 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                 mark_task_running(task, &runtime_step, 10.0);
             }
         }
-        TaskType::StartManagedSite | TaskType::DeployManagedSite => {
+        TaskType::StartManagedSite => {
+            if runtime.status == ManagedSiteStatus::Failed
+                || runtime
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                let message = runtime
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "站点启动失败".to_string());
+                mark_task_failed(task, &runtime_step, &message);
+            } else if runtime.status == ManagedSiteStatus::Running
+                && runtime.web_running
+                && runtime.web_status_ok == Some(true)
+                && runtime.database_connected == Some(true)
+                && runtime.surrealdb_connected == Some(true)
+                && runtime.site_identity_ok == Some(true)
+            {
+                mark_task_completed(task, "启动完成：Web/DB/Surreal/站点身份验收通过");
+            } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
+                mark_task_running(task, "Web 已启动，等待业务连通性验收", 90.0);
+            } else if runtime.current_stage == "generating" {
+                mark_task_running(task, &runtime_step, 45.0);
+            } else if runtime.parse_status == ManagedSiteParseStatus::Running {
+                mark_task_running(task, &runtime_step, 30.0);
+            } else if runtime.db_running && runtime.web_running {
+                mark_task_running(task, &runtime_step, 90.0);
+            } else if runtime.db_running {
+                mark_task_running(task, &runtime_step, 75.0);
+            } else if runtime.status == ManagedSiteStatus::Starting {
+                mark_task_running(task, &runtime_step, 65.0);
+            } else {
+                mark_task_running(task, &runtime_step, 10.0);
+            }
+        }
+        TaskType::DeployManagedSite => {
             if runtime.status == ManagedSiteStatus::Failed
                 || runtime
                     .last_error
@@ -712,7 +807,32 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                     .unwrap_or_else(|| "站点部署失败".to_string());
                 mark_task_failed(task, &runtime_step, &message);
             } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
-                mark_task_completed(task, &runtime_step);
+                match managed_project_sites::deploy_validation_report(&runtime.site_id) {
+                    Ok(report) if report.exists && report.blocking_count == 0 => {
+                        mark_task_completed(task, "部署完成：部署后验收无阻断项");
+                    }
+                    Ok(report) if report.exists => {
+                        let blocking = report
+                            .checks
+                            .iter()
+                            .filter(|check| check.status.eq_ignore_ascii_case("blocking"))
+                            .map(|check| format!("{}: {}", check.label, check.message))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        mark_task_failed(
+                            task,
+                            "部署后验收未通过",
+                            &if blocking.is_empty() {
+                                "部署后验收存在阻断项".to_string()
+                            } else {
+                                blocking
+                            },
+                        );
+                    }
+                    _ => {
+                        mark_task_running(task, "Web 已启动，等待部署后验收报告", 95.0);
+                    }
+                }
             } else if runtime.current_stage == "generating" {
                 mark_task_running(task, &runtime_step, 45.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {

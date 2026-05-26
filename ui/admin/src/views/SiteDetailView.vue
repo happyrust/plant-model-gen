@@ -60,9 +60,12 @@ const logsError = ref('')
 const preflightError = ref('')
 const deployValidationError = ref('')
 const deployTaskError = ref('')
+const reconcileError = ref('')
+const reconcileActions = ref<string[]>([])
 const preflightLoading = ref(false)
 const deployValidationLoading = ref(false)
 const deployTaskLoading = ref(false)
+const reconcileLoading = ref(false)
 type DetailTab = 'overview' | 'deploy'
 
 // D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy`
@@ -146,6 +149,17 @@ const matchedPreset = computed(() => matchParsePreset(
 ))
 const deployProgressSteps = computed(() => buildDeployProgressSteps())
 const deployTaskPercent = computed(() => Math.round(deployTask.value?.progress.percentage ?? 0))
+const needsReconcile = computed(() => {
+  const r = runtime.value
+  if (!r) return false
+  return (
+    (r.status === 'Running' && (!r.web_running || !r.db_running)) ||
+    (r.status === 'Starting' && !r.web_running) ||
+    !!r.web_port_conflict ||
+    !!r.db_port_conflict ||
+    !!r.viewer_port_conflict
+  )
+})
 
 const selectedLogState = computed(() => detailLogs.value[activeLogTab.value])
 const selectedLogs = computed(() => selectedLogState.value.lines)
@@ -345,6 +359,19 @@ async function fetchDeployValidation() {
   }
 }
 
+async function refreshDeployValidation() {
+  if (!siteId.value) return
+  deployValidationLoading.value = true
+  try {
+    deployValidation.value = await sitesApi.refreshDeployValidation(siteId.value)
+    deployValidationError.value = ''
+  } catch (err: unknown) {
+    deployValidationError.value = extractErrorMessage(err)
+  } finally {
+    deployValidationLoading.value = false
+  }
+}
+
 async function fetchDeployTask() {
   if (!deployTaskId.value) return
   deployTaskLoading.value = true
@@ -355,6 +382,22 @@ async function fetchDeployTask() {
     deployTaskError.value = extractErrorMessage(err)
   } finally {
     deployTaskLoading.value = false
+  }
+}
+
+async function handleReconcile(cleanupOrphans = false) {
+  if (!siteId.value) return
+  reconcileLoading.value = true
+  reconcileError.value = ''
+  try {
+    const result = await sitesApi.reconcile(siteId.value, { cleanup_orphans: cleanupOrphans })
+    runtime.value = result.runtime
+    reconcileActions.value = result.actions
+    await fetchAll()
+  } catch (err: unknown) {
+    reconcileError.value = extractErrorMessage(err)
+  } finally {
+    reconcileLoading.value = false
   }
 }
 
@@ -710,6 +753,14 @@ useAdminSitesStream({
 })
 
 const { start: startPolling } = usePolling(fetchAll, 10000)
+const { start: startDeployTaskPolling } = usePolling(async () => {
+  if (!deployTaskId.value) return
+  await fetchDeployTask()
+  if (deployTask.value?.status === 'Completed' || deployTask.value?.status === 'Failed' || deployTask.value?.status === 'Cancelled') {
+    await fetchAll()
+    await fetchDeployValidation()
+  }
+}, 3000)
 
 onMounted(async () => {
   await fetchAll()
@@ -718,6 +769,7 @@ onMounted(async () => {
     await fetchDeployValidation()
   }
   startPolling()
+  startDeployTaskPolling()
 })
 </script>
 
@@ -988,6 +1040,40 @@ onMounted(async () => {
         </div>
       </div>
 
+      <div class="rounded-lg border border-border bg-card p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 class="text-base font-medium">运行态对账</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {{ needsReconcile ? '当前状态与进程/端口信号不完全一致，建议先对账。' : '当前没有发现明显半启动或端口残留。' }}
+            </p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              :disabled="reconcileLoading"
+              @click="handleReconcile(false)"
+              class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              <Loader2 v-if="reconcileLoading" class="h-3.5 w-3.5 animate-spin" />
+              对账状态
+            </button>
+            <button
+              :disabled="reconcileLoading"
+              @click="handleReconcile(true)"
+              class="inline-flex h-8 items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 text-xs font-medium text-amber-700 hover:bg-amber-500/20 transition-colors disabled:pointer-events-none disabled:opacity-50 dark:text-amber-300"
+            >
+              清理残留进程
+            </button>
+          </div>
+        </div>
+        <div v-if="reconcileError" class="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          对账失败：{{ reconcileError }}
+        </div>
+        <div v-if="reconcileActions.length" class="mt-3 rounded-md border border-border/60 bg-background px-3 py-2 text-xs text-muted-foreground">
+          <div v-for="action in reconcileActions" :key="action">{{ action }}</div>
+        </div>
+      </div>
+
       <div v-if="runtime?.entry_url" class="rounded-lg border border-border bg-card p-4">
         <div class="text-sm text-muted-foreground mb-2">访问地址</div>
         <div class="space-y-1">
@@ -1189,7 +1275,7 @@ onMounted(async () => {
           </div>
           <button
             :disabled="deployValidationLoading"
-            @click="fetchDeployValidation"
+            @click="refreshDeployValidation"
             class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
           >
             <Loader2 v-if="deployValidationLoading" class="h-3.5 w-3.5 animate-spin" />

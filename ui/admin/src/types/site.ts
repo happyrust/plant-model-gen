@@ -143,6 +143,10 @@ export interface ManagedSiteRuntimeStatus {
   risk_level: ManagedSiteRiskLevel
   warnings: string[]
   parse_health: ManagedSiteParseHealth
+  web_status_ok?: boolean | null
+  database_connected?: boolean | null
+  surrealdb_connected?: boolean | null
+  site_identity_ok?: boolean | null
 }
 
 export interface AdminResourceSummary {
@@ -230,6 +234,17 @@ export interface ManagedSiteActionResponse {
   site_id: string
   action: string
   task_id?: string
+}
+
+export interface ManagedSiteReconcileRequest {
+  cleanup_orphans?: boolean
+}
+
+export interface ManagedSiteReconcileResponse {
+  site_id: string
+  changed: boolean
+  actions: string[]
+  runtime: ManagedSiteRuntimeStatus
 }
 
 export interface CreateManagedSiteRequest {

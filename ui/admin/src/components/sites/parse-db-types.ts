@@ -12,7 +12,7 @@ export interface ParsePresetOption {
   forceRebuildSystemDb: boolean
 }
 
-export const DEFAULT_PARSE_DB_TYPES = ['SYST', 'DESI']
+export const DEFAULT_PARSE_DB_TYPES = ['SYST', 'DESI', 'CATA', 'DICT', 'GLB', 'GLOB']
 
 export const PARSE_DB_TYPE_OPTIONS: ParseDbTypeOption[] = [
   {

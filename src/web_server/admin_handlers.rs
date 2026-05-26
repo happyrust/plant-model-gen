@@ -17,8 +17,8 @@ use crate::web_server::{
     admin_task_handlers, managed_project_sites as managed_sites,
     models::{
         AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedSiteLogsResponse,
-        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, TaskPriority, TaskType,
-        UpdateManagedSiteRequest,
+        ManagedSiteReconcileRequest, ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest,
+        TaskPriority, TaskType, UpdateManagedSiteRequest,
     },
 };
 
@@ -47,8 +47,9 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/sites/{id}/logs", get(get_site_logs))
         .route(
             "/api/admin/sites/{id}/deploy-validation",
-            get(get_site_deploy_validation),
+            get(get_site_deploy_validation).post(refresh_site_deploy_validation),
         )
+        .route("/api/admin/sites/{id}/reconcile", post(reconcile_site))
         .route("/api/admin/sites/{id}/logs/{kind}", get(get_site_log_kind))
         .route(
             "/api/admin/sites/{id}/logs/{kind}/download",
@@ -338,6 +339,26 @@ pub async fn get_site_logs(Path(site_id): Path<String>) -> impl IntoResponse {
 pub async fn get_site_deploy_validation(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::deploy_validation_report(&site_id) {
         Ok(report) => admin_response::ok("获取部署验收报告成功", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn refresh_site_deploy_validation(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::refresh_deploy_validation_report(&site_id).await {
+        Ok(report) => admin_response::ok("刷新部署验收报告成功", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn reconcile_site(
+    Path(site_id): Path<String>,
+    payload: Option<Json<ManagedSiteReconcileRequest>>,
+) -> impl IntoResponse {
+    let cleanup_orphans = payload
+        .map(|Json(req)| req.cleanup_orphans)
+        .unwrap_or(false);
+    match managed_sites::reconcile_site(&site_id, cleanup_orphans).await {
+        Ok(report) => admin_response::ok("站点运行态对账完成", report),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }

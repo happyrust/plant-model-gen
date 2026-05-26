@@ -1,11 +1,11 @@
 param(
     [string]$BaseUrl = "http://127.0.0.1:3209",
     [string]$SiteId = "",
-    [string]$ProjectName = "AvevaMarineSample",
+    [string]$ProjectName = "AvevaPlantSample",
     [string]$ProjectPath = "",
-    [string]$AssociatedProject = "AvevaMarineSample",
-    [int]$ProjectCode = 1516,
-    [string]$ManualDbNums = "7997",
+    [string]$AssociatedProject = "AvevaPlantSample,AvevaCatalogue",
+    [int]$ProjectCode = 7011,
+    [string]$ManualDbNums = "",
     [int]$DbPort = 3339,
     [int]$WebPort = 3340,
     [string]$DbUser = "codex_site_user",
@@ -29,6 +29,7 @@ function Resolve-ProjectPath {
     param([string]$Name, [string]$Provided)
     if ($Provided -and (Test-Path $Provided)) { return (Resolve-Path $Provided).Path }
     $candidates = @(
+        "D:\AVEVA\Projects\E3D2.1\$Name",
         "D:\e3d_models\$Name",
         "D:\work\e3d_models\$Name",
         "D:\work\plant-code\e3d_models\$Name",
@@ -84,14 +85,20 @@ function Invoke-AdminApi {
     } catch {
         $status = 0
         $bodyObj = $null
+        $text = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { "" }
         if ($_.Exception.Response) {
             $status = [int]$_.Exception.Response.StatusCode
-            $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-            $text = $reader.ReadToEnd()
-            $reader.Close()
-            if ($text) {
-                try { $bodyObj = $text | ConvertFrom-Json } catch { $bodyObj = [pscustomobject]@{ message = $text } }
+            if (-not $text -and $_.Exception.Response.Content) {
+                try { $text = $_.Exception.Response.Content.ReadAsStringAsync().GetAwaiter().GetResult() } catch { $text = "" }
             }
+            if (-not $text -and $_.Exception.Response.GetResponseStream) {
+                $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
+                $text = $reader.ReadToEnd()
+                $reader.Close()
+            }
+        }
+        if ($text) {
+            try { $bodyObj = $text | ConvertFrom-Json } catch { $bodyObj = [pscustomobject]@{ message = $text } }
         }
         return [pscustomobject]@{ Status = $status; Body = $bodyObj; Error = $_.Exception.Message }
     }
@@ -119,6 +126,32 @@ function Probe-Url {
         throw "Response too small for ${Url}: $length bytes, expected >= $MinBytes"
     }
     Pass "$Url ($length bytes)"
+}
+
+function Resolve-DesiDbNums {
+    param([string]$ProjectPath, [string]$ProjectName, [string]$Provided)
+    $scanUrl = "$BaseUrl/api/wizard/scan-database-files?project_path=$([uri]::EscapeDataString($ProjectPath))&project_name=$([uri]::EscapeDataString($ProjectName))"
+    $scan = Invoke-WebRequest -Uri $scanUrl -UseBasicParsing -TimeoutSec 120
+    $scanBody = $scan.Content | ConvertFrom-Json
+    $desiFiles = @($scanBody.database_files | Where-Object { $_.db_type -eq "DESI" } | Sort-Object db_num)
+    if ($desiFiles.Count -eq 0) {
+        throw "No DESI database file found under $ProjectPath for $ProjectName"
+    }
+    $all = @($desiFiles | ForEach-Object { [int]$_.db_num })
+    if (-not $Provided) {
+        Info "all DESI dbnums discovered=$($all -join ',') count=$($all.Count); leaving manual_db_nums empty for full-project deployment"
+        return @()
+    }
+    $requested = @($Provided -split "[,\s]+" | Where-Object { $_ } | ForEach-Object { [int]$_ })
+    $valid = @{}
+    foreach ($file in $desiFiles) { $valid[[int]$file.db_num] = $file.file_name }
+    foreach ($dbnum in $requested) {
+        if (-not $valid.ContainsKey($dbnum)) {
+            throw "Requested dbnum=$dbnum is not a DESI database file under $ProjectPath"
+        }
+    }
+    Info "validated DESI dbnums=$($requested -join ',')"
+    return @($requested)
 }
 
 function Convert-AgentBrowserJson {
@@ -202,18 +235,19 @@ Pass "logged in as $AdminUser"
 if (-not $SiteId) {
     Step "Create site with auto deploy"
     $resolvedProjectPath = Resolve-ProjectPath $ProjectName $ProjectPath
-    $dbNums = @($ManualDbNums -split "[,\s]+" | Where-Object { $_ } | ForEach-Object { [int]$_ })
+    $dbNums = Resolve-DesiDbNums $resolvedProjectPath $ProjectName $ManualDbNums
     $payload = @{
         project_name = $ProjectName
         project_path = $resolvedProjectPath
         project_code = $ProjectCode
         associated_project = $AssociatedProject
-        manual_db_nums = $dbNums
+        manual_db_nums = @($dbNums)
+        parse_db_types = @("SYST", "DESI", "CATA", "DICT", "GLB", "GLOB")
         db_port = $DbPort
         web_port = $WebPort
         bind_host = "127.0.0.1"
         gen_model = $true
-        gen_mesh = $false
+        gen_mesh = $true
         gen_spatial_tree = $true
         apply_boolean_operation = $true
         export_json = $false
@@ -272,7 +306,7 @@ if ($runtime.viewer_url) { Probe-Url $runtime.viewer_url 64 }
 if ($runtime.viewer_url) { Assert-ViewerModelLoaded $runtime.viewer_url $ViewerBrowserTimeoutSec }
 
 Step "Validate backend deploy-validation report"
-$report = Require-Success (Invoke-AdminApi GET "/api/admin/sites/$SiteId/deploy-validation") "get deploy validation"
+$report = Require-Success (Invoke-AdminApi POST "/api/admin/sites/$SiteId/deploy-validation" @{}) "refresh deploy validation"
 if (-not $report.exists) {
     throw "deploy-validation report does not exist for $SiteId"
 }

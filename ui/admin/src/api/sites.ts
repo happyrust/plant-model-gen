@@ -8,6 +8,8 @@ import type {
   ManagedSitePreflightReport,
   ManagedSiteDeployValidationReport,
   ManagedSiteActionResponse,
+  ManagedSiteReconcileRequest,
+  ManagedSiteReconcileResponse,
   CreateManagedSiteRequest,
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
@@ -94,6 +96,15 @@ export const sitesApi = {
 
   deployValidation: (id: string) =>
     apiGet<ManagedSiteDeployValidationReport>(`/api/admin/sites/${id}/deploy-validation`),
+
+  refreshDeployValidation: (id: string) =>
+    apiPost<ManagedSiteDeployValidationReport>(`/api/admin/sites/${id}/deploy-validation`),
+
+  reconcile: (id: string, payload: ManagedSiteReconcileRequest = {}) =>
+    apiPost<ManagedSiteReconcileResponse>(
+      `/api/admin/sites/${id}/reconcile`,
+      payload as unknown as Record<string, unknown>,
+    ),
 
   /**
    * D5 / Sprint D · 单类日志的分页尾部

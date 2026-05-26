@@ -310,13 +310,14 @@ pub async fn start_web_server_with_config(
         config_manager.current_config = runtime_config.clone();
         config_manager.add_template("runtime", runtime_config);
     }
-    if db_option.effective_surrealdb().mode == aios_core::options::DbConnMode::Ws {
+    let surreal_cfg = db_option.effective_surrealdb();
+    if surreal_cfg.mode == aios_core::options::DbConnMode::Ws {
         match aios_core::connect_surdb(
-            &db_option.surrealdb_conn_str(),
+            &surreal_cfg.conn_str(),
             &db_option.surreal_ns,
             &db_option.project_name,
-            &db_option.surreal_user,
-            &db_option.surreal_password,
+            &surreal_cfg.user,
+            &surreal_cfg.password,
         )
         .await
         {
@@ -391,6 +392,14 @@ pub async fn start_web_server_with_config(
         crate::web_server::handlers::ensure_deployment_sites_schema().await;
         if let Err(err) = crate::web_server::managed_project_sites::ensure_schema() {
             eprintln!("⚠️ 初始化管理员站点表失败: {}", err);
+        } else {
+            match crate::web_server::managed_project_sites::reconcile_sites_on_startup() {
+                Ok(count) if count > 0 => {
+                    eprintln!("🔁 管理员站点启动对账已修正 {count} 个运行态记录");
+                }
+                Ok(_) => {}
+                Err(err) => eprintln!("⚠️ 管理员站点启动对账失败: {}", err),
+            }
         }
     });
 

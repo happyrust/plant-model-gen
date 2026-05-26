@@ -1096,6 +1096,14 @@ pub struct ManagedSiteRuntimeStatus {
     pub warnings: Vec<String>,
     #[serde(default)]
     pub parse_health: ManagedSiteParseHealth,
+    #[serde(default)]
+    pub web_status_ok: Option<bool>,
+    #[serde(default)]
+    pub database_connected: Option<bool>,
+    #[serde(default)]
+    pub surrealdb_connected: Option<bool>,
+    #[serde(default)]
+    pub site_identity_ok: Option<bool>,
 }
 
 /// 管理后台资源摘要
@@ -1217,6 +1225,21 @@ pub struct ManagedSiteDeployValidationReport {
     pub warning_count: usize,
     #[serde(default)]
     pub checks: Vec<ManagedSiteDeployValidationCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteReconcileRequest {
+    #[serde(default)]
+    pub cleanup_orphans: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteReconcileResponse {
+    pub site_id: String,
+    pub changed: bool,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    pub runtime: ManagedSiteRuntimeStatus,
 }
 
 impl Default for ProjectStatus {

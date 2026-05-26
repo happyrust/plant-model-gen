@@ -184,6 +184,20 @@ use rusqlite::OptionalExtension;
 #[cfg(feature = "sqlite-index")]
 use std::str::FromStr;
 
+async fn run_project_db_probe(label: &str, sql: &'static str) -> (bool, Option<String>) {
+    match tokio::time::timeout(Duration::from_secs(5), project_primary_db().query(sql)).await {
+        Ok(Ok(_)) => (true, None),
+        Ok(Err(error)) => (false, Some(format!("{label}失败: {error}"))),
+        Err(_) => (false, Some(format!("{label}超时"))),
+    }
+}
+
+async fn probe_project_database_connectivity() -> ((bool, Option<String>), (bool, Option<String>)) {
+    let surrealdb = run_project_db_probe("SurrealDB 连接探测", "RETURN 1;").await;
+    let database = run_project_db_probe("项目数据库上下文探测", "INFO FOR DB;").await;
+    (database, surrealdb)
+}
+
 // 可选：从本地 SQLite 读取项目列表（按 DbOption.toml 配置）
 // use rusqlite as _; // 确保依赖已链接 - 暂时禁用
 
@@ -3665,11 +3679,9 @@ pub async fn get_system_status(
         Duration::from_secs(0)
     };
 
-    // 测试数据库连接
-    let surrealdb_connected = match project_primary_db().query("SELECT 1").await {
-        Ok(_) => true,
-        Err(_) => false,
-    };
+    // 分开探测 SurrealDB TCP/会话可用性和项目 DB 上下文，避免 Web 200 掩盖业务库未就绪。
+    let ((database_connected, _), (surrealdb_connected, _)) =
+        probe_project_database_connectivity().await;
 
     let status = SystemStatus {
         uptime,
@@ -3677,7 +3689,7 @@ pub async fn get_system_status(
         memory_usage,
         active_tasks: active_count,
         queued_task_count: queued_count,
-        database_connected: surrealdb_connected,
+        database_connected,
         surrealdb_connected,
     };
 
@@ -4302,18 +4314,25 @@ pub async fn test_tcp_connection(addr: &str) -> bool {
 
 /// 测试SurrealDB数据库功能连接
 pub async fn test_database_functionality() -> (bool, Option<String>) {
-    use tokio::time::{Duration, timeout};
-
-    match timeout(
-        Duration::from_secs(5),
-        project_primary_db().query("SELECT 1 as test"),
-    )
-    .await
-    {
-        Ok(Ok(_)) => (true, None),
-        Ok(Err(e)) => (false, Some(format!("数据库查询失败: {}", e))),
-        Err(_) => (false, Some("数据库连接超时".to_string())),
+    let ((database_connected, database_error), (surrealdb_connected, surrealdb_error)) =
+        probe_project_database_connectivity().await;
+    if database_connected && surrealdb_connected {
+        return (true, None);
     }
+
+    let mut errors = Vec::new();
+    if let Some(error) = database_error {
+        errors.push(error);
+    }
+    if let Some(error) = surrealdb_error {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        errors.push(format!(
+            "数据库连接状态异常: database_connected={database_connected}, surrealdb_connected={surrealdb_connected}"
+        ));
+    }
+    (false, Some(errors.join("; ")))
 }
 
 async fn run_remote_ssh(ssh: &SshOptions, remote_cmd: &str) -> Result<(), String> {
@@ -4432,10 +4451,7 @@ pub async fn get_surreal_status(
     let listening = is_addr_listening(&bind_addr);
 
     // 是否能够进行基本查询（需要已初始化连接）
-    let connected = match project_primary_db().query("SELECT 1").await {
-        Ok(_) => true,
-        Err(_) => false,
-    };
+    let (_, (connected, _)) = probe_project_database_connectivity().await;
 
     // 读取本地 PID（若由本服务启动）
     let (pid, pid_present) = match std::fs::read_to_string(".surreal.pid") {

@@ -1154,6 +1154,7 @@ fn build_site_config(
     set_toml_integer(table, "surreal_port", site.db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
     set_toml_string(table, "surreal_password", db_password.to_string());
+    set_toml_string(table, "surreal_script_dir", "resource/surreal");
     table.remove("v_ip");
     table.remove("v_port");
     table.remove("v_user");

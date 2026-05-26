@@ -26,9 +26,11 @@ if (-not $OutputRoot) {
 $PackageRoot = Join-Path $OutputRoot $BundleName
 $TargetTriple = "x86_64-pc-windows-msvc"
 $BackendExe = Join-Path $RepoRoot "target/$TargetTriple/release/web_server.exe"
+$AiosDatabaseExe = Join-Path $RepoRoot "target/$TargetTriple/release/aios-database.exe"
 $FrontendDist = Join-Path $FrontendRoot "dist"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
-$Features = "ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export"
+$SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
+$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export"
 
 function Step([string]$Message) {
     Write-Host ""
@@ -159,6 +161,7 @@ function Resolve-SurrealExe() {
 function Update-PackageDbOption([string]$Path) {
     $updates = @{
         "__root__.meshes_path" = '"./assets/meshes"'
+        "__root__.surreal_script_dir" = '"resource/surreal"'
         "web_server.port" = "3100"
         "web_server.auto_start_surreal" = "true"
         "web_server.surreal_bin" = '"bin/surreal/surreal.exe"'
@@ -168,6 +171,8 @@ function Update-PackageDbOption([string]$Path) {
         "web_server.surreal_password" = '"root"'
         "surrealdb.mode" = '"ws"'
         "surrealdb.path" = '"runtime/surrealdb"'
+        "surrealkv.mode" = '"file"'
+        "surrealkv.path" = '"runtime/surrealkv"'
     }
     $section = "__root__"
     $seen = @{}
@@ -198,19 +203,19 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "Cargo.toml"))) {
 if (-not (Test-Path -LiteralPath (Join-Path $FrontendRoot "package.json"))) {
     throw "Frontend repo not found: $FrontendRoot"
 }
-
 if (-not $SkipBackendBuild) {
-    Step "Build backend web_server"
+    Step "Build backend web_server and aios-database"
     Assert-NasmAvailable
     Push-Location $RepoRoot
     try {
-        & cargo build --release --bin web_server --target $TargetTriple --no-default-features --features $Features
+        & cargo build --release --bin web_server --bin aios-database --target $TargetTriple --no-default-features --features $Features
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
     } finally {
         Pop-Location
     }
 }
 Require-File $BackendExe "Backend executable"
+Require-File $AiosDatabaseExe "aios-database executable"
 
 if (-not $SkipFrontendBuild) {
     Step "Build plant3d-web for /viewer/"
@@ -243,18 +248,24 @@ try {
     $surrealVersionText = "unknown"
 }
 $surrealSha = Get-FileSha256 $ResolvedSurreal
+$aiosDatabaseSha = Get-FileSha256 $AiosDatabaseExe
 
 Step "Create package layout"
 if (Test-Path -LiteralPath $PackageRoot) {
     Remove-Item -LiteralPath $PackageRoot -Recurse -Force
 }
-foreach ($dir in @("bin", "bin/surreal", "viewer", "db_options", "runtime", "output", "assets/meshes", "logs")) {
+foreach ($dir in @("bin", "bin/surreal", "viewer", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot $dir) | Out-Null
 }
 
 Copy-Item -LiteralPath $BackendExe -Destination (Join-Path $PackageRoot "bin/web_server.exe") -Force
+Copy-Item -LiteralPath $AiosDatabaseExe -Destination (Join-Path $PackageRoot "bin/aios-database.exe") -Force
 Copy-Item -LiteralPath $ResolvedSurreal -Destination (Join-Path $PackageRoot "bin/surreal/surreal.exe") -Force
 Copy-Tree $FrontendDist (Join-Path $PackageRoot "viewer")
+if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
+    throw "Surreal resource directory not found: $SurrealResourceDir"
+}
+Copy-Tree $SurrealResourceDir (Join-Path $PackageRoot "resource/surreal")
 Copy-Item -Path (Join-Path $RepoRoot "db_options/*") -Destination (Join-Path $PackageRoot "db_options") -Recurse -Force
 Update-PackageDbOption (Join-Path $PackageRoot "db_options/DbOption.toml")
 
@@ -271,6 +282,10 @@ $buildInfo = [ordered]@{
     surrealVersion = $SurrealVersion
     surrealVersionText = $surrealVersionText
     surrealSha256 = $surrealSha
+    surrealBundled = $true
+    aiosDatabaseBundled = $true
+    aiosDatabaseSha256 = $aiosDatabaseSha
+    databaseDataIncluded = $false
     webPort = 3100
     viewerUrl = "http://127.0.0.1:3100/viewer/"
 }
@@ -307,12 +322,19 @@ http://127.0.0.1:3100/viewer/
 ## 目录说明
 
 - `bin/web_server.exe`：后端服务。
+- `bin/aios-database.exe`：站点部署/解析使用的数据库导入执行文件。
 - `bin/surreal/surreal.exe`：随包分发的 SurrealDB。
+- `resource/surreal/`：初始化函数与 `att_meta` 属性元数据脚本。
 - `viewer/`：plant3d-web 静态前端，挂载在 `/viewer/`。
 - `db_options/DbOption.toml`：默认运行配置。
-- `runtime/surrealdb/`：本地 SurrealDB 数据目录。
+- `runtime/surrealdb/`：目标电脑首次启动时创建的新 SurrealDB 数据目录；安装包不包含本机数据库数据。
+- `runtime/surrealkv/`：预留的空运行目录；安装包不复制本机数据库数据。
 - `output/`、`assets/meshes/`：模型输出与网格资源目录。
 - `logs/`：启动日志。
+
+## 数据说明
+
+该安装包只携带数据库执行文件 `bin/surreal/surreal.exe`，不携带本机 SurrealDB 数据。部署到另一台电脑后会从空的 `runtime/surrealdb/` 开始创建新站点数据。
 
 ## 修改端口
 

@@ -933,17 +933,16 @@ async fn query_export_insts_local(
                         (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
                             record::id(type::record("pe_transform", record::id(in)).world_trans)
                         }} else {{ None }}) as world_trans_hash,
-                        (
-                            SELECT
-                                record::id(trans) as trans_hash,
-                                record::id(out) as geo_hash,
-                                out.unit_flag ?? false as unit_flag
-                            FROM out->geo_relate
+                        out->geo_relate[
                             WHERE visible
                               && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                               && (trans.d ?? NONE) != NONE
                               && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
-                        ) as insts,
+                        ].{{
+                            trans_hash: record::id(trans),
+                            geo_hash: record::id(out),
+                            unit_flag: out.unit_flag ?? false
+                        }} as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
                     WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
@@ -976,17 +975,16 @@ async fn query_export_insts_local(
                     (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
                         record::id(type::record("pe_transform", record::id(in)).world_trans)
                     }} else {{ None }}) as world_trans_hash,
-                    (
-                        SELECT
-                            record::id(trans) as trans_hash,
-                            record::id(out) as geo_hash,
-                            out.unit_flag ?? false as unit_flag
-                        FROM out->geo_relate
+                    out->geo_relate[
                         WHERE visible
                           && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                           && (trans.d ?? NONE) != NONE
                           && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
-                    ) as insts,
+                    ].{{
+                        trans_hash: record::id(trans),
+                        geo_hash: record::id(out),
+                        unit_flag: out.unit_flag ?? false
+                    }} as insts,
                     false as has_neg
                 FROM [{inst_relate_keys}]
                 WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE

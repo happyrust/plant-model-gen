@@ -104,6 +104,21 @@ export function canParseSite(site: ManagedProjectSite): boolean {
   )
 }
 
+export function canGenerateSite(site: ManagedProjectSite): boolean {
+  return (
+    (site.gen_model || site.gen_mesh || site.gen_spatial_tree) &&
+    !isSiteBusy(site) &&
+    !['Running', 'Starting', 'Stopping'].includes(site.status)
+  )
+}
+
+export function canDeploySite(site: ManagedProjectSite): boolean {
+  return (
+    !isSiteBusy(site) &&
+    !['Running', 'Starting', 'Stopping'].includes(site.status)
+  )
+}
+
 export function canDeleteSite(site: ManagedProjectSite): boolean {
   return (
     !isSiteBusy(site) &&
@@ -156,11 +171,13 @@ export const quickFilterOptions: { value: QuickFilter; label: string }[] = [
  */
 export const siteActionLabelMap = {
   parse: '解析',
+  generate: '生成',
+  deploy: '部署',
   start: '启动',
   stop: '停止',
   restart: '重启',
   delete: '删除',
-} as const satisfies Record<'parse' | 'start' | 'stop' | 'restart' | 'delete', string>
+} as const satisfies Record<'parse' | 'generate' | 'deploy' | 'start' | 'stop' | 'restart' | 'delete', string>
 
 export interface SiteStatsExtended {
   total: number

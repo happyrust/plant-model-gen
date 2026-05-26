@@ -2,7 +2,7 @@ use aios_core::DbOptionSurrealExt;
 use axum::{
     Router,
     body::Body,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{Method, StatusCode, header},
     middleware,
     response::{Html, Json, Response},
@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
@@ -346,6 +346,12 @@ pub async fn start_web_server_with_config(
             error
         );
     }
+    tokio::spawn(async {
+        match crate::web_api::review_db::warm_review_schema().await {
+            Ok(_) => println!("✅ review schema/index 后台预热完成"),
+            Err(error) => eprintln!("⚠️ review schema/index 后台预热失败: {}", error),
+        }
+    });
     let config_name_for_init = config_name.clone();
     let startup_ns = db_option.surreal_ns.clone();
     let startup_db = db_option.project_name.clone();
@@ -1043,6 +1049,12 @@ pub async fn start_web_server_with_config(
         )
         .route("/console", get(console_index_page).head(console_head_page))
         .route("/console/", get(console_index_page).head(console_head_page))
+        .route("/viewer", get(viewer_index_page).head(viewer_head_page))
+        .route("/viewer/", get(viewer_index_page).head(viewer_head_page))
+        .route(
+            "/viewer/{*path}",
+            get(viewer_static_or_index).head(viewer_static_or_index),
+        )
         // 静态文件服务
         .nest_service(
             "/admin/static",
@@ -1405,6 +1417,8 @@ const WEB_CONSOLE_DIST_DIR: &str = "web_console/dist";
 const WEB_CONSOLE_INDEX_FILE: &str = "web_console/dist/index.html";
 const ADMIN_STATIC_DIR: &str = "src/web_server/static/admin";
 const ADMIN_INDEX_FILE: &str = "src/web_server/static/admin/index.html";
+const VIEWER_DIST_DIR: &str = "viewer";
+const VIEWER_INDEX_FILE: &str = "viewer/index.html";
 const CONSOLE_ROUTE_MAPPINGS: &[(&str, &str)] = &[
     ("/dashboard", "/console/dashboard"),
     ("/tasks", "/console/tasks"),
@@ -1441,6 +1455,10 @@ fn admin_index_html() -> Option<String> {
     std::fs::read_to_string(ADMIN_INDEX_FILE).ok()
 }
 
+fn viewer_index_html() -> Option<String> {
+    std::fs::read_to_string(VIEWER_INDEX_FILE).ok()
+}
+
 fn is_admin_route_request(path: &str) -> bool {
     path == "/admin" || path.starts_with("/admin/")
 }
@@ -1472,6 +1490,10 @@ async fn admin_index_page() -> Result<Html<String>, StatusCode> {
     admin_index_html().map(Html).ok_or(StatusCode::NOT_FOUND)
 }
 
+async fn viewer_index_page() -> Result<Html<String>, StatusCode> {
+    viewer_index_html().map(Html).ok_or(StatusCode::NOT_FOUND)
+}
+
 async fn admin_head_page() -> Result<Response, StatusCode> {
     if admin_index_html().is_none() {
         return Err(StatusCode::NOT_FOUND);
@@ -1486,6 +1508,18 @@ async fn admin_head_page() -> Result<Response, StatusCode> {
 
 async fn console_head_page() -> Result<Response, StatusCode> {
     if web_console_index_html().is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty())))
+}
+
+async fn viewer_head_page() -> Result<Response, StatusCode> {
+    if viewer_index_html().is_none() {
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -1527,6 +1561,65 @@ async fn admin_history_fallback(uri: axum::http::Uri) -> Result<Response, Status
     }
 
     let html = admin_index_html().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap_or_else(|_| Response::new(Body::from(Cow::Borrowed("")))))
+}
+
+fn is_safe_viewer_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+fn viewer_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn viewer_static_or_index(AxumPath(path): AxumPath<String>) -> Result<Response, StatusCode> {
+    if !is_safe_viewer_path(&path) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let local_path = Path::new(VIEWER_DIST_DIR).join(path.trim_start_matches('/'));
+    if local_path.is_file() {
+        let bytes = tokio::fs::read(&local_path)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, viewer_content_type(&local_path))
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| Response::new(Body::empty())));
+    }
+
+    let html = viewer_index_html().ok_or(StatusCode::NOT_FOUND)?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")

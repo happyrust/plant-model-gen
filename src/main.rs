@@ -644,9 +644,9 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("model-writer")
                 .long("model-writer")
-                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence")
+                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence; ducklake writes 9 trait-covered Phase 1 raw tables to ducklake-canonical schema via Rust duckdb crate (requires feature `model-writer-ducklake`; see goals/ducklake-model-writer/)")
                 .value_name("WRITER")
-                .value_parser(["surreal", "drain-only"]),
+                .value_parser(["surreal", "drain-only", "ducklake", "duck-lake"]),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -1103,6 +1103,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(writer) = matches.get_one::<String>("model-writer") {
         db_option_ext.model_writer_mode = match writer.as_str() {
             "drain-only" => ModelWriterMode::DrainOnly,
+            "ducklake" | "duck-lake" => ModelWriterMode::DuckLake,
             _ => ModelWriterMode::Surreal,
         };
         println!(
@@ -1111,6 +1112,12 @@ async fn main() -> anyhow::Result<()> {
         );
         if db_option_ext.model_writer_mode == ModelWriterMode::DrainOnly {
             println!("🔧 drain-only 压测模式: 生成几何 batch，仅消费统计，不写 SurrealDB");
+        }
+        if db_option_ext.model_writer_mode == ModelWriterMode::DuckLake {
+            println!(
+                "🔧 ducklake 模式: 写 9 张 trait 覆盖的 Phase 1 raw 表到 ducklake-canonical schema; \
+                 tubi/transforms/refno_assoc 6 项保持 Known Gap (goals/ducklake-model-writer/)"
+            );
         }
     }
     db_option_ext.validate_model_writer_features()?;

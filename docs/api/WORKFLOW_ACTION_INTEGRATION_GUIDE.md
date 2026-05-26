@@ -183,7 +183,7 @@ curl -X POST http://<host>/api/review/workflow/sync \
 
 ## 6. 干跑（verify）vs 落库（sync）
 
-- `/api/review/workflow/verify` ：**不写库**，仅做合法性 + 批注门禁 + owner 校验，
+- `/api/review/workflow/verify` ：**不写库**，仅做节点/终态合法性与 action-aware 批注门禁（`return/stop` 不查批注；external 模式 owner 校验按当前服务配置处理），
   返回 `passed=true/false` 与诊断字段。**推荐 PMS 在 UI 上"提交"按钮被点击时先调 verify，
   把可能的软阻断展示给用户后再调 sync**。
 - `/api/review/workflow/sync` ：**落库**，把流程节点真正推进。

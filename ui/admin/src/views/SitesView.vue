@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, MemoryStick, Play, RadioTower, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
@@ -10,9 +11,10 @@ import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
 import { useSitesStore, type SiteBulkAction } from '@/stores/sites'
 import { matchesQuickFilter, computeStats, siteActionLabelMap, type QuickFilter } from '@/components/sites/site-status'
-import type { AdminResourceSummary, ManagedSiteRiskLevel } from '@/types/site'
+import type { AdminResourceSummary, ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
 
 const sitesStore = useSitesStore()
+const router = useRouter()
 
 const drawerOpen = ref(false)
 const editingSiteId = ref<string | null>(null)
@@ -35,6 +37,8 @@ const bulkActionLabel: Record<SiteBulkAction, string> = {
   stop: '停止',
   restart: '重启',
   parse: '解析',
+  generate: '生成',
+  deploy: '部署',
   delete: '删除',
 }
 const searchQuery = ref('')
@@ -160,11 +164,18 @@ function handleQuickFilter(filter: QuickFilter) {
   activeQuickFilter.value = filter
 }
 
-function handleDrawerSaved() {
+function handleDrawerSaved(payload?: { site: ManagedProjectSite; autoDeploy: boolean }) {
   drawerOpen.value = false
   editingSiteId.value = null
   cloningSiteId.value = null
   void fetchPageData()
+  if (payload?.autoDeploy && payload.site?.site_id) {
+    const query: Record<string, string> = { tab: 'deploy' }
+    if (payload.site.deployment_task_id) {
+      query.task_id = payload.site.deployment_task_id
+    }
+    void router.push({ path: `/sites/${payload.site.site_id}`, query })
+  }
 }
 
 function handleSelectionChange(siteIds: string[]) {
@@ -450,6 +461,22 @@ onMounted(async () => {
           class="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
         >
           <RefreshCw class="h-3.5 w-3.5" /> 批量解析
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('generate')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+          title="未解析站点会先解析，再执行模型生成"
+        >
+          <Cpu class="h-3.5 w-3.5" /> 批量生成
+        </button>
+        <button
+          :disabled="bulkInFlight !== null"
+          @click="handleBulkAction('deploy')"
+          class="inline-flex h-8 items-center gap-1.5 rounded-md bg-blue-600 px-3 text-xs font-medium text-white shadow hover:bg-blue-700 transition-colors disabled:pointer-events-none disabled:opacity-50"
+          title="按配置解析、生成模型并启动站点"
+        >
+          <Play class="h-3.5 w-3.5" /> 批量部署
         </button>
         <button
           :disabled="bulkInFlight !== null"

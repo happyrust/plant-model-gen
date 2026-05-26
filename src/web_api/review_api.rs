@@ -29,7 +29,8 @@ use crate::web_api::platform_api::{
 };
 use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
 use crate::web_api::review_db::{
-    ensure_review_workflow_history_schema, fresh_review_db, review_primary_db,
+    await_review_query, await_review_query_long, fresh_review_db, review_primary_db,
+    review_workflow_history_schema_ready,
 };
 use axum::extract::Extension;
 use std::collections::HashSet;
@@ -159,12 +160,11 @@ struct InternalWorkflowMutationWrite {
 async fn apply_internal_workflow_mutation_transaction(
     write: InternalWorkflowMutationWrite,
 ) -> Result<(), (StatusCode, String)> {
-    ensure_review_workflow_history_schema().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("初始化 workflow history schema 失败: {}", e),
-        )
-    })?;
+    if !review_workflow_history_schema_ready() {
+        warn!(
+            "[REVIEW_API.workflow_mutation] workflow history schema warmup is not ready; using current database schema without blocking request"
+        );
+    }
 
     let form_id = write
         .form_id
@@ -223,47 +223,55 @@ async fn apply_internal_workflow_mutation_transaction(
     "#;
 
     let form_id_for_error = form_id.clone();
-    review_primary_db()
-        .query(sql)
-        .bind(("task_id", write.task_id))
-        .bind(("form_id", form_id))
-        .bind(("project_id", write.project_id))
-        .bind(("requester_id", write.requester_id))
-        .bind(("next_node", write.next_node))
-        .bind(("status", write.next_status))
-        .bind(("return_reason", write.return_reason))
-        .bind(("form_status", form_status))
-        .bind(("history_from_node", write.history_from_node))
-        .bind(("history_target_node", write.history_target_node))
-        .bind(("history_action", write.history_action))
-        .bind(("actor_id", write.actor_id))
-        .bind(("actor_role", write.actor_role))
-        .bind(("actor_name", write.actor_name))
-        .bind(("comment", write.comment))
-        .await
-        .and_then(|response| response.check())
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("INTERNAL_WORKFLOW_TASK_NOT_FOUND") {
-                return (
-                    StatusCode::CONFLICT,
-                    "单据状态已变化，请刷新后重试".to_string(),
-                );
-            }
-            if message.contains("INTERNAL_REVIEW_FORM_NOT_FOUND") {
-                return (
-                    StatusCode::CONFLICT,
-                    format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
-                );
-            }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
-                    message
-                ),
-            )
-        })?;
+    let db = fresh_review_db().await.map_err(|error| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("获取校审数据库独立连接失败: {}", error),
+        )
+    })?;
+    await_review_query(
+        "review.workflow_mutation",
+        db.query(sql)
+            .bind(("task_id", write.task_id))
+            .bind(("form_id", form_id))
+            .bind(("project_id", write.project_id))
+            .bind(("requester_id", write.requester_id))
+            .bind(("next_node", write.next_node))
+            .bind(("status", write.next_status))
+            .bind(("return_reason", write.return_reason))
+            .bind(("form_status", form_status))
+            .bind(("history_from_node", write.history_from_node))
+            .bind(("history_target_node", write.history_target_node))
+            .bind(("history_action", write.history_action))
+            .bind(("actor_id", write.actor_id))
+            .bind(("actor_role", write.actor_role))
+            .bind(("actor_name", write.actor_name))
+            .bind(("comment", write.comment)),
+    )
+    .await
+    .and_then(|response| response.check().map_err(anyhow::Error::from))
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("INTERNAL_WORKFLOW_TASK_NOT_FOUND") {
+            return (
+                StatusCode::CONFLICT,
+                "单据状态已变化，请刷新后重试".to_string(),
+            );
+        }
+        if message.contains("INTERNAL_REVIEW_FORM_NOT_FOUND") {
+            return (
+                StatusCode::CONFLICT,
+                format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
+            );
+        }
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
+                message
+            ),
+        )
+    })?;
 
     Ok(())
 }
@@ -750,7 +758,7 @@ fn attachment_from_value(value: &Value) -> ReviewAttachment {
 
 pub(crate) async fn query_review_attachments_by_form_id(
     form_id: &str,
-) -> Result<Vec<ReviewAttachment>, surrealdb::Error> {
+) -> anyhow::Result<Vec<ReviewAttachment>> {
     #[derive(Debug, Deserialize, SurrealValue)]
     struct AttachmentRow {
         file_id: Option<String>,
@@ -759,16 +767,19 @@ pub(crate) async fn query_review_attachments_by_form_id(
         file_ext: Option<String>,
     }
 
-    let mut response = review_primary_db()
-        .query(
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.attachments.by_form_id",
+        db.query(
             r#"
             SELECT file_id, download_url, description, file_ext
             FROM review_attachment
             WHERE form_id = $form_id
             "#,
         )
-        .bind(("form_id", form_id.to_string()))
-        .await?;
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
 
     let rows: Vec<AttachmentRow> = response.take(0).unwrap_or_default();
     Ok(rows
@@ -1058,7 +1069,7 @@ async fn query_review_task_page(
         q = q.bind((*name, value.clone()));
     }
 
-    let mut response = q.await?;
+    let mut response = await_review_query_long("review.tasks.page", q).await?;
     let rows: Vec<TaskRow> = match response.take(0) {
         Ok(rows) => rows,
         Err(deser_err) => {
@@ -1207,12 +1218,15 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
         approver_id: Option<String>,
     }
 
-    let mut resp = review_primary_db()
-        .query(
+    let db = fresh_review_db().await.ok()?;
+    let mut resp = await_review_query(
+        "review.tasks.context",
+        db.query(
             "SELECT form_id, current_node, requester_id, checker_id, reviewer_id, approver_id FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
         )
-        .bind(("id", id.to_string()))
-        .await
+        .bind(("id", id.to_string())),
+    )
+    .await
         .ok()?;
     let rows: Vec<TaskContextRow> = resp.take(0).unwrap_or_default();
     let row = rows.into_iter().next()?;
@@ -1623,12 +1637,34 @@ async fn create_task(
     // （bug-resubmit-creates-duplicate-task simulator 场景）。
     // 同时给 review_workflow_history 写一条 action='resubmit' 事件，保持 form_id 全生命周期可追溯。
     if form_id_was_provided {
-        match review_primary_db()
-            .query(
+        let db = match fresh_review_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                warn!(
+                    "[REVIEW_API.create_task] DEDUP_CONNECT_FAIL form_id={} actor_id={} elapsed_ms={} reason={}（继续走 CREATE 路径）",
+                    form_id,
+                    claims.user_id,
+                    started.elapsed().as_millis(),
+                    e
+                );
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(TaskResponse {
+                        success: false,
+                        task: None,
+                        error_message: Some(format!("连接校审数据库超时: {}", e)),
+                    }),
+                );
+            }
+        };
+        match await_review_query(
+            "review.create_task.dedup",
+            db.query(
                 "SELECT * FROM review_tasks WHERE form_id = $form_id AND (deleted IS NONE OR deleted = false) ORDER BY created_at ASC LIMIT 1",
             )
-            .bind(("form_id", form_id.clone()))
-            .await
+            .bind(("form_id", form_id.clone())),
+        )
+        .await
         {
             Ok(mut resp) => {
                 let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
@@ -1643,25 +1679,9 @@ async fn create_task(
                         claims.user_id,
                         started.elapsed().as_millis()
                     );
-                    if let Err(e) = ensure_review_workflow_history_schema().await {
+                    if !review_workflow_history_schema_ready() {
                         warn!(
-                            "[REVIEW_API.create_task] FAIL form_id={} existing_task_id={} actor_id={} elapsed_ms={} reason=history_schema_error: {}",
-                            form_id,
-                            existing.id,
-                            claims.user_id,
-                            started.elapsed().as_millis(),
-                            e
-                        );
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(TaskResponse {
-                                success: false,
-                                task: None,
-                                error_message: Some(format!(
-                                    "初始化 workflow history schema 失败: {}",
-                                    e
-                                )),
-                            }),
+                            "[REVIEW_API.create_task] workflow history schema warmup is not ready; resubmit history write uses current schema"
                         );
                     }
                     let history_sql = r#"
@@ -1684,19 +1704,21 @@ async fn create_task(
                         .as_ref()
                         .map(|r| r.trim().to_string())
                         .filter(|s| !s.is_empty());
-                    if let Err(e) = review_primary_db()
-                        .query(history_sql)
-                        .bind(("task_id", existing.id.clone()))
-                        .bind(("form_id", Some(form_id.clone())))
-                        .bind(("from_node", existing.current_node.clone()))
-                        .bind(("target_node", Some("jd".to_string())))
-                        .bind(("actor_id", claims.user_id.clone()))
-                        .bind(("actor_role", actor_role_resubmit))
-                        .bind(("actor_name", requester_name.clone()))
-                        .bind(("source", "plant3d-internal".to_string()))
-                        .bind(("comment", Some("再次发起编校审（form_id 复用）".to_string())))
-                        .await
-                        .and_then(|response| response.check())
+                    if let Err(e) = await_review_query(
+                        "review.create_task.resubmit_history",
+                        db.query(history_sql)
+                            .bind(("task_id", existing.id.clone()))
+                            .bind(("form_id", Some(form_id.clone())))
+                            .bind(("from_node", existing.current_node.clone()))
+                            .bind(("target_node", Some("jd".to_string())))
+                            .bind(("actor_id", claims.user_id.clone()))
+                            .bind(("actor_role", actor_role_resubmit))
+                            .bind(("actor_name", requester_name.clone()))
+                            .bind(("source", "plant3d-internal".to_string()))
+                            .bind(("comment", Some("再次发起编校审（form_id 复用）".to_string()))),
+                    )
+                    .await
+                    .and_then(|response| response.check().map_err(anyhow::Error::from))
                     {
                         warn!(
                             "[REVIEW_API.create_task] FAIL form_id={} existing_task_id={} actor_id={} elapsed_ms={} reason=resubmit_history_error: {}",
@@ -1766,32 +1788,47 @@ async fn create_task(
             updated_at = time::now()
     "#;
 
-    let result = review_primary_db()
-        .query(sql)
-        .bind(("id", task_id.clone()))
-        .bind(("form_id", form_id.clone()))
-        .bind(("title", request.title.clone()))
-        .bind(("description", request.description.clone()))
-        .bind(("model_name", request.model_name.clone()))
-        .bind(("priority", request.priority.clone()))
-        .bind(("requester_id", requester_id.clone()))
-        .bind(("requester_name", requester_name.clone()))
-        .bind(("checker_id", checker_id.clone()))
-        .bind(("checker_name", resolved_names.checker_name.clone()))
-        .bind(("approver_id", approver_id.clone()))
-        .bind(("approver_name", resolved_names.approver_name.clone()))
-        .bind(("reviewer_id", assignees.reviewer_id.clone()))
-        .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
-        .bind(("components", request.components.clone()))
-        .bind(("attachments", request.attachments.clone()))
-        .bind((
-            "due_date",
-            request
-                .due_date
-                .map(|d| chrono::DateTime::from_timestamp_millis(d).map(|dt| dt.to_rfc3339()))
-                .flatten(),
-        ))
-        .await;
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let result = await_review_query(
+        "review.create_task.insert",
+        db.query(sql)
+            .bind(("id", task_id.clone()))
+            .bind(("form_id", form_id.clone()))
+            .bind(("title", request.title.clone()))
+            .bind(("description", request.description.clone()))
+            .bind(("model_name", request.model_name.clone()))
+            .bind(("priority", request.priority.clone()))
+            .bind(("requester_id", requester_id.clone()))
+            .bind(("requester_name", requester_name.clone()))
+            .bind(("checker_id", checker_id.clone()))
+            .bind(("checker_name", resolved_names.checker_name.clone()))
+            .bind(("approver_id", approver_id.clone()))
+            .bind(("approver_name", resolved_names.approver_name.clone()))
+            .bind(("reviewer_id", assignees.reviewer_id.clone()))
+            .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
+            .bind(("components", request.components.clone()))
+            .bind(("attachments", request.attachments.clone()))
+            .bind((
+                "due_date",
+                request
+                    .due_date
+                    .map(|d| chrono::DateTime::from_timestamp_millis(d).map(|dt| dt.to_rfc3339()))
+                    .flatten(),
+            )),
+    )
+    .await;
 
     match result {
         Ok(_response) => {
@@ -1988,7 +2025,7 @@ async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
         q = q.bind((*name, value.clone()));
     }
 
-    match q.await {
+    match await_review_query_long("review.tasks.count", q).await {
         Ok(mut response) => {
             #[derive(Debug, serde::Deserialize, SurrealValue)]
             struct CountRow {
@@ -2073,7 +2110,7 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db.query(sql).bind(("id", id.clone())).await {
+    match await_review_query("review.tasks.get", db.query(sql).bind(("id", id.clone()))).await {
         Ok(mut response) => {
             let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
             if let Some(row) = rows.into_iter().next() {
@@ -2154,7 +2191,20 @@ async fn update_task(
         updates.join(", ")
     );
 
-    let mut q = review_primary_db().query(&sql).bind(("id", id.clone()));
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&sql).bind(("id", id.clone()));
 
     if let Some(ref title) = request.title {
         q = q.bind(("title", title.clone()));
@@ -2176,14 +2226,15 @@ async fn update_task(
         q = q.bind(("attachments", attachments.clone()));
     }
 
-    match q.await {
+    match await_review_query("review.tasks.update", q).await {
         Ok(_) => {
             // 返回更新后的任务
             let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)";
-            if let Ok(mut resp) = review_primary_db()
-                .query(get_sql)
-                .bind(("id", id.clone()))
-                .await
+            if let Ok(mut resp) = await_review_query(
+                "review.tasks.update_get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
             {
                 let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
                 if let Some(row) = rows.into_iter().next() {
@@ -2254,10 +2305,24 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
         WHERE record::id(id) = $id
     "#;
 
-    match review_primary_db()
-        .query(soft_sql)
-        .bind(("id", id.clone()))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.tasks.delete",
+        db.query(soft_sql).bind(("id", id.clone())),
+    )
+    .await
     {
         Ok(_) => {
             if let Some(form_id) = form_id.as_deref() {
@@ -2391,7 +2456,20 @@ async fn update_task_status(
         }
     };
 
-    let mut q = review_primary_db()
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db
         .query(sql)
         .bind(("id", id.clone()))
         .bind(("status", status.clone()));
@@ -2403,7 +2481,7 @@ async fn update_task_status(
         q = q.bind(("comment", c.clone()));
     }
 
-    match q.await {
+    match await_review_query("review.tasks.status_update", q).await {
         Ok(_) => {
             if let Some(form_id) = form_id.as_deref() {
                 if let Err(error) = sync_review_form_with_task_status(
@@ -2421,10 +2499,9 @@ async fn update_task_status(
                     );
                 }
             }
-            if let Err(e) = ensure_review_workflow_history_schema().await {
+            if !review_workflow_history_schema_ready() {
                 warn!(
-                    "[REVIEW_API.update_task_status] ensure_review_workflow_history_schema 失败：{}（继续写入，但 history 可能丢失）",
-                    e
+                    "[REVIEW_API.update_task_status] workflow history schema warmup is not ready; history write uses current schema"
                 );
             }
             let history_sql = r#"
@@ -2441,13 +2518,15 @@ async fn update_task_status(
                 }
             "#;
             let log_task_id = id.clone();
-            let _ = review_primary_db()
-                .query(history_sql)
-                .bind(("task_id", id))
-                .bind(("form_id", form_id.clone()))
-                .bind(("action", status.clone()))
-                .bind(("comment", comment))
-                .await;
+            let _ = await_review_query(
+                "review.tasks.status_history",
+                db.query(history_sql)
+                    .bind(("task_id", id))
+                    .bind(("form_id", form_id.clone()))
+                    .bind(("action", status.clone()))
+                    .bind(("comment", comment)),
+            )
+            .await;
 
             info!(
                 "[REVIEW_API.update_task_status] OK task_id={} form_id={:?} new_status={} target_node={:?} elapsed_ms={}",
@@ -2542,7 +2621,12 @@ async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db.query(sql).bind(("task_id", id.clone())).await {
+    match await_review_query(
+        "review.tasks.history",
+        db.query(sql).bind(("task_id", id.clone())),
+    )
+    .await
+    {
         Ok(mut response) => {
             let rows: Vec<HistoryRow> = response.take(0).unwrap_or_default();
             let history: Vec<HistoryItem> = rows
@@ -2764,11 +2848,27 @@ async fn create_record(
         &note,
     );
     let record_id = build_confirmed_record_stable_id(&slot_key);
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
 
-    let existing_row = match review_primary_db()
-        .query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
-        .bind(("id", record_id.clone()))
-        .await
+    let existing_row = match await_review_query(
+        "review.records.existing",
+        db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+            .bind(("id", record_id.clone())),
+    )
+    .await
     {
         Ok(mut response) => {
             let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
@@ -2794,8 +2894,9 @@ async fn create_record(
                 "Confirmed record no-op: task_id={}, slot_key={}",
                 request.task_id, slot_key
             );
-            match review_primary_db()
-                .query(
+            match await_review_query(
+                "review.records.refresh_noop",
+                db.query(
                     r#"
                     UPDATE type::record('review_records', $id) MERGE {
                         task_id: $task_id,
@@ -2829,8 +2930,9 @@ async fn create_record(
                 .bind(("operator_id", operator_id.clone()))
                 .bind(("operator_name", operator_name.clone()))
                 .bind(("slot_key", slot_key.clone()))
-                .bind(("snapshot_hash", snapshot_hash.clone()))
-                .await
+                .bind(("snapshot_hash", snapshot_hash.clone())),
+            )
+            .await
             {
                 Ok(mut response) => {
                     let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
@@ -2887,24 +2989,26 @@ async fn create_record(
     let sync_operator_name = operator_name.clone();
     let sync_role = claims.role.clone().unwrap_or_default();
 
-    match review_primary_db()
-        .query(upsert_sql)
-        .bind(("id", record_id.clone()))
-        .bind(("task_id", request.task_id.clone()))
-        .bind(("form_id", form_id))
-        .bind(("type", record_type))
-        .bind(("annotations", request.annotations.clone()))
-        .bind(("cloud_annotations", request.cloud_annotations.clone()))
-        .bind(("rect_annotations", request.rect_annotations.clone()))
-        .bind(("obb_annotations", request.obb_annotations.clone()))
-        .bind(("measurements", request.measurements.clone()))
-        .bind(("note", note))
-        .bind(("current_node", current_node))
-        .bind(("operator_id", operator_id))
-        .bind(("operator_name", operator_name))
-        .bind(("slot_key", slot_key))
-        .bind(("snapshot_hash", snapshot_hash))
-        .await
+    match await_review_query(
+        "review.records.upsert",
+        db.query(upsert_sql)
+            .bind(("id", record_id.clone()))
+            .bind(("task_id", request.task_id.clone()))
+            .bind(("form_id", form_id))
+            .bind(("type", record_type))
+            .bind(("annotations", request.annotations.clone()))
+            .bind(("cloud_annotations", request.cloud_annotations.clone()))
+            .bind(("rect_annotations", request.rect_annotations.clone()))
+            .bind(("obb_annotations", request.obb_annotations.clone()))
+            .bind(("measurements", request.measurements.clone()))
+            .bind(("note", note))
+            .bind(("current_node", current_node))
+            .bind(("operator_id", operator_id))
+            .bind(("operator_name", operator_name))
+            .bind(("slot_key", slot_key))
+            .bind(("snapshot_hash", snapshot_hash)),
+    )
+    .await
     {
         Ok(mut response) => {
             let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
@@ -2984,7 +3088,12 @@ async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
         }
     };
 
-    match db.query(sql).bind(("task_id", task_id)).await {
+    match await_review_query(
+        "review.records.by_task",
+        db.query(sql).bind(("task_id", task_id)),
+    )
+    .await
+    {
         Ok(mut response) => {
             let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
             let records: Vec<ConfirmedRecordWithMeta> = rows
@@ -3023,7 +3132,25 @@ async fn delete_record(Path(record_id): Path<String>) -> impl IntoResponse {
 
     let sql = "DELETE [type::record('review_records', $id)]";
 
-    match review_primary_db().query(sql).bind(("id", record_id)).await {
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.records.delete",
+        db.query(sql).bind(("id", record_id)),
+    )
+    .await
+    {
         Ok(_) => (
             StatusCode::OK,
             Json(ActionResponse {
@@ -3055,10 +3182,24 @@ async fn clear_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse
         DELETE $ids;
     "#;
 
-    match review_primary_db()
-        .query(sql)
-        .bind(("task_id", task_id))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.records.clear_task",
+        db.query(sql).bind(("task_id", task_id)),
+    )
+    .await
     {
         Ok(_) => (
             StatusCode::OK,
@@ -3184,21 +3325,37 @@ async fn create_comment(
         }
     "#;
 
-    match review_primary_db()
-        .query(sql)
-        .bind(("id", comment_id.clone()))
-        .bind(("annotation_id", request.annotation_id.clone()))
-        .bind(("annotation_type", request.annotation_type.clone()))
-        .bind(("author_id", author_id.clone()))
-        .bind(("author_name", author_name.clone()))
-        .bind(("author_role", author_role.clone()))
-        .bind(("content", request.content.clone()))
-        .bind(("reply_to_id", request.reply_to_id.clone()))
-        .bind(("form_id", form_id))
-        .bind(("task_id", task_id))
-        .bind(("workflow_node", workflow_node))
-        .bind(("review_round", review_round))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.comments.create",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("annotation_id", request.annotation_id.clone()))
+            .bind(("annotation_type", request.annotation_type.clone()))
+            .bind(("author_id", author_id.clone()))
+            .bind(("author_name", author_name.clone()))
+            .bind(("author_role", author_role.clone()))
+            .bind(("content", request.content.clone()))
+            .bind(("reply_to_id", request.reply_to_id.clone()))
+            .bind(("form_id", form_id))
+            .bind(("task_id", task_id))
+            .bind(("workflow_node", workflow_node))
+            .bind(("review_round", review_round)),
+    )
+    .await
     {
         Ok(_) => {
             let comment = AnnotationComment {
@@ -3305,7 +3462,7 @@ async fn get_comments_by_annotation(
         }
     }
 
-    match q.await {
+    match await_review_query("review.comments.by_annotation", q).await {
         Ok(mut response) => {
             let rows: Vec<CommentRow> = response.take(0).unwrap_or_default();
             let comments: Vec<AnnotationComment> = rows
@@ -3366,12 +3523,27 @@ async fn edit_comment(
             updated_at = time::now()
     "#;
 
-    match review_primary_db()
-        .query(sql)
-        .bind(("id", comment_id.clone()))
-        .bind(("author_id", claims.user_id.clone()))
-        .bind(("content", body.content.clone()))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.comments.edit",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("author_id", claims.user_id.clone()))
+            .bind(("content", body.content.clone())),
+    )
+    .await
     {
         Ok(_) => (
             StatusCode::OK,
@@ -3427,10 +3599,24 @@ async fn delete_comment(
     }
 
     let lookup_sql = "SELECT author_id FROM type::record('review_comments', $id)";
-    let owner = match review_primary_db()
-        .query(lookup_sql)
-        .bind(("id", comment_id.clone()))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let owner = match await_review_query(
+        "review.comments.delete_lookup",
+        db.query(lookup_sql).bind(("id", comment_id.clone())),
+    )
+    .await
     {
         Ok(mut response) => {
             let rows: Vec<CommentOwnerRow> = response.take(0).unwrap_or_default();
@@ -3479,11 +3665,13 @@ async fn delete_comment(
             deleted_by = $user_id
     "#;
 
-    match review_primary_db()
-        .query(sql)
-        .bind(("id", comment_id.clone()))
-        .bind(("user_id", user_id))
-        .await
+    match await_review_query(
+        "review.comments.delete",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("user_id", user_id)),
+    )
+    .await
     {
         Ok(_) => (
             StatusCode::OK,
@@ -3627,7 +3815,10 @@ where
         filters.join(" AND ")
     );
 
-    let mut query = review_primary_db().query(sql);
+    let db = fresh_review_db()
+        .await
+        .map_err(|error| format!("连接校审数据库失败: {}", error))?;
+    let mut query = db.query(sql);
     if let Some(task_id) = task_id.as_ref() {
         query = query.bind(("task_id", task_id.clone()));
     }
@@ -3635,7 +3826,7 @@ where
         query = query.bind(("form_id", form_id.clone()));
     }
 
-    let mut response = query
+    let mut response = await_review_query("review.annotations.patch_records.select", query)
         .await
         .map_err(|error| format!("查询确认记录失败: {}", error))?;
     let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
@@ -3666,15 +3857,17 @@ where
                 rect_annotations = $rect_annotations,
                 obb_annotations = $obb_annotations
         "#;
-        review_primary_db()
-            .query(update_sql)
-            .bind(("id", record_id))
-            .bind(("annotations", annotations))
-            .bind(("cloud_annotations", cloud_annotations))
-            .bind(("rect_annotations", rect_annotations))
-            .bind(("obb_annotations", obb_annotations))
-            .await
-            .map_err(|error| format!("更新确认记录失败: {}", error))?;
+        await_review_query(
+            "review.annotations.patch_records.update",
+            db.query(update_sql)
+                .bind(("id", record_id))
+                .bind(("annotations", annotations))
+                .bind(("cloud_annotations", cloud_annotations))
+                .bind(("rect_annotations", rect_annotations))
+                .bind(("obb_annotations", obb_annotations)),
+        )
+        .await
+        .map_err(|error| format!("更新确认记录失败: {}", error))?;
         updated += 1;
     }
 
@@ -3859,14 +4052,30 @@ async fn update_annotation_severity(
         }
     "#;
 
-    match review_primary_db()
-        .query(sql)
-        .bind(("form_id", form_id.clone().unwrap_or_default()))
-        .bind(("task_id", task_id.clone().unwrap_or_default()))
-        .bind(("annotation_id", annotation_id.clone()))
-        .bind(("annotation_type", query.r#type.clone()))
-        .bind(("severity", body.severity.clone()))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.annotations.severity",
+        db.query(sql)
+            .bind(("form_id", form_id.clone().unwrap_or_default()))
+            .bind(("task_id", task_id.clone().unwrap_or_default()))
+            .bind(("annotation_id", annotation_id.clone()))
+            .bind(("annotation_type", query.r#type.clone()))
+            .bind(("severity", body.severity.clone())),
+    )
+    .await
     {
         Ok(_) => {
             let severity_for_patch = body.severity.clone();
@@ -4081,7 +4290,7 @@ async fn list_returned_tasks() -> impl IntoResponse {
         }
     };
 
-    match db.query(sql).await {
+    match await_review_query("review.tasks.returned", db.query(sql)).await {
         Ok(mut response) => {
             let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
             info!("[RETURNED_TASKS] 查询到 {} 条驳回任务", rows.len());
@@ -4155,6 +4364,19 @@ async fn batch_reactivate_tasks(Json(request): Json<BatchReactivateRequest>) -> 
     let mut results = Vec::new();
     let mut success_count = 0usize;
     let mut skip_count = 0usize;
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("连接校审数据库超时: {}", e),
+                    "results": [],
+                })),
+            );
+        }
+    };
 
     for task_id in &request.task_ids {
         let trimmed = task_id.trim();
@@ -4163,12 +4385,14 @@ async fn batch_reactivate_tasks(Json(request): Json<BatchReactivateRequest>) -> 
             continue;
         }
 
-        match review_primary_db()
-            .query(update_sql)
-            .bind(("task_id", trimmed.to_string()))
-            .bind(("checker_id", checker_id.clone()))
-            .bind(("checker_name", checker_name.clone()))
-            .await
+        match await_review_query(
+            "review.tasks.batch_reactivate",
+            db.query(update_sql)
+                .bind(("task_id", trimmed.to_string()))
+                .bind(("checker_id", checker_id.clone()))
+                .bind(("checker_name", checker_name.clone())),
+        )
+        .await
         {
             Ok(_) => {
                 info!("[BATCH_REACTIVATE] 任务 {} 已推进到 jd/submitted", trimmed);
@@ -4329,10 +4553,16 @@ async fn submit_to_next_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let task_result = review_primary_db()
-        .query(get_sql)
-        .bind(("id", id.clone()))
-        .await;
+    let task_result = match fresh_review_db().await {
+        Ok(db) => {
+            await_review_query(
+                "review.tasks.submit.get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
 
     let task_row = match task_result {
         Ok(mut resp) => {
@@ -4593,10 +4823,16 @@ async fn return_to_node(
 
     // 1. 获取当前任务
     let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let task_result = review_primary_db()
-        .query(get_sql)
-        .bind(("id", id.clone()))
-        .await;
+    let task_result = match fresh_review_db().await {
+        Ok(db) => {
+            await_review_query(
+                "review.tasks.return.get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
 
     let task_row = match task_result {
         Ok(mut resp) => {
@@ -4833,7 +5069,12 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
     };
 
     let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-    let current_node = match db.query(get_sql).bind(("id", id.clone())).await {
+    let current_node = match await_review_query(
+        "review.workflow.current_node",
+        db.query(get_sql).bind(("id", id.clone())),
+    )
+    .await
+    {
         Ok(mut resp) => {
             let rows: Vec<CurrentNodeRow> = resp.take(0).unwrap_or_default();
             match rows.into_iter().next() {
@@ -4884,7 +5125,12 @@ async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
         ORDER BY timestamp ASC
     "#;
 
-    let history = match db.query(history_sql).bind(("task_id", id.clone())).await {
+    let history = match await_review_query(
+        "review.workflow.history",
+        db.query(history_sql).bind(("task_id", id.clone())),
+    )
+    .await
+    {
         Ok(mut resp) => {
             let rows: Vec<WorkflowRow> = resp.take(0).unwrap_or_default();
             rows.into_iter()

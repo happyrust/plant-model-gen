@@ -656,8 +656,13 @@ async fn process_inst_aabb_batch(
         )
         .await?;
     println!(
-        "[batch_stage] batch={} stage=writer_backend worker={} mesh_persist={:?} inst_relate_aabb={:?}",
-        batch.batch_id, worker_id, mesh_report.status, inst_report.status
+        "[batch_stage] batch={} stage=writer_backend worker={} mesh_persist={:?}/{} inst_relate_aabb={:?}/{}",
+        batch.batch_id,
+        worker_id,
+        mesh_report.status,
+        mesh_report.item_count,
+        inst_report.status,
+        inst_report.item_count
     );
     let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
     drop(aabb_permit);
@@ -1579,7 +1584,7 @@ async fn process_index_tree_generation(
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     {
-        if db_option.inner.enable_sqlite_rtree {
+        if db_option.inner.enable_sqlite_rtree && db_option.inner.gen_spatial_tree {
             let mut sqlite_dbnums: Vec<u32> =
                 if let Some(nums) = db_option.inner.manual_db_nums.clone() {
                     nums
@@ -1606,10 +1611,25 @@ async fn process_index_tree_generation(
                 )
                 .await
                 {
-                    Ok(count) => println!("[sqlite-index] 空间索引刷新完成: inserted={count}"),
-                    Err(err) => eprintln!("[sqlite-index] 空间索引刷新失败: {err:#}"),
+                    Ok(count) if count > 0 => {
+                        println!("[sqlite-index] 空间索引刷新完成: inserted={count}")
+                    }
+                    Ok(_) => {
+                        return Err(anyhow::anyhow!(
+                            "gen_spatial_tree 已启用，但空间索引刷新结果为空: dbnums={sqlite_dbnums:?}"
+                        )
+                        .into());
+                    }
+                    Err(err) => {
+                        return Err(anyhow::anyhow!(
+                            "gen_spatial_tree 已启用，但空间索引刷新失败: {err:#}"
+                        )
+                        .into());
+                    }
                 }
             }
+        } else if db_option.inner.enable_sqlite_rtree {
+            println!("[sqlite-index] 跳过刷新：gen_spatial_tree 未启用");
         }
     }
 

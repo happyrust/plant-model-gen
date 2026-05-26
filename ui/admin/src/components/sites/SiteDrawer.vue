@@ -29,7 +29,7 @@ const props = defineProps<{
    * 开启后从 `siteId` 拉取既有站点配置，但**保持创建语义**：
    * - 标题为「克隆站点」
    * - project_name 自动加 ` (副本)` 后缀
-   * - db_port / web_port 各 +1（避免立刻撞端口）
+   * - 默认交给后端自动分配 db_port / web_port
    * - 凭据强制清空，必须重填
    * - 提交走 createSite 而非 updateSite
    */
@@ -38,7 +38,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  saved: []
+  saved: [payload?: { site: ManagedProjectSite; autoDeploy: boolean }]
 }>()
 
 const sitesStore = useSitesStore()
@@ -50,6 +50,8 @@ const previewError = ref('')
 const previewPlan = ref<ManagedSiteParsePlan | null>(null)
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 let previewRequestSeq = 0
+const DEFAULT_DB_PORT = 8020
+const DEFAULT_WEB_PORT = 8080
 
 // D4 / Sprint D · 修 G12：端口冲突前端预检
 //
@@ -75,6 +77,10 @@ const portCheckSeq: Record<PortFieldKey, number> = {
 }
 
 async function checkPortField(field: PortFieldKey) {
+  if (autoAllocatePorts.value && !isEditing.value) {
+    portStatuses.value[field] = { state: 'idle' }
+    return
+  }
   const port = field === 'db_port' ? form.value.db_port : form.value.web_port
   if (!port || port < 1 || port > 65535) {
     portStatuses.value[field] = { state: 'idle' }
@@ -142,8 +148,15 @@ const form = ref<CreateManagedSiteRequest>({
   manual_db_nums: [],
   parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
   force_rebuild_system_db: false,
-  db_port: 8020,
-  web_port: 8080,
+  gen_model: true,
+  gen_mesh: false,
+  gen_spatial_tree: true,
+  apply_boolean_operation: true,
+  mesh_tol_ratio: 3.0,
+  export_json: false,
+  export_parquet: true,
+  db_port: DEFAULT_DB_PORT,
+  web_port: DEFAULT_WEB_PORT,
   bind_host: '127.0.0.1',
   public_base_url: '',
   associated_project: '',
@@ -152,6 +165,7 @@ const form = ref<CreateManagedSiteRequest>({
 })
 
 const manualDbNumsStr = ref('')
+const autoAllocatePorts = ref(true)
 
 const isEditing = computed(() => !!props.siteId && !props.clone)
 const isCloning = computed(() => !!props.siteId && !!props.clone)
@@ -205,9 +219,15 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         manual_db_nums: s.manual_db_nums,
         parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
-        // 克隆模式下端口 +1 避免立刻撞端口；用户仍可手动修改
-        db_port: cloning ? s.db_port + 1 : s.db_port,
-        web_port: cloning ? s.web_port + 1 : s.web_port,
+        gen_model: s.gen_model ?? true,
+        gen_mesh: s.gen_mesh ?? false,
+        gen_spatial_tree: s.gen_spatial_tree ?? true,
+        apply_boolean_operation: s.apply_boolean_operation ?? true,
+        mesh_tol_ratio: s.mesh_tol_ratio ?? 3.0,
+        export_json: s.export_json ?? false,
+        export_parquet: s.export_parquet ?? true,
+        db_port: s.db_port,
+        web_port: s.web_port,
         bind_host: s.bind_host || '127.0.0.1',
         public_base_url: s.public_base_url || '',
         associated_project: s.associated_project || '',
@@ -218,6 +238,9 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
       if (cloning) {
         existingSite.value = null
+        autoAllocatePorts.value = true
+      } else {
+        autoAllocatePorts.value = false
       }
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to load site'
@@ -231,8 +254,15 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       manual_db_nums: [],
       parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
       force_rebuild_system_db: false,
-      db_port: 8020,
-      web_port: 8080,
+      gen_model: true,
+      gen_mesh: false,
+      gen_spatial_tree: true,
+      apply_boolean_operation: true,
+      mesh_tol_ratio: 3.0,
+      export_json: false,
+      export_parquet: true,
+      db_port: DEFAULT_DB_PORT,
+      web_port: DEFAULT_WEB_PORT,
       bind_host: '127.0.0.1',
       public_base_url: '',
       associated_project: '',
@@ -240,6 +270,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       db_password: '',
     }
     manualDbNumsStr.value = ''
+    autoAllocatePorts.value = true
   }
   schedulePreview()
 })
@@ -281,9 +312,10 @@ function applyParsePreset(presetKey: string) {
 const previewPayload = computed<PreviewManagedSiteParsePlanRequest | null>(() => {
   const projectName = form.value.project_name.trim()
   const projectPath = form.value.project_path.trim()
-  if (!props.open || !projectName || !projectPath || !form.value.web_port) {
+  if (!props.open || !projectName || !projectPath) {
     return null
   }
+  const previewWebPort = form.value.web_port || DEFAULT_WEB_PORT
   const parseDbTypes = normalizeParseDbTypes(form.value.parse_db_types ?? [])
   return {
     site_id: props.siteId ?? undefined,
@@ -292,7 +324,7 @@ const previewPayload = computed<PreviewManagedSiteParsePlanRequest | null>(() =>
     manual_db_nums: parseManualDbNumsInput(manualDbNumsStr.value),
     parse_db_types: parseDbTypes,
     force_rebuild_system_db: parseDbTypes.includes('SYST') ? !!form.value.force_rebuild_system_db : false,
-    web_port: form.value.web_port,
+    web_port: previewWebPort,
     bind_host: form.value.bind_host?.trim() || undefined,
     public_base_url: form.value.public_base_url?.trim() || undefined,
     associated_project: form.value.associated_project?.trim() || undefined,
@@ -363,13 +395,23 @@ onBeforeUnmount(() => {
   }
 })
 
-async function handleSubmit() {
+const canSubmit = computed(() => {
+  if (!form.value.project_name || !form.value.project_path) return false
+  if (!isEditing.value && (!form.value.db_user?.trim() || !form.value.db_password?.trim())) return false
+  if (!isEditing.value && autoAllocatePorts.value) return true
+  return !!form.value.db_port && !!form.value.web_port
+})
+
+async function handleSubmit(autoDeploy = false) {
   saving.value = true
   error.value = ''
   parseDbNums()
   form.value.parse_db_types = normalizeParseDbTypes(form.value.parse_db_types ?? [])
   if (!form.value.parse_db_types.includes('SYST')) {
     form.value.force_rebuild_system_db = false
+  }
+  if (!Number.isFinite(form.value.mesh_tol_ratio ?? NaN) || (form.value.mesh_tol_ratio ?? 0) <= 0) {
+    form.value.mesh_tol_ratio = 3.0
   }
   try {
     // 克隆模式走 create 路径（不是 update），保持新建语义
@@ -381,11 +423,19 @@ async function handleSubmit() {
       }
       await sitesStore.updateSite(props.siteId, payload)
     } else {
-      await sitesStore.createSite({
+      const payload: CreateManagedSiteRequest = {
         ...form.value,
+        auto_deploy: autoDeploy,
         db_user: form.value.db_user?.trim() || '',
         db_password: form.value.db_password?.trim() || '',
-      })
+      }
+      if (autoAllocatePorts.value) {
+        delete payload.db_port
+        delete payload.web_port
+      }
+      const site = await sitesStore.createSite(payload)
+      emit('saved', { site, autoDeploy })
+      return
     }
     emit('saved')
   } catch (e) {
@@ -424,7 +474,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
           </div>
 
           <!-- Form -->
-          <form class="flex-1 overflow-auto px-6 py-4 space-y-6" @submit.prevent="handleSubmit">
+          <form class="flex-1 overflow-auto px-6 py-4 space-y-6" @submit.prevent="handleSubmit(false)">
             <fieldset class="space-y-3">
               <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">项目信息</legend>
               <div class="space-y-2">
@@ -442,13 +492,28 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <div class="space-y-2">
                 <label class="text-sm font-medium">关联工程 <span class="text-muted-foreground">(可选)</span></label>
                 <input v-model="form.associated_project" type="text" :placeholder="form.project_name || '默认使用项目名称'" :class="inputClass" />
-                <p class="text-xs text-muted-foreground">打开 Viewer 时自动切换到的工程名</p>
+                <p class="text-xs text-muted-foreground">用于解析源目录和打开 Viewer 的真实 E3D 工程名。</p>
               </div>
             </fieldset>
 
             <fieldset class="space-y-3">
               <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">运行配置</legend>
-              <div class="grid grid-cols-2 gap-4">
+              <label v-if="!isEditing" class="flex items-start gap-2 rounded-lg border border-border/60 bg-muted/30 p-3 text-sm">
+                <input v-model="autoAllocatePorts" type="checkbox" class="mt-0.5" />
+                <span>
+                  <span class="font-medium">自动分配端口</span>
+                  <span class="mt-1 block text-xs text-muted-foreground">
+                    保存时后端会从 DB {{ DEFAULT_DB_PORT }} / Web {{ DEFAULT_WEB_PORT }} 起自动选择空闲端口。
+                  </span>
+                </span>
+              </label>
+              <div
+                v-if="!isEditing && autoAllocatePorts"
+                class="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950 dark:text-emerald-200"
+              >
+                无需手动填写端口；创建成功后会在站点详情中显示实际分配的 DB/Web 端口。
+              </div>
+              <div v-else class="grid grid-cols-2 gap-4">
                 <div class="space-y-2">
                   <label class="text-sm font-medium">DB 端口 *</label>
                   <input
@@ -661,6 +726,73 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
             </fieldset>
 
             <fieldset class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">模型生成</legend>
+              <div class="rounded-lg border border-border/60 bg-background p-4 space-y-3">
+                <div>
+                  <div class="text-sm font-medium">生成开关</div>
+                  <p class="mt-1 text-xs text-muted-foreground">
+                    保存后会写入该部署项目的 DbOption.toml，解析完成后启动站点/完整生成时使用这些配置。
+                  </p>
+                </div>
+                <div class="grid gap-2">
+                  <label class="flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2 cursor-pointer transition-colors hover:border-border">
+                    <input v-model="form.gen_model" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-medium">生成模型数据</span>
+                      <span class="block text-xs text-muted-foreground">控制 gen_model，关闭后只保留解析/数据准备流程。</span>
+                    </span>
+                  </label>
+                  <label class="flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2 cursor-pointer transition-colors hover:border-border">
+                    <input v-model="form.gen_mesh" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-medium">生成 Mesh</span>
+                      <span class="block text-xs text-muted-foreground">控制 gen_mesh，开启后会生成网格/模型文件，耗时和磁盘占用更高。</span>
+                    </span>
+                  </label>
+                  <label class="flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2 cursor-pointer transition-colors hover:border-border">
+                    <input v-model="form.gen_spatial_tree" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-medium">生成空间树</span>
+                      <span class="block text-xs text-muted-foreground">控制 gen_spatial_tree，用于空间查询、房间树和 Viewer 加载。</span>
+                    </span>
+                  </label>
+                  <label class="flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2 cursor-pointer transition-colors hover:border-border">
+                    <input v-model="form.apply_boolean_operation" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-medium">应用布尔运算</span>
+                      <span class="block text-xs text-muted-foreground">控制 apply_boolean_operation，精度更高但生成耗时更长。</span>
+                    </span>
+                  </label>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                  <div class="space-y-2">
+                    <label class="text-sm font-medium">Mesh 容差比</label>
+                    <input
+                      v-model.number="form.mesh_tol_ratio"
+                      type="number"
+                      min="0.1"
+                      step="0.1"
+                      :class="inputClass"
+                    />
+                  </div>
+                  <div class="space-y-2">
+                    <label class="text-sm font-medium">导出格式</label>
+                    <div class="flex h-9 items-center gap-4 text-sm">
+                      <label class="flex items-center gap-2">
+                        <input v-model="form.export_json" type="checkbox" class="h-4 w-4 rounded border-input" />
+                        JSON
+                      </label>
+                      <label class="flex items-center gap-2">
+                        <input v-model="form.export_parquet" type="checkbox" class="h-4 w-4 rounded border-input" />
+                        Parquet
+                      </label>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset class="space-y-3">
               <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">数据库凭据</legend>
               <div class="grid grid-cols-2 gap-4">
                 <div class="space-y-2">
@@ -705,13 +837,17 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               取消
             </button>
             <button
-              @click="handleSubmit"
-              :disabled="saving
-                || !form.project_name
-                || !form.project_path
-                || (!isEditing && (!form.db_user?.trim() || !form.db_password?.trim()))"
+              @click="handleSubmit(false)"
+              :disabled="saving || !canSubmit"
               class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50">
               {{ saving ? '保存中...' : '保存' }}
+            </button>
+            <button
+              v-if="!isEditing"
+              @click="handleSubmit(true)"
+              :disabled="saving || !canSubmit"
+              class="inline-flex h-9 items-center rounded-md bg-emerald-600 px-4 text-sm font-medium text-white shadow hover:bg-emerald-700 transition-colors disabled:pointer-events-none disabled:opacity-50">
+              {{ saving ? '提交中...' : '保存并一键部署' }}
             </button>
           </div>
         </div>

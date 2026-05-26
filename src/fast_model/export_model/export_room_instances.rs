@@ -141,6 +141,27 @@ pub struct RoomExportStats {
     pub export_time_ms: u64,
 }
 
+/// Snapshot format consumed by `plant-model-core/examples/room_compute_from_snapshot.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreRoomComputeSnapshot {
+    pub room_panels: Vec<CoreRoomPanelGroup>,
+    pub aabbs: Vec<CoreRoomAabbRecord>,
+    pub expected_component_refnos: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreRoomPanelGroup {
+    pub room_refno: String,
+    pub room_num: String,
+    pub panel_refnos: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreRoomAabbRecord {
+    pub refno: String,
+    pub aabb: AabbJson,
+}
+
 // ============================================================================
 // 数据库查询结构
 // ============================================================================
@@ -260,6 +281,65 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
         .unwrap_or_default();
 
     Ok(records)
+}
+
+async fn query_core_snapshot_aabbs(refnos: &[RefnoEnum]) -> Result<Vec<CoreRoomAabbRecord>> {
+    const BATCH_SIZE: usize = 500;
+
+    let mut records = Vec::new();
+    for chunk in refnos.chunks(BATCH_SIZE) {
+        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>();
+        let pe_list = pe_keys.join(",");
+        let sql = format!(
+            r#"
+            SELECT
+                id as refno,
+                type::record('inst_relate_booled_aabb', record::id(id)).aabb_id.d
+                    ?? type::record('inst_relate_aabb', record::id(id)).aabb_id.d
+                    ?? type::record('inst_relate_agg_aabb', record::id(id)).aabb_id.d
+                    as world_aabb
+            FROM [{pe_list}]
+            "#
+        );
+        let rows: Vec<CoreSnapshotAabbQueryRow> = model_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .with_context(|| "查询 core room snapshot AABB 失败")?;
+
+        for row in rows {
+            let Some(plant_aabb) = row.world_aabb else {
+                continue;
+            };
+            records.push(CoreRoomAabbRecord {
+                refno: row.refno.to_string(),
+                aabb: plant_aabb_to_json(&plant_aabb),
+            });
+        }
+    }
+
+    Ok(records)
+}
+
+#[derive(Debug, Clone, Deserialize, SurrealValue)]
+struct CoreSnapshotAabbQueryRow {
+    refno: RefnoEnum,
+    world_aabb: Option<aios_core::types::PlantAabb>,
+}
+
+fn plant_aabb_to_json(plant_aabb: &aios_core::types::PlantAabb) -> AabbJson {
+    let inner = &plant_aabb.0;
+    AabbJson {
+        min: [
+            inner.mins.x as f64,
+            inner.mins.y as f64,
+            inner.mins.z as f64,
+        ],
+        max: [
+            inner.maxs.x as f64,
+            inner.maxs.y as f64,
+            inner.maxs.z as f64,
+        ],
+    }
 }
 
 // ============================================================================
@@ -491,6 +571,83 @@ pub async fn export_room_geometries(output_path: &Path, verbose: bool) -> Result
     })
 }
 
+/// 导出 `plant-model-core` snapshot A/B 输入 (room_core_snapshot.json).
+pub async fn export_core_room_compute_snapshot(
+    output_path: &Path,
+    verbose: bool,
+) -> Result<RoomExportStats> {
+    let start_time = std::time::Instant::now();
+    let panel_relations = query_room_panel_relations().await?;
+    let component_relations = query_room_relations().await?;
+
+    let mut room_panel_map: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut all_refnos = Vec::new();
+    for row in &panel_relations {
+        room_panel_map
+            .entry((row.room_refno.to_string(), row.room_num.clone()))
+            .or_default()
+            .push(row.panel_refno.to_string());
+        all_refnos.push(row.panel_refno);
+    }
+
+    let mut expected_component_refnos = Vec::new();
+    for row in &component_relations {
+        let refno = row.component_refno.to_string();
+        expected_component_refnos.push(refno);
+        all_refnos.push(row.component_refno);
+    }
+    expected_component_refnos.sort();
+    expected_component_refnos.dedup();
+    all_refnos.sort();
+    all_refnos.dedup();
+
+    let mut room_panels = room_panel_map
+        .into_iter()
+        .map(|((room_refno, room_num), mut panel_refnos)| {
+            panel_refnos.sort();
+            panel_refnos.dedup();
+            CoreRoomPanelGroup {
+                room_refno,
+                room_num,
+                panel_refnos,
+            }
+        })
+        .collect::<Vec<_>>();
+    room_panels.sort_by(|a, b| {
+        a.room_num
+            .cmp(&b.room_num)
+            .then(a.room_refno.cmp(&b.room_refno))
+    });
+
+    let aabbs = query_core_snapshot_aabbs(&all_refnos).await?;
+    let snapshot = CoreRoomComputeSnapshot {
+        room_panels,
+        aabbs,
+        expected_component_refnos,
+    };
+    let json_content =
+        serde_json::to_string_pretty(&snapshot).context("序列化 room_core_snapshot.json 失败")?;
+    std::fs::write(output_path, json_content)
+        .with_context(|| format!("写入文件失败: {}", output_path.display()))?;
+
+    if verbose {
+        info!("✅ core room snapshot 导出完成: {}", output_path.display());
+        info!(
+            "   - rooms={}, aabbs={}, expected_components={}",
+            snapshot.room_panels.len(),
+            snapshot.aabbs.len(),
+            snapshot.expected_component_refnos.len()
+        );
+    }
+
+    Ok(RoomExportStats {
+        total_rooms: snapshot.room_panels.len(),
+        total_panels: panel_relations.len(),
+        total_components: snapshot.expected_component_refnos.len(),
+        export_time_ms: start_time.elapsed().as_millis() as u64,
+    })
+}
+
 // ============================================================================
 // 辅助函数
 // ============================================================================
@@ -533,12 +690,17 @@ pub async fn export_room_instances(
 
     let relations_path = output_dir.join("room_relations.json");
     let geometries_path = output_dir.join("room_geometries.json");
+    let core_snapshot_path = output_dir.join("room_core_snapshot.json");
 
     // 导出关系数据
     let relations_stats = export_room_relations(&relations_path, verbose).await?;
 
     // 导出几何数据
     let geometries_stats = export_room_geometries(&geometries_path, verbose).await?;
+
+    // 导出 core A/B snapshot
+    let _core_snapshot_stats =
+        export_core_room_compute_snapshot(&core_snapshot_path, verbose).await?;
 
     if verbose {
         info!("🎉 房间数据导出完成!");
@@ -550,6 +712,7 @@ pub async fn export_room_instances(
             "   - room_geometries.json: {} 个面板",
             geometries_stats.total_panels
         );
+        info!("   - room_core_snapshot.json: core facade A/B 输入");
     }
 
     Ok((relations_stats, geometries_stats))

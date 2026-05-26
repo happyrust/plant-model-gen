@@ -26,7 +26,7 @@ use crate::web_server::wizard_handlers::open_deployment_sites_sqlite;
 
 const TABLE_NAME: &str = "admin_tasks";
 const ADMIN_TASK_SUBMITTED_STEP: &str = "已提交，等待站点状态更新";
-const ADMIN_TASK_TOTAL_STEPS: u32 = 4;
+const ADMIN_TASK_TOTAL_STEPS: u32 = 7;
 
 #[derive(Clone)]
 struct StoredAdminTask {
@@ -98,7 +98,10 @@ pub fn create_and_dispatch_site_task(
     config: DatabaseConfig,
 ) -> Result<TaskInfo, String> {
     if !is_supported_admin_task_type(&task_type) {
-        return Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration".to_string());
+        return Err(
+            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite"
+                .to_string(),
+        );
     }
 
     let site_id = normalize_site_id(Some(site_id))
@@ -167,7 +170,7 @@ async fn create_task(Json(payload): Json<CreateTaskRequest>) -> impl IntoRespons
 
     if !is_supported_admin_task_type(&task_type) {
         return admin_response::bad_request(
-            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration",
+            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite",
         );
     }
 
@@ -424,6 +427,8 @@ fn parse_task_type(s: &str) -> TaskType {
         "DataParsingWizard" => TaskType::DataParsingWizard,
         "RefnoModelGeneration" => TaskType::RefnoModelGeneration,
         "ModelExport" => TaskType::ModelExport,
+        "StartManagedSite" => TaskType::StartManagedSite,
+        "DeployManagedSite" => TaskType::DeployManagedSite,
         other => TaskType::Custom(other.to_string()),
     }
 }
@@ -463,7 +468,35 @@ async fn dispatch_admin_task(task_id: String) {
                 Err(e) => Err(e.to_string()),
             }
         }
-        (TaskType::DataGeneration | TaskType::FullGeneration, Some(sid)) => {
+        (TaskType::DataGeneration, Some(sid)) => {
+            mark_task_running(
+                &mut stored.task,
+                "已提交模型生成任务，等待站点状态更新",
+                10.0,
+            );
+            let _ = save_task(&stored.task, stored.site_id.as_deref());
+            match crate::web_server::managed_project_sites::generate_site(sid.to_string(), false)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        (TaskType::FullGeneration, Some(sid)) => {
+            mark_task_running(
+                &mut stored.task,
+                "已提交完整生成任务，等待站点状态更新",
+                10.0,
+            );
+            let _ = save_task(&stored.task, stored.site_id.as_deref());
+            match crate::web_server::managed_project_sites::generate_site(sid.to_string(), true)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        (TaskType::StartManagedSite, Some(sid)) => {
             mark_task_running(&mut stored.task, "已提交启动任务，等待站点状态更新", 10.0);
             let _ = save_task(&stored.task, stored.site_id.as_deref());
             match crate::web_server::managed_project_sites::start_site(sid.to_string()).await {
@@ -471,8 +504,16 @@ async fn dispatch_admin_task(task_id: String) {
                 Err(e) => Err(e.to_string()),
             }
         }
+        (TaskType::DeployManagedSite, Some(sid)) => {
+            mark_task_running(&mut stored.task, "已提交完整部署任务，等待预检与流水线启动", 10.0);
+            let _ = save_task(&stored.task, stored.site_id.as_deref());
+            match crate::web_server::managed_project_sites::deploy_site(sid.to_string()).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
         (_, Some(_)) => {
-            Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration".into())
+            Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite".into())
         }
         (_, None) => Err("创建 admin 任务必须指定 site_id".into()),
     };
@@ -500,7 +541,11 @@ fn normalize_site_id(site_id: Option<String>) -> Option<String> {
 fn is_supported_admin_task_type(task_type: &TaskType) -> bool {
     matches!(
         task_type,
-        TaskType::ParsePdmsData | TaskType::DataGeneration | TaskType::FullGeneration
+        TaskType::ParsePdmsData
+            | TaskType::DataGeneration
+            | TaskType::FullGeneration
+            | TaskType::StartManagedSite
+            | TaskType::DeployManagedSite
     )
 }
 
@@ -637,6 +682,11 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                 mark_task_failed(task, &runtime_step, &message);
             } else if runtime.status == ManagedSiteStatus::Running {
                 mark_task_completed(task, &runtime_step);
+            } else if runtime.parse_status == ManagedSiteParseStatus::Parsed
+                && runtime.status == ManagedSiteStatus::Parsed
+                && !runtime.parse_running
+            {
+                mark_task_completed(task, &runtime_step);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {
                 mark_task_running(task, &runtime_step, 40.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Parsed
@@ -649,11 +699,48 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                 mark_task_running(task, &runtime_step, 10.0);
             }
         }
+        TaskType::StartManagedSite | TaskType::DeployManagedSite => {
+            if runtime.status == ManagedSiteStatus::Failed
+                || runtime
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                let message = runtime
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "站点部署失败".to_string());
+                mark_task_failed(task, &runtime_step, &message);
+            } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
+                mark_task_completed(task, &runtime_step);
+            } else if runtime.current_stage == "generating" {
+                mark_task_running(task, &runtime_step, 45.0);
+            } else if runtime.parse_status == ManagedSiteParseStatus::Running {
+                mark_task_running(task, &runtime_step, 30.0);
+            } else if runtime.db_running && runtime.web_running {
+                mark_task_running(task, &runtime_step, 90.0);
+            } else if runtime.db_running {
+                mark_task_running(task, &runtime_step, 75.0);
+            } else if runtime.status == ManagedSiteStatus::Starting {
+                mark_task_running(task, &runtime_step, 65.0);
+            } else {
+                mark_task_running(task, &runtime_step, 10.0);
+            }
+        }
         _ => {}
     }
 }
 
 fn runtime_step(runtime: &ManagedSiteRuntimeStatus) -> String {
+    if let Some(error) = runtime
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("失败：{error}");
+    }
+
     let label = runtime.current_stage_label.trim();
     let detail = runtime
         .current_stage_detail

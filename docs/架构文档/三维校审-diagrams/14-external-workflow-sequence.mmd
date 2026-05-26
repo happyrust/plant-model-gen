@@ -1,0 +1,40 @@
+sequenceDiagram
+  autonumber
+  actor PMS as PMS 外部流程平台
+  participant FE as plant3d-web iframe
+  participant Store as useReviewStore
+  participant Records as /api/review/records
+  participant Verify as /api/review/workflow/verify
+  participant Sync as /api/review/workflow/sync
+  participant DB as SurrealDB
+
+  PMS->>FE: iframe 打开 embed-url<br/>form_id + user_token + role
+  FE->>Store: 恢复 form_id 快照<br/>currentTask / records / attachments
+
+  PMS->>FE: pms.workflow_pre_action<br/>{formId, action, requestId}
+  FE->>Store: flushPendingConfirmForExternalAction(formId)
+  alt 有未保存批注/测量
+    Store->>Records: POST /api/review/records<br/>保存确认快照
+    Records->>DB: CREATE review_records
+    Records-->>Store: record_id
+  else 无未保存数据
+    Store-->>FE: saveOk=true
+  end
+
+  FE->>Verify: POST workflow/verify<br/>{form_id, token, action}
+  Verify->>DB: 读取 review_tasks / review_records
+  Verify-->>FE: passed / reason / recommended_action
+  FE-->>PMS: plant3d.workflow_pre_action_acked
+
+  alt PMS 决定继续推进
+    PMS->>FE: pms.workflow_changed<br/>{formId, action, nextStep, comments}
+    FE->>Sync: POST workflow/sync<br/>{form_id, actor, action, next_step, comments}
+    Sync->>DB: UPDATE review_tasks / review_forms
+    Sync->>DB: CREATE review_workflow_history
+    Sync->>DB: SELECT form_id 聚合快照
+    Sync-->>FE: SyncWorkflowResponse
+    FE->>Store: 刷新 currentTask / records / history
+    FE-->>PMS: plant3d.workflow_synced
+  else PMS 阻止
+    PMS-->>PMS: 停止外部流程动作
+  end

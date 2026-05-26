@@ -12,6 +12,19 @@
 - 验证：
   - `cargo check --bin web_server --features web_server` 通过（本机已补齐 NASM；仅既有依赖 warning）。
 
+## 2026-05-14
+
+### Fixed — dbnum 全量 Parquet 导出 inst_relate 大结果分页
+
+> 修复 `--export-dbnum-instances --dbnum 7997` 在扫描 `inst_relate` 后卡住的问题。根因不是索引缺失：`idx_inst_relate_dbnum` 已命中，`EXPLAIN FULL` 显示 51625 行 IndexScan 约 0.46s；卡点来自一次性通过 SurrealDB WebSocket 拉回 5 万多行时触发 `Failed to decode fb value`。
+
+- `export_dbnum_instances_parquet.rs`：`query_inst_relate_by_dbnum()` 改为 `ORDER BY in LIMIT 10000 START ...` 分页读取，避免单次 WS 大结果包。
+- verbose 模式新增每页行数和耗时输出，便于定位后续阶段瓶颈。
+- 验证：
+  - `cargo check --features "full,pdms_io/sync-archive,model-writer-drain"` 通过（仅既有依赖 warning）。
+  - `dbnum=7997` 全量 Parquet 导出成功：`inst_relate` 6 页共 51625 行，分页扫描约 2.38s；最终 `instances=46482`、`geo_instances=46786`、`transforms=47585`、`aabb=1205`、总大小 `3352452` bytes，业务耗时约 20.78s。
+  - 输出目录：`target/phase7-ab/baseline-parquet-7997-full/7997`。
+
 ## 2026-05-12
 
 ### Changed — 校审内外部模式改为编译期 feature 控制

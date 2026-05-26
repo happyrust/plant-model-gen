@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, ReviewAuthConfig, verify_token};
 use crate::web_api::review_annotation_state::load_annotation_states_by_task;
-use crate::web_api::review_db::review_primary_db;
+use crate::web_api::review_db::{await_review_query, fresh_review_db};
 use axum::{
     Json,
     http::{HeaderMap, StatusCode},
@@ -723,16 +723,24 @@ async fn load_effective_annotations(
         ORDER BY confirmed_at ASC
     "#;
 
-    let mut response = review_primary_db()
-        .query(query_sql)
-        .bind(("task_id", context.task_id.clone()))
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询 review_records 失败: {}", error),
-            )
-        })?;
+    let db = fresh_review_db().await.map_err(|error| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("连接校审数据库失败: {}", error),
+        )
+    })?;
+    let mut response = await_review_query(
+        "review.annotation_check.records",
+        db.query(query_sql)
+            .bind(("task_id", context.task_id.clone())),
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询 review_records 失败: {}", error),
+        )
+    })?;
 
     let rows: Vec<AnnotationCheckRecordRow> = response.take(0).unwrap_or_default();
     let mut annotations: Vec<EffectiveAnnotation> = Vec::new();
@@ -966,16 +974,23 @@ async fn find_annotation_check_task_by_id(
         LIMIT 1
     "#;
 
-    let mut response = review_primary_db()
-        .query(query_sql)
-        .bind(("id", task_id.to_string()))
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("查询任务失败: {}", error),
-            )
-        })?;
+    let db = fresh_review_db().await.map_err(|error| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("连接校审数据库失败: {}", error),
+        )
+    })?;
+    let mut response = await_review_query(
+        "review.annotation_check.task",
+        db.query(query_sql).bind(("id", task_id.to_string())),
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询任务失败: {}", error),
+        )
+    })?;
 
     let rows: Vec<AnnotationCheckTaskRow> = response.take(0).unwrap_or_default();
     let Some(row) = rows.into_iter().next() else {

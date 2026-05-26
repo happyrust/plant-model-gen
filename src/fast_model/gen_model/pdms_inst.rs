@@ -1,7 +1,7 @@
 use std::collections::{HashMap, hash_map::Entry};
 
 use aios_core::Transform;
-use aios_core::geometry::ShapeInstancesData;
+use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
@@ -23,6 +23,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
+use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
 use super::refno_assoc_index::RefnoAssocIndexBatch;
@@ -809,6 +810,7 @@ pub async fn save_instance_data_with_report(
         delete_inst_relate_by_in(&inst_refnos, CHUNK_SIZE).await?;
     }
     let inst_dbnum_map = query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await;
+    let inst_relate_precomputed = InstRelatePrecomputed::build(&inst_refnos).await;
     if let Entry::Vacant(entry) = transform_map.entry(0) {
         entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
     }
@@ -1258,31 +1260,13 @@ FROM neg_relate WHERE out = {} AND pe = {}",
             inst_info_buffer.clear();
         }
 
-        // 优先从实际网格几何计算世界空间AABB，避免使用过时的单位盒子
-        let resolved_aabb: Option<(u64, Aabb)> =
-            if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
-                let mut union_aabb: Option<Aabb> = None;
-                for inst in &geos_info.insts {
-                    if let Some(mr) = mesh_results.get(&inst.geo_hash) {
-                        if let Some(h) = mr.aabb_hash {
-                            if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
-                                let world_t = info.world_transform * inst.geo_transform;
-                                let world_aabb = aabb_apply_transform(&aabb_ref, &world_t);
-                                union_aabb = Some(match union_aabb {
-                                    Some(existing) => existing.merged(&world_aabb),
-                                    None => world_aabb,
-                                });
-                            }
-                        }
-                    }
-                }
-                union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
-            } else if let Some(aabb) = info.aabb {
-                // 仅当无可用网格时才回退到 info.aabb（可能是占位符）
-                Some((gen_aabb_hash(&aabb), aabb))
-            } else {
-                None
-            };
+        let resolved_aabb: Option<(u64, Aabb)> = resolve_element_world_aabb_for_index(
+            info,
+            inst_mgr.inst_geos_map.get(&info.get_inst_key()),
+            mesh_results,
+            mesh_aabb_map,
+        )
+        .map(|aabb| (gen_aabb_hash(&aabb), aabb));
 
         if let Some((aabb_hash, aabb)) = resolved_aabb {
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
@@ -1303,13 +1287,19 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
-        let dbnum = inst_dbnum_map.get(key).copied().unwrap_or(0);
+        let dbnum = inst_dbnum_map
+            .get(key)
+            .copied()
+            .filter(|dbnum| *dbnum != 0)
+            .unwrap_or_else(|| inst_relate_precomputed.dbnum(key));
+        let dt = inst_relate_precomputed.dt(key);
         let relate_sql = format!(
-            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: fn::ses_date({1}), has_cata_neg: {4}, solid: {5}, owner_refno: {6}, owner_type: '{7}'}}",
+            "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: {4}, has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
             key.to_inst_relate_key(),
             key.to_pe_key(),
             info.id_str(),
             dbnum,
+            dt,
             info.has_cata_neg,
             info.is_solid,
             info.owner_refno.to_pe_key(),
@@ -1584,6 +1574,155 @@ FROM neg_relate WHERE out = {} AND pe = {}",
     Ok(report)
 }
 
+fn merge_aabb_slot(slot: &mut Option<Aabb>, next: Aabb) {
+    *slot = Some(match slot.take() {
+        Some(existing) => existing.merged(&next),
+        None => next,
+    });
+}
+
+fn is_valid_aabb(aabb: &Aabb) -> bool {
+    let ext = aabb.extents().magnitude();
+    !ext.is_nan() && !ext.is_infinite()
+}
+
+fn extrusion_key_points_aabb(
+    extrusion: &aios_core::prim_geo::Extrusion,
+    world_t: Transform,
+) -> Option<Aabb> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut min_z0 = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut max_z0 = f32::NEG_INFINITY;
+
+    for poly in &extrusion.verts {
+        for v in poly {
+            min_x = min_x.min(v.x);
+            min_y = min_y.min(v.y);
+            min_z0 = min_z0.min(v.z);
+            max_x = max_x.max(v.x);
+            max_y = max_y.max(v.y);
+            max_z0 = max_z0.max(v.z);
+        }
+    }
+
+    if !min_x.is_finite() || !min_y.is_finite() || !min_z0.is_finite() {
+        return None;
+    }
+
+    let z_candidates = [
+        min_z0,
+        max_z0,
+        min_z0 + extrusion.height,
+        max_z0 + extrusion.height,
+    ];
+    let min_z = z_candidates.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_z = z_candidates
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let corners = [
+        glam::Vec3::new(min_x, min_y, min_z),
+        glam::Vec3::new(min_x, min_y, max_z),
+        glam::Vec3::new(min_x, max_y, min_z),
+        glam::Vec3::new(min_x, max_y, max_z),
+        glam::Vec3::new(max_x, min_y, min_z),
+        glam::Vec3::new(max_x, min_y, max_z),
+        glam::Vec3::new(max_x, max_y, min_z),
+        glam::Vec3::new(max_x, max_y, max_z),
+    ];
+
+    let mut aabb = Aabb::new_invalid();
+    for corner in corners {
+        let wp = world_t.transform_point(corner);
+        aabb.take_point(Point::new(wp.x, wp.y, wp.z));
+    }
+
+    is_valid_aabb(&aabb).then_some(aabb)
+}
+
+fn derive_inst_world_aabb_from_param(info: &EleGeosInfo, inst: &EleInstGeo) -> Option<Aabb> {
+    let world_t = info.get_geo_world_transform(inst);
+
+    if let Some(local_aabb) = inst.aabb {
+        let world_aabb = aabb_apply_transform(&local_aabb, &world_t);
+        return is_valid_aabb(&world_aabb).then_some(world_aabb);
+    }
+
+    let points = inst.geo_param.key_points();
+    if points.is_empty() {
+        return match &inst.geo_param {
+            PdmsGeoParam::PrimExtrusion(extrusion) => extrusion_key_points_aabb(extrusion, world_t),
+            _ => None,
+        };
+    }
+
+    let mut aabb = Aabb::new_invalid();
+    for point in points {
+        let wp = world_t.transform_point(point.0);
+        aabb.take_point(Point::new(wp.x, wp.y, wp.z));
+    }
+
+    is_valid_aabb(&aabb).then_some(aabb)
+}
+
+fn resolve_inst_world_aabb_for_index(
+    info: &EleGeosInfo,
+    inst: &EleInstGeo,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+) -> Option<Aabb> {
+    if let Some(mr) = mesh_results.get(&inst.geo_hash) {
+        if let Some(h) = mr.aabb_hash {
+            if let Some(local_aabb) = mesh_aabb_map.get(&h.to_string()) {
+                let world_t = info.get_geo_world_transform(inst);
+                let world_aabb = aabb_apply_transform(&local_aabb, &world_t);
+                return is_valid_aabb(&world_aabb).then_some(world_aabb);
+            }
+        }
+    }
+
+    if let Some(local_aabb) = crate::fast_model::EXIST_MESH_GEO_HASHES
+        .get(&inst.geo_hash.to_string())
+        .map(|aabb| *aabb)
+    {
+        let world_t = info.get_geo_world_transform(inst);
+        let world_aabb = aabb_apply_transform(&local_aabb, &world_t);
+        return is_valid_aabb(&world_aabb).then_some(world_aabb);
+    }
+
+    derive_inst_world_aabb_from_param(info, inst)
+}
+
+fn resolve_element_world_aabb_for_index(
+    info: &EleGeosInfo,
+    geos_info: Option<&EleInstGeosData>,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+) -> Option<Aabb> {
+    if let Some(geos_info) = geos_info {
+        let mut union_aabb: Option<Aabb> = None;
+        for inst in &geos_info.insts {
+            if let Some(world_aabb) =
+                resolve_inst_world_aabb_for_index(info, inst, mesh_results, mesh_aabb_map)
+            {
+                merge_aabb_slot(&mut union_aabb, world_aabb);
+            }
+        }
+        if union_aabb.is_some() {
+            return union_aabb;
+        }
+        if let Some(aabb) = geos_info.aabb {
+            return is_valid_aabb(&aabb).then_some(aabb);
+        }
+    }
+
+    info.aabb.filter(is_valid_aabb)
+}
+
 pub fn build_inst_relate_aabb_rows(
     inst_mgr: &ShapeInstancesData,
     mesh_results: &HashMap<u64, MeshResult>,
@@ -1594,33 +1733,13 @@ pub fn build_inst_relate_aabb_rows(
     let mut inst_relate_aabb_ids: Vec<String> = Vec::new();
 
     for (key, info) in &inst_mgr.inst_info_map {
-        let resolved_aabb: Option<(u64, Aabb)> = if let Some(aabb) = info.aabb {
-            Some((gen_aabb_hash(&aabb), aabb))
-        } else if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
-            let mut union_aabb: Option<Aabb> = None;
-            for inst in &geos_info.insts {
-                if let Some(mr) = mesh_results.get(&inst.geo_hash) {
-                    if let Some(h) = mr.aabb_hash {
-                        if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
-                            union_aabb = Some(match union_aabb {
-                                Some(existing) => existing.merged(&*aabb_ref),
-                                None => *aabb_ref,
-                            });
-                        }
-                    }
-                } else if let Some(aabb_ref) =
-                    crate::fast_model::EXIST_MESH_GEO_HASHES.get(&inst.geo_hash.to_string())
-                {
-                    union_aabb = Some(match union_aabb {
-                        Some(existing) => existing.merged(&*aabb_ref),
-                        None => *aabb_ref,
-                    });
-                }
-            }
-            union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
-        } else {
-            None
-        };
+        let resolved_aabb: Option<(u64, Aabb)> = resolve_element_world_aabb_for_index(
+            info,
+            inst_mgr.inst_geos_map.get(&info.get_inst_key()),
+            mesh_results,
+            mesh_aabb_map,
+        )
+        .map(|aabb| (gen_aabb_hash(&aabb), aabb));
 
         if let Some((aabb_hash, aabb)) = resolved_aabb {
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
@@ -2854,31 +2973,13 @@ pub async fn save_instance_data_to_sql_file(
             inst_info_buffer.clear();
         }
 
-        // 优先从实际网格几何计算世界空间AABB，避免使用过时的单位盒子
-        let resolved_aabb: Option<(u64, Aabb)> =
-            if let Some(geos_info) = inst_mgr.inst_geos_map.get(&info.get_inst_key()) {
-                let mut union_aabb: Option<Aabb> = None;
-                for inst in &geos_info.insts {
-                    if let Some(mr) = mesh_results.get(&inst.geo_hash) {
-                        if let Some(h) = mr.aabb_hash {
-                            if let Some(aabb_ref) = mesh_aabb_map.get(&h.to_string()) {
-                                let world_t = info.world_transform * inst.geo_transform;
-                                let world_aabb = aabb_apply_transform(&aabb_ref, &world_t);
-                                union_aabb = Some(match union_aabb {
-                                    Some(existing) => existing.merged(&world_aabb),
-                                    None => world_aabb,
-                                });
-                            }
-                        }
-                    }
-                }
-                union_aabb.map(|aabb| (gen_aabb_hash(&aabb), aabb))
-            } else if let Some(aabb) = info.aabb {
-                // 仅当无可用网格时才回退到 info.aabb（可能是占位符）
-                Some((gen_aabb_hash(&aabb), aabb))
-            } else {
-                None
-            };
+        let resolved_aabb: Option<(u64, Aabb)> = resolve_element_world_aabb_for_index(
+            info,
+            inst_mgr.inst_geos_map.get(&info.get_inst_key()),
+            mesh_results,
+            mesh_aabb_map,
+        )
+        .map(|aabb| (gen_aabb_hash(&aabb), aabb));
 
         if let Some((aabb_hash, aabb)) = resolved_aabb {
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {

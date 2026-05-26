@@ -22,6 +22,10 @@ function formatTime(value?: string | null) {
     hour: '2-digit', minute: '2-digit', second: '2-digit',
   })
 }
+
+function yesNo(value: boolean | undefined) {
+  return value ? '是' : '否'
+}
 </script>
 
 <template>
@@ -75,6 +79,15 @@ function formatTime(value?: string | null) {
         <span class="text-muted-foreground">常用预设</span>
         <span>
           {{ matchedPreset?.label || '自定义组合' }}
+        </span>
+        <span class="text-muted-foreground">生成模型</span><span>{{ yesNo(site.gen_model) }}</span>
+        <span class="text-muted-foreground">生成 Mesh</span><span>{{ yesNo(site.gen_mesh) }}</span>
+        <span class="text-muted-foreground">生成空间树</span><span>{{ yesNo(site.gen_spatial_tree) }}</span>
+        <span class="text-muted-foreground">布尔运算</span><span>{{ yesNo(site.apply_boolean_operation) }}</span>
+        <span class="text-muted-foreground">Mesh 容差比</span><span>{{ site.mesh_tol_ratio ?? 3.0 }}</span>
+        <span class="text-muted-foreground">导出格式</span>
+        <span>
+          JSON {{ yesNo(site.export_json) }} / Parquet {{ yesNo(site.export_parquet) }}
         </span>
       </div>
     </div>

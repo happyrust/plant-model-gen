@@ -50,6 +50,9 @@ cmd/ams-8009-test.db/
 scripts/db/ams-8009-test.db/
 scripts/db/ams-demo.db/
 
+# Generated admin site runtime, configs, logs, and local secrets
+/runtime/admin_sites/
+
 # SurrealKV
 db-data/*.skv
 db-data/version-test.skv/
@@ -98,9 +101,9 @@ simple-http-server.exe
 simple_grpc
 web_server
 aios-database
-web-server
 web-test/
 rumqttd-server/
+tools/surrealdb/
 !/src/web_server/
 
 # ═══════════════════════════════════════════════════════════════

@@ -1,0 +1,58 @@
+flowchart LR
+  subgraph PMS["PMS / 外部流程平台"]
+    PMSForm["form_id<br/>外部单据主键"]
+    PMSAction["action<br/>active / agree / return / stop / query"]
+    PMSActor["actor<br/>当前办理人"]
+    PMSNext["nextStep<br/>assignee_id / name / roles"]
+  end
+
+  subgraph FE["plant3d-web iframe"]
+    Bridge["embedPostMessageBridge<br/>workflow_pre_action / workflow_changed"]
+    ReviewStore["useReviewStore<br/>currentTask / records / history"]
+    ReviewUI["ReviewPanel / InitiateReviewPanel<br/>批注 · 测量 · 附件 · 保存"]
+  end
+
+  subgraph API["plant-model-gen platform_api"]
+    EmbedUrl["/api/review/embed-url<br/>生成/恢复 form_id + token"]
+    Verify["/api/review/workflow/verify<br/>预校验，不写库"]
+    Sync["/api/review/workflow/sync<br/>状态镜像 + 快照回读"]
+  end
+
+  subgraph DB["SurrealDB"]
+    Forms[("review_forms")]
+    Tasks[("review_tasks")]
+    Records[("review_records")]
+    Comments[("review_comments")]
+    History[("review_workflow_history")]
+    Attachments[("review_attachments")]
+  end
+
+  PMSForm --> EmbedUrl
+  EmbedUrl --> FE
+
+  PMSAction --> Bridge
+  PMSActor --> Bridge
+  PMSNext --> Bridge
+
+  Bridge --> Verify
+  Bridge --> Sync
+  Bridge --> ReviewStore
+  ReviewStore --> ReviewUI
+
+  Verify --> Tasks
+  Verify --> Records
+  Sync --> Forms
+  Sync --> Tasks
+  Sync --> Records
+  Sync --> Comments
+  Sync --> History
+  Sync --> Attachments
+
+  classDef external fill:#fff2cc,stroke:#d6b656,color:#111;
+  classDef frontend fill:#dae8fc,stroke:#6c8ebf,color:#111;
+  classDef backend fill:#d5e8d4,stroke:#82b366,color:#111;
+  classDef data fill:#f8cecc,stroke:#b85450,color:#111;
+  class PMSForm,PMSAction,PMSActor,PMSNext external;
+  class Bridge,ReviewStore,ReviewUI frontend;
+  class EmbedUrl,Verify,Sync backend;
+  class Forms,Tasks,Records,Comments,History,Attachments data;

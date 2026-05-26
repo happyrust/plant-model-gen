@@ -1,12 +1,8 @@
 use aios_core::options::DbOption;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-/// 任务ID计数器
-static TASK_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// 自定义SystemTime序列化函数，转换为毫秒时间戳
 fn serialize_system_time<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
@@ -112,6 +108,10 @@ pub enum TaskType {
     RefnoModelGeneration,
     /// 模型导出
     ModelExport,
+    /// 启动受管站点
+    StartManagedSite,
+    /// 完整部署受管站点
+    DeployManagedSite,
     /// 自定义任务
     Custom(String),
 }
@@ -851,11 +851,27 @@ pub struct ManagedProjectSite {
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
+    #[serde(default = "default_true")]
+    pub gen_model: bool,
+    #[serde(default)]
+    pub gen_mesh: bool,
+    #[serde(default = "default_true")]
+    pub gen_spatial_tree: bool,
+    #[serde(default = "default_true")]
+    pub apply_boolean_operation: bool,
+    #[serde(default = "default_mesh_tol_ratio")]
+    pub mesh_tol_ratio: f64,
+    #[serde(default)]
+    pub export_json: bool,
+    #[serde(default = "default_true")]
+    pub export_parquet: bool,
     pub config_path: String,
     pub runtime_dir: String,
     pub db_data_path: String,
     pub db_port: u16,
     pub web_port: u16,
+    #[serde(default)]
+    pub viewer_port: Option<u16>,
     pub bind_host: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -863,6 +879,10 @@ pub struct ManagedProjectSite {
     pub associated_project: Option<String>,
     pub db_pid: Option<u32>,
     pub web_pid: Option<u32>,
+    #[serde(default)]
+    pub viewer_pid: Option<u32>,
+    #[serde(default)]
+    pub viewer_url: Option<String>,
     pub parse_pid: Option<u32>,
     pub status: ManagedSiteStatus,
     pub parse_status: ManagedSiteParseStatus,
@@ -897,6 +917,8 @@ pub struct ManagedSiteProcessResource {
 pub struct ManagedSiteResourceMetrics {
     pub db_process: ManagedSiteProcessResource,
     pub web_process: ManagedSiteProcessResource,
+    #[serde(default)]
+    pub viewer_process: ManagedSiteProcessResource,
     pub parse_process: ManagedSiteProcessResource,
     pub runtime_dir_size_bytes: u64,
     pub data_dir_size_bytes: u64,
@@ -919,8 +941,26 @@ pub struct CreateManagedSiteRequest {
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
-    pub db_port: u16,
-    pub web_port: u16,
+    #[serde(default)]
+    pub gen_model: Option<bool>,
+    #[serde(default)]
+    pub gen_mesh: Option<bool>,
+    #[serde(default)]
+    pub gen_spatial_tree: Option<bool>,
+    #[serde(default)]
+    pub apply_boolean_operation: Option<bool>,
+    #[serde(default)]
+    pub mesh_tol_ratio: Option<f64>,
+    #[serde(default)]
+    pub export_json: Option<bool>,
+    #[serde(default)]
+    pub export_parquet: Option<bool>,
+    #[serde(default)]
+    pub db_port: Option<u16>,
+    #[serde(default)]
+    pub web_port: Option<u16>,
+    #[serde(default)]
+    pub auto_deploy: bool,
     #[serde(default)]
     pub bind_host: Option<String>,
     #[serde(default)]
@@ -948,6 +988,20 @@ pub struct UpdateManagedSiteRequest {
     pub parse_db_types: Option<Vec<String>>,
     #[serde(default)]
     pub force_rebuild_system_db: Option<bool>,
+    #[serde(default)]
+    pub gen_model: Option<bool>,
+    #[serde(default)]
+    pub gen_mesh: Option<bool>,
+    #[serde(default)]
+    pub gen_spatial_tree: Option<bool>,
+    #[serde(default)]
+    pub apply_boolean_operation: Option<bool>,
+    #[serde(default)]
+    pub mesh_tol_ratio: Option<f64>,
+    #[serde(default)]
+    pub export_json: Option<bool>,
+    #[serde(default)]
+    pub export_parquet: Option<bool>,
     #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]
@@ -999,12 +1053,20 @@ pub struct ManagedSiteRuntimeStatus {
     pub current_stage_detail: Option<String>,
     pub db_running: bool,
     pub web_running: bool,
+    #[serde(default)]
+    pub viewer_running: bool,
     pub parse_running: bool,
     pub db_pid: Option<u32>,
     pub web_pid: Option<u32>,
+    #[serde(default)]
+    pub viewer_pid: Option<u32>,
     pub parse_pid: Option<u32>,
     pub db_port: u16,
     pub web_port: u16,
+    #[serde(default)]
+    pub viewer_port: Option<u16>,
+    #[serde(default)]
+    pub viewer_url: Option<String>,
     pub entry_url: Option<String>,
     pub local_entry_url: Option<String>,
     pub public_entry_url: Option<String>,
@@ -1013,9 +1075,13 @@ pub struct ManagedSiteRuntimeStatus {
     #[serde(default)]
     pub web_port_conflict: bool,
     #[serde(default)]
+    pub viewer_port_conflict: bool,
+    #[serde(default)]
     pub db_conflict_pids: Vec<u32>,
     #[serde(default)]
     pub web_conflict_pids: Vec<u32>,
+    #[serde(default)]
+    pub viewer_conflict_pids: Vec<u32>,
     pub last_error: Option<String>,
     pub active_log_kind: Option<String>,
     pub last_log_at: Option<String>,
@@ -1075,9 +1141,82 @@ pub struct ManagedSiteLogStreamSummary {
 pub struct ManagedSiteLogsResponse {
     pub site_id: String,
     pub parse_log: Vec<String>,
+    #[serde(default)]
+    pub generate_log: Vec<String>,
     pub db_log: Vec<String>,
     pub web_log: Vec<String>,
+    #[serde(default)]
+    pub viewer_log: Vec<String>,
     pub streams: Vec<ManagedSiteLogStreamSummary>,
+}
+
+/// 管理后台部署预检单项状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedSitePreflightStatus {
+    Pass,
+    Warning,
+    Blocking,
+}
+
+impl Default for ManagedSitePreflightStatus {
+    fn default() -> Self {
+        Self::Pass
+    }
+}
+
+/// 管理后台部署预检单项
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSitePreflightCheck {
+    pub key: String,
+    pub label: String,
+    pub status: ManagedSitePreflightStatus,
+    pub message: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub action_hint: Option<String>,
+    #[serde(default)]
+    pub pids: Vec<u32>,
+}
+
+/// 管理后台部署预检报告
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSitePreflightReport {
+    pub site_id: String,
+    pub ready: bool,
+    pub blocking_count: usize,
+    pub warning_count: usize,
+    pub updated_at: String,
+    pub checks: Vec<ManagedSitePreflightCheck>,
+}
+
+/// 管理后台部署后验收单项。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteDeployValidationCheck {
+    pub key: String,
+    pub label: String,
+    pub status: String,
+    pub message: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub bytes: Option<u64>,
+}
+
+/// 管理后台部署后验收报告。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedSiteDeployValidationReport {
+    pub site_id: String,
+    pub exists: bool,
+    #[serde(default)]
+    pub checked_at: Option<String>,
+    pub blocking_count: usize,
+    pub warning_count: usize,
+    #[serde(default)]
+    pub checks: Vec<ManagedSiteDeployValidationCheck>,
 }
 
 impl Default for ProjectStatus {
@@ -1648,9 +1787,9 @@ impl TaskQueueManager {
 }
 
 impl TaskInfo {
-    /// 生成任务ID格式: 站点名称_任务名_流水号
+    /// 生成任务ID格式: 站点名称_任务名_随机后缀
     fn generate_task_id(site_name: &str, task_name: &str) -> String {
-        let counter = TASK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nonce = Uuid::new_v4().simple().to_string();
         let site_part = site_name
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -1676,7 +1815,7 @@ impl TaskInfo {
             &task_part
         };
 
-        format!("{}_{}_{}", site_part, task_part, counter)
+        format!("{}_{}_{}", site_part, task_part, &nonce[..8])
     }
 
     pub fn new(name: String, task_type: TaskType, config: DatabaseConfig) -> Self {
@@ -2116,6 +2255,10 @@ pub struct RoomRegenerateRequest {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_mesh_tol_ratio() -> f64 {
+    3.0
 }
 
 /// 房间模型重新生成响应

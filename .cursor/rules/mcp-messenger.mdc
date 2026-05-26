@@ -90,6 +90,29 @@ alwaysApply: true
 
 一句话原则：**`check_messages` 返回的新消息，不是汇报材料，而是下一条必须立刻处理的会话输入。**
 
+## 4.5 激活回执（activation_ack，goal: mcp-activation-ack-marker）
+
+当 `check_messages` 返回的消息体里包含形如：
+
+```
+[激活回执 activation_id=act_a1b2c3d4e5f6]
+请在你下一次 check_messages 调用中, 将上面的 activation_id 填入 activation_ack 字段, 以确认本次激活送达。
+```
+
+的 marker 块时，说明 daemon 刚刚为本会话派发了一次激活：
+
+- **MUST**: 从 marker 中提取 `activation_id`（格式 `^act_[a-z0-9]{6,32}$`）。
+- **MUST**: 在你**下一次** `check_messages` 调用里把它填入可选参数 `activation_ack`，例如：
+
+  ```text
+  check_messages({"turn_complete": true, "activation_ack": "act_a1b2c3d4e5f6"})
+  ```
+
+- **MUST NOT**: 把 `activation_ack` 用于其它目的（它只是一次性回执）。
+- **MUST NOT**: 在没收到 marker 的常规心跳调用里乱填 `activation_ack`（会触发 daemon 的 `not_found` 判罚日志）。
+- 没看到 marker 就**省略** `activation_ack`，按原 §4.1 规则正常 `check_messages` 即可——本字段**完全可选**，老规则未做任何放宽。
+- 同一 `activation_id` 在已 ack 之后再次回填是幂等的（daemon 会回 `already_acked`，不影响行为）。
+
 ---
 
 # 5. 明确禁止（MUST NOT）

@@ -64,6 +64,9 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
         Some(mode) if mode == "drain-only" || mode == "drain_only" || mode == "drain" => {
             ModelWriterMode::DrainOnly
         }
+        Some(mode) if mode == "ducklake" || mode == "duck-lake" || mode == "duck_lake" => {
+            ModelWriterMode::DuckLake
+        }
         Some(_) | None => ModelWriterMode::Surreal,
     }
 }
@@ -138,6 +141,12 @@ pub enum ModelWriterMode {
     Surreal,
     /// 只消费生成端 batch 并输出统计，不持久化，用于压测生成吞吐。
     DrainOnly,
+    /// 通过 Rust duckdb crate 直接挂载 DuckLake，把 trait 已覆盖的 9 张 Phase 1 raw 表
+    /// 写入 `ducklake-canonical` schema。需启用 feature `model-writer-ducklake`。
+    /// 4 类 Phase 1 trait gap 表（tubi/transforms/refno_assoc）本期不写入。
+    /// 参考 `goals/ducklake-model-writer/`。
+    #[serde(alias = "ducklake", alias = "duck_lake")]
+    DuckLake,
 }
 
 impl Default for ModelWriterMode {
@@ -151,6 +160,7 @@ impl ModelWriterMode {
         match self {
             Self::Surreal => "surreal",
             Self::DrainOnly => "drain-only",
+            Self::DuckLake => "ducklake",
         }
     }
 
@@ -591,6 +601,11 @@ impl DbOptionExt {
             ModelWriterMode::DrainOnly if !cfg!(feature = "model-writer-drain") => {
                 anyhow::bail!(
                     "model_writer=drain-only 需要编译 feature `model-writer-drain`；例如 --features \"review,model-writer-drain\""
+                )
+            }
+            ModelWriterMode::DuckLake if !cfg!(feature = "model-writer-ducklake") => {
+                anyhow::bail!(
+                    "model_writer=ducklake 需要编译 feature `model-writer-ducklake`；例如 --features \"review,model-writer-ducklake\"（参考 goals/ducklake-model-writer/）"
                 )
             }
             _ => Ok(()),

@@ -9,6 +9,7 @@ import type {
   UpdateManagedSiteRequest,
   ManagedSiteStatus,
   ManagedSiteParseStatus,
+  ManagedSiteActionResponse,
 } from '@/types/site'
 import type {
   AdminSiteSnapshotPayload,
@@ -16,7 +17,7 @@ import type {
   AdminSiteDeletedPayload,
 } from '@/composables/useAdminSitesStream'
 
-export type SiteAction = 'parse' | 'start' | 'stop' | 'restart' | 'delete'
+export type SiteAction = 'parse' | 'generate' | 'deploy' | 'start' | 'stop' | 'restart' | 'delete'
 export interface SiteActionError {
   siteId: string
   action: SiteAction
@@ -24,7 +25,7 @@ export interface SiteActionError {
 }
 
 // D3 / Sprint D · 批量操作类型
-export type SiteBulkAction = 'start' | 'stop' | 'restart' | 'parse' | 'delete'
+export type SiteBulkAction = 'start' | 'stop' | 'restart' | 'parse' | 'generate' | 'deploy' | 'delete'
 
 export interface SiteBulkResult {
   total: number
@@ -66,12 +67,12 @@ export const useSitesStore = defineStore('sites', () => {
     }
   }
 
-  async function withAction(siteId: string, action: SiteAction, fn: () => Promise<void>) {
-    if (pendingActions.has(siteId)) return
+  async function withAction<T>(siteId: string, action: SiteAction, fn: () => Promise<T>): Promise<T | undefined> {
+    if (pendingActions.has(siteId)) return undefined
     pendingActions.set(siteId, action)
     clearSiteActionError(siteId)
     try {
-      await fn()
+      return await fn()
     } catch (err: unknown) {
       const message = extractErrorMessage(err)
       const payload = { siteId, action, message }
@@ -183,10 +184,32 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
-  async function startSite(id: string) {
-    await withAction(id, 'start', async () => {
-      await sitesApi.start(id)
+  async function generateSite(id: string) {
+    await withAction(id, 'generate', async () => {
+      await sitesApi.generate(id)
       await fetchSites()
+    })
+  }
+
+  async function deploySite(id: string): Promise<ManagedSiteActionResponse | undefined> {
+    return withAction(id, 'deploy', async () => {
+      const response = await sitesApi.deploy(id)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交完整部署任务失败')
+      }
+      await fetchSites()
+      return response.data
+    })
+  }
+
+  async function startSite(id: string): Promise<ManagedSiteActionResponse | undefined> {
+    return withAction(id, 'start', async () => {
+      const response = await sitesApi.start(id)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交站点启动任务失败')
+      }
+      await fetchSites()
+      return response.data
     })
   }
 
@@ -229,6 +252,12 @@ export const useSitesStore = defineStore('sites', () => {
           case 'parse':
             await parseSite(siteId)
             break
+          case 'generate':
+            await generateSite(siteId)
+            break
+          case 'deploy':
+            await deploySite(siteId)
+            break
           case 'delete':
             await deleteSite(siteId)
             break
@@ -249,7 +278,7 @@ export const useSitesStore = defineStore('sites', () => {
     pendingActions, actionErrors, latestActionError,
     getSiteAction, isSiteActionPending, getSiteActionError, clearSiteActionError,
     fetchSites, createSite, updateSite, deleteSite,
-    parseSite, startSite, stopSite, restartSite,
+    parseSite, generateSite, deploySite, startSite, stopSite, restartSite,
     bulkAction,
     patchSiteSnapshot, handleSiteCreated, handleSiteDeleted, refreshOnReconnect,
   }

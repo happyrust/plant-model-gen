@@ -72,7 +72,7 @@ verify -> sync
 |---|---|---|---|
 | `active` | 仅 `sj` | 所有批注都被回复（`open == 0`） | `block` |
 | `agree` | `jd` / `sh` / `pz` | `open == 0 && rejected == 0 && pending == 0` | `return`（有 rejected）/ `block`（仅 pending） |
-| `return` | `jd` / `sh` / `pz` | 至少 1 条 `open` 或 `rejected`（"有问题才能驳回"） | `block`（"无问题批注，不允许驳回"） |
+| `return` | `jd` / `sh` / `pz` | 不做 annotation_check；驳回原因与目标节点由 PMS 流程决定 | — |
 | `stop` | `jd` / `sh` / `pz` | 不做 annotation_check | — |
 
 任何业务规则触发的阻断都走「软阻断」：`HTTP 200 + passed=false + 结构化诊断`。
@@ -134,33 +134,29 @@ curl -sS -X POST 'http://127.0.0.1:3100/api/review/workflow/verify' \
 }
 ```
 
-### 2.5 典型响应（软阻断·无问题批注却要 return）
+### 2.5 典型响应（return 预校验通过，不因批注状态阻断）
 
 ```json
 {
   "code": 200,
-  "message": "无未处理或被驳回的批注，不允许驳回",
-  "error_code": "ANNOTATION_CHECK_FAILED",
-  "annotation_check": {
-    "passed": false,
-    "recommended_action": "block",
-    "current_node": "jd"
-  },
+  "message": "ok",
+  "error_code": null,
+  "annotation_check": null,
   "data": {
-    "passed": false,
+    "passed": true,
     "action": "return",
-    "block_code": "ANNOTATION_CHECK_FAILED",
+    "block_code": null,
     "current_node": "jd",
     "task_status": "submitted",
-    "reason": "无未处理或被驳回的批注，不允许驳回",
-    "recommended_action": "block"
+    "reason": "验证通过，可继续流转",
+    "recommended_action": "proceed"
   }
 }
 ```
 
 ### 2.6 状态码语义
 
-- `HTTP 200 + passed=false`：业务规则阻断（节点不匹配 / 批注门未通过 / owner 不一致 / 终态等）
+- `HTTP 200 + passed=false`：业务规则阻断（节点不匹配 / agree 批注门未通过 / owner 不一致 / 终态等）；`return` 不因批注状态阻断
 - `HTTP 400`：action 不可识别、解析失败等格式错
 - `HTTP 404`：`form_id` 没有对应单据
 - `HTTP 401`：token 不合法
@@ -208,7 +204,7 @@ annotation 检查在 sync 路径与 verify 完全一致：
 
 - `active`：sj 节点 `open == 0`
 - `agree`：jd/sh/pz 节点 `open == 0 && rejected == 0 && pending == 0`
-- `return`：jd/sh/pz 节点至少 1 条 `open` 或 `rejected`（"无问题批注，不允许驳回"）
+- `return`：jd/sh/pz 节点不做 annotation_check；必须由 PMS 显式传 `next_step`
 - `stop`：不做 annotation_check
 
 不满足时返 `HTTP 409 + error_code = "ANNOTATION_CHECK_FAILED"` + `annotation_check` 诊断字段。

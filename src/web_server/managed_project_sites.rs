@@ -9,7 +9,7 @@
 //! - 新增 `path_size_bytes` 的 TTL 缓存；递归扫描限制深度并跳过隐藏/符号链接。
 //! - `open_db` 使用进程内共享连接 + 一次性 schema 升级；pid 存在性检查改用 `libc::kill(pid,0)`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -31,9 +31,11 @@ use tokio::task;
 
 use super::models::{
     AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite,
-    ManagedSiteActivitySummary, ManagedSiteLogStreamSummary, ManagedSiteLogsResponse,
+    ManagedSiteActivitySummary, ManagedSiteDeployValidationCheck,
+    ManagedSiteDeployValidationReport, ManagedSiteLogStreamSummary, ManagedSiteLogsResponse,
     ManagedSiteParseHealth, ManagedSiteParseHealthStatus, ManagedSiteParsePlan,
-    ManagedSiteParsePlanMode, ManagedSiteParseStatus, ManagedSiteProcessResource,
+    ManagedSiteParsePlanMode, ManagedSiteParseStatus, ManagedSitePreflightCheck,
+    ManagedSitePreflightReport, ManagedSitePreflightStatus, ManagedSiteProcessResource,
     ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
     PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
 };
@@ -61,6 +63,9 @@ const PARSE_CRITICAL_DURATION_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI"];
 const SUPPORTED_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI", "CATA", "DICT", "GLB", "GLOB"];
 const REPARSE_REUSE_DB_TYPES: &[&str] = &["SYST"];
+const AUTO_DB_PORT_START: u16 = 8020;
+const AUTO_WEB_PORT_START: u16 = 8080;
+const AUTO_PORT_END: u16 = 8999;
 
 // 运行时等待/杀进程超时。
 const WAIT_PORT_ATTEMPTS: usize = 30;
@@ -76,7 +81,7 @@ const SCAN_MAX_FILES: usize = 200_000;
 const PATH_SIZE_CACHE_TTL_MS: u64 = 60_000;
 
 // Schema 版本号：每次迁移 +1。
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 6;
 
 // ─── Global state (opt-in, interior mutability) ─────────────────────────────
 
@@ -317,6 +322,14 @@ fn web_log_path(site_id: &str) -> PathBuf {
     site_logs_dir(site_id).join("web_server.log")
 }
 
+fn viewer_log_path(site_id: &str) -> PathBuf {
+    site_logs_dir(site_id).join("viewer.log")
+}
+
+fn generate_log_path(site_id: &str) -> PathBuf {
+    site_logs_dir(site_id).join("generate.log")
+}
+
 fn metadata_path(site_id: &str) -> PathBuf {
     site_runtime_dir(site_id).join("metadata.json")
 }
@@ -526,6 +539,16 @@ fn normalize_force_rebuild_system_db(
             .any(|value| REPARSE_REUSE_DB_TYPES.contains(&value.as_str()))
 }
 
+fn default_generation_config() -> DatabaseConfig {
+    DatabaseConfig::from_db_option(&aios_core::get_db_option())
+}
+
+fn normalize_mesh_tol_ratio(value: Option<f64>, fallback: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(fallback)
+}
+
 // ─── Enum / string conversions ──────────────────────────────────────────────
 
 fn status_to_str(status: &ManagedSiteStatus) -> &'static str {
@@ -623,6 +646,22 @@ fn split_project_root(project_name: &str, raw_path: &str) -> (String, Vec<String
         vec![project_name.to_string()],
         vec![project_name.to_string()],
     )
+}
+
+fn site_source_project_name(site: &ManagedProjectSite) -> String {
+    site.associated_project
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            PathBuf::from(&site.project_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| site.project_name.clone())
 }
 
 fn project_dir_candidates(project_name: &str, raw_path: &str) -> Vec<PathBuf> {
@@ -774,13 +813,18 @@ fn parse_scope_enabled(site: &ManagedProjectSite) -> bool {
     !site.manual_db_nums.is_empty() || !configured_parse_db_types(site).is_empty()
 }
 
+fn generation_enabled(site: &ManagedProjectSite) -> bool {
+    site.gen_model || site.gen_mesh || site.gen_spatial_tree
+}
+
 fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
     let parse_db_types = configured_parse_db_types(site);
     if site.manual_db_nums.is_empty() && parse_db_types.is_empty() {
         return Ok(Vec::new());
     }
 
-    let project_root = project_dir_candidates(&site.project_name, &site.project_path)
+    let source_project_name = site_source_project_name(site);
+    let project_root = project_dir_candidates(&source_project_name, &site.project_path)
         .into_iter()
         .find(|path| path.exists())
         .ok_or_else(|| anyhow!("项目路径不存在: {}", site.project_path))?;
@@ -1028,6 +1072,10 @@ fn set_toml_bool(table: &mut toml::value::Table, key: &str, value: bool) {
     table.insert(key.to_string(), toml::Value::Boolean(value));
 }
 
+fn set_toml_float(table: &mut toml::value::Table, key: &str, value: f64) {
+    table.insert(key.to_string(), toml::Value::Float(value));
+}
+
 fn set_toml_array(table: &mut toml::value::Table, key: &str, values: Vec<String>) {
     table.insert(
         key.to_string(),
@@ -1072,8 +1120,9 @@ fn build_site_config(
         .as_table_mut()
         .ok_or_else(|| anyhow!("DbOption 模板不是 table 结构"))?;
 
+    let source_project_name = site_source_project_name(site);
     let runtime_cfg = DatabaseConfig {
-        project_name: site.project_name.clone(),
+        project_name: source_project_name.clone(),
         project_path: site.project_path.clone(),
         project_code: site.project_code,
         manual_db_nums: site.manual_db_nums.clone(),
@@ -1082,13 +1131,20 @@ fn build_site_config(
         db_port: site.db_port.to_string(),
         db_user: db_user.to_string(),
         db_password: db_password.to_string(),
+        gen_model: site.gen_model,
+        gen_mesh: site.gen_mesh,
+        gen_spatial_tree: site.gen_spatial_tree,
+        apply_boolean_operation: site.apply_boolean_operation,
+        mesh_tol_ratio: site.mesh_tol_ratio,
+        export_json: site.export_json,
+        export_parquet: site.export_parquet,
         ..DatabaseConfig::from_db_option(&aios_core::get_db_option())
     };
     let db_option = runtime_cfg.to_runtime_db_option();
     let (project_root, included_projects, project_dirs) =
-        split_project_root(&site.project_name, &site.project_path);
+        split_project_root(&source_project_name, &site.project_path);
 
-    set_toml_string(table, "project_name", site.project_name.clone());
+    set_toml_string(table, "project_name", source_project_name);
     set_toml_string(table, "project_path", project_root);
     set_toml_string(table, "project_code", site.project_code.to_string());
     set_toml_string(table, "surreal_ns", site.project_code.to_string());
@@ -1105,6 +1161,22 @@ fn build_site_config(
     set_toml_array(table, "included_projects", included_projects);
     set_toml_array(table, "project_dirs", project_dirs);
     set_toml_integer_array(table, "manual_db_nums", runtime_cfg.manual_db_nums.clone());
+    set_toml_bool(table, "gen_model", runtime_cfg.gen_model);
+    set_toml_bool(table, "gen_mesh", runtime_cfg.gen_mesh);
+    set_toml_bool(table, "gen_spatial_tree", runtime_cfg.gen_spatial_tree);
+    set_toml_bool(
+        table,
+        "apply_boolean_operation",
+        runtime_cfg.apply_boolean_operation,
+    );
+    set_toml_float(table, "mesh_tol_ratio", runtime_cfg.mesh_tol_ratio);
+    set_toml_bool(table, "export_json", runtime_cfg.export_json);
+    set_toml_bool(table, "export_parquet", runtime_cfg.export_parquet);
+    set_toml_bool(
+        table,
+        "export_parquet_after_gen",
+        runtime_cfg.export_parquet,
+    );
 
     let web_server = ensure_table(table, "web_server");
     set_toml_integer(web_server, "port", site.web_port as i64);
@@ -1219,6 +1291,13 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
         "manual_db_nums": site.manual_db_nums,
         "parse_db_types": site.parse_db_types,
         "force_rebuild_system_db": site.force_rebuild_system_db,
+        "gen_model": site.gen_model,
+        "gen_mesh": site.gen_mesh,
+        "gen_spatial_tree": site.gen_spatial_tree,
+        "apply_boolean_operation": site.apply_boolean_operation,
+        "mesh_tol_ratio": site.mesh_tol_ratio,
+        "export_json": site.export_json,
+        "export_parquet": site.export_parquet,
         "db_port": site.db_port,
         "web_port": site.web_port,
         "entry_url": site.entry_url,
@@ -1251,6 +1330,21 @@ fn derive_entry_urls(
 
 // ─── Row mapping ────────────────────────────────────────────────────────────
 
+fn row_bool_or(row: &rusqlite::Row<'_>, column: &str, default: bool) -> bool {
+    row.get::<_, Option<i64>>(column)
+        .ok()
+        .flatten()
+        .map(|value| value != 0)
+        .unwrap_or(default)
+}
+
+fn row_f64_or(row: &rusqlite::Row<'_>, column: &str, default: f64) -> f64 {
+    row.get::<_, Option<f64>>(column)
+        .ok()
+        .flatten()
+        .unwrap_or(default)
+}
+
 fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> {
     let web_port = row.get::<_, i64>("web_port")? as u16;
     let bind_host: String = row.get("bind_host")?;
@@ -1270,11 +1364,22 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
             .unwrap_or(None)
             .unwrap_or(0)
             != 0,
+        gen_model: row_bool_or(row, "gen_model", true),
+        gen_mesh: row_bool_or(row, "gen_mesh", false),
+        gen_spatial_tree: row_bool_or(row, "gen_spatial_tree", true),
+        apply_boolean_operation: row_bool_or(row, "apply_boolean_operation", true),
+        mesh_tol_ratio: row_f64_or(row, "mesh_tol_ratio", 3.0),
+        export_json: row_bool_or(row, "export_json", false),
+        export_parquet: row_bool_or(row, "export_parquet", true),
         config_path: row.get("config_path")?,
         runtime_dir: row.get("runtime_dir")?,
         db_data_path: row.get("db_data_path")?,
         db_port: row.get::<_, i64>("db_port")? as u16,
         web_port,
+        viewer_port: row
+            .get::<_, Option<i64>>("viewer_port")
+            .unwrap_or(None)
+            .map(|value| value as u16),
         bind_host,
         public_base_url,
         associated_project,
@@ -1284,6 +1389,11 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         web_pid: row
             .get::<_, Option<i64>>("web_pid")?
             .map(|value| value as u32),
+        viewer_pid: row
+            .get::<_, Option<i64>>("viewer_pid")
+            .unwrap_or(None)
+            .map(|value| value as u32),
+        viewer_url: row.get("viewer_url").unwrap_or(None),
         parse_pid: row
             .get::<_, Option<i64>>("parse_pid")?
             .map(|value| value as u32),
@@ -1319,14 +1429,24 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             manual_db_nums TEXT NOT NULL DEFAULT '[]',
             parse_db_types TEXT NOT NULL DEFAULT '["SYST","DESI"]',
             force_rebuild_system_db INTEGER NOT NULL DEFAULT 0,
+            gen_model INTEGER NOT NULL DEFAULT 1,
+            gen_mesh INTEGER NOT NULL DEFAULT 0,
+            gen_spatial_tree INTEGER NOT NULL DEFAULT 1,
+            apply_boolean_operation INTEGER NOT NULL DEFAULT 1,
+            mesh_tol_ratio REAL NOT NULL DEFAULT 3.0,
+            export_json INTEGER NOT NULL DEFAULT 0,
+            export_parquet INTEGER NOT NULL DEFAULT 1,
             config_path TEXT NOT NULL,
             runtime_dir TEXT NOT NULL,
             db_data_path TEXT NOT NULL,
             db_port INTEGER NOT NULL,
             web_port INTEGER NOT NULL,
+            viewer_port INTEGER,
             bind_host TEXT NOT NULL,
             db_pid INTEGER,
             web_pid INTEGER,
+            viewer_pid INTEGER,
+            viewer_url TEXT,
             parse_pid INTEGER,
             status TEXT NOT NULL,
             parse_status TEXT NOT NULL,
@@ -1383,6 +1503,28 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         current_version = 4;
         conn.pragma_update(None, "user_version", current_version as i64)?;
     }
+    if current_version < 5 {
+        for column in [
+            "gen_model",
+            "gen_mesh",
+            "gen_spatial_tree",
+            "apply_boolean_operation",
+            "mesh_tol_ratio",
+            "export_json",
+            "export_parquet",
+        ] {
+            ensure_column_exists(conn, column)?;
+        }
+        current_version = 5;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
+    if current_version < 6 {
+        for column in ["viewer_port", "viewer_pid", "viewer_url"] {
+            ensure_column_exists(conn, column)?;
+        }
+        current_version = 6;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
     debug_assert!(current_version <= SCHEMA_VERSION);
     Ok(())
 }
@@ -1396,9 +1538,17 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
     if !has_column {
         let column_type = match column {
             "last_parse_duration_ms" => "INTEGER",
+            "viewer_port" | "viewer_pid" => "INTEGER",
             "manual_db_nums" => "TEXT NOT NULL DEFAULT '[]'",
             "parse_db_types" => "TEXT NOT NULL DEFAULT '[\"SYST\",\"DESI\"]'",
             "force_rebuild_system_db" => "INTEGER NOT NULL DEFAULT 0",
+            "gen_model" => "INTEGER NOT NULL DEFAULT 1",
+            "gen_mesh" => "INTEGER NOT NULL DEFAULT 0",
+            "gen_spatial_tree" => "INTEGER NOT NULL DEFAULT 1",
+            "apply_boolean_operation" => "INTEGER NOT NULL DEFAULT 1",
+            "mesh_tol_ratio" => "REAL NOT NULL DEFAULT 3.0",
+            "export_json" => "INTEGER NOT NULL DEFAULT 0",
+            "export_parquet" => "INTEGER NOT NULL DEFAULT 1",
             _ => "TEXT",
         };
         conn.execute(
@@ -1437,13 +1587,16 @@ fn persist_site_with_conn(
         &format!(
             "INSERT OR REPLACE INTO {table} (
                 site_id, project_name, project_code, project_path, config_path, runtime_dir,
-                manual_db_nums, parse_db_types, force_rebuild_system_db, db_data_path, db_port, web_port, bind_host, public_base_url,
+                manual_db_nums, parse_db_types, force_rebuild_system_db,
+                gen_model, gen_mesh, gen_spatial_tree, apply_boolean_operation, mesh_tol_ratio,
+                export_json, export_parquet,
+                db_data_path, db_port, web_port, viewer_port, bind_host, public_base_url,
                 associated_project,
-                db_pid, web_pid, parse_pid,
+                db_pid, web_pid, viewer_pid, viewer_url, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
             table = TABLE_NAME
         ),
         params![
@@ -1456,14 +1609,24 @@ fn persist_site_with_conn(
             manual_db_nums_to_json(&site.manual_db_nums)?,
             parse_db_types_to_json(&site.parse_db_types)?,
             if site.force_rebuild_system_db { 1i64 } else { 0i64 },
+            if site.gen_model { 1i64 } else { 0i64 },
+            if site.gen_mesh { 1i64 } else { 0i64 },
+            if site.gen_spatial_tree { 1i64 } else { 0i64 },
+            if site.apply_boolean_operation { 1i64 } else { 0i64 },
+            site.mesh_tol_ratio,
+            if site.export_json { 1i64 } else { 0i64 },
+            if site.export_parquet { 1i64 } else { 0i64 },
             &site.db_data_path,
             site.db_port as i64,
             site.web_port as i64,
+            site.viewer_port.map(|value| value as i64),
             &site.bind_host,
             &site.public_base_url,
             &site.associated_project,
             site.db_pid.map(|value| value as i64),
             site.web_pid.map(|value| value as i64),
+            site.viewer_pid.map(|value| value as i64),
+            &site.viewer_url,
             site.parse_pid.map(|value| value as i64),
             status_to_str(&site.status),
             parse_status_to_str(&site.parse_status),
@@ -1517,8 +1680,11 @@ fn assert_port_available_with_conn(
     db_port: u16,
     web_port: u16,
 ) -> Result<()> {
+    if db_port == web_port {
+        bail!("数据库端口和站点端口不能相同: {}", db_port);
+    }
     let sql = format!(
-        "SELECT site_id, db_port, web_port FROM {table} WHERE (?1 IS NULL OR site_id != ?1)",
+        "SELECT site_id, db_port, web_port, viewer_port FROM {table} WHERE (?1 IS NULL OR site_id != ?1)",
         table = TABLE_NAME
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1527,15 +1693,36 @@ fn assert_port_available_with_conn(
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)? as u16,
             row.get::<_, i64>(2)? as u16,
+            row.get::<_, Option<i64>>(3)?.map(|value| value as u16),
         ))
     })?;
     for row in rows {
-        let (site_id, existing_db_port, existing_web_port) = row?;
-        if existing_db_port == db_port {
-            bail!("数据库端口 {} 已被站点 {} 使用", db_port, site_id);
-        }
-        if existing_web_port == web_port {
-            bail!("站点端口 {} 已被站点 {} 使用", web_port, site_id);
+        let (site_id, existing_db_port, existing_web_port, existing_viewer_port) = row?;
+        for (candidate, label) in [(db_port, "数据库"), (web_port, "站点")] {
+            if existing_db_port == candidate {
+                bail!(
+                    "{}端口 {} 已被站点 {} 的数据库端口使用",
+                    label,
+                    candidate,
+                    site_id
+                );
+            }
+            if existing_web_port == candidate {
+                bail!(
+                    "{}端口 {} 已被站点 {} 的站点端口使用",
+                    label,
+                    candidate,
+                    site_id
+                );
+            }
+            if existing_viewer_port == Some(candidate) {
+                bail!(
+                    "{}端口 {} 已被站点 {} 的 Viewer 端口使用",
+                    label,
+                    candidate,
+                    site_id
+                );
+            }
         }
     }
     if port_in_use("127.0.0.1", db_port) {
@@ -1545,6 +1732,76 @@ fn assert_port_available_with_conn(
         bail!("站点端口 {} 已被当前机器上的其他进程占用", web_port);
     }
     Ok(())
+}
+
+fn collect_reserved_ports_with_conn(
+    conn: &Connection,
+    exclude_site_id: Option<&str>,
+) -> Result<HashSet<u16>> {
+    let sql = format!(
+        "SELECT db_port, web_port, viewer_port FROM {table} WHERE (?1 IS NULL OR site_id != ?1)",
+        table = TABLE_NAME
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([exclude_site_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)? as u16,
+            row.get::<_, i64>(1)? as u16,
+            row.get::<_, Option<i64>>(2)?.map(|value| value as u16),
+        ))
+    })?;
+    let mut used = HashSet::new();
+    for row in rows {
+        let (db_port, web_port, viewer_port) = row?;
+        used.insert(db_port);
+        used.insert(web_port);
+        if let Some(port) = viewer_port {
+            used.insert(port);
+        }
+    }
+    Ok(used)
+}
+
+fn first_available_port(used: &mut HashSet<u16>, start: u16, end: u16) -> Result<u16> {
+    for port in start..=end {
+        if used.contains(&port) || port_in_use("127.0.0.1", port) {
+            continue;
+        }
+        used.insert(port);
+        return Ok(port);
+    }
+    bail!("没有可用端口: {}-{}", start, end)
+}
+
+fn reserve_explicit_port(used: &mut HashSet<u16>, port: u16, label: &str) -> Result<u16> {
+    if used.contains(&port) {
+        bail!("{}端口 {} 已被已有站点使用", label, port);
+    }
+    if port_in_use("127.0.0.1", port) {
+        bail!("{}端口 {} 已被当前机器上的其他进程占用", label, port);
+    }
+    used.insert(port);
+    Ok(port)
+}
+
+fn resolve_create_ports_with_conn(
+    conn: &Connection,
+    db_port: Option<u16>,
+    web_port: Option<u16>,
+) -> Result<(u16, u16)> {
+    let mut used = collect_reserved_ports_with_conn(conn, None)?;
+    let db_port = match db_port.filter(|port| *port != 0) {
+        Some(port) => reserve_explicit_port(&mut used, port, "数据库")?,
+        None => first_available_port(&mut used, AUTO_DB_PORT_START, AUTO_PORT_END)?,
+    };
+    let web_port = match web_port.filter(|port| *port != 0) {
+        Some(port) => reserve_explicit_port(&mut used, port, "站点")?,
+        None => first_available_port(&mut used, AUTO_WEB_PORT_START, AUTO_PORT_END)?,
+    };
+    if db_port == web_port {
+        bail!("数据库端口和站点端口不能相同: {}", db_port);
+    }
+    Ok((db_port, web_port))
 }
 
 // ─── Public read-side API ───────────────────────────────────────────────────
@@ -1602,7 +1859,9 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
 
     let _guard = lock_op()?;
 
-    let site_id = infer_site_id(&req.project_name, req.web_port);
+    let (db_port, web_port) =
+        with_conn(|conn| resolve_create_ports_with_conn(conn, req.db_port, req.web_port))?;
+    let site_id = infer_site_id(&req.project_name, web_port);
     let created_at = now_rfc3339();
     let bind_host = normalize_host(req.bind_host);
     assert_bind_host_safe(&bind_host)?;
@@ -1615,12 +1874,13 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         .filter(|v| !v.trim().is_empty())
         .map(|v| v.trim().to_string());
     let (local_entry_url, public_entry_url, entry_url) =
-        derive_entry_urls(req.web_port, &bind_host, &public_base_url);
+        derive_entry_urls(web_port, &bind_host, &public_base_url);
     let db_user = require_db_user(req.db_user)?;
     let db_password = require_db_password(req.db_password)?;
     assert_db_credentials_strong(&db_user, &db_password)?;
 
     let parse_db_types = normalize_parse_db_types(req.parse_db_types);
+    let generation_defaults = default_generation_config();
     let site = ManagedProjectSite {
         site_id: site_id.clone(),
         project_name: req.project_name.trim().to_string(),
@@ -1632,16 +1892,35 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
             &parse_db_types,
         ),
         parse_db_types,
+        gen_model: req.gen_model.unwrap_or(generation_defaults.gen_model),
+        gen_mesh: req.gen_mesh.unwrap_or(generation_defaults.gen_mesh),
+        gen_spatial_tree: req
+            .gen_spatial_tree
+            .unwrap_or(generation_defaults.gen_spatial_tree),
+        apply_boolean_operation: req
+            .apply_boolean_operation
+            .unwrap_or(generation_defaults.apply_boolean_operation),
+        mesh_tol_ratio: normalize_mesh_tol_ratio(
+            req.mesh_tol_ratio,
+            generation_defaults.mesh_tol_ratio,
+        ),
+        export_json: req.export_json.unwrap_or(generation_defaults.export_json),
+        export_parquet: req
+            .export_parquet
+            .unwrap_or(generation_defaults.export_parquet),
         config_path: config_path(&site_id).to_string_lossy().to_string(),
         runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
         db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
-        db_port: req.db_port,
-        web_port: req.web_port,
+        db_port,
+        web_port,
+        viewer_port: None,
         bind_host,
         public_base_url,
         associated_project,
         db_pid: None,
         web_pid: None,
+        viewer_pid: None,
+        viewer_url: None,
         parse_pid: None,
         status: ManagedSiteStatus::Draft,
         parse_status: ManagedSiteParseStatus::Pending,
@@ -1724,6 +2003,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             .map(|value| value.to_string());
         let (local_entry_url, public_entry_url, entry_url) =
             derive_entry_urls(req.web_port, &bind_host, &public_base_url);
+        let generation_defaults = default_generation_config();
 
         ManagedProjectSite {
             site_id: site_id.clone(),
@@ -1733,16 +2013,26 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             manual_db_nums: Vec::new(),
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
+            gen_model: generation_defaults.gen_model,
+            gen_mesh: generation_defaults.gen_mesh,
+            gen_spatial_tree: generation_defaults.gen_spatial_tree,
+            apply_boolean_operation: generation_defaults.apply_boolean_operation,
+            mesh_tol_ratio: generation_defaults.mesh_tol_ratio,
+            export_json: generation_defaults.export_json,
+            export_parquet: generation_defaults.export_parquet,
             config_path: config_path(&site_id).to_string_lossy().to_string(),
             runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
             db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
             db_port: 0,
             web_port: req.web_port,
+            viewer_port: None,
             bind_host,
             public_base_url,
             associated_project,
             db_pid: None,
             web_pid: None,
+            viewer_pid: None,
+            viewer_url: None,
             parse_pid: None,
             status: ManagedSiteStatus::Draft,
             parse_status: ManagedSiteParseStatus::Pending,
@@ -1829,6 +2119,27 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     if let Some(value) = req.force_rebuild_system_db {
         site.force_rebuild_system_db = value;
     }
+    if let Some(value) = req.gen_model {
+        site.gen_model = value;
+    }
+    if let Some(value) = req.gen_mesh {
+        site.gen_mesh = value;
+    }
+    if let Some(value) = req.gen_spatial_tree {
+        site.gen_spatial_tree = value;
+    }
+    if let Some(value) = req.apply_boolean_operation {
+        site.apply_boolean_operation = value;
+    }
+    if req.mesh_tol_ratio.is_some() {
+        site.mesh_tol_ratio = normalize_mesh_tol_ratio(req.mesh_tol_ratio, site.mesh_tol_ratio);
+    }
+    if let Some(value) = req.export_json {
+        site.export_json = value;
+    }
+    if let Some(value) = req.export_parquet {
+        site.export_parquet = value;
+    }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
         let value = value.trim().to_string();
         assert_bind_host_safe(&value)?;
@@ -1877,6 +2188,9 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     site.parse_status = ManagedSiteParseStatus::Pending;
     site.db_pid = None;
     site.web_pid = None;
+    site.viewer_port = None;
+    site.viewer_pid = None;
+    site.viewer_url = None;
     site.parse_pid = None;
     site.last_error = None;
 
@@ -1908,6 +2222,9 @@ pub struct RuntimeUpdate {
     pub parse_status: Option<ManagedSiteParseStatus>,
     pub db_pid: Option<Option<u32>>,
     pub web_pid: Option<Option<u32>>,
+    pub viewer_port: Option<Option<u16>>,
+    pub viewer_pid: Option<Option<u32>>,
+    pub viewer_url: Option<Option<String>>,
     pub parse_pid: Option<Option<u32>>,
     pub last_error: Option<Option<String>>,
     pub entry_url: Option<Option<String>>,
@@ -1922,6 +2239,9 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         parse_status,
         db_pid,
         web_pid,
+        viewer_port,
+        viewer_pid,
+        viewer_url,
         parse_pid,
         last_error,
         entry_url,
@@ -1943,6 +2263,15 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         }
         if let Some(value) = web_pid {
             site.web_pid = value;
+        }
+        if let Some(value) = viewer_port {
+            site.viewer_port = value;
+        }
+        if let Some(value) = viewer_pid {
+            site.viewer_pid = value;
+        }
+        if let Some(value) = viewer_url {
+            site.viewer_url = value;
         }
         if let Some(value) = parse_pid {
             site.parse_pid = value;
@@ -2013,16 +2342,40 @@ fn port_in_use(host: &str, port: u16) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct PortRuntimeProbe {
+    managed_running: bool,
+    conflict_pids: Vec<u32>,
+}
+
+fn probe_managed_port(port: u16, managed_pid: Option<u32>) -> PortRuntimeProbe {
+    let port_pids = collect_port_pids_sync(port);
+    let managed_pid = managed_pid.filter(|pid| pid_running(Some(*pid)));
+    let managed_running = managed_pid
+        .map(|pid| port_pids.iter().any(|port_pid| *port_pid == pid))
+        .unwrap_or(false);
+    let conflict_pids = port_pids
+        .into_iter()
+        .filter(|pid| !(managed_running && Some(*pid) == managed_pid))
+        .collect();
+    PortRuntimeProbe {
+        managed_running,
+        conflict_pids,
+    }
+}
+
 /// 根据 pid / 端口等信号派生出当前运行时状态，不写库、不覆盖 `entry_url`。
 fn derive_runtime_state(mut site: ManagedProjectSite) -> ManagedProjectSite {
-    let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
-    let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
+    let db_running = probe_managed_port(site.db_port, site.db_pid).managed_running;
+    let web_running = probe_managed_port(site.web_port, site.web_pid).managed_running;
     let parse_running = pid_running(site.parse_pid);
 
-    if parse_running {
+    if parse_running && site.parse_status != ManagedSiteParseStatus::Parsed {
         site.parse_status = ManagedSiteParseStatus::Running;
     }
-    if web_running {
+    if web_running
+        && !(matches!(site.status, ManagedSiteStatus::Starting) && site.viewer_url.is_none())
+    {
         site.status = ManagedSiteStatus::Running;
     } else if matches!(
         site.status,
@@ -2043,11 +2396,27 @@ fn derive_runtime_state(mut site: ManagedProjectSite) -> ManagedProjectSite {
 }
 
 fn site_db_running(site: &ManagedProjectSite) -> bool {
-    pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port)
+    probe_managed_port(site.db_port, site.db_pid).managed_running
 }
 
 fn site_web_running(site: &ManagedProjectSite) -> bool {
-    pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port)
+    probe_managed_port(site.web_port, site.web_pid).managed_running
+}
+
+fn site_viewer_running(site: &ManagedProjectSite) -> bool {
+    if pid_running(site.viewer_pid) {
+        return true;
+    }
+    site.viewer_port
+        .map(|port| {
+            port_in_use("127.0.0.1", port)
+                && site.viewer_url.is_some()
+                && matches!(
+                    site.status,
+                    ManagedSiteStatus::Running | ManagedSiteStatus::Starting
+                )
+        })
+        .unwrap_or(false)
 }
 
 fn site_parse_running(site: &ManagedProjectSite) -> bool {
@@ -2055,7 +2424,10 @@ fn site_parse_running(site: &ManagedProjectSite) -> bool {
 }
 
 fn site_has_active_processes(site: &ManagedProjectSite) -> bool {
-    site_db_running(site) || site_web_running(site) || site_parse_running(site)
+    site_db_running(site)
+        || site_web_running(site)
+        || pid_running(site.viewer_pid)
+        || site_parse_running(site)
 }
 
 // ─── pid existence check ────────────────────────────────────────────────────
@@ -2306,6 +2678,7 @@ fn build_site_resource_metrics(
     site: &ManagedProjectSite,
     db_running: bool,
     web_running: bool,
+    viewer_running: bool,
     parse_running: bool,
     system: &System,
     cpu_ready: bool,
@@ -2316,6 +2689,7 @@ fn build_site_resource_metrics(
     ManagedSiteResourceMetrics {
         db_process: build_process_resource(site.db_pid, db_running, system, cpu_ready),
         web_process: build_process_resource(site.web_pid, web_running, system, cpu_ready),
+        viewer_process: build_process_resource(site.viewer_pid, viewer_running, system, cpu_ready),
         parse_process: build_process_resource(site.parse_pid, parse_running, system, cpu_ready),
         runtime_dir_size_bytes: path_size_bytes(&runtime_dir),
         data_dir_size_bytes: path_size_bytes(&data_dir),
@@ -2331,9 +2705,10 @@ fn collect_site_resource_metrics(
     site: &ManagedProjectSite,
     db_running: bool,
     web_running: bool,
+    viewer_running: bool,
     parse_running: bool,
 ) -> ManagedSiteResourceMetrics {
-    let tracked_pids = [site.db_pid, site.web_pid, site.parse_pid]
+    let tracked_pids = [site.db_pid, site.web_pid, site.viewer_pid, site.parse_pid]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -2343,6 +2718,7 @@ fn collect_site_resource_metrics(
             site,
             db_running,
             web_running,
+            viewer_running,
             parse_running,
             system,
             cpu_ready,
@@ -2481,6 +2857,12 @@ fn evaluate_site_risk(
         &mut warnings,
     );
     apply_process_risk(
+        "Viewer",
+        &resources.viewer_process,
+        &mut risk_level,
+        &mut warnings,
+    );
+    apply_process_risk(
         "Parse",
         &resources.parse_process,
         &mut risk_level,
@@ -2527,8 +2909,10 @@ fn evaluate_site_risk(
 fn annotate_site_risk(site: &mut ManagedProjectSite) {
     let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
     let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
+    let viewer_running = site_viewer_running(site);
     let parse_running = pid_running(site.parse_pid);
-    let resources = collect_site_resource_metrics(site, db_running, web_running, parse_running);
+    let resources =
+        collect_site_resource_metrics(site, db_running, web_running, viewer_running, parse_running);
     let (risk_level, risk_reasons, _) = evaluate_site_risk(site, &resources);
     site.risk_level = risk_level;
     site.risk_reasons = risk_reasons;
@@ -2541,24 +2925,26 @@ fn annotate_sites_risks(sites: &mut [ManagedProjectSite]) {
             (
                 pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port),
                 pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port),
+                site_viewer_running(site),
                 pid_running(site.parse_pid),
             )
         })
         .collect::<Vec<_>>();
     let tracked_pids = sites
         .iter()
-        .flat_map(|site| [site.db_pid, site.web_pid, site.parse_pid])
+        .flat_map(|site| [site.db_pid, site.web_pid, site.viewer_pid, site.parse_pid])
         .flatten()
         .collect::<Vec<_>>();
 
     with_resource_sampler(&tracked_pids, |cpu_ready, system| {
-        for (site, (db_running, web_running, parse_running)) in
+        for (site, (db_running, web_running, viewer_running, parse_running)) in
             sites.iter_mut().zip(runtime_states.into_iter())
         {
             let resources = build_site_resource_metrics(
                 site,
                 db_running,
                 web_running,
+                viewer_running,
                 parse_running,
                 system,
                 cpu_ready,
@@ -2617,6 +3003,475 @@ pub fn resource_summary() -> Result<AdminResourceSummary> {
     }))
 }
 
+fn preflight_check(
+    key: &str,
+    label: &str,
+    status: ManagedSitePreflightStatus,
+    message: impl Into<String>,
+    detail: Option<String>,
+    action_hint: Option<String>,
+    pids: Vec<u32>,
+) -> ManagedSitePreflightCheck {
+    ManagedSitePreflightCheck {
+        key: key.to_string(),
+        label: label.to_string(),
+        status,
+        message: message.into(),
+        detail,
+        action_hint,
+        pids,
+    }
+}
+
+fn preflight_pass(
+    key: &str,
+    label: &str,
+    message: impl Into<String>,
+    detail: Option<String>,
+) -> ManagedSitePreflightCheck {
+    preflight_check(
+        key,
+        label,
+        ManagedSitePreflightStatus::Pass,
+        message,
+        detail,
+        None,
+        Vec::new(),
+    )
+}
+
+fn preflight_warning(
+    key: &str,
+    label: &str,
+    message: impl Into<String>,
+    detail: Option<String>,
+    action_hint: Option<String>,
+    pids: Vec<u32>,
+) -> ManagedSitePreflightCheck {
+    preflight_check(
+        key,
+        label,
+        ManagedSitePreflightStatus::Warning,
+        message,
+        detail,
+        action_hint,
+        pids,
+    )
+}
+
+fn preflight_blocking(
+    key: &str,
+    label: &str,
+    message: impl Into<String>,
+    detail: Option<String>,
+    action_hint: Option<String>,
+    pids: Vec<u32>,
+) -> ManagedSitePreflightCheck {
+    preflight_check(
+        key,
+        label,
+        ManagedSitePreflightStatus::Blocking,
+        message,
+        detail,
+        action_hint,
+        pids,
+    )
+}
+
+fn preflight_port_check(
+    site: &ManagedProjectSite,
+    key: &str,
+    label: &str,
+    port: u16,
+    managed_pid: Option<u32>,
+) -> ManagedSitePreflightCheck {
+    let pids = collect_port_pids_sync(port);
+    if pids.is_empty() {
+        return preflight_pass(key, label, format!("{label}端口 {port} 可用"), None);
+    }
+    if let Some(pid) = managed_pid.filter(|pid| pid_running(Some(*pid))) {
+        if pids.iter().any(|value| *value == pid) {
+            return preflight_warning(
+                key,
+                label,
+                format!("{label}端口 {port} 正由当前站点的已记录进程占用"),
+                Some(format!("site_id={} pid={pid}", site.site_id)),
+                Some("如需完整重新部署，请先停止站点再部署".to_string()),
+                pids,
+            );
+        }
+    }
+    preflight_blocking(
+        key,
+        label,
+        format!("{label}端口 {port} 已被其他进程占用"),
+        Some(format!("PIDs: {:?}", pids)),
+        Some("更换端口，或停止占用该端口的外部进程".to_string()),
+        pids,
+    )
+}
+
+fn preflight_aios_database() -> ManagedSitePreflightCheck {
+    let repo = match repo_root() {
+        Ok(repo) => repo,
+        Err(err) => {
+            return preflight_blocking(
+                "aios_database",
+                "aios-database",
+                "无法定位仓库根目录",
+                Some(err.to_string()),
+                Some("从 plant-model-gen 仓库根目录启动 admin web_server".to_string()),
+                Vec::new(),
+            );
+        }
+    };
+    match aios_database_binary() {
+        Ok(Some(path)) => preflight_pass(
+            "aios_database",
+            "aios-database",
+            "已找到 aios-database 可执行文件",
+            Some(path.display().to_string()),
+        ),
+        Ok(None) if should_run_aios_database_from_source(&repo) => preflight_warning(
+            "aios_database",
+            "aios-database",
+            "未找到二进制，将回退到 cargo run --bin aios-database",
+            Some(repo.display().to_string()),
+            Some("生产环境建议配置 ADMIN_AIOS_DATABASE_BINARY 指向已编译二进制".to_string()),
+            Vec::new(),
+        ),
+        Ok(None) => preflight_blocking(
+            "aios_database",
+            "aios-database",
+            "未找到 aios-database 二进制",
+            None,
+            Some(
+                "配置 ADMIN_AIOS_DATABASE_BINARY，或设置 ADMIN_ALLOW_CARGO_RUN=1 仅用于本地开发"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ),
+        Err(err) => preflight_blocking(
+            "aios_database",
+            "aios-database",
+            "aios-database 配置不可用",
+            Some(err.to_string()),
+            Some("修正 admin_aios_database_binary / ADMIN_AIOS_DATABASE_BINARY".to_string()),
+            Vec::new(),
+        ),
+    }
+}
+
+fn preflight_surreal() -> ManagedSitePreflightCheck {
+    match std::process::Command::new("surreal")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            preflight_pass(
+                "surreal",
+                "SurrealDB",
+                "surreal 命令可用",
+                (!version.is_empty()).then_some(version),
+            )
+        }
+        Ok(output) => preflight_blocking(
+            "surreal",
+            "SurrealDB",
+            "surreal 命令执行失败",
+            Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            Some("确认 surreal 已安装并在 PATH 中".to_string()),
+            Vec::new(),
+        ),
+        Err(err) => preflight_blocking(
+            "surreal",
+            "SurrealDB",
+            "未找到 surreal 命令",
+            Some(err.to_string()),
+            Some("安装 SurrealDB CLI，或把 surreal 所在目录加入 PATH".to_string()),
+            Vec::new(),
+        ),
+    }
+}
+
+fn preflight_project_path(site: &ManagedProjectSite) -> ManagedSitePreflightCheck {
+    let source_project_name = site_source_project_name(site);
+    let candidates = project_dir_candidates(&source_project_name, &site.project_path);
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        preflight_pass(
+            "project_path",
+            "项目路径",
+            "项目路径可访问",
+            Some(path.display().to_string()),
+        )
+    } else {
+        preflight_blocking(
+            "project_path",
+            "项目路径",
+            "项目路径不存在或不可访问",
+            Some(site.project_path.clone()),
+            Some("检查 project_path 或 associated_project 是否指向真实 AVEVA 项目目录".to_string()),
+            Vec::new(),
+        )
+    }
+}
+
+fn preflight_parse_scope(site: &ManagedProjectSite) -> ManagedSitePreflightCheck {
+    match resolve_included_db_files(site) {
+        Ok(files) if files.is_empty() && parse_scope_enabled(site) => preflight_warning(
+            "parse_scope",
+            "解析文件",
+            "未解析出明确 included_db_files，将按 DbOption 规则执行",
+            Some(format!(
+                "manual_db_nums={:?}, parse_db_types={:?}",
+                site.manual_db_nums, site.parse_db_types
+            )),
+            Some("确认项目目录下存在目标 DB 文件，或收紧解析范围".to_string()),
+            Vec::new(),
+        ),
+        Ok(files) if files.is_empty() => preflight_warning(
+            "parse_scope",
+            "解析文件",
+            "未限制解析范围，可能触发全量解析",
+            None,
+            Some("建议选择 dbnum 或解析类型，避免误触发大范围解析".to_string()),
+            Vec::new(),
+        ),
+        Ok(files) => preflight_pass(
+            "parse_scope",
+            "解析文件",
+            format!("已定位 {} 个待解析 DB 文件", files.len()),
+            Some(files.join(", ")),
+        ),
+        Err(err) => preflight_blocking(
+            "parse_scope",
+            "解析文件",
+            "解析文件检查失败",
+            Some(err.to_string()),
+            Some("检查 project_path、manual_db_nums 和 parse_db_types 配置".to_string()),
+            Vec::new(),
+        ),
+    }
+}
+
+async fn preflight_viewer(site: &ManagedProjectSite) -> ManagedSitePreflightCheck {
+    if !managed_viewer_enabled() {
+        return preflight_warning(
+            "viewer",
+            "plant3d-web",
+            "受管 Viewer 启动已禁用",
+            Some("AIOS_MANAGED_VIEWER_ENABLED=0".to_string()),
+            Some(
+                "如需一键打开三维 Viewer，请启用受管 Viewer 或配置 AIOS_VIEWER_BASE_URL"
+                    .to_string(),
+            ),
+            Vec::new(),
+        );
+    }
+
+    let viewer_dir = match viewer_project_dir() {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return preflight_warning(
+                "viewer",
+                "plant3d-web",
+                "未找到 plant3d-web 目录，部署将只启动后端站点",
+                None,
+                Some(
+                    "设置 AIOS_VIEWER_PROJECT_DIR，或将 plant3d-web 放在 plant-model-gen 同级目录"
+                        .to_string(),
+                ),
+                Vec::new(),
+            );
+        }
+        Err(err) => {
+            return preflight_blocking(
+                "viewer",
+                "plant3d-web",
+                "Viewer 配置不可用",
+                Some(err.to_string()),
+                Some("修正 AIOS_VIEWER_PROJECT_DIR".to_string()),
+                Vec::new(),
+            );
+        }
+    };
+
+    if !viewer_dir.join("package.json").exists() {
+        return preflight_blocking(
+            "viewer",
+            "plant3d-web",
+            "plant3d-web 缺少 package.json",
+            Some(viewer_dir.display().to_string()),
+            Some("确认 AIOS_VIEWER_PROJECT_DIR 指向 plant3d-web 项目根目录".to_string()),
+            Vec::new(),
+        );
+    }
+
+    let (port, reuse_existing) = match choose_viewer_port(site).await {
+        Ok(result) => result,
+        Err(err) => {
+            return preflight_blocking(
+                "viewer",
+                "plant3d-web",
+                "未找到可用 Viewer 端口",
+                Some(err.to_string()),
+                Some("释放 3101..3120 端口，或设置 AIOS_VIEWER_PORT 指向可用端口".to_string()),
+                Vec::new(),
+            );
+        }
+    };
+    let pids = collect_port_pids_sync(port);
+    if reuse_existing {
+        return preflight_warning(
+            "viewer",
+            "plant3d-web",
+            format!("将复用已运行的 plant3d-web Viewer 端口 {port}"),
+            Some(viewer_dir.display().to_string()),
+            Some("停止站点不会关闭被复用的外部 Viewer 进程".to_string()),
+            pids,
+        );
+    }
+    if !viewer_dir.join("node_modules").exists() {
+        return preflight_warning(
+            "viewer",
+            "plant3d-web",
+            format!("Viewer 端口 {port} 可用，但 node_modules 不存在"),
+            Some(viewer_dir.display().to_string()),
+            Some("先在 plant3d-web 执行 npm install，再进行一键部署".to_string()),
+            Vec::new(),
+        );
+    }
+    preflight_pass(
+        "viewer",
+        "plant3d-web",
+        format!("Viewer 目录和端口 {port} 可用"),
+        Some(viewer_dir.display().to_string()),
+    )
+}
+
+fn preflight_machine_resources() -> ManagedSitePreflightCheck {
+    match resource_summary() {
+        Ok(summary) if summary.risk_level == ManagedSiteRiskLevel::Critical => preflight_blocking(
+            "machine_resources",
+            "机器资源",
+            "当前机器资源处于严重风险状态",
+            Some(summary.warnings.join("; ")),
+            Some("释放 CPU/内存/磁盘后再部署".to_string()),
+            Vec::new(),
+        ),
+        Ok(summary) if summary.risk_level == ManagedSiteRiskLevel::Warning => preflight_warning(
+            "machine_resources",
+            "机器资源",
+            "当前机器资源存在告警",
+            Some(summary.warnings.join("; ")),
+            Some("资源紧张时部署可能变慢或失败".to_string()),
+            Vec::new(),
+        ),
+        Ok(summary) => preflight_pass(
+            "machine_resources",
+            "机器资源",
+            "机器资源检查通过",
+            Some(format!(
+                "cpu={:?} memory={:?} disk={:?}",
+                summary.cpu_usage, summary.memory_usage, summary.disk_usage
+            )),
+        ),
+        Err(err) => preflight_warning(
+            "machine_resources",
+            "机器资源",
+            "机器资源检查失败，继续部署但风险未知",
+            Some(err.to_string()),
+            Some("检查运行目录权限和磁盘状态".to_string()),
+            Vec::new(),
+        ),
+    }
+}
+
+pub async fn preflight_site(site_id: &str) -> Result<ManagedSitePreflightReport> {
+    let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let mut checks = Vec::new();
+
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        checks.push(preflight_blocking(
+            "site_state",
+            "站点状态",
+            "解析任务正在运行，暂不能部署",
+            None,
+            Some("等待当前解析结束，或先停止站点".to_string()),
+            Vec::new(),
+        ));
+    } else if matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) {
+        checks.push(preflight_blocking(
+            "site_state",
+            "站点状态",
+            format!("当前状态为 {:?}，暂不能完整部署", site.status),
+            None,
+            Some("先停止站点，待状态稳定后重新部署".to_string()),
+            Vec::new(),
+        ));
+    } else {
+        checks.push(preflight_pass(
+            "site_state",
+            "站点状态",
+            format!("当前状态 {:?} 可提交部署", site.status),
+            None,
+        ));
+    }
+
+    checks.push(preflight_project_path(&site));
+    checks.push(preflight_parse_scope(&site));
+    checks.push(preflight_aios_database());
+    checks.push(preflight_surreal());
+    checks.push(preflight_port_check(
+        &site,
+        "db_port",
+        "数据库",
+        site.db_port,
+        site.db_pid,
+    ));
+    checks.push(preflight_port_check(
+        &site,
+        "web_port",
+        "Web",
+        site.web_port,
+        site.web_pid,
+    ));
+    checks.push(preflight_viewer(&site).await);
+    checks.push(preflight_machine_resources());
+
+    let blocking_count = checks
+        .iter()
+        .filter(|check| check.status == ManagedSitePreflightStatus::Blocking)
+        .count();
+    let warning_count = checks
+        .iter()
+        .filter(|check| check.status == ManagedSitePreflightStatus::Warning)
+        .count();
+
+    Ok(ManagedSitePreflightReport {
+        site_id: site.site_id,
+        ready: blocking_count == 0,
+        blocking_count,
+        warning_count,
+        updated_at: now_rfc3339(),
+        checks,
+    })
+}
+
+fn preflight_blocking_summary(report: &ManagedSitePreflightReport) -> String {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.status == ManagedSitePreflightStatus::Blocking)
+        .map(|check| format!("{}: {}", check.label, check.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 // ─── Process spawn helpers ──────────────────────────────────────────────────
 
 fn repo_root() -> Result<PathBuf> {
@@ -2625,6 +3480,14 @@ fn repo_root() -> Result<PathBuf> {
 
 fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("获取当前 web_server 可执行文件失败")
+}
+
+fn aios_database_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "aios-database.exe"
+    } else {
+        "aios-database"
+    }
 }
 
 fn aios_database_binary() -> Result<Option<PathBuf>> {
@@ -2641,12 +3504,20 @@ fn aios_database_binary() -> Result<Option<PathBuf>> {
     let parent = current
         .parent()
         .ok_or_else(|| anyhow!("无法定位当前二进制目录"))?;
-    let sibling = parent.join("aios-database");
-    if sibling.exists() {
-        Ok(Some(sibling))
-    } else {
-        Ok(None)
+    let mut candidates = vec![parent.join(aios_database_exe_name())];
+    if let Ok(repo) = repo_root() {
+        candidates.push(
+            repo.join("target")
+                .join("debug")
+                .join(aios_database_exe_name()),
+        );
+        candidates.push(
+            repo.join("target")
+                .join("release")
+                .join(aios_database_exe_name()),
+        );
     }
+    Ok(candidates.into_iter().find(|candidate| candidate.exists()))
 }
 
 fn should_run_aios_database_from_source(repo: &Path) -> bool {
@@ -2661,6 +3532,41 @@ fn should_run_aios_database_from_source(repo: &Path) -> bool {
         && current
             .components()
             .any(|component| component.as_os_str() == "target")
+}
+
+fn config_path_without_toml(path: &Path) -> String {
+    path.to_string_lossy()
+        .to_string()
+        .strip_suffix(".toml")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn config_string_without_toml(path: &str) -> String {
+    path.strip_suffix(".toml")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn aios_database_command(repo: &Path, config_no_ext: &str) -> Result<Command> {
+    if let Some(binary) = aios_database_binary()? {
+        let mut cmd = Command::new(binary);
+        cmd.arg("-c").arg(config_no_ext);
+        Ok(cmd)
+    } else if should_run_aios_database_from_source(repo) {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("run")
+            .arg("--bin")
+            .arg("aios-database")
+            .arg("--")
+            .arg("-c")
+            .arg(config_no_ext);
+        Ok(cmd)
+    } else {
+        bail!(
+            "未找到 aios-database 二进制（请配置 admin_aios_database_binary 或设置 ADMIN_ALLOW_CARGO_RUN=1）"
+        );
+    }
 }
 
 fn open_log_file(path: &Path) -> Result<(std::fs::File, std::fs::File)> {
@@ -2699,8 +3605,16 @@ async fn wait_for_port(port: u16, attempts: usize, delay_ms: u64) -> bool {
 }
 
 async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
     for _ in 0..attempts {
-        if let Ok(response) = reqwest::get(url).await {
+        if let Ok(response) = client.get(url).send().await {
             if response.status().is_success() {
                 return true;
             }
@@ -2708,6 +3622,530 @@ async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
     false
+}
+
+// ─── Deploy readiness validation ────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DeployValidationReport {
+    site_id: String,
+    checked_at: String,
+    blocking_count: usize,
+    warning_count: usize,
+    checks: Vec<DeployValidationCheck>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DeployValidationCheck {
+    key: String,
+    label: String,
+    status: String,
+    message: String,
+    detail: Option<String>,
+    url: Option<String>,
+    bytes: Option<u64>,
+}
+
+impl DeployValidationReport {
+    fn new(site_id: &str) -> Self {
+        Self {
+            site_id: site_id.to_string(),
+            checked_at: now_rfc3339(),
+            blocking_count: 0,
+            warning_count: 0,
+            checks: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, check: DeployValidationCheck) {
+        match check.status.as_str() {
+            "blocking" => self.blocking_count += 1,
+            "warning" => self.warning_count += 1,
+            _ => {}
+        }
+        self.checks.push(check);
+    }
+}
+
+fn deploy_validation_check(
+    key: impl Into<String>,
+    label: impl Into<String>,
+    status: &'static str,
+    message: impl Into<String>,
+    detail: Option<String>,
+    url: Option<String>,
+    bytes: Option<u64>,
+) -> DeployValidationCheck {
+    DeployValidationCheck {
+        key: key.into(),
+        label: label.into(),
+        status: status.to_string(),
+        message: message.into(),
+        detail,
+        url,
+        bytes,
+    }
+}
+
+fn deploy_validation_report_path(site_id: &str) -> PathBuf {
+    site_runtime_dir(site_id).join("deploy-validation.json")
+}
+
+pub fn deploy_validation_report(site_id: &str) -> Result<ManagedSiteDeployValidationReport> {
+    let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let path = deploy_validation_report_path(site_id);
+    if !path.exists() {
+        return Ok(ManagedSiteDeployValidationReport {
+            site_id: site_id.to_string(),
+            exists: false,
+            ..Default::default()
+        });
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("读取部署验收报告失败: {}", path.display()))?;
+    let report: DeployValidationReport = serde_json::from_str(&raw)
+        .with_context(|| format!("解析部署验收报告失败: {}", path.display()))?;
+    Ok(ManagedSiteDeployValidationReport {
+        site_id: report.site_id,
+        exists: true,
+        checked_at: Some(report.checked_at),
+        blocking_count: report.blocking_count,
+        warning_count: report.warning_count,
+        checks: report
+            .checks
+            .into_iter()
+            .map(|check| ManagedSiteDeployValidationCheck {
+                key: check.key,
+                label: check.label,
+                status: check.status,
+                message: check.message,
+                detail: check.detail,
+                url: check.url,
+                bytes: check.bytes,
+            })
+            .collect(),
+    })
+}
+
+fn write_deploy_validation_report(report: &DeployValidationReport) -> Result<()> {
+    let path = deploy_validation_report_path(&report.site_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建部署验收报告目录失败: {}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(report)?;
+    fs::write(&path, content).with_context(|| format!("写入部署验收报告失败: {}", path.display()))
+}
+
+fn deploy_validation_blocking_summary(report: &DeployValidationReport) -> String {
+    report
+        .checks
+        .iter()
+        .filter(|check| check.status == "blocking")
+        .map(|check| format!("{}: {}", check.label, check.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn readable_file_size(path: &Path) -> Result<u64> {
+    let meta = fs::metadata(path).with_context(|| format!("文件不存在: {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("不是普通文件: {}", path.display());
+    }
+    Ok(meta.len())
+}
+
+fn push_required_file_check(
+    report: &mut DeployValidationReport,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    path: &Path,
+    min_bytes: u64,
+) {
+    let key = key.into();
+    let label = label.into();
+    match readable_file_size(path) {
+        Ok(bytes) if bytes >= min_bytes => report.push(deploy_validation_check(
+            key,
+            label,
+            "pass",
+            format!("文件存在且大小 {bytes} bytes"),
+            Some(path.display().to_string()),
+            None,
+            Some(bytes),
+        )),
+        Ok(bytes) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            format!("文件过小: {bytes} bytes，期望至少 {min_bytes} bytes"),
+            Some(path.display().to_string()),
+            None,
+            Some(bytes),
+        )),
+        Err(err) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            err.to_string(),
+            Some(path.display().to_string()),
+            None,
+            None,
+        )),
+    }
+}
+
+fn push_required_json_file_check(
+    report: &mut DeployValidationReport,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    path: &Path,
+    min_bytes: u64,
+) {
+    let key = key.into();
+    let label = label.into();
+    match readable_file_size(path) {
+        Ok(bytes) if bytes >= min_bytes => match fs::read_to_string(path)
+            .with_context(|| format!("读取 JSON 文件失败: {}", path.display()))
+            .and_then(|raw| {
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .with_context(|| format!("JSON 解析失败: {}", path.display()))
+            }) {
+            Ok(_) => report.push(deploy_validation_check(
+                key,
+                label,
+                "pass",
+                format!("JSON 文件存在且可解析，大小 {bytes} bytes"),
+                Some(path.display().to_string()),
+                None,
+                Some(bytes),
+            )),
+            Err(err) => report.push(deploy_validation_check(
+                key,
+                label,
+                "blocking",
+                err.to_string(),
+                Some(path.display().to_string()),
+                None,
+                Some(bytes),
+            )),
+        },
+        Ok(bytes) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            format!("JSON 文件过小: {bytes} bytes，期望至少 {min_bytes} bytes"),
+            Some(path.display().to_string()),
+            None,
+            Some(bytes),
+        )),
+        Err(err) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            err.to_string(),
+            Some(path.display().to_string()),
+            None,
+            None,
+        )),
+    }
+}
+
+async fn push_required_http_check(
+    report: &mut DeployValidationReport,
+    client: &reqwest::Client,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    url: String,
+    min_bytes: u64,
+) {
+    let key = key.into();
+    let label = label.into();
+    match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => {
+            let status = response.status();
+            match response.bytes().await {
+                Ok(bytes) if bytes.len() as u64 >= min_bytes => {
+                    report.push(deploy_validation_check(
+                        key,
+                        label,
+                        "pass",
+                        format!("HTTP {status}，返回 {} bytes", bytes.len()),
+                        None,
+                        Some(url),
+                        Some(bytes.len() as u64),
+                    ));
+                }
+                Ok(bytes) => report.push(deploy_validation_check(
+                    key,
+                    label,
+                    "blocking",
+                    format!(
+                        "HTTP {status} 但响应过小: {} bytes，期望至少 {min_bytes} bytes",
+                        bytes.len()
+                    ),
+                    None,
+                    Some(url),
+                    Some(bytes.len() as u64),
+                )),
+                Err(err) => report.push(deploy_validation_check(
+                    key,
+                    label,
+                    "blocking",
+                    format!("读取 HTTP 响应失败: {err}"),
+                    None,
+                    Some(url),
+                    None,
+                )),
+            }
+        }
+        Ok(response) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            format!("HTTP 状态异常: {}", response.status()),
+            None,
+            Some(url),
+            None,
+        )),
+        Err(err) => report.push(deploy_validation_check(
+            key,
+            label,
+            "blocking",
+            format!("HTTP 请求失败: {err}"),
+            None,
+            Some(url),
+            None,
+        )),
+    }
+}
+
+fn mesh_serve_root_from_current_config() -> PathBuf {
+    let path = aios_core::get_db_option().get_meshes_path();
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("lod_"))
+    {
+        path.parent().unwrap_or(&path).to_path_buf()
+    } else {
+        path
+    }
+}
+
+fn find_first_glb(root: &Path) -> Option<PathBuf> {
+    const MAX_DEPTH: usize = 4;
+    const MAX_FILES: usize = 20_000;
+
+    fn visit(path: &Path, depth: usize, visited: &mut usize) -> Option<PathBuf> {
+        if depth > MAX_DEPTH || *visited > MAX_FILES {
+            return None;
+        }
+        let entries = fs::read_dir(path).ok()?;
+        for entry in entries.flatten() {
+            *visited += 1;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                if let Some(found) = visit(&entry_path, depth + 1, visited) {
+                    return Some(found);
+                }
+                continue;
+            }
+            if entry_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
+            {
+                return Some(entry_path);
+            }
+        }
+        None
+    }
+
+    let mut visited = 0usize;
+    visit(root, 0, &mut visited)
+}
+
+fn relative_path_to_url(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .map(|segment| urlencoding::encode(segment).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployValidationReport> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("创建部署验收 HTTP client 失败")?;
+    let mut report = DeployValidationReport::new(&site.site_id);
+    let local_base = format!("http://127.0.0.1:{}", site.web_port);
+
+    push_required_http_check(
+        &mut report,
+        &client,
+        "web_status",
+        "站点 Web 健康",
+        format!("{local_base}/api/status"),
+        2,
+    )
+    .await;
+
+    if let Some(viewer_url) = site.viewer_url.clone() {
+        push_required_http_check(
+            &mut report,
+            &client,
+            "viewer",
+            "plant3d-web Viewer",
+            viewer_url,
+            64,
+        )
+        .await;
+    } else if managed_viewer_enabled() {
+        report.push(deploy_validation_check(
+            "viewer",
+            "plant3d-web Viewer",
+            "blocking",
+            "部署未产生 viewer_url，无法确认 plant3d-web 已接入当前站点",
+            None,
+            None,
+            None,
+        ));
+    } else {
+        report.push(deploy_validation_check(
+            "viewer",
+            "plant3d-web Viewer",
+            "warning",
+            "受管 Viewer 已禁用，跳过 Viewer 验收",
+            Some("AIOS_MANAGED_VIEWER_ENABLED=0".to_string()),
+            None,
+            None,
+        ));
+    }
+
+    if site.export_parquet {
+        let output_project = site_source_project_name(site);
+        let parquet_root = PathBuf::from("output")
+            .join(&output_project)
+            .join("parquet");
+        if site.manual_db_nums.is_empty() {
+            report.push(deploy_validation_check(
+                "parquet_scope",
+                "Parquet 目标",
+                "warning",
+                "未配置 manual_db_nums，无法按 dbnum 验收 Parquet manifest",
+                Some(parquet_root.display().to_string()),
+                None,
+                None,
+            ));
+        }
+        for dbnum in &site.manual_db_nums {
+            let manifest_path = parquet_root.join(format!("manifest_{dbnum}.json"));
+            let dbnum_dir = parquet_root.join(dbnum.to_string());
+            let instances_path = dbnum_dir.join("instances.parquet");
+            let geo_instances_path = dbnum_dir.join("geo_instances.parquet");
+
+            push_required_json_file_check(
+                &mut report,
+                format!("parquet_manifest_{dbnum}"),
+                format!("Parquet manifest {dbnum}"),
+                &manifest_path,
+                2,
+            );
+            push_required_file_check(
+                &mut report,
+                format!("parquet_instances_{dbnum}"),
+                format!("instances.parquet {dbnum}"),
+                &instances_path,
+                1,
+            );
+            push_required_file_check(
+                &mut report,
+                format!("parquet_geo_instances_{dbnum}"),
+                format!("geo_instances.parquet {dbnum}"),
+                &geo_instances_path,
+                1,
+            );
+
+            let encoded_project = urlencoding::encode(&output_project);
+            push_required_http_check(
+                &mut report,
+                &client,
+                format!("http_parquet_manifest_{dbnum}"),
+                format!("HTTP manifest {dbnum}"),
+                format!(
+                    "{local_base}/files/output/{encoded_project}/parquet/manifest_{dbnum}.json"
+                ),
+                2,
+            )
+            .await;
+            push_required_http_check(
+                &mut report,
+                &client,
+                format!("http_parquet_instances_{dbnum}"),
+                format!("HTTP instances.parquet {dbnum}"),
+                format!(
+                    "{local_base}/files/output/{encoded_project}/parquet/{dbnum}/instances.parquet"
+                ),
+                1,
+            )
+            .await;
+            push_required_http_check(
+                &mut report,
+                &client,
+                format!("http_parquet_geo_instances_{dbnum}"),
+                format!("HTTP geo_instances.parquet {dbnum}"),
+                format!("{local_base}/files/output/{encoded_project}/parquet/{dbnum}/geo_instances.parquet"),
+                1,
+            )
+            .await;
+        }
+    } else {
+        report.push(deploy_validation_check(
+            "parquet_disabled",
+            "Parquet 产物",
+            "warning",
+            "站点未启用 export_parquet，跳过 Parquet 验收",
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let mesh_root = mesh_serve_root_from_current_config();
+    if let Some(glb_path) = find_first_glb(&mesh_root) {
+        push_required_file_check(&mut report, "mesh_glb_file", "GLB 模型文件", &glb_path, 1);
+        let rel = glb_path.strip_prefix(&mesh_root).unwrap_or(&glb_path);
+        let rel_url = relative_path_to_url(rel);
+        push_required_http_check(
+            &mut report,
+            &client,
+            "http_mesh_glb",
+            "HTTP GLB 模型文件",
+            format!("{local_base}/files/meshes/{rel_url}"),
+            1,
+        )
+        .await;
+    } else {
+        report.push(deploy_validation_check(
+            "mesh_glb_file",
+            "GLB 模型文件",
+            "blocking",
+            "未找到可供 plant3d-web 加载的 .glb 模型文件",
+            Some(mesh_root.display().to_string()),
+            None,
+            None,
+        ));
+    }
+
+    write_deploy_validation_report(&report)?;
+    Ok(report)
 }
 
 // ─── Port helpers ───────────────────────────────────────────────────────────
@@ -2770,7 +4208,22 @@ fn collect_port_pids_sync(port: u16) -> Vec<u32> {
             Err(_) => Vec::new(),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .output();
+        let want = format!(":{port}");
+        match output {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| line.contains(&want) && line.contains("LISTENING"))
+                .filter_map(|line| line.split_whitespace().last()?.trim().parse::<u32>().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = port;
         Vec::new()
@@ -2823,6 +4276,26 @@ async fn kill_pid(pid: u32) -> Result<()> {
 
 // ─── Parse / start pipelines ────────────────────────────────────────────────
 
+fn site_was_stopped_by_user(site_id: &str) -> bool {
+    matches!(
+        get_site(site_id),
+        Ok(Some(site)) if site.status == ManagedSiteStatus::Stopped && site.parse_pid.is_none()
+    )
+}
+
+async fn cleanup_started_db(site_id: &str, db_pid: Option<u32>) {
+    if let Some(pid) = db_pid {
+        let _ = kill_pid(pid).await;
+        let _ = update_runtime(
+            site_id,
+            RuntimeUpdate {
+                db_pid: Some(None),
+                ..Default::default()
+            },
+        );
+    }
+}
+
 async fn spawn_parse_process(site_id: String) -> Result<()> {
     let (site, db_user, db_password) = task::spawn_blocking({
         let site_id = site_id.clone();
@@ -2841,12 +4314,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     .context("写入站点配置失败 (join error)")??;
 
     let config_path = parse_config_path(&site.site_id);
-    let config_no_ext = config_path
-        .to_string_lossy()
-        .to_string()
-        .strip_suffix(".toml")
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| config_path.to_string_lossy().to_string());
+    let config_no_ext = config_path_without_toml(&config_path);
     let single_dbnum = site
         .manual_db_nums
         .first()
@@ -2855,30 +4323,10 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     let (stdout, stderr) = open_log_file(&parse_log_path(&site.site_id))?;
     let repo = repo_root()?;
 
-    let mut command = if let Some(binary) = aios_database_binary()? {
-        let mut cmd = Command::new(binary);
-        cmd.arg("-c").arg(&config_no_ext);
-        if let Some(dbnum) = single_dbnum {
-            cmd.arg("--dbnum").arg(dbnum.to_string());
-        }
-        cmd
-    } else if should_run_aios_database_from_source(&repo) {
-        let mut cmd = Command::new("cargo");
-        cmd.arg("run")
-            .arg("--bin")
-            .arg("aios-database")
-            .arg("--")
-            .arg("-c")
-            .arg(&config_no_ext);
-        if let Some(dbnum) = single_dbnum {
-            cmd.arg("--dbnum").arg(dbnum.to_string());
-        }
-        cmd
-    } else {
-        bail!(
-            "未找到 aios-database 二进制（请配置 admin_aios_database_binary 或设置 ADMIN_ALLOW_CARGO_RUN=1）"
-        );
-    };
+    let mut command = aios_database_command(&repo, &config_no_ext)?;
+    if let Some(dbnum) = single_dbnum {
+        command.arg("--dbnum").arg(dbnum.to_string());
+    }
     command
         .current_dir(&repo)
         .stdout(Stdio::from(stdout))
@@ -2926,21 +4374,106 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         .await
         .context("刷新解析配置失败 (join error)")??;
     } else {
+        if site_was_stopped_by_user(&site.site_id) {
+            bail!("站点操作已被手动停止");
+        }
+        let message = format!("解析失败，退出码: {:?}", exit.code());
         update_runtime(
             &site.site_id,
             RuntimeUpdate {
                 status: Some(ManagedSiteStatus::Failed),
                 parse_status: Some(ManagedSiteParseStatus::Failed),
                 parse_pid: Some(None),
-                last_error: Some(Some(format!("解析失败，退出码: {:?}", exit.code()))),
+                last_error: Some(Some(message.clone())),
                 last_parse_finished_at: Some(Some(parse_finished_at)),
                 last_parse_duration_ms: Some(Some(parse_duration_ms)),
                 ..Default::default()
             },
         )?;
+        bail!(message);
     }
     let _ = db_user;
     let _ = db_password;
+    Ok(())
+}
+
+async fn spawn_generation_process(site_id: String) -> Result<()> {
+    let (site, db_user, db_password) = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || load_site_and_credentials(&site_id)
+    })
+    .await
+    .context("加载站点凭据失败 (join error)")??;
+
+    if !generation_enabled(&site) {
+        tracing::info!(
+            site = %site.site_id,
+            "模型生成配置均未启用，跳过 generation process"
+        );
+        return Ok(());
+    }
+
+    task::spawn_blocking({
+        let site = site.clone();
+        let db_user = db_user.clone();
+        let db_password = db_password.clone();
+        move || write_site_files(&site, &db_user, &db_password)
+    })
+    .await
+    .context("写入站点配置失败 (join error)")??;
+
+    let config_no_ext = config_string_without_toml(&site.config_path);
+    let (stdout, stderr) = open_log_file(&generate_log_path(&site.site_id))?;
+    let repo = repo_root()?;
+    let mut command = aios_database_command(&repo, &config_no_ext)?;
+    command
+        .current_dir(&repo)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    isolate_process_group(&mut command);
+
+    let mut child = command.spawn().context("启动模型生成进程失败")?;
+    let pid = child.id();
+    update_runtime(
+        &site.site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Starting),
+            parse_status: Some(ManagedSiteParseStatus::Parsed),
+            parse_pid: Some(pid),
+            last_error: Some(None),
+            ..Default::default()
+        },
+    )?;
+
+    let exit = child.wait().await.context("等待模型生成进程失败")?;
+    if exit.success() {
+        update_runtime(
+            &site.site_id,
+            RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Parsed),
+                parse_status: Some(ManagedSiteParseStatus::Parsed),
+                parse_pid: Some(None),
+                last_error: Some(None),
+                ..Default::default()
+            },
+        )?;
+    } else {
+        if site_was_stopped_by_user(&site.site_id) {
+            bail!("站点操作已被手动停止");
+        }
+        let message = format!("模型生成失败，退出码: {:?}", exit.code());
+        update_runtime(
+            &site.site_id,
+            RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Failed),
+                parse_status: Some(ManagedSiteParseStatus::Parsed),
+                parse_pid: Some(None),
+                last_error: Some(Some(message.clone())),
+                ..Default::default()
+            },
+        )?;
+        bail!(message);
+    }
     Ok(())
 }
 
@@ -2993,12 +4526,231 @@ async fn spawn_web_process(site: &ManagedProjectSite) -> Result<u32> {
     Ok(child.id().unwrap_or_default())
 }
 
+#[derive(Debug, Clone)]
+struct ViewerLaunch {
+    port: u16,
+    pid: Option<u32>,
+    url: String,
+}
+
+fn managed_viewer_enabled() -> bool {
+    std::env::var("AIOS_MANAGED_VIEWER_ENABLED")
+        .map(|value| !matches!(value.trim(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
+}
+
+fn viewer_project_dir() -> Result<Option<PathBuf>> {
+    if let Ok(value) = std::env::var("AIOS_VIEWER_PROJECT_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if path.exists() {
+                return Ok(Some(path));
+            }
+            bail!(
+                "AIOS_VIEWER_PROJECT_DIR 指向的 plant3d-web 目录不存在: {}",
+                path.display()
+            );
+        }
+    }
+
+    let repo = repo_root()?;
+    let Some(parent) = repo.parent() else {
+        return Ok(None);
+    };
+    let candidate = parent.join("plant3d-web");
+    Ok(candidate.exists().then_some(candidate))
+}
+
+fn configured_viewer_port() -> Result<Option<u16>> {
+    let value = match std::env::var("AIOS_VIEWER_PORT") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let port = trimmed
+        .parse::<u16>()
+        .with_context(|| format!("AIOS_VIEWER_PORT 不是有效端口: {trimmed}"))?;
+    if port == 0 {
+        bail!("AIOS_VIEWER_PORT 不能为 0");
+    }
+    Ok(Some(port))
+}
+
+async fn viewer_http_ok(port: u16) -> bool {
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let url = format!("http://127.0.0.1:{port}/");
+    let Ok(response) = client.get(url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let text = response.text().await.unwrap_or_default();
+    text.contains("plant3d") || text.contains("Vite")
+}
+
+async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
+    let configured_port = configured_viewer_port()?;
+    let explicit_port = site.viewer_port.or(configured_port);
+    if let Some(port) = explicit_port {
+        if port == site.db_port || port == site.web_port {
+            bail!("Viewer 端口 {} 与站点 DB/Web 端口冲突", port);
+        }
+        if port_in_use("127.0.0.1", port) {
+            if viewer_http_ok(port).await {
+                return Ok((port, true));
+            }
+            bail!("Viewer 端口 {} 已被非 plant3d-web 进程占用", port);
+        }
+        return Ok((port, false));
+    }
+
+    for port in 3101..=3120 {
+        if port == site.db_port || port == site.web_port {
+            continue;
+        }
+        if port_in_use("127.0.0.1", port) {
+            if viewer_http_ok(port).await {
+                return Ok((port, true));
+            }
+            continue;
+        }
+        return Ok((port, false));
+    }
+    bail!("未找到可用的 Viewer 端口 (3101..3120)");
+}
+
+fn build_viewer_url(site: &ManagedProjectSite, port: u16) -> String {
+    let base = format!("http://127.0.0.1:{port}");
+    let backend = site
+        .local_entry_url
+        .clone()
+        .or_else(|| site.entry_url.clone())
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", site.web_port));
+    let project = site
+        .associated_project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&site.project_name);
+    let mut url = format!(
+        "{base}/?backendPort={}&backend={}&output_project={}",
+        site.web_port,
+        urlencoding::encode(&backend),
+        urlencoding::encode(project)
+    );
+    if let Some(dbnum) = site.manual_db_nums.first() {
+        url.push_str("&show_dbnum=");
+        url.push_str(&dbnum.to_string());
+    }
+    if site.export_parquet {
+        url.push_str("&data_source=parquet");
+    }
+    url
+}
+
+async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<ViewerLaunch>> {
+    if !managed_viewer_enabled() {
+        tracing::info!(site = %site.site_id, "受管 plant3d-web Viewer 启动已禁用");
+        return Ok(None);
+    }
+    let Some(viewer_dir) = viewer_project_dir()? else {
+        tracing::warn!(
+            site = %site.site_id,
+            "未找到 plant3d-web 目录，跳过受管 Viewer 启动（可设置 AIOS_VIEWER_PROJECT_DIR）"
+        );
+        return Ok(None);
+    };
+
+    let (port, reuse_existing) = choose_viewer_port(site).await?;
+    let url = build_viewer_url(site, port);
+    if reuse_existing {
+        tracing::info!(site = %site.site_id, port, "复用已运行的 plant3d-web Viewer");
+        return Ok(Some(ViewerLaunch {
+            port,
+            pid: None,
+            url,
+        }));
+    }
+
+    let (stdout, stderr) = open_log_file(&viewer_log_path(&site.site_id))?;
+    #[cfg(windows)]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg("npm");
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new("npm");
+
+    command
+        .arg("run")
+        .arg("dev")
+        .arg("--")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--strictPort")
+        .current_dir(&viewer_dir)
+        .env("BROWSER", "none")
+        .env("VITE_BACKEND_PORT", site.web_port.to_string())
+        .env(
+            "VITE_BACKEND_URL",
+            format!("http://127.0.0.1:{}", site.web_port),
+        )
+        .env(
+            "VITE_API_BASE_URL",
+            format!("http://127.0.0.1:{}", site.web_port),
+        )
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    isolate_process_group(&mut command);
+
+    let child = command.spawn().with_context(|| {
+        format!(
+            "启动 plant3d-web Viewer 失败 (dir={}, port={})",
+            viewer_dir.display(),
+            port
+        )
+    })?;
+    let pid = child.id().unwrap_or_default();
+    if !wait_for_http_ok(
+        &format!("http://127.0.0.1:{port}/"),
+        WAIT_HTTP_ATTEMPTS,
+        WAIT_STEP_MS,
+    )
+    .await
+    {
+        if pid != 0 {
+            let _ = kill_pid(pid).await;
+        }
+        bail!("plant3d-web Viewer 未在端口 {} 启动成功", port);
+    }
+
+    Ok(Some(ViewerLaunch {
+        port,
+        pid: (pid != 0).then_some(pid),
+        url,
+    }))
+}
+
 async fn ensure_site_db_started(
     site: &ManagedProjectSite,
     status: ManagedSiteStatus,
 ) -> Result<Option<u32>> {
     if port_in_use("127.0.0.1", site.db_port) {
-        if pid_running(site.db_pid) {
+        if probe_managed_port(site.db_port, site.db_pid).managed_running {
             return Ok(None);
         }
         bail!("数据库端口 {} 已被占用", site.db_port);
@@ -3016,6 +4768,13 @@ async fn ensure_site_db_started(
     )?;
     if !wait_for_port(site.db_port, WAIT_PORT_ATTEMPTS, WAIT_STEP_MS).await {
         let _ = kill_pid(db_pid).await;
+        let _ = update_runtime(
+            &site.site_id,
+            RuntimeUpdate {
+                db_pid: Some(None),
+                ..Default::default()
+            },
+        );
         bail!("SurrealDB 未在端口 {} 成功启动", site.db_port);
     }
     Ok(Some(db_pid))
@@ -3047,7 +4806,101 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
     parse_result
 }
 
+async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<()> {
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+
+    let started_db_pid = ensure_site_db_started(&site, ManagedSiteStatus::Starting).await?;
+
+    let result = async {
+        let site = task::spawn_blocking({
+            let site_id = site_id.clone();
+            move || get_site(&site_id)
+        })
+        .await
+        .context("读取站点状态失败 (join error)")??
+        .ok_or_else(|| anyhow!("站点不存在"))?;
+
+        if site.parse_status != ManagedSiteParseStatus::Parsed {
+            if parse_first {
+                spawn_parse_process(site_id.clone()).await?;
+            } else {
+                bail!("站点尚未解析，请先执行解析或选择完整生成");
+            }
+        }
+
+        spawn_generation_process(site_id.clone()).await
+    }
+    .await;
+
+    if let Some(db_pid) = started_db_pid {
+        let _ = kill_pid(db_pid).await;
+        let _ = update_runtime(
+            &site_id,
+            RuntimeUpdate {
+                db_pid: Some(None),
+                ..Default::default()
+            },
+        );
+    }
+
+    result
+}
+
+async fn run_deploy_pipeline(site_id: String) -> Result<()> {
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+
+    if generation_enabled(&site) {
+        run_generation_pipeline(site_id.clone(), true).await?;
+    } else if site.parse_status != ManagedSiteParseStatus::Parsed {
+        run_parse_pipeline(site_id.clone()).await?;
+    }
+
+    run_start_pipeline_for_deploy(site_id.clone()).await?;
+
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+    let validation = validate_deploy_readiness(&site).await?;
+    if validation.blocking_count > 0 {
+        let blocking = deploy_validation_blocking_summary(&validation);
+        bail!("部署后验收未通过: {blocking}");
+    }
+    update_runtime(
+        &site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Running),
+            last_error: Some(None),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
 async fn run_start_pipeline(site_id: String) -> Result<()> {
+    run_start_pipeline_inner(site_id, true).await
+}
+
+async fn run_start_pipeline_for_deploy(site_id: String) -> Result<()> {
+    run_start_pipeline_inner(site_id, false).await
+}
+
+async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result<()> {
     let site = task::spawn_blocking({
         let site_id = site_id.clone();
         move || get_site(&site_id)
@@ -3075,6 +4928,9 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
         RuntimeUpdate {
             status: Some(ManagedSiteStatus::Starting),
             last_error: Some(None),
+            viewer_port: Some(None),
+            viewer_pid: Some(None),
+            viewer_url: Some(None),
             ..Default::default()
         },
     )?;
@@ -3097,8 +4953,10 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
     .ok_or_else(|| anyhow!("站点不存在"))?;
     if site.parse_status != ManagedSiteParseStatus::Parsed {
         if let Err(err) = spawn_parse_process(site_id.clone()).await {
-            if let Some(pid) = db_pid {
-                let _ = kill_pid(pid).await;
+            let stopped_by_user = site_was_stopped_by_user(&site_id);
+            cleanup_started_db(&site_id, db_pid).await;
+            if stopped_by_user {
+                return Err(err);
             }
             let _ = update_runtime(
                 &site_id,
@@ -3121,7 +4979,13 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
-    let web_pid = spawn_web_process(&site).await?;
+    let web_pid = match spawn_web_process(&site).await {
+        Ok(pid) => pid,
+        Err(err) => {
+            cleanup_started_db(&site_id, db_pid).await;
+            return Err(err);
+        }
+    };
     update_runtime(
         &site_id,
         RuntimeUpdate {
@@ -3135,25 +4999,54 @@ async fn run_start_pipeline(site_id: String) -> Result<()> {
     let status_url = format!("http://127.0.0.1:{}/api/status", site.web_port);
     if !wait_for_http_ok(&status_url, WAIT_HTTP_ATTEMPTS, WAIT_STEP_MS).await {
         let _ = kill_pid(web_pid).await;
-        if let Some(pid) = db_pid {
-            let _ = kill_pid(pid).await;
+        cleanup_started_db(&site_id, db_pid).await;
+        let _ = update_runtime(
+            &site_id,
+            RuntimeUpdate {
+                web_pid: Some(None),
+                ..Default::default()
+            },
+        );
+        bail!("项目站点未在 {} 启动成功", status_url);
+    }
+
+    let viewer = match spawn_viewer_process(&site).await {
+        Ok(viewer) => viewer,
+        Err(err) => {
+            let _ = kill_pid(web_pid).await;
+            cleanup_started_db(&site_id, db_pid).await;
             let _ = update_runtime(
                 &site_id,
                 RuntimeUpdate {
-                    db_pid: Some(None),
+                    status: Some(ManagedSiteStatus::Failed),
+                    web_pid: Some(None),
+                    viewer_port: Some(None),
+                    viewer_pid: Some(None),
+                    viewer_url: Some(None),
+                    last_error: Some(Some(format!("启动 Viewer 失败: {err}"))),
                     ..Default::default()
                 },
             );
+            return Err(err);
         }
-        bail!("项目站点未在 {} 启动成功", status_url);
-    }
+    };
+    let (viewer_port, viewer_pid, viewer_url) = viewer
+        .map(|launch| (Some(launch.port), launch.pid, Some(launch.url)))
+        .unwrap_or((None, None, None));
 
     update_runtime(
         &site_id,
         RuntimeUpdate {
-            status: Some(ManagedSiteStatus::Running),
+            status: Some(if mark_running {
+                ManagedSiteStatus::Running
+            } else {
+                ManagedSiteStatus::Starting
+            }),
             parse_status: Some(ManagedSiteParseStatus::Parsed),
             parse_pid: Some(None),
+            viewer_port: Some(viewer_port),
+            viewer_pid: Some(viewer_pid),
+            viewer_url: Some(viewer_url),
             last_error: Some(None),
             entry_url: Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
             ..Default::default()
@@ -3202,6 +5095,9 @@ pub async fn start_site(site_id: String) -> Result<()> {
     )?;
     tokio::spawn(async move {
         if let Err(err) = run_start_pipeline(site_id.clone()).await {
+            if site_was_stopped_by_user(&site_id) {
+                return;
+            }
             let _ = update_runtime(
                 &site_id,
                 RuntimeUpdate {
@@ -3250,11 +5146,151 @@ pub async fn parse_site(site_id: String) -> Result<()> {
     }
     tokio::spawn(async move {
         if let Err(err) = run_parse_pipeline(site_id.clone()).await {
+            if site_was_stopped_by_user(&site_id) {
+                return;
+            }
             let _ = update_runtime(
                 &site_id,
                 RuntimeUpdate {
                     status: Some(ManagedSiteStatus::Failed),
                     parse_status: Some(ManagedSiteParseStatus::Failed),
+                    parse_pid: Some(None),
+                    last_error: Some(Some(err.to_string())),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    Ok(())
+}
+
+pub async fn generate_site(site_id: String, parse_first: bool) -> Result<()> {
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+    if !generation_enabled(&site) {
+        let message = "模型生成配置未启用，请先在站点配置中开启生成模型、网格或空间树".to_string();
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        let message = "解析任务正在运行，请稍后再生成模型".to_string();
+        record_site_error(
+            &site_id,
+            message.clone(),
+            Some(site.status.clone()),
+            Some(ManagedSiteParseStatus::Running),
+        );
+        bail!(message);
+    }
+    if matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) {
+        let message = match site.status {
+            ManagedSiteStatus::Running => "站点运行中，请先停止站点再生成模型",
+            ManagedSiteStatus::Starting => "站点启动中，请稍后再生成模型",
+            ManagedSiteStatus::Stopping => "站点停止中，请稍后再生成模型",
+            _ => "当前状态不能执行模型生成",
+        }
+        .to_string();
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    let preflight = preflight_site(&site_id).await?;
+    if !preflight.ready {
+        let blocking = preflight_blocking_summary(&preflight);
+        let message = format!("部署预检未通过: {blocking}");
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    update_runtime(
+        &site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Starting),
+            last_error: Some(None),
+            ..Default::default()
+        },
+    )?;
+    tokio::spawn(async move {
+        if let Err(err) = run_generation_pipeline(site_id.clone(), parse_first).await {
+            if site_was_stopped_by_user(&site_id) {
+                return;
+            }
+            let _ = update_runtime(
+                &site_id,
+                RuntimeUpdate {
+                    status: Some(ManagedSiteStatus::Failed),
+                    parse_pid: Some(None),
+                    last_error: Some(Some(err.to_string())),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    Ok(())
+}
+
+pub async fn deploy_site(site_id: String) -> Result<()> {
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        let message = "解析任务正在运行，请稍后再完整部署".to_string();
+        record_site_error(
+            &site_id,
+            message.clone(),
+            Some(site.status.clone()),
+            Some(ManagedSiteParseStatus::Running),
+        );
+        bail!(message);
+    }
+    if matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) {
+        let message = match site.status {
+            ManagedSiteStatus::Running => "站点运行中，请先停止站点再完整部署",
+            ManagedSiteStatus::Starting => "站点启动中，请稍后再完整部署",
+            ManagedSiteStatus::Stopping => "站点停止中，请稍后再完整部署",
+            _ => "当前状态不能执行完整部署",
+        }
+        .to_string();
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    let preflight = preflight_site(&site_id).await?;
+    if !preflight.ready {
+        let blocking = preflight_blocking_summary(&preflight);
+        let message = format!("部署预检未通过: {blocking}");
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
+        bail!(message);
+    }
+    update_runtime(
+        &site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Starting),
+            last_error: Some(None),
+            ..Default::default()
+        },
+    )?;
+    tokio::spawn(async move {
+        if let Err(err) = run_deploy_pipeline(site_id.clone()).await {
+            if site_was_stopped_by_user(&site_id) {
+                return;
+            }
+            let _ = update_runtime(
+                &site_id,
+                RuntimeUpdate {
+                    status: Some(ManagedSiteStatus::Failed),
                     parse_pid: Some(None),
                     last_error: Some(Some(err.to_string())),
                     ..Default::default()
@@ -3282,9 +5318,10 @@ pub async fn restart_site(site_id: &str) -> Result<()> {
     let stop_result = stop_site(site_id).await?;
     if stop_result.conflict {
         bail!(
-            "停止站点时检测到端口冲突（web={:?} db={:?}），无法继续重启；请先排查外部占用",
+            "停止站点时检测到端口冲突（web={:?} db={:?} viewer={:?}），无法继续重启；请先排查外部占用",
             stop_result.web_conflict_pids,
-            stop_result.db_conflict_pids
+            stop_result.db_conflict_pids,
+            stop_result.viewer_conflict_pids
         );
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -3325,6 +5362,9 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     if let Some(pid) = site.parse_pid {
         kill_pid(pid).await?;
     }
+    if let Some(pid) = site.viewer_pid {
+        kill_pid(pid).await?;
+    }
     if let Some(pid) = site.web_pid {
         kill_pid(pid).await?;
     }
@@ -3334,7 +5374,13 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
 
     let web_conflict_pids = process_ids_on_port(site.web_port).await.unwrap_or_default();
     let db_conflict_pids = process_ids_on_port(site.db_port).await.unwrap_or_default();
-    let has_conflict = !web_conflict_pids.is_empty() || !db_conflict_pids.is_empty();
+    let viewer_conflict_pids = match (site.viewer_pid, site.viewer_port) {
+        (Some(_), Some(port)) => process_ids_on_port(port).await.unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let has_conflict = !web_conflict_pids.is_empty()
+        || !db_conflict_pids.is_empty()
+        || !viewer_conflict_pids.is_empty();
 
     if has_conflict {
         let mut reasons = Vec::new();
@@ -3350,6 +5396,14 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
                 site.db_port, db_conflict_pids
             ));
         }
+        if let Some(port) = site.viewer_port {
+            if !viewer_conflict_pids.is_empty() {
+                reasons.push(format!(
+                    "viewer 端口 {} 被外部进程占用 (PIDs: {:?})",
+                    port, viewer_conflict_pids
+                ));
+            }
+        }
         let conflict_msg = reasons.join("; ");
         update_runtime(
             site_id,
@@ -3357,6 +5411,8 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
                 status: Some(ManagedSiteStatus::Failed),
                 db_pid: Some(None),
                 web_pid: Some(None),
+                viewer_pid: Some(None),
+                viewer_url: Some(None),
                 parse_pid: Some(None),
                 last_error: Some(Some(format!("端口冲突: {}", conflict_msg))),
                 ..Default::default()
@@ -3368,9 +5424,11 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
             conflict: true,
             web_conflict_pids,
             db_conflict_pids,
+            viewer_conflict_pids,
         });
     }
 
+    let operation_was_running = site.parse_pid.is_some();
     let parse_was_running = site.parse_status == ManagedSiteParseStatus::Running;
     let next_parse_status = if parse_was_running {
         ManagedSiteParseStatus::Pending
@@ -3382,8 +5440,8 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     } else {
         None
     };
-    let aborted_error = if parse_was_running {
-        Some(Some("解析被手动中止".to_string()))
+    let aborted_error = if operation_was_running {
+        Some(Some("站点操作被手动中止".to_string()))
     } else {
         Some(None)
     };
@@ -3395,6 +5453,8 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
             parse_status: Some(next_parse_status),
             db_pid: Some(None),
             web_pid: Some(None),
+            viewer_pid: Some(None),
+            viewer_url: Some(None),
             parse_pid: Some(None),
             last_error: aborted_error,
             last_parse_finished_at: aborted_finished_at,
@@ -3407,6 +5467,7 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
         conflict: false,
         web_conflict_pids: Vec::new(),
         db_conflict_pids: Vec::new(),
+        viewer_conflict_pids: Vec::new(),
     })
 }
 
@@ -3415,6 +5476,7 @@ pub struct StopSiteResult {
     pub conflict: bool,
     pub web_conflict_pids: Vec<u32>,
     pub db_conflict_pids: Vec<u32>,
+    pub viewer_conflict_pids: Vec<u32>,
 }
 
 pub fn delete_site(site_id: &str) -> Result<bool> {
@@ -3467,14 +5529,42 @@ pub fn delete_site(site_id: &str) -> Result<bool> {
 
 pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-    let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
-    let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
+    let db_probe = probe_managed_port(site.db_port, site.db_pid);
+    let web_probe = probe_managed_port(site.web_port, site.web_pid);
+    let viewer_probe = site
+        .viewer_port
+        .map(|port| probe_managed_port(port, site.viewer_pid))
+        .unwrap_or_default();
+    let db_running = db_probe.managed_running;
+    let web_running = web_probe.managed_running;
+    let viewer_pid_running = pid_running(site.viewer_pid);
+    let viewer_adopted_running = site
+        .viewer_port
+        .map(|port| {
+            port_in_use("127.0.0.1", port)
+                && site.viewer_url.is_some()
+                && matches!(
+                    site.status,
+                    ManagedSiteStatus::Running | ManagedSiteStatus::Starting
+                )
+        })
+        .unwrap_or(false);
+    let viewer_running =
+        viewer_probe.managed_running || viewer_pid_running || viewer_adopted_running;
     let parse_running = pid_running(site.parse_pid);
-    let resources = collect_site_resource_metrics(&site, db_running, web_running, parse_running);
+    let resources = collect_site_resource_metrics(
+        &site,
+        db_running,
+        web_running,
+        viewer_running,
+        parse_running,
+    );
     let snapshots = collect_log_snapshots(site_id);
     let parse_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "parse");
+    let generate_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "generate");
     let db_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "db");
     let web_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "web");
+    let viewer_snapshot = snapshots.iter().find(|snapshot| snapshot.key == "viewer");
     let recent = snapshots
         .iter()
         .filter_map(|snapshot| {
@@ -3507,27 +5597,26 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         db_running,
         web_running,
         parse_running,
+        generate_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
         parse_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
         db_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
-        web_snapshot.and_then(|snapshot| snapshot.last_key_log.clone()),
+        web_snapshot
+            .and_then(|snapshot| snapshot.last_key_log.clone())
+            .or_else(|| viewer_snapshot.and_then(|snapshot| snapshot.last_key_log.clone())),
     );
 
     let (risk_level, mut warnings, parse_health) = evaluate_site_risk(&site, &resources);
 
-    let managed_db_pids: Vec<u32> = site.db_pid.into_iter().collect();
-    let managed_web_pids: Vec<u32> = site.web_pid.into_iter().collect();
-    let db_port_pids = collect_port_pids_sync(site.db_port);
-    let web_port_pids = collect_port_pids_sync(site.web_port);
-    let db_conflict_pids: Vec<u32> = db_port_pids
-        .into_iter()
-        .filter(|pid| !managed_db_pids.contains(pid))
-        .collect();
-    let web_conflict_pids: Vec<u32> = web_port_pids
-        .into_iter()
-        .filter(|pid| !managed_web_pids.contains(pid))
-        .collect();
+    let db_conflict_pids = db_probe.conflict_pids;
+    let web_conflict_pids = web_probe.conflict_pids;
+    let viewer_conflict_pids = if viewer_probe.managed_running || viewer_adopted_running {
+        Vec::new()
+    } else {
+        viewer_probe.conflict_pids
+    };
     let db_port_conflict = !db_conflict_pids.is_empty();
     let web_port_conflict = !web_conflict_pids.is_empty();
+    let viewer_port_conflict = !viewer_conflict_pids.is_empty();
     if db_port_conflict {
         warnings.push(format!(
             "db 端口 {} 被外部进程占用 (PIDs: {:?})",
@@ -3540,6 +5629,14 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
             site.web_port, web_conflict_pids
         ));
     }
+    if viewer_port_conflict {
+        if let Some(port) = site.viewer_port {
+            warnings.push(format!(
+                "viewer 端口 {} 被外部进程占用 (PIDs: {:?})",
+                port, viewer_conflict_pids
+            ));
+        }
+    }
 
     Ok(ManagedSiteRuntimeStatus {
         site_id: site.site_id,
@@ -3551,19 +5648,25 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
         current_stage_detail,
         db_running,
         web_running,
+        viewer_running,
         parse_running,
         db_pid: site.db_pid,
         web_pid: site.web_pid,
+        viewer_pid: site.viewer_pid,
         parse_pid: site.parse_pid,
         db_port: site.db_port,
         web_port: site.web_port,
+        viewer_port: site.viewer_port,
+        viewer_url: site.viewer_url,
         entry_url: site.entry_url,
         local_entry_url: site.local_entry_url,
         public_entry_url: site.public_entry_url,
         db_port_conflict,
         web_port_conflict,
+        viewer_port_conflict,
         db_conflict_pids,
         web_conflict_pids,
+        viewer_conflict_pids,
         last_error: site.last_error,
         active_log_kind,
         last_log_at,
@@ -3767,8 +5870,10 @@ fn log_snapshot(key: &'static str, label: &'static str, path: PathBuf) -> LogSna
 fn collect_log_snapshots(site_id: &str) -> Vec<LogSnapshot> {
     vec![
         log_snapshot("parse", "解析日志", parse_log_path(site_id)),
+        log_snapshot("generate", "生成日志", generate_log_path(site_id)),
         log_snapshot("db", "数据库日志", db_log_path(site_id)),
         log_snapshot("web", "站点日志", web_log_path(site_id)),
+        log_snapshot("viewer", "Viewer 日志", viewer_log_path(site_id)),
     ]
 }
 
@@ -3777,10 +5882,38 @@ fn current_stage(
     db_running: bool,
     web_running: bool,
     parse_running: bool,
+    generate_detail: Option<String>,
     parse_detail: Option<String>,
     db_detail: Option<String>,
     web_detail: Option<String>,
 ) -> (String, String, Option<String>) {
+    if matches!(site.status, ManagedSiteStatus::Failed)
+        || site.parse_status == ManagedSiteParseStatus::Failed
+        || site
+            .last_error
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return (
+            "failed".to_string(),
+            "失败".to_string(),
+            site.last_error
+                .clone()
+                .or(parse_detail)
+                .or(db_detail)
+                .or(web_detail),
+        );
+    }
+    if parse_running
+        && site.parse_status == ManagedSiteParseStatus::Parsed
+        && matches!(site.status, ManagedSiteStatus::Starting)
+    {
+        return (
+            "generating".to_string(),
+            "模型生成中".to_string(),
+            generate_detail.or(Some("模型生成进程正在运行".to_string())),
+        );
+    }
     if parse_running {
         return (
             "parsing".to_string(),
@@ -3828,19 +5961,6 @@ fn current_stage(
             parse_detail.or(Some("解析结果已生成".to_string())),
         );
     }
-    if matches!(site.status, ManagedSiteStatus::Failed)
-        || site.parse_status == ManagedSiteParseStatus::Failed
-    {
-        return (
-            "failed".to_string(),
-            "失败".to_string(),
-            site.last_error
-                .clone()
-                .or(parse_detail)
-                .or(db_detail)
-                .or(web_detail),
-        );
-    }
     if matches!(site.status, ManagedSiteStatus::Stopped) {
         return (
             "stopped".to_string(),
@@ -3864,7 +5984,7 @@ fn current_stage(
 /// - `truncated`：当 `total_lines > returned_lines` 时为 true
 ///
 /// 路径：runtime/admin_sites/<site_id>/logs/<kind>.log
-/// `kind` 必须是 "parse" / "db" / "web"。
+/// `kind` 必须是 "parse" / "generate" / "db" / "web" / "viewer"。
 pub fn tail_log(site_id: &str, kind: &str, limit: usize) -> Result<TailLogResponse> {
     let _ = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     let path = log_file_path(site_id, kind)?;
@@ -3889,8 +6009,11 @@ pub fn full_log_path(site_id: &str, kind: &str) -> Result<PathBuf> {
 
 fn log_file_path(site_id: &str, kind: &str) -> Result<PathBuf> {
     match kind {
-        "parse" | "db" | "web" => {}
-        other => bail!("非法日志类型: {} (必须为 parse / db / web)", other),
+        "parse" | "generate" | "db" | "web" | "viewer" => {}
+        other => bail!(
+            "非法日志类型: {} (必须为 parse / generate / db / web / viewer)",
+            other
+        ),
     }
     let safe_id = sanitize_site_id_for_path(site_id);
     let mut p = PathBuf::from(ADMIN_RUNTIME_ROOT);
@@ -3948,6 +6071,11 @@ pub fn logs(site_id: &str) -> Result<ManagedSiteLogsResponse> {
         .find(|snapshot| snapshot.key == "parse")
         .map(|snapshot| snapshot.lines.clone())
         .unwrap_or_default();
+    let generate_log = snapshots
+        .iter()
+        .find(|snapshot| snapshot.key == "generate")
+        .map(|snapshot| snapshot.lines.clone())
+        .unwrap_or_default();
     let db_log = snapshots
         .iter()
         .find(|snapshot| snapshot.key == "db")
@@ -3958,12 +6086,19 @@ pub fn logs(site_id: &str) -> Result<ManagedSiteLogsResponse> {
         .find(|snapshot| snapshot.key == "web")
         .map(|snapshot| snapshot.lines.clone())
         .unwrap_or_default();
+    let viewer_log = snapshots
+        .iter()
+        .find(|snapshot| snapshot.key == "viewer")
+        .map(|snapshot| snapshot.lines.clone())
+        .unwrap_or_default();
 
     Ok(ManagedSiteLogsResponse {
         site_id: site.site_id,
         parse_log,
+        generate_log,
         db_log,
         web_log,
+        viewer_log,
         streams: snapshots
             .into_iter()
             .map(|snapshot| ManagedSiteLogStreamSummary {

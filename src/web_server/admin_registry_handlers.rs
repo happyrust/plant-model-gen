@@ -161,6 +161,16 @@ async fn create_site_task(
         .task_name
         .unwrap_or_else(|| format!("{} - {:?}", site.name, task_type));
     let config = payload.config_override.unwrap_or(site.config);
+    match crate::web_server::managed_project_sites::get_site(&site.site_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return admin_response::conflict(format!(
+                "注册表站点未绑定受管站点，不能提交解析/生成任务: {}",
+                site.site_id
+            ));
+        }
+        Err(err) => return admin_response::server_error(format!("受管站点查询失败: {}", err)),
+    }
 
     match admin_task_handlers::create_and_dispatch_site_task(
         site.site_id.clone(),

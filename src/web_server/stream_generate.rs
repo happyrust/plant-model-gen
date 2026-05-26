@@ -600,13 +600,19 @@ pub async fn api_stream_generate(
                                     // 生成 mesh（GLB 强制输出）——保证前端可直接拉取 /files/meshes/lod_L1/{geo_hash}_L1.glb
                                     let replace_exist = false; // replace_exist 已废弃
                                     let meshes_dir = db_option.get_meshes_path();
-                                    let precision = Arc::new(db_option.mesh_precision().clone());
+                                    let mut precision = db_option.mesh_precision().clone();
+                                    precision.default_lod = aios_core::mesh_precision::LodLevel::L1;
+                                    let precision = Arc::new(precision);
+                                    let mesh_formats = [
+                                        crate::options::MeshFormat::PdmsMesh,
+                                        crate::options::MeshFormat::Glb,
+                                    ];
                                     if let Err(e) = crate::fast_model::mesh_generate::gen_inst_meshes(
                                         &meshes_dir,
                                         &precision,
                                         &batch_all,
                                         replace_exist,
-                                        &[crate::options::MeshFormat::PdmsMesh],
+                                        &mesh_formats,
                                     )
                                     .await
                                     {

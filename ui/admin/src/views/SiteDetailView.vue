@@ -3,15 +3,22 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AlertTriangle,
+  CheckCircle2,
+  Circle,
   Database,
   FolderArchive,
   Globe,
   HardDrive,
+  ListChecks,
+  Loader2,
+  Monitor,
   ShieldAlert,
   TimerReset,
+  XCircle,
 } from 'lucide-vue-next'
 import { extractErrorMessage } from '@/api/client'
 import { sitesApi, type ManagedSiteLogKind } from '@/api/sites'
+import { tasksApi } from '@/api/tasks'
 import { usePolling } from '@/composables/usePolling'
 import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
 import { useSitesStore } from '@/stores/sites'
@@ -26,11 +33,16 @@ import { parsePlanClass, siteActionLabelMap } from '@/components/sites/site-stat
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
+  ManagedSiteDeployValidationCheck,
+  ManagedSiteDeployValidationReport,
   ManagedSiteLogsResponse,
+  ManagedSitePreflightCheck,
+  ManagedSitePreflightReport,
   ManagedSiteProcessResource,
   ManagedSiteRiskLevel,
   ManagedSiteRuntimeStatus,
 } from '@/types/site'
+import type { TaskInfo, TaskStatus } from '@/types/task'
 
 const route = useRoute()
 const router = useRouter()
@@ -39,9 +51,18 @@ const sitesStore = useSitesStore()
 const site = ref<ManagedProjectSite | null>(null)
 const runtime = ref<ManagedSiteRuntimeStatus | null>(null)
 const logsData = ref<ManagedSiteLogsResponse | null>(null)
+const preflight = ref<ManagedSitePreflightReport | null>(null)
+const deployValidation = ref<ManagedSiteDeployValidationReport | null>(null)
+const deployTask = ref<TaskInfo | null>(null)
 const siteError = ref('')
 const runtimeError = ref('')
 const logsError = ref('')
+const preflightError = ref('')
+const deployValidationError = ref('')
+const deployTaskError = ref('')
+const preflightLoading = ref(false)
+const deployValidationLoading = ref(false)
+const deployTaskLoading = ref(false)
 type DetailTab = 'overview' | 'deploy'
 
 // D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy`
@@ -50,6 +71,8 @@ type DetailTab = 'overview' | 'deploy'
 // 取初值并双向同步，刷新 / 分享链接都能保留 tab 选择。
 const initialTab: DetailTab = route.query.tab === 'deploy' ? 'deploy' : 'overview'
 const activeTab = ref<DetailTab>(initialTab)
+const initialDeployTaskId = typeof route.query.task_id === 'string' ? route.query.task_id : ''
+const deployTaskId = ref(initialDeployTaskId)
 
 watch(activeTab, (next) => {
   if (route.query.tab === next) return
@@ -58,6 +81,23 @@ watch(activeTab, (next) => {
     query: { ...route.query, tab: next },
   })
 }, { flush: 'post' })
+watch(activeTab, (next) => {
+  if (next === 'deploy' && !preflight.value && !preflightLoading.value) {
+    void fetchPreflight()
+  }
+  if (next === 'deploy' && !deployValidation.value && !deployValidationLoading.value) {
+    void fetchDeployValidation()
+  }
+})
+watch(() => route.query.task_id, (next) => {
+  deployTaskId.value = typeof next === 'string' ? next : ''
+  if (deployTaskId.value) {
+    void fetchDeployTask()
+  } else {
+    deployTask.value = null
+    deployTaskError.value = ''
+  }
+})
 const activeLogTab = ref<ManagedSiteLogKind>('parse')
 const drawerOpen = ref(false)
 const downloadPending = ref(false)
@@ -89,8 +129,10 @@ const emptyLogState = (): DetailLogState => ({
 
 const detailLogs = ref<Record<ManagedSiteLogKind, DetailLogState>>({
   parse: emptyLogState(),
+  generate: emptyLogState(),
   db: emptyLogState(),
   web: emptyLogState(),
+  viewer: emptyLogState(),
 })
 
 const siteId = computed(() => String(route.params.id ?? ''))
@@ -102,6 +144,8 @@ const matchedPreset = computed(() => matchParsePreset(
   site.value?.parse_db_types ?? [],
   site.value?.force_rebuild_system_db ?? false,
 ))
+const deployProgressSteps = computed(() => buildDeployProgressSteps())
+const deployTaskPercent = computed(() => Math.round(deployTask.value?.progress.percentage ?? 0))
 
 const selectedLogState = computed(() => detailLogs.value[activeLogTab.value])
 const selectedLogs = computed(() => selectedLogState.value.lines)
@@ -120,12 +164,151 @@ const processCards = computed(() => [
     process: resources.value?.web_process ?? null,
   },
   {
+    key: 'viewer',
+    label: 'Viewer 进程',
+    icon: Monitor,
+    process: resources.value?.viewer_process ?? null,
+  },
+  {
     key: 'parse',
     label: 'Parse 进程',
     icon: TimerReset,
     process: resources.value?.parse_process ?? null,
   },
 ])
+
+type DeployStepState = 'complete' | 'current' | 'pending' | 'warning' | 'error' | 'skipped'
+
+interface DeployProgressStep {
+  key: string
+  label: string
+  state: DeployStepState
+  detail: string
+}
+
+const taskStatusConfig: Record<TaskStatus, { class: string; label: string }> = {
+  Pending: { class: 'bg-muted text-muted-foreground', label: '等待中' },
+  Running: { class: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200', label: '运行中' },
+  Completed: { class: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200', label: '已完成' },
+  Failed: { class: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200', label: '失败' },
+  Cancelled: { class: 'bg-muted text-muted-foreground line-through', label: '已取消' },
+}
+
+function buildDeployProgressSteps(): DeployProgressStep[] {
+  const s = site.value
+  const r = runtime.value
+  const generationEnabled = !!(s?.gen_model || s?.gen_mesh || s?.gen_spatial_tree)
+  const currentStage = r?.current_stage ?? ''
+  return [
+    {
+      key: 'preflight',
+      label: '部署预检',
+      state: !preflight.value
+        ? 'pending'
+        : preflight.value.blocking_count > 0
+          ? 'error'
+          : preflight.value.warning_count > 0
+            ? 'warning'
+            : 'complete',
+      detail: preflight.value
+        ? `${preflight.value.blocking_count} 个阻断 / ${preflight.value.warning_count} 个警告`
+        : '尚未执行预检',
+    },
+    {
+      key: 'parse',
+      label: '项目解析',
+      state: r?.parse_status === 'Parsed'
+        ? 'complete'
+        : r?.parse_status === 'Running'
+          ? 'current'
+          : r?.parse_status === 'Failed'
+            ? 'error'
+            : 'pending',
+      detail: r?.parse_status === 'Parsed' ? '解析已完成' : r?.current_stage_detail || '等待解析',
+    },
+    {
+      key: 'generate',
+      label: '模型生成',
+      state: !generationEnabled
+        ? 'skipped'
+        : currentStage === 'generating'
+          ? 'current'
+          : r?.status === 'Running' || r?.web_running
+            ? 'complete'
+            : r?.status === 'Failed'
+              ? 'error'
+              : 'pending',
+      detail: generationEnabled ? (r?.current_stage_detail || '等待生成') : '生成配置未启用，部署时跳过',
+    },
+    {
+      key: 'db',
+      label: '启动数据库',
+      state: r?.db_running ? 'complete' : r?.status === 'Starting' ? 'current' : 'pending',
+      detail: r?.db_running ? `DB 端口 ${r.db_port ?? s?.db_port ?? '-'}` : '等待 DB 进程启动',
+    },
+    {
+      key: 'web',
+      label: '启动 Web 服务',
+      state: r?.web_running ? 'complete' : r?.status === 'Starting' && r?.db_running ? 'current' : 'pending',
+      detail: r?.web_running ? `Web 端口 ${r.web_port ?? s?.web_port ?? '-'}` : '等待 Web 服务 /api/status',
+    },
+    {
+      key: 'viewer',
+      label: '启动 Viewer',
+      state: r?.viewer_running || r?.viewer_url
+        ? 'complete'
+        : r?.status === 'Running'
+          ? 'warning'
+          : r?.web_running
+            ? 'current'
+            : 'pending',
+      detail: r?.viewer_url || '等待 plant3d-web Viewer',
+    },
+  ]
+}
+
+function deployStepIcon(step: DeployProgressStep) {
+  if (step.state === 'complete') return CheckCircle2
+  if (step.state === 'error') return XCircle
+  if (step.state === 'warning') return AlertTriangle
+  if (step.state === 'current') return Loader2
+  return Circle
+}
+
+function deployStepClass(step: DeployProgressStep) {
+  if (step.state === 'complete') return 'border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+  if (step.state === 'error') return 'border-destructive/50 bg-destructive/5 text-destructive'
+  if (step.state === 'warning') return 'border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300'
+  if (step.state === 'current') return 'border-blue-500/40 bg-blue-500/5 text-blue-700 dark:text-blue-300'
+  return 'border-border bg-background text-muted-foreground'
+}
+
+function preflightCheckClass(check: ManagedSitePreflightCheck) {
+  if (check.status === 'blocking') return 'border-destructive/50 bg-destructive/5'
+  if (check.status === 'warning') return 'border-amber-500/40 bg-amber-500/5'
+  return 'border-emerald-500/30 bg-emerald-500/5'
+}
+
+function preflightStatusLabel(status: ManagedSitePreflightCheck['status']) {
+  if (status === 'blocking') return '阻断'
+  if (status === 'warning') return '警告'
+  return '通过'
+}
+
+function deployValidationCheckClass(check: ManagedSiteDeployValidationCheck) {
+  const status = check.status?.toLowerCase()
+  if (status === 'blocking') return 'border-destructive/50 bg-destructive/5'
+  if (status === 'warning') return 'border-amber-500/40 bg-amber-500/5'
+  return 'border-emerald-500/30 bg-emerald-500/5'
+}
+
+function deployValidationStatusLabel(status: string) {
+  const normalized = status?.toLowerCase()
+  if (normalized === 'blocking') return '阻断'
+  if (normalized === 'warning') return '警告'
+  if (normalized === 'pass') return '通过'
+  return status || '未知'
+}
 
 const riskTone = computed(() => toneForRisk(runtime.value?.risk_level ?? 'normal'))
 const parseHealthTone = computed(() => {
@@ -135,6 +318,53 @@ const parseHealthTone = computed(() => {
   if (status === 'normal') return 'text-emerald-700 dark:text-emerald-300'
   return 'text-muted-foreground'
 })
+
+async function fetchPreflight() {
+  if (!siteId.value) return
+  preflightLoading.value = true
+  try {
+    preflight.value = await sitesApi.preflight(siteId.value)
+    preflightError.value = ''
+  } catch (err: unknown) {
+    preflightError.value = extractErrorMessage(err)
+  } finally {
+    preflightLoading.value = false
+  }
+}
+
+async function fetchDeployValidation() {
+  if (!siteId.value) return
+  deployValidationLoading.value = true
+  try {
+    deployValidation.value = await sitesApi.deployValidation(siteId.value)
+    deployValidationError.value = ''
+  } catch (err: unknown) {
+    deployValidationError.value = extractErrorMessage(err)
+  } finally {
+    deployValidationLoading.value = false
+  }
+}
+
+async function fetchDeployTask() {
+  if (!deployTaskId.value) return
+  deployTaskLoading.value = true
+  try {
+    deployTask.value = await tasksApi.get(deployTaskId.value)
+    deployTaskError.value = ''
+  } catch (err: unknown) {
+    deployTaskError.value = extractErrorMessage(err)
+  } finally {
+    deployTaskLoading.value = false
+  }
+}
+
+async function setDeployTaskId(taskId: string) {
+  deployTaskId.value = taskId
+  await router.replace({
+    path: route.path,
+    query: { ...route.query, tab: 'deploy', task_id: taskId },
+  })
+}
 
 async function fetchAll() {
   const id = siteId.value
@@ -161,6 +391,14 @@ async function fetchAll() {
 
   // 跟随当前 tab 刷新一次详情日志（保留用户已"加载更多"的 limit）
   await fetchKindLog(activeLogTab.value)
+
+  if (deployTaskId.value) {
+    await fetchDeployTask()
+  }
+
+  if (activeTab.value === 'deploy') {
+    await fetchDeployValidation()
+  }
 }
 
 async function fetchKindLog(kind: ManagedSiteLogKind, overrideLimit?: number) {
@@ -333,6 +571,21 @@ function processValueTone(label: string, kind: 'cpu' | 'memory') {
   return warningTone(reason)
 }
 
+function logTabLabel(tab: ManagedSiteLogKind) {
+  switch (tab) {
+    case 'parse':
+      return '解析日志'
+    case 'generate':
+      return '生成日志'
+    case 'db':
+      return 'DB 日志'
+    case 'web':
+      return 'Web 日志'
+    case 'viewer':
+      return 'Viewer 日志'
+  }
+}
+
 function viewerUrl() {
   const s = site.value
   if (!s) return null
@@ -390,6 +643,35 @@ async function handleParse() {
   }
 }
 
+async function handleGenerate() {
+  try {
+    await sitesStore.generateSite(siteId.value)
+    activeLogTab.value = 'generate'
+    await fetchAll()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
+async function handleDeploy() {
+  try {
+    activeTab.value = 'deploy'
+    await fetchPreflight()
+    if (preflight.value && !preflight.value.ready) return
+    const submitted = await sitesStore.deploySite(siteId.value)
+    if (submitted?.task_id) {
+      await setDeployTaskId(submitted.task_id)
+      await fetchDeployTask()
+    }
+    activeLogTab.value = 'generate'
+    await fetchAll()
+    await fetchPreflight()
+    await fetchDeployValidation()
+  } catch {
+    // 错误已写入 store，页面横幅会显示
+  }
+}
+
 function copyText(text: string) {
   navigator.clipboard.writeText(text)
 }
@@ -431,6 +713,10 @@ const { start: startPolling } = usePolling(fetchAll, 10000)
 
 onMounted(async () => {
   await fetchAll()
+  if (activeTab.value === 'deploy') {
+    await fetchPreflight()
+    await fetchDeployValidation()
+  }
   startPolling()
 })
 </script>
@@ -445,6 +731,8 @@ onMounted(async () => {
       @stop="handleStop"
       @restart="handleRestart"
       @parse="handleParse"
+      @generate="handleGenerate"
+      @deploy="handleDeploy"
       @refresh="fetchAll"
       @open-viewer="openViewer()"
       @edit="openEditDrawer"
@@ -486,7 +774,7 @@ onMounted(async () => {
         class="px-4 py-2 text-sm font-medium transition-colors border-b-2"
         :class="activeTab === 'deploy' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'"
         @click="activeTab = 'deploy'"
-      >配置信息</button>
+      >部署进度</button>
     </div>
 
     <div v-if="activeTab === 'overview'" class="space-y-4">
@@ -614,7 +902,7 @@ onMounted(async () => {
           <HardDrive class="h-4 w-4 text-muted-foreground" />
           <h3 class="text-base font-medium">进程资源</h3>
         </div>
-        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <div v-for="card in processCards" :key="card.key" class="rounded-lg border border-border/60 bg-background p-4">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2 text-sm text-muted-foreground">
@@ -687,10 +975,13 @@ onMounted(async () => {
         <div class="mt-1 text-sm text-destructive/80">{{ runtime.last_error }}</div>
       </div>
 
-      <div v-if="runtime?.db_port_conflict || runtime?.web_port_conflict" class="rounded-lg border border-amber-500/50 bg-amber-500/5 p-4">
+      <div v-if="runtime?.db_port_conflict || runtime?.web_port_conflict || runtime?.viewer_port_conflict" class="rounded-lg border border-amber-500/50 bg-amber-500/5 p-4">
         <div class="text-sm font-medium text-amber-700 dark:text-amber-300 mb-1">端口冲突</div>
         <div v-if="runtime?.web_port_conflict" class="text-sm text-amber-600 dark:text-amber-400">
           Web 端口 {{ runtime.web_port }} 被外部进程占用 (PIDs: {{ runtime.web_conflict_pids?.join(', ') }})
+        </div>
+        <div v-if="runtime?.viewer_port_conflict" class="text-sm text-amber-600 dark:text-amber-400">
+          Viewer 端口 {{ runtime.viewer_port ?? '-' }} 被外部进程占用 (PIDs: {{ runtime.viewer_conflict_pids?.join(', ') }})
         </div>
         <div v-if="runtime?.db_port_conflict" class="text-sm text-amber-600 dark:text-amber-400">
           DB 端口 {{ runtime.db_port }} 被外部进程占用 (PIDs: {{ runtime.db_conflict_pids?.join(', ') }})
@@ -715,6 +1006,14 @@ onMounted(async () => {
             </a>
           </div>
           <div v-if="!runtime.public_entry_url" class="text-xs text-amber-600 mt-1">仅本机地址，未配置 public_base_url</div>
+          <div v-if="runtime.viewer_url" class="flex items-center gap-2 pt-2">
+            <span class="text-xs text-muted-foreground w-16 shrink-0">Viewer</span>
+            <a :href="runtime.viewer_url" target="_blank" class="text-sm text-primary hover:underline">
+              {{ runtime.viewer_url }}
+            </a>
+            <button @click="copyText(runtime.viewer_url || '')"
+              class="text-xs text-muted-foreground hover:text-foreground transition-colors">复制</button>
+          </div>
         </div>
       </div>
 
@@ -731,13 +1030,13 @@ onMounted(async () => {
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2">
           <div class="flex flex-wrap items-center gap-2">
             <button
-              v-for="tab in (['parse', 'db', 'web'] as const)"
+              v-for="tab in (['parse', 'generate', 'db', 'web', 'viewer'] as const)"
               :key="tab"
               @click="onLogTabChange(tab)"
               class="rounded-md px-3 py-1 text-xs font-medium transition-colors"
               :class="activeLogTab === tab ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:text-foreground'"
             >
-              {{ tab === 'parse' ? '解析日志' : tab === 'db' ? 'DB 日志' : 'Web 日志' }}
+              {{ logTabLabel(tab) }}
             </button>
             <span class="text-xs text-muted-foreground">
               {{ selectedLogState.loading
@@ -775,7 +1074,210 @@ onMounted(async () => {
       </div>
     </div>
 
-    <SiteConfigSections v-else-if="site" :site="site" />
+    <div v-else-if="site" class="space-y-4">
+      <div class="rounded-lg border border-border bg-card p-5">
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-2">
+            <ListChecks class="h-4 w-4 text-muted-foreground" />
+            <h3 class="text-base font-medium">一键部署进度</h3>
+          </div>
+          <button
+            :disabled="preflightLoading"
+            @click="fetchPreflight"
+            class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+          >
+            <Loader2 v-if="preflightLoading" class="h-3.5 w-3.5 animate-spin" />
+            {{ preflightLoading ? '检查中...' : '刷新预检' }}
+          </button>
+        </div>
+
+        <div
+          v-if="preflightError"
+          class="mb-4 rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+        >
+          预检失败：{{ preflightError }}
+        </div>
+
+        <div
+          v-if="deployTaskId"
+          class="mb-4 rounded-lg border border-border bg-background/60 p-4"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-medium">当前部署任务</span>
+                <span
+                  v-if="deployTask"
+                  class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                  :class="taskStatusConfig[deployTask.status]?.class"
+                >
+                  {{ taskStatusConfig[deployTask.status]?.label ?? deployTask.status }}
+                </span>
+              </div>
+              <div class="mt-1 font-mono text-xs text-muted-foreground break-all">{{ deployTaskId }}</div>
+            </div>
+            <div class="flex items-center gap-2">
+              <router-link
+                :to="{ name: 'task-detail', params: { id: deployTaskId } }"
+                class="inline-flex h-8 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors"
+              >
+                打开任务
+              </router-link>
+              <button
+                :disabled="deployTaskLoading"
+                @click="fetchDeployTask"
+                class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+              >
+                <Loader2 v-if="deployTaskLoading" class="h-3.5 w-3.5 animate-spin" />
+                {{ deployTaskLoading ? '刷新中...' : '刷新任务' }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="deployTask" class="mt-4 space-y-2">
+            <div class="flex items-center justify-between text-xs text-muted-foreground">
+              <span>{{ deployTask.progress.current_step }}</span>
+              <span>{{ deployTaskPercent }}%</span>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-muted">
+              <div class="h-full rounded-full bg-primary transition-all" :style="{ width: `${deployTaskPercent}%` }" />
+            </div>
+            <div
+              v-if="deployTask.error"
+              class="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+            >
+              {{ deployTask.error }}
+            </div>
+          </div>
+          <div
+            v-else-if="deployTaskError"
+            class="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          >
+            任务加载失败：{{ deployTaskError }}
+          </div>
+        </div>
+
+        <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div
+            v-for="step in deployProgressSteps"
+            :key="step.key"
+            class="rounded-lg border p-4"
+            :class="deployStepClass(step)"
+          >
+            <div class="flex items-center gap-2 text-sm font-medium">
+              <component
+                :is="deployStepIcon(step)"
+                class="h-4 w-4"
+                :class="step.state === 'current' ? 'animate-spin' : ''"
+              />
+              <span>{{ step.label }}</span>
+            </div>
+            <div class="mt-2 text-xs opacity-80">{{ step.detail }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-lg border border-border bg-card p-5">
+        <div class="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <h3 class="text-base font-medium">部署后验收</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {{ deployValidation?.exists
+                ? `检查时间 ${formatDateTime(deployValidation.checked_at)}，${deployValidation.blocking_count} 个阻断 / ${deployValidation.warning_count} 个警告`
+                : '部署成功后会生成验收报告，覆盖 Web、Viewer、Parquet 和 GLB 资源。' }}
+            </p>
+          </div>
+          <button
+            :disabled="deployValidationLoading"
+            @click="fetchDeployValidation"
+            class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+          >
+            <Loader2 v-if="deployValidationLoading" class="h-3.5 w-3.5 animate-spin" />
+            {{ deployValidationLoading ? '加载中...' : '刷新验收' }}
+          </button>
+        </div>
+
+        <div
+          v-if="deployValidationError"
+          class="mb-4 rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+        >
+          验收报告加载失败：{{ deployValidationError }}
+        </div>
+
+        <div v-if="deployValidation?.exists && deployValidation.checks.length" class="space-y-3">
+          <div
+            v-for="check in deployValidation.checks"
+            :key="check.key"
+            class="rounded-lg border p-4 text-sm"
+            :class="deployValidationCheckClass(check)"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="font-medium">{{ check.label }}</div>
+              <span class="rounded-full border border-current/20 px-2 py-0.5 text-xs">
+                {{ deployValidationStatusLabel(check.status) }}
+              </span>
+            </div>
+            <div class="mt-2">{{ check.message }}</div>
+            <div v-if="check.detail" class="mt-1 text-xs text-muted-foreground break-all">{{ check.detail }}</div>
+            <a
+              v-if="check.url"
+              :href="check.url"
+              target="_blank"
+              class="mt-2 block text-xs text-primary hover:underline break-all"
+            >
+              {{ check.url }}
+            </a>
+          </div>
+        </div>
+        <div v-else class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          暂无部署后验收报告。提交完整部署并等待任务完成后再刷新。
+        </div>
+      </div>
+
+      <div class="rounded-lg border border-border bg-card p-5">
+        <div class="mb-4 flex items-center justify-between gap-3">
+          <div>
+            <h3 class="text-base font-medium">部署预检</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {{ preflight
+                ? `更新时间 ${formatDateTime(preflight.updated_at)}，${preflight.blocking_count} 个阻断 / ${preflight.warning_count} 个警告`
+                : '尚未执行预检' }}
+            </p>
+          </div>
+          <span
+            v-if="preflight"
+            class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+            :class="preflight.ready ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'"
+          >
+            {{ preflight.ready ? '可以部署' : '存在阻断' }}
+          </span>
+        </div>
+
+        <div v-if="preflight?.checks.length" class="space-y-3">
+          <div
+            v-for="check in preflight.checks"
+            :key="check.key"
+            class="rounded-lg border p-4 text-sm"
+            :class="preflightCheckClass(check)"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="font-medium">{{ check.label }}</div>
+              <span class="rounded-full border border-current/20 px-2 py-0.5 text-xs">
+                {{ preflightStatusLabel(check.status) }}
+              </span>
+            </div>
+            <div class="mt-2">{{ check.message }}</div>
+            <div v-if="check.detail" class="mt-1 text-xs text-muted-foreground break-all">{{ check.detail }}</div>
+            <div v-if="check.action_hint" class="mt-2 text-xs text-muted-foreground">建议：{{ check.action_hint }}</div>
+          </div>
+        </div>
+        <div v-else class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+          点击“刷新预检”检查部署前置条件。
+        </div>
+      </div>
+
+      <SiteConfigSections :site="site" />
+    </div>
 
     <SiteDrawer
       :open="drawerOpen"

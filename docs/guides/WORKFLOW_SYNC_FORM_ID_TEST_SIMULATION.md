@@ -91,7 +91,7 @@
    -> POST /api/review/records
 4. 外部流程驱动先调用 workflow/verify
    -> POST /api/review/workflow/verify { form_id, token, action }
-   -> 只检查是否允许流转（节点合法性 + owner + 按 action 分化的 annotation 门）
+   -> 只检查是否允许流转（节点合法性 + 终态 + action-aware annotation 门；return 不查批注状态）
    -> 不写 review_tasks / review_forms
 5. 仅当 verify 通过时，再调用 workflow/sync
    -> POST /api/review/workflow/sync

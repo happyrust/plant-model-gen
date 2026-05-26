@@ -14,10 +14,11 @@ use tokio::io::AsyncReadExt;
 use crate::web_server::{
     admin_auth_handlers::admin_auth_middleware,
     admin_response::{self, ApiResponse},
-    managed_project_sites as managed_sites,
+    admin_task_handlers, managed_project_sites as managed_sites,
     models::{
-        AdminResourceSummary, CreateManagedSiteRequest, ManagedSiteLogsResponse,
-        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
+        AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedSiteLogsResponse,
+        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, TaskPriority, TaskType,
+        UpdateManagedSiteRequest,
     },
 };
 
@@ -35,12 +36,19 @@ pub fn create_admin_routes() -> Router {
             "/api/admin/sites/{id}",
             get(get_site).put(update_site).delete(delete_site),
         )
+        .route("/api/admin/sites/{id}/preflight", post(preflight_site))
         .route("/api/admin/sites/{id}/parse", post(parse_site))
+        .route("/api/admin/sites/{id}/generate", post(generate_site))
+        .route("/api/admin/sites/{id}/deploy", post(deploy_site))
         .route("/api/admin/sites/{id}/start", post(start_site))
         .route("/api/admin/sites/{id}/stop", post(stop_site))
         .route("/api/admin/sites/{id}/restart", post(restart_site))
         .route("/api/admin/sites/{id}/runtime", get(get_site_runtime))
         .route("/api/admin/sites/{id}/logs", get(get_site_logs))
+        .route(
+            "/api/admin/sites/{id}/deploy-validation",
+            get(get_site_deploy_validation),
+        )
         .route("/api/admin/sites/{id}/logs/{kind}", get(get_site_log_kind))
         .route(
             "/api/admin/sites/{id}/logs/{kind}/download",
@@ -70,6 +78,26 @@ fn resolve_admin_app_config() -> AdminAppConfig {
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty());
     AdminAppConfig { viewer_base_url }
+}
+
+fn submit_managed_site_task(
+    site_id: &str,
+    task_type: TaskType,
+    action_label: &str,
+) -> Result<String, String> {
+    let site = managed_sites::get_site(site_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("站点不存在: {site_id}"))?;
+    let mut config = DatabaseConfig::default();
+    config.name = format!("{} - {}", site.project_name, action_label);
+    let task = admin_task_handlers::create_and_dispatch_site_task(
+        site.site_id.clone(),
+        config.name.clone(),
+        task_type,
+        TaskPriority::Normal,
+        config,
+    )?;
+    Ok(task.id)
 }
 
 pub async fn list_sites() -> impl IntoResponse {
@@ -131,13 +159,54 @@ pub async fn check_port(Query(params): Query<PortCheckQuery>) -> impl IntoRespon
 }
 
 pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {
+    let auto_deploy = payload.auto_deploy;
     match managed_sites::create_site(payload) {
-        Ok(site) => admin_response::response(
-            axum::http::StatusCode::CREATED,
-            true,
-            "创建站点成功",
-            Some(site),
-        ),
+        Ok(site) => {
+            let mut response = serde_json::to_value(&site).unwrap_or_else(|_| json!({}));
+            let mut deployment_submitted = false;
+            let mut deployment_error = None;
+            let mut deployment_task_id = None;
+            if auto_deploy {
+                match submit_managed_site_task(
+                    &site.site_id,
+                    TaskType::DeployManagedSite,
+                    "完整部署",
+                ) {
+                    Ok(task_id) => {
+                        deployment_submitted = true;
+                        deployment_task_id = Some(task_id);
+                    }
+                    Err(err) => {
+                        deployment_error = Some(err);
+                    }
+                }
+                if let Ok(Some(updated)) = managed_sites::get_site(&site.site_id) {
+                    response = serde_json::to_value(updated).unwrap_or(response);
+                }
+            }
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("auto_deploy".to_string(), json!(auto_deploy));
+                obj.insert(
+                    "deployment_submitted".to_string(),
+                    json!(deployment_submitted),
+                );
+                obj.insert("deployment_error".to_string(), json!(deployment_error));
+                obj.insert("deployment_task_id".to_string(), json!(deployment_task_id));
+            }
+            let message = if auto_deploy && deployment_submitted {
+                "创建站点成功，已提交完整部署任务"
+            } else if auto_deploy {
+                "创建站点成功，但提交完整部署任务失败"
+            } else {
+                "创建站点成功"
+            };
+            admin_response::response(
+                axum::http::StatusCode::CREATED,
+                true,
+                message,
+                Some(response),
+            )
+        }
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }
@@ -147,6 +216,13 @@ pub async fn preview_parse_plan(
 ) -> impl IntoResponse {
     match managed_sites::preview_parse_plan(payload) {
         Ok(plan) => admin_response::ok("获取解析预览成功", plan),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn preflight_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::preflight_site(&site_id).await {
+        Ok(report) => admin_response::ok("部署预检完成", report),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }
@@ -190,11 +266,31 @@ pub async fn parse_site(Path(site_id): Path<String>) -> impl IntoResponse {
     }
 }
 
-pub async fn start_site(Path(site_id): Path<String>) -> impl IntoResponse {
-    match managed_sites::start_site(site_id.clone()).await {
+pub async fn generate_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::generate_site(site_id.clone(), true).await {
         Ok(()) => admin_response::accepted(
+            "已提交模型生成任务",
+            json!({ "site_id": site_id, "action": "generate" }),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn deploy_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    match submit_managed_site_task(&site_id, TaskType::DeployManagedSite, "完整部署") {
+        Ok(task_id) => admin_response::accepted(
+            "已提交完整部署任务",
+            json!({ "site_id": site_id, "action": "deploy", "task_id": task_id }),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn start_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    match submit_managed_site_task(&site_id, TaskType::StartManagedSite, "启动站点") {
+        Ok(task_id) => admin_response::accepted(
             "已提交启动任务",
-            json!({ "site_id": site_id, "action": "start" }),
+            json!({ "site_id": site_id, "action": "start", "task_id": task_id }),
         ),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
@@ -203,8 +299,8 @@ pub async fn start_site(Path(site_id): Path<String>) -> impl IntoResponse {
 pub async fn stop_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::stop_site(&site_id).await {
         Ok(result) if result.conflict => admin_response::conflict(format!(
-            "受管进程已停止，但端口仍被外部进程占用: web={:?} db={:?}",
-            result.web_conflict_pids, result.db_conflict_pids
+            "受管进程已停止，但端口仍被外部进程占用: web={:?} db={:?} viewer={:?}",
+            result.web_conflict_pids, result.db_conflict_pids, result.viewer_conflict_pids
         )),
         Ok(result) => admin_response::ok("停止站点成功", result.site),
         Err(err) => admin_response::managed_error(err.to_string()),
@@ -239,10 +335,17 @@ pub async fn get_site_logs(Path(site_id): Path<String>) -> impl IntoResponse {
     }
 }
 
+pub async fn get_site_deploy_validation(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::deploy_validation_report(&site_id) {
+        Ok(report) => admin_response::ok("获取部署验收报告成功", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
 /// 单条日志类别的分页尾部查询（D5 / Sprint D · 修 G13）
 ///
 /// `GET /api/admin/sites/{id}/logs/{kind}?limit=N`
-/// - `kind` ∈ parse / db / web
+/// - `kind` ∈ parse / generate / db / web
 /// - `limit` 默认 200，上限 5000；超出会被钳制
 /// - 响应包含 `total_lines` 与 `truncated` 让前端决定是否展示「加载更多」
 #[derive(Debug, Deserialize)]

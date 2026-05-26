@@ -20,7 +20,7 @@ use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{info, warn};
 
 use crate::web_api::jwt_auth::TokenClaims;
-use crate::web_api::review_db::review_primary_db;
+use crate::web_api::review_db::{await_review_query, fresh_review_db};
 
 // ============================================================================
 // Types
@@ -319,12 +319,27 @@ async fn apply_annotation_state(
         "timestamp": chrono::Utc::now().timestamp_millis(),
     });
 
-    let existing = match review_primary_db()
-        .query(
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ApplyAnnotationStateResponse {
+                    success: false,
+                    state: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let existing = match await_review_query(
+        "review.annotation_states.existing",
+        db.query(
             "SELECT * FROM review_annotation_states WHERE record::id(id) = $composite_id LIMIT 1",
         )
-        .bind(("composite_id", composite_id.clone()))
-        .await
+        .bind(("composite_id", composite_id.clone())),
+    )
+    .await
     {
         Ok(mut resp) => {
             let rows: Vec<AnnotationStateRow> = resp.take(0).unwrap_or_default();
@@ -380,23 +395,25 @@ async fn apply_annotation_state(
         } RETURN AFTER
     "#;
 
-    match review_primary_db()
-        .query(upsert_sql)
-        .bind(("composite_id", composite_id))
-        .bind(("form_id", form_id.to_string()))
-        .bind(("task_id", task_id.to_string()))
-        .bind(("annotation_id", annotation_id.to_string()))
-        .bind(("annotation_type", annotation_type.clone()))
-        .bind(("workflow_node", current_node.clone()))
-        .bind(("review_round", review_round))
-        .bind(("resolution_status", resolution_status.to_string()))
-        .bind(("decision_status", decision_status.to_string()))
-        .bind(("note", note))
-        .bind(("updated_by_id", user_id))
-        .bind(("updated_by_name", user_name))
-        .bind(("updated_by_role", user_role))
-        .bind(("merged_history", merged_history))
-        .await
+    match await_review_query(
+        "review.annotation_states.upsert",
+        db.query(upsert_sql)
+            .bind(("composite_id", composite_id))
+            .bind(("form_id", form_id.to_string()))
+            .bind(("task_id", task_id.to_string()))
+            .bind(("annotation_id", annotation_id.to_string()))
+            .bind(("annotation_type", annotation_type.clone()))
+            .bind(("workflow_node", current_node.clone()))
+            .bind(("review_round", review_round))
+            .bind(("resolution_status", resolution_status.to_string()))
+            .bind(("decision_status", decision_status.to_string()))
+            .bind(("note", note))
+            .bind(("updated_by_id", user_id))
+            .bind(("updated_by_name", user_name))
+            .bind(("updated_by_role", user_role))
+            .bind(("merged_history", merged_history)),
+    )
+    .await
     {
         Ok(mut response) => {
             let rows: Vec<AnnotationStateRow> = response.take(0).unwrap_or_default();
@@ -468,14 +485,25 @@ async fn query_annotation_states(
         )
     };
 
-    let mut q = review_primary_db()
-        .query(&sql)
-        .bind(("form_id", form_id.to_string()));
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(QueryAnnotationStatesResponse {
+                    success: false,
+                    states: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&sql).bind(("form_id", form_id.to_string()));
     if let Some(tid) = task_id_bind {
         q = q.bind(("task_id", tid));
     }
 
-    match q.await {
+    match await_review_query("review.annotation_states.query", q).await {
         Ok(mut response) => {
             let rows: Vec<AnnotationStateRow> = response.take(0).unwrap_or_default();
             let states: Vec<AnnotationStateView> =
@@ -596,11 +624,15 @@ async fn lookup_task_node(task_id: &str) -> Result<Option<TaskNodeRow>, String> 
         LIMIT 1
     "#;
 
-    let mut response = review_primary_db()
-        .query(sql)
-        .bind(("id", task_id.to_string()))
+    let db = fresh_review_db()
         .await
-        .map_err(|e| format!("查询任务失败: {}", e))?;
+        .map_err(|e| format!("连接校审数据库失败: {}", e))?;
+    let mut response = await_review_query(
+        "review.annotation_states.task_node",
+        db.query(sql).bind(("id", task_id.to_string())),
+    )
+    .await
+    .map_err(|e| format!("查询任务失败: {}", e))?;
 
     let rows: Vec<TaskNodeRow> = response.take(0).unwrap_or_default();
     Ok(rows.into_iter().next())
@@ -614,11 +646,15 @@ async fn compute_review_round(task_id: &str) -> Result<u32, String> {
         GROUP ALL
     "#;
 
-    let mut response = review_primary_db()
-        .query(sql)
-        .bind(("task_id", task_id.to_string()))
+    let db = fresh_review_db()
         .await
-        .map_err(|e| format!("计算 review_round 失败: {}", e))?;
+        .map_err(|e| format!("连接校审数据库失败: {}", e))?;
+    let mut response = await_review_query(
+        "review.annotation_states.review_round",
+        db.query(sql).bind(("task_id", task_id.to_string())),
+    )
+    .await
+    .map_err(|e| format!("计算 review_round 失败: {}", e))?;
 
     let rows: Vec<ReturnCountRow> = response.take(0).unwrap_or_default();
     let return_count = rows.into_iter().next().and_then(|r| r.count).unwrap_or(0);
@@ -664,6 +700,16 @@ pub async fn sync_annotation_states_from_snapshot(
     rect_annotations: &[Value],
 ) {
     let review_round = compute_review_round(task_id).await.unwrap_or(1);
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!(
+                "sync_annotation_states_from_snapshot skipped: failed to connect review db: {}",
+                e
+            );
+            return;
+        }
+    };
 
     let bundles: [(&str, &[Value]); 3] = [
         ("text", annotations),
@@ -726,21 +772,23 @@ pub async fn sync_annotation_states_from_snapshot(
                 }
             "#;
 
-            if let Err(e) = review_primary_db()
-                .query(sql)
-                .bind(("composite_id", composite_id))
-                .bind(("form_id", form_id.to_string()))
-                .bind(("task_id", task_id.to_string()))
-                .bind(("annotation_id", annotation_id.to_string()))
-                .bind(("annotation_type", anno_type.to_string()))
-                .bind(("workflow_node", current_node.to_string()))
-                .bind(("review_round", review_round))
-                .bind(("resolution_status", resolution_status))
-                .bind(("decision_status", decision_status))
-                .bind(("updated_by_id", operator_id.to_string()))
-                .bind(("updated_by_name", operator_name.to_string()))
-                .bind(("updated_by_role", operator_role.to_string()))
-                .await
+            if let Err(e) = await_review_query(
+                "review.annotation_states.sync_snapshot",
+                db.query(sql)
+                    .bind(("composite_id", composite_id))
+                    .bind(("form_id", form_id.to_string()))
+                    .bind(("task_id", task_id.to_string()))
+                    .bind(("annotation_id", annotation_id.to_string()))
+                    .bind(("annotation_type", anno_type.to_string()))
+                    .bind(("workflow_node", current_node.to_string()))
+                    .bind(("review_round", review_round))
+                    .bind(("resolution_status", resolution_status))
+                    .bind(("decision_status", decision_status))
+                    .bind(("updated_by_id", operator_id.to_string()))
+                    .bind(("updated_by_name", operator_name.to_string()))
+                    .bind(("updated_by_role", operator_role.to_string())),
+            )
+            .await
             {
                 warn!(
                     "sync_annotation_states_from_snapshot failed for {}/{}: {}",
@@ -759,12 +807,17 @@ pub async fn load_annotation_states_by_task(
     let sql =
         "SELECT * FROM review_annotation_states WHERE form_id = $form_id AND task_id = $task_id";
 
-    let mut response = review_primary_db()
-        .query(sql)
-        .bind(("form_id", form_id.to_string()))
-        .bind(("task_id", task_id.to_string()))
+    let db = fresh_review_db()
         .await
-        .map_err(|e| format!("查询独立批注状态失败: {}", e))?;
+        .map_err(|e| format!("连接校审数据库失败: {}", e))?;
+    let mut response = await_review_query(
+        "review.annotation_states.by_task",
+        db.query(sql)
+            .bind(("form_id", form_id.to_string()))
+            .bind(("task_id", task_id.to_string())),
+    )
+    .await
+    .map_err(|e| format!("查询独立批注状态失败: {}", e))?;
 
     let rows: Vec<AnnotationStateRow> = response.take(0).unwrap_or_default();
     Ok(rows.into_iter().map(state_view_from_row).collect())
@@ -774,11 +827,15 @@ pub async fn load_annotation_states_by_task(
 pub async fn delete_annotation_states_by_form_id(form_id: &str) -> Result<(), String> {
     let sql = "DELETE FROM review_annotation_states WHERE form_id = $form_id";
 
-    review_primary_db()
-        .query(sql)
-        .bind(("form_id", form_id.to_string()))
+    let db = fresh_review_db()
         .await
-        .map_err(|e| format!("删除批注状态失败: {}", e))?;
+        .map_err(|e| format!("连接校审数据库失败: {}", e))?;
+    await_review_query(
+        "review.annotation_states.delete_by_form",
+        db.query(sql).bind(("form_id", form_id.to_string())),
+    )
+    .await
+    .map_err(|e| format!("删除批注状态失败: {}", e))?;
 
     info!("Deleted annotation states for form_id={}", form_id);
     Ok(())

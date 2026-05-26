@@ -144,6 +144,7 @@ struct MissingMeshReportSummary {
     checked_geo_hashes: usize,
     missing_geo_hashes: usize,
     missing_owner_refnos: usize,
+    missing_geo_hash_values: HashSet<String>,
 }
 
 fn mesh_base_dir_from_db_option(db_option: &DbOption) -> PathBuf {
@@ -198,6 +199,61 @@ fn record_geo_hash_usage(
         .or_default()
         .insert(owner_refno.to_string());
     *row_count_by_hash.entry(hash.to_string()).or_insert(0) += 1;
+}
+
+fn append_tubing_rows_for_owner(
+    owner_refno: &RefnoEnum,
+    tubis: &[TubiQueryResult],
+    spec_info_map: &HashMap<u64, i64>,
+    dbnum: u32,
+    tubing_rows: &mut Vec<TubingRow>,
+    trans_hashes: &mut HashSet<String>,
+    aabb_hashes: &mut HashSet<String>,
+    owner_refnos_by_hash: &mut HashMap<String, HashSet<String>>,
+    row_count_by_hash: &mut HashMap<String, usize>,
+) {
+    for tubi in tubis {
+        let aabb_hash = tubi.world_aabb_hash.clone().unwrap_or_default();
+        let trans_hash = tubi.world_trans_hash.clone().unwrap_or_default();
+        let geo_hash = tubi.geo_hash.clone().unwrap_or_default();
+
+        if aabb_hash.is_empty() || geo_hash.is_empty() {
+            continue;
+        }
+
+        if !aabb_hash.is_empty() {
+            aabb_hashes.insert(aabb_hash.clone());
+        }
+        if !trans_hash.is_empty() {
+            trans_hashes.insert(trans_hash.clone());
+        }
+
+        let index = tubi.index.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+
+        let mut tubi_spec = tubi.spec_value.unwrap_or(0);
+        if tubi_spec == 0 {
+            tubi_spec = *spec_info_map.get(&refno_to_u64(owner_refno)).unwrap_or(&0);
+        }
+
+        tubing_rows.push(TubingRow {
+            tubi_refno_str: tubi.leave.to_string(),
+            tubi_refno_u64: refno_to_u64(&tubi.leave),
+            owner_refno_str: owner_refno.to_string(),
+            owner_refno_u64: refno_to_u64(owner_refno),
+            order: index,
+            geo_hash,
+            trans_hash,
+            aabb_hash,
+            spec_value: tubi_spec,
+            dbnum,
+        });
+        record_geo_hash_usage(
+            &tubi.geo_hash.clone().unwrap_or_default(),
+            &owner_refno.to_string(),
+            owner_refnos_by_hash,
+            row_count_by_hash,
+        );
+    }
 }
 
 fn write_missing_mesh_report(
@@ -311,6 +367,10 @@ fn write_missing_mesh_report(
         checked_geo_hashes,
         missing_geo_hashes: missing_entries.len(),
         missing_owner_refnos: missing_owner_union.len(),
+        missing_geo_hash_values: missing_entries
+            .iter()
+            .map(|(geo_hash, _, _, _, _)| geo_hash.clone())
+            .collect(),
     })
 }
 
@@ -690,25 +750,66 @@ async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<Ins
         );
     }
 
-    let sql = r#"
-        SELECT
-            owner_refno,
-            owner_type,
-            in as refno,
-            in.noun as noun,
-            spec_value as spec_value
-        FROM inst_relate
-        WHERE dbnum = $dbnum
-    "#;
+    const PAGE_SIZE: usize = 10_000;
 
-    let mut resp = aios_core::project_primary_db()
-        .query(sql)
-        .bind(("dbnum", dbnum))
-        .await?;
-    let rows: Vec<InstRelateRow> = resp.take(0)?;
+    let query_start = std::time::Instant::now();
+    let mut rows = Vec::new();
+    let mut offset = 0usize;
+    let mut page = 0usize;
+
+    loop {
+        let sql = format!(
+            r#"
+            SELECT
+                owner_refno,
+                owner_type,
+                in as refno,
+                in.noun as noun,
+                spec_value as spec_value
+            FROM inst_relate
+            WHERE dbnum = $dbnum
+            ORDER BY in
+            LIMIT {PAGE_SIZE} START {offset}
+            "#
+        );
+
+        let page_start = std::time::Instant::now();
+        let mut resp = aios_core::project_primary_db()
+            .query(&sql)
+            .bind(("dbnum", dbnum))
+            .await?;
+        let mut page_rows: Vec<InstRelateRow> = resp.take(0)?;
+
+        if page_rows.is_empty() {
+            break;
+        }
+
+        page += 1;
+        offset += page_rows.len();
+
+        if verbose {
+            println!(
+                "   - inst_relate page {}: {} rows ({:?})",
+                page,
+                page_rows.len(),
+                page_start.elapsed()
+            );
+        }
+
+        let is_last_page = page_rows.len() < PAGE_SIZE;
+        rows.append(&mut page_rows);
+
+        if is_last_page {
+            break;
+        }
+    }
 
     if verbose {
-        println!("✅ inst_relate 命中记录: {}", rows.len());
+        println!(
+            "✅ inst_relate 命中记录: {} ({:?})",
+            rows.len(),
+            query_start.elapsed()
+        );
     }
 
     Ok(rows)
@@ -837,11 +938,11 @@ async fn query_export_insts_local(
                                 record::id(trans) as trans_hash,
                                 record::id(out) as geo_hash,
                                 out.unit_flag ?? false as unit_flag
-                            FROM $parent.out->geo_relate
+                            FROM out->geo_relate
                             WHERE visible
-                              && (out.unit_flag || record::id(out) IN ['1','2','3'] || true)
+                              && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                               && (trans.d ?? NONE) != NONE
-                              && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
+                              && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
                         ) as insts,
                         false as has_neg
                     FROM [{non_bool_keys}]
@@ -880,11 +981,11 @@ async fn query_export_insts_local(
                             record::id(trans) as trans_hash,
                             record::id(out) as geo_hash,
                             out.unit_flag ?? false as unit_flag
-                        FROM $parent.out->geo_relate
+                        FROM out->geo_relate
                         WHERE visible
-                          && (out.unit_flag || record::id(out) IN ['1','2','3'] || true)
+                          && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                           && (trans.d ?? NONE) != NONE
-                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
+                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
                     ) as insts,
                     false as has_neg
                 FROM [{inst_relate_keys}]
@@ -1319,7 +1420,7 @@ pub async fn export_dbnum_instances_parquet(
     // =========================================================================
     // 4. 查询 tubi_relate
     // =========================================================================
-    let tubi_owner_refnos: Vec<RefnoEnum> = grouped_children
+    let mut tubi_owner_refnos: Vec<RefnoEnum> = grouped_children
         .iter()
         .filter(|(_, children)| {
             children
@@ -1328,6 +1429,17 @@ pub async fn export_dbnum_instances_parquet(
         })
         .map(|(k, _)| *k)
         .collect();
+
+    if let Some(root) = root_refno {
+        let root_noun = tree_manager
+            .get_noun(root)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+        if matches!(root_noun.as_str(), "BRAN" | "HANG") && !tubi_owner_refnos.contains(&root) {
+            tubi_owner_refnos.push(root);
+        }
+    }
 
     if verbose {
         println!(
@@ -1347,6 +1459,8 @@ pub async fn export_dbnum_instances_parquet(
     let mut aabb_hashes: HashSet<String> = HashSet::new();
     let mut owner_refnos_by_hash: HashMap<String, HashSet<String>> = HashMap::new();
     let mut row_count_by_hash: HashMap<String, usize> = HashMap::new();
+
+    let mut emitted_tubing_owners: HashSet<RefnoEnum> = HashSet::new();
 
     // 处理 grouped children
     for (owner_refno, children) in &grouped_children {
@@ -1417,48 +1531,37 @@ pub async fn export_dbnum_instances_parquet(
 
         // tubings
         if let Some(tubis) = tubings_map.get(owner_refno) {
-            for tubi in tubis {
-                let aabb_hash = tubi.world_aabb_hash.clone().unwrap_or_default();
-                let trans_hash = tubi.world_trans_hash.clone().unwrap_or_default();
-                let geo_hash = tubi.geo_hash.clone().unwrap_or_default();
+            append_tubing_rows_for_owner(
+                owner_refno,
+                tubis,
+                &spec_info_map,
+                dbnum,
+                &mut tubing_rows,
+                &mut trans_hashes,
+                &mut aabb_hashes,
+                &mut owner_refnos_by_hash,
+                &mut row_count_by_hash,
+            );
+            emitted_tubing_owners.insert(*owner_refno);
+        }
+    }
 
-                if aabb_hash.is_empty() || geo_hash.is_empty() {
-                    continue;
-                }
-
-                if !aabb_hash.is_empty() {
-                    aabb_hashes.insert(aabb_hash.clone());
-                }
-                if !trans_hash.is_empty() {
-                    trans_hashes.insert(trans_hash.clone());
-                }
-
-                let index = tubi.index.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
-
-                let mut tubi_spec = tubi.spec_value.unwrap_or(0);
-                if tubi_spec == 0 {
-                    tubi_spec = *spec_info_map.get(&refno_to_u64(owner_refno)).unwrap_or(&0);
-                }
-
-                tubing_rows.push(TubingRow {
-                    tubi_refno_str: tubi.leave.to_string(),
-                    tubi_refno_u64: refno_to_u64(&tubi.leave),
-                    owner_refno_str: owner_refno.to_string(),
-                    owner_refno_u64: refno_to_u64(owner_refno),
-                    order: index,
-                    geo_hash,
-                    trans_hash,
-                    aabb_hash,
-                    spec_value: tubi_spec,
-                    dbnum,
-                });
-                record_geo_hash_usage(
-                    &tubi.geo_hash.clone().unwrap_or_default(),
-                    &owner_refno.to_string(),
-                    &mut owner_refnos_by_hash,
-                    &mut row_count_by_hash,
-                );
-            }
+    for owner_refno in &tubi_owner_refnos {
+        if emitted_tubing_owners.contains(owner_refno) {
+            continue;
+        }
+        if let Some(tubis) = tubings_map.get(owner_refno) {
+            append_tubing_rows_for_owner(
+                owner_refno,
+                tubis,
+                &spec_info_map,
+                dbnum,
+                &mut tubing_rows,
+                &mut trans_hashes,
+                &mut aabb_hashes,
+                &mut owner_refnos_by_hash,
+                &mut row_count_by_hash,
+            );
         }
     }
 
@@ -1530,6 +1633,42 @@ pub async fn export_dbnum_instances_parquet(
         &row_count_by_hash,
         verbose,
     )?;
+
+    if !missing_mesh_report.missing_geo_hash_values.is_empty() {
+        let before_geo_rows = geo_instance_rows.len();
+        let before_tubing_rows = tubing_rows.len();
+        let before_instance_rows = instance_rows.len();
+
+        geo_instance_rows.retain(|row| {
+            !missing_mesh_report
+                .missing_geo_hash_values
+                .contains(row.geo_hash.trim())
+        });
+        tubing_rows.retain(|row| {
+            !missing_mesh_report
+                .missing_geo_hash_values
+                .contains(row.geo_hash.trim())
+        });
+
+        let renderable_refnos = geo_instance_rows
+            .iter()
+            .map(|row| row.refno_str.clone())
+            .chain(tubing_rows.iter().map(|row| row.owner_refno_str.clone()))
+            .collect::<HashSet<_>>();
+        instance_rows.retain(|row| renderable_refnos.contains(&row.refno_str));
+
+        if verbose {
+            println!(
+                "   ⚠️ 已从 Parquet 渲染表剔除缺失 GLB: geo_rows {} -> {}, tubings {} -> {}, instances {} -> {}",
+                before_geo_rows,
+                geo_instance_rows.len(),
+                before_tubing_rows,
+                tubing_rows.len(),
+                before_instance_rows,
+                instance_rows.len()
+            );
+        }
+    }
 
     // =========================================================================
     // 6. 查询 trans/aabb 实际数据

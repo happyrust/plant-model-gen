@@ -529,8 +529,8 @@ async fn refresh_sqlite_spatial_index_from_refnos(
                 in.noun as noun,
                 NONE as name,
                 spec_value
-            FROM [{pe_list}]->inst_relate
-            WHERE in != NONE
+            FROM inst_relate
+            WHERE in IN [{pe_list}] AND in != NONE
             "#
         );
         let inst_rows: Vec<InstRelateRow> = model_primary_db().query_take(&inst_sql, 0).await?;
@@ -1059,7 +1059,7 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
     idx: &SqliteSpatialIndex,
     db_nums: &[u32],
 ) -> anyhow::Result<SpatialIndexRefreshStats> {
-    const PAGE_SIZE: usize = 10_000;
+    const AABB_QUERY_BATCH_SIZE: usize = 2_000;
     const INSERT_BATCH_SIZE: usize = 5_000;
 
     let mut stats = SpatialIndexRefreshStats::default();
@@ -1067,45 +1067,73 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
         return Ok(stats);
     }
 
-    let inst_rows = query_inst_relate_rows_by_dbnums(db_nums).await?;
-    let inst_map: HashMap<RefnoEnum, InstRelateRow> = inst_rows
-        .into_iter()
-        .filter(|row| row.refno.is_valid())
-        .map(|row| (row.refno, row))
-        .collect();
-
-    let booled_rows =
-        query_aabb_rows_by_dbnums("inst_relate_booled_aabb", db_nums, PAGE_SIZE).await?;
-    let raw_rows = query_aabb_rows_by_dbnums("inst_relate_aabb", db_nums, PAGE_SIZE).await?;
-
-    let mut booled_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
-    for row in booled_rows {
-        if !row.refno.is_valid() {
-            continue;
-        }
-        let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
-            stats.skipped_invalid_aabb += 1;
-            continue;
-        };
-        booled_map
-            .entry(row.refno)
-            .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
-            .or_insert(aabb);
+    let scoped_refnos = query_visible_geo_refnos_by_dbnums(db_nums).await?;
+    if scoped_refnos.is_empty() {
+        warn!(
+            "[room_model] SQLite AABB dbnum 刷新跳过: TreeIndex 未找到可见几何 refnos, dbnums={:?}",
+            db_nums
+        );
+        return Ok(stats);
     }
 
+    let mut booled_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
     let mut raw_map: HashMap<RefnoEnum, Aabb> = HashMap::new();
-    for row in raw_rows {
-        if !row.refno.is_valid() {
-            continue;
+
+    let total_query_chunks =
+        (scoped_refnos.len() + AABB_QUERY_BATCH_SIZE - 1) / AABB_QUERY_BATCH_SIZE;
+    for (chunk_idx, chunk) in scoped_refnos.chunks(AABB_QUERY_BATCH_SIZE).enumerate() {
+        let pe_list = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT refno, aabb_id.d as aabb
+            FROM inst_relate_booled_aabb
+            WHERE refno IN [{pe_list}] AND aabb_id.d != NONE;
+            SELECT refno, aabb_id.d as aabb
+            FROM inst_relate_aabb
+            WHERE refno IN [{pe_list}] AND aabb_id.d != NONE;
+            "#
+        );
+        let mut response = model_primary_db().query_response(&sql).await?;
+        let booled_rows: Vec<QueryAabbRowRaw> = response.take(0)?;
+        let raw_rows: Vec<QueryAabbRowRaw> = response.take(1)?;
+
+        for row in booled_rows {
+            if !row.refno.is_valid() {
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                stats.skipped_invalid_aabb += 1;
+                continue;
+            };
+            merge_aabb_into(&mut booled_map, row.refno, aabb);
         }
-        let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
-            stats.skipped_invalid_aabb += 1;
-            continue;
-        };
-        raw_map
-            .entry(row.refno)
-            .and_modify(|acc| *acc = merge_aabb(acc, &aabb))
-            .or_insert(aabb);
+
+        for row in raw_rows {
+            if !row.refno.is_valid() {
+                continue;
+            }
+            let Some(aabb) = parse_inst_relate_aabb(&row.aabb) else {
+                stats.skipped_invalid_aabb += 1;
+                continue;
+            };
+            merge_aabb_into(&mut raw_map, row.refno, aabb);
+        }
+
+        let current = chunk_idx + 1;
+        if current == 1 || current == total_query_chunks || current % 10 == 0 {
+            println!(
+                "[room_model] SQLite AABB dbnum 查询进度: {}/{}, raw={}, booled={}",
+                current,
+                total_query_chunks,
+                raw_map.len(),
+                booled_map.len()
+            );
+        }
     }
 
     let mut real_aabb_map = raw_map.clone();
@@ -1143,6 +1171,13 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
     let mut spec_resolver = SpatialIndexSpecResolver::new()?;
 
     for (batch_idx, chunk) in all_refnos.chunks(INSERT_BATCH_SIZE).enumerate() {
+        let inst_rows = query_inst_relate_batch(chunk, false, false).await?;
+        let inst_map: HashMap<RefnoEnum, InstRelateRow> = inst_rows
+            .into_iter()
+            .filter(|row| row.refno.is_valid())
+            .map(|row| (row.refno, row))
+            .collect();
+
         let mut batch_with_spec: Vec<(i64, String, i64, f64, f64, f64, f64, f64, f64)> =
             Vec::with_capacity(chunk.len());
 

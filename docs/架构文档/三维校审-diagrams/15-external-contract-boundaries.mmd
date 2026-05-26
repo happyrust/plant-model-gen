@@ -1,0 +1,56 @@
+flowchart TB
+  subgraph ExternalTruth["PMS 事实源"]
+    FormId["form_id<br/>单据主键"]
+    Actor["actor<br/>当前办理人"]
+    Action["action<br/>流程动作"]
+    NextStep["nextStep<br/>下一办理人 + 角色"]
+  end
+
+  subgraph Plant3DTruth["Plant3D 事实源"]
+    Model["模型构件选择"]
+    Annotation["批注 / 云线 / OBB"]
+    Measure["测量"]
+    Attachment["附件"]
+    Record["review_records<br/>确认快照"]
+  end
+
+  subgraph Mirror["Plant3D 流程镜像"]
+    Task["review_tasks<br/>current_node / status / return_reason"]
+    Form["review_forms<br/>form_status / task_created"]
+    History["review_workflow_history<br/>action / actor / target_node"]
+  end
+
+  subgraph Forbidden["禁止混合事实源"]
+    InferNext["前端不得推导 nextStep"]
+    TargetOnly["targetNode 仅诊断<br/>不能补 assignee_id"]
+    VerifyWrite["verify 不写库"]
+    ReturnGate["return 不做批注状态门禁"]
+  end
+
+  FormId --> Record
+  FormId --> Task
+  FormId --> Form
+  Model --> Record
+  Annotation --> Record
+  Measure --> Record
+  Attachment --> Record
+
+  Action --> Task
+  Actor --> History
+  NextStep --> Task
+  NextStep --> History
+  Task --> Form
+
+  NextStep -. "缺失则失败" .-> InferNext
+  Action -. "verify 只预校验" .-> VerifyWrite
+  Action -. "return 只查节点合法性" .-> ReturnGate
+  TargetOnly -. "不作为流程事实" .-> InferNext
+
+  classDef pms fill:#fff2cc,stroke:#d6b656,color:#111;
+  classDef plant fill:#dae8fc,stroke:#6c8ebf,color:#111;
+  classDef mirror fill:#d5e8d4,stroke:#82b366,color:#111;
+  classDef forbid fill:#f8cecc,stroke:#b85450,color:#111;
+  class FormId,Actor,Action,NextStep pms;
+  class Model,Annotation,Measure,Attachment,Record plant;
+  class Task,Form,History mirror;
+  class InferNext,TargetOnly,VerifyWrite,ReturnGate forbid;

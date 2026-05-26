@@ -154,7 +154,12 @@ sysinfo = { version = "0.37.0", optional = true }
 # SQLite driver for spatial tests and cache
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 
-# DuckDB removed - backend no longer uses this feature
+# DuckDB (bundled) — gated behind `model-writer-ducklake` feature for the DuckLakeModelWriterBackend.
+# 旧的 `# DuckDB removed - backend no longer uses this feature` 注释指的是更早的占位依赖；
+# 本次为 goals/ducklake-model-writer goal 引入，用于 src/fast_model/gen_model/model_writer_ducklake.rs。
+duckdb = { version = "1.10502.0", optional = true, default-features = false, features = [
+    "bundled",
+] }
 
 indicatif = "0.18.1"
 rust_xlsxwriter = { version = "0.91.0", optional = true }
@@ -253,6 +258,8 @@ manifold = ["aios_core/manifold"]
 surreal-save = []
 write-to-surrealdb = []
 model-writer-drain = []
+# DuckLake backend for ModelWriter (goals/ducklake-model-writer). Default off; loads Rust duckdb crate.
+model-writer-ducklake = ["dep:duckdb"]
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

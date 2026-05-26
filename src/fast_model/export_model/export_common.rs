@@ -700,7 +700,7 @@ pub struct InstRelateAabbRow {
 
 /// 批量查询 inst_relate（基础版，不含 aabb_hash）
 ///
-/// 使用图遍历语法 `[{pe_list}]->inst_relate` 替代 `FROM inst_relate WHERE in IN [...]`。
+/// 直接查询 `inst_relate` 表，避免图遍历在部分 SurrealDB 版本中把缺失字段折叠成空数组。
 /// `include_name` 为 true 时额外查询 `fn::default_full_name(in) as name`。
 pub async fn query_inst_relate_batch(
     refnos: &[RefnoEnum],
@@ -747,8 +747,8 @@ pub async fn query_inst_relate_batch(
                 in.noun as noun,
                 {name_field}
                 spec_value
-            FROM [{pe_list}]->inst_relate
-            WHERE in != NONE
+            FROM inst_relate
+            WHERE in IN [{pe_list}] AND in != NONE
             "#
         );
 

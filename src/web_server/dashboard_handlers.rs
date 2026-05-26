@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 use tracing::warn;
 
+use crate::web_api::review_db::{await_review_query, fresh_review_db};
+
 use super::{
     AppState, TaskManager,
     models::{TaskInfo, TaskStatus, TaskType},
@@ -67,6 +69,8 @@ fn task_type_label(task_type: &TaskType) -> &'static str {
         TaskType::DataParsingWizard => "数据解析向导",
         TaskType::RefnoModelGeneration => "按 Refno 生成模型",
         TaskType::ModelExport => "模型导出",
+        TaskType::StartManagedSite => "启动受管站点",
+        TaskType::DeployManagedSite => "完整部署受管站点",
         TaskType::Custom(_) => "自定义任务",
     }
 }
@@ -183,10 +187,22 @@ async fn load_review_activities(limit: usize) -> Vec<DashboardActivityItem> {
         LIMIT $limit
     "#;
 
-    match aios_core::project_primary_db()
-        .query(sql)
-        .bind(("limit", limit as i64))
-        .await
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(error) => {
+            warn!(
+                "Dashboard review activities skipped: failed to connect review db: {}",
+                error
+            );
+            return Vec::new();
+        }
+    };
+
+    match await_review_query(
+        "dashboard.review_activities",
+        db.query(sql).bind(("limit", limit as i64)),
+    )
+    .await
     {
         Ok(mut response) => {
             let rows: Vec<ReviewActivityRow> = response.take(0).unwrap_or_default();

@@ -1,5 +1,8 @@
 use anyhow::{Result, anyhow};
 use once_cell::sync::OnceCell;
+use std::future::{Future, IntoFuture};
+use std::time::Instant;
+use surrealdb::IndexedResults;
 use surrealdb::Surreal;
 use surrealdb::engine::remote::ws::{Client, Ws};
 use surrealdb::opt::auth::Root;
@@ -10,36 +13,100 @@ use aios_core::options::{DbConnMode, DbOption};
 static REVIEW_PRIMARY_DB: OnceCell<Surreal<Client>> = OnceCell::new();
 static REVIEW_QUERY_INDEXES_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
+const REVIEW_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const REVIEW_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const REVIEW_DDL_TIMEOUT: Duration = Duration::from_secs(30);
+const REVIEW_SLOW_QUERY_WARN: Duration = Duration::from_millis(1000);
+
+async fn with_review_timeout<T, F>(
+    operation: &'static str,
+    timeout_after: Duration,
+    fut: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let started = Instant::now();
+    match timeout(timeout_after, fut).await {
+        Ok(Ok(value)) => {
+            let elapsed = started.elapsed();
+            if elapsed >= REVIEW_SLOW_QUERY_WARN {
+                tracing::warn!(
+                    "[REVIEW_DB.slow] operation={} elapsed_ms={} timeout_ms={}",
+                    operation,
+                    elapsed.as_millis(),
+                    timeout_after.as_millis()
+                );
+            }
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                "[REVIEW_DB.error] operation={} elapsed_ms={} error={}",
+                operation,
+                started.elapsed().as_millis(),
+                error
+            );
+            Err(error)
+        }
+        Err(_) => {
+            tracing::warn!(
+                "[REVIEW_DB.timeout] operation={} elapsed_ms={} timeout_ms={}",
+                operation,
+                started.elapsed().as_millis(),
+                timeout_after.as_millis()
+            );
+            Err(anyhow!(
+                "{} 超时（{}ms）",
+                operation,
+                timeout_after.as_millis()
+            ))
+        }
+    }
+}
+
+pub async fn await_review_query<F>(operation: &'static str, fut: F) -> Result<IndexedResults>
+where
+    F: IntoFuture<Output = std::result::Result<IndexedResults, surrealdb::Error>>,
+{
+    with_review_timeout(operation, REVIEW_QUERY_TIMEOUT, async {
+        fut.into_future().await.map_err(anyhow::Error::from)
+    })
+    .await
+}
+
+pub async fn await_review_query_long<F>(operation: &'static str, fut: F) -> Result<IndexedResults>
+where
+    F: IntoFuture<Output = std::result::Result<IndexedResults, surrealdb::Error>>,
+{
+    with_review_timeout(operation, Duration::from_secs(8), async {
+        fut.into_future().await.map_err(anyhow::Error::from)
+    })
+    .await
+}
+
+async fn await_review_ddl<F>(operation: &'static str, fut: F) -> Result<IndexedResults>
+where
+    F: IntoFuture<Output = std::result::Result<IndexedResults, surrealdb::Error>>,
+{
+    with_review_timeout(operation, REVIEW_DDL_TIMEOUT, async {
+        fut.into_future().await.map_err(anyhow::Error::from)
+    })
+    .await
+}
+
 pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_some() {
         return Ok(());
     }
 
-    let surreal_cfg = db_option.effective_surrealdb();
-    if surreal_cfg.mode != DbConnMode::Ws {
-        return Err(anyhow!(
-            "review_primary_db 仅支持 surrealdb.mode=ws，当前为 {}",
-            surreal_cfg.mode.as_str()
-        ));
-    }
-
-    let address = format!(
-        "{}:{}",
-        if surreal_cfg.ip == "localhost" {
-            "127.0.0.1"
-        } else {
-            surreal_cfg.ip.as_str()
-        },
-        surreal_cfg.port
-    );
-    let db = Surreal::new::<Ws>(address.as_str()).await?;
-
-    db.signin(Root {
-        username: surreal_cfg.user.clone(),
-        password: surreal_cfg.password.clone(),
-    })
+    let db_option = db_option.clone();
+    let db = with_review_timeout(
+        "review.init_primary_db",
+        REVIEW_CONNECT_TIMEOUT,
+        async move { open_review_db_from_option(&db_option).await },
+    )
     .await?;
-    aios_core::use_ns_db_compat(&db, &db_option.surreal_ns, &db_option.project_name).await?;
 
     let _ = REVIEW_PRIMARY_DB.set(db);
     Ok(())
@@ -49,7 +116,16 @@ pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
 ///
 /// 说明：部分 Surreal WS 客户端在高并发下可能出现内部 channel 堵塞；这里按需新建连接以隔离请求。
 pub async fn fresh_review_db() -> Result<Surreal<Client>> {
-    let db_option = aios_core::get_db_option();
+    let db_option = (*aios_core::get_db_option()).clone();
+    with_review_timeout(
+        "review.fresh_connection",
+        REVIEW_CONNECT_TIMEOUT,
+        async move { open_review_db_from_option(&db_option).await },
+    )
+    .await
+}
+
+async fn open_review_db_from_option(db_option: &DbOption) -> Result<Surreal<Client>> {
     let surreal_cfg = db_option.effective_surrealdb();
     if surreal_cfg.mode != DbConnMode::Ws {
         return Err(anyhow!(
@@ -85,14 +161,18 @@ pub async fn ensure_review_primary_db_context() -> Result<()> {
     }
 
     let db_option = aios_core::get_db_option();
-    aios_core::use_ns_db_compat(
-        review_primary_db(),
-        &db_option.surreal_ns,
-        &db_option.project_name,
+    let ns = db_option.surreal_ns.clone();
+    let db = db_option.project_name.clone();
+    with_review_timeout(
+        "review.ensure_context",
+        REVIEW_CONNECT_TIMEOUT,
+        async move {
+            aios_core::use_ns_db_compat(review_primary_db(), &ns, &db)
+                .await
+                .map_err(anyhow::Error::from)
+        },
     )
     .await?;
-
-    ensure_review_query_indexes().await?;
 
     Ok(())
 }
@@ -105,8 +185,8 @@ pub fn review_primary_db() -> &'static Surreal<Client> {
 
 async fn ensure_review_query_indexes_inner() -> Result<()> {
     let db = fresh_review_db().await?;
-    timeout(
-        Duration::from_secs(30),
+    await_review_ddl(
+        "review.ensure_query_indexes",
         db.query(
             r#"
             DEFINE INDEX IF NOT EXISTS idx_review_tasks_form_id ON TABLE review_tasks FIELDS form_id;
@@ -124,8 +204,7 @@ async fn ensure_review_query_indexes_inner() -> Result<()> {
             "#,
         ),
     )
-    .await
-    .map_err(|_| anyhow!("ensure_review_query_indexes 超时"))??
+    .await?
     .check()?;
     tracing::info!(
         "[REVIEW_DB.schema] review 查询索引已确认（tasks/records/comments/attachments/form_model）"
@@ -138,6 +217,10 @@ pub async fn ensure_review_query_indexes() -> Result<()> {
         .get_or_try_init(|| async { ensure_review_query_indexes_inner().await })
         .await?;
     Ok(())
+}
+
+pub fn review_query_indexes_ready() -> bool {
+    REVIEW_QUERY_INDEXES_READY.get().is_some()
 }
 
 // ============================================================================
@@ -154,8 +237,10 @@ static REVIEW_WORKFLOW_HISTORY_SCHEMA_READY: tokio::sync::OnceCell<()> =
 
 async fn ensure_review_workflow_history_schema_inner() -> Result<()> {
     let db = fresh_review_db().await?;
-    db.query(
-        r#"
+    await_review_ddl(
+        "review.ensure_workflow_history_schema",
+        db.query(
+            r#"
         DEFINE TABLE OVERWRITE review_workflow_history SCHEMAFULL;
         DEFINE FIELD OVERWRITE task_id ON review_workflow_history TYPE string;
         DEFINE FIELD OVERWRITE node ON review_workflow_history TYPE string;
@@ -178,6 +263,7 @@ async fn ensure_review_workflow_history_schema_inner() -> Result<()> {
         DEFINE FIELD OVERWRITE source ON review_history TYPE option<string>;
         DEFINE FIELD OVERWRITE created_at ON review_history TYPE option<datetime>;
         "#,
+        ),
     )
     .await?
     .check()?;
@@ -191,5 +277,15 @@ pub async fn ensure_review_workflow_history_schema() -> Result<()> {
     REVIEW_WORKFLOW_HISTORY_SCHEMA_READY
         .get_or_try_init(|| async { ensure_review_workflow_history_schema_inner().await })
         .await?;
+    Ok(())
+}
+
+pub fn review_workflow_history_schema_ready() -> bool {
+    REVIEW_WORKFLOW_HISTORY_SCHEMA_READY.get().is_some()
+}
+
+pub async fn warm_review_schema() -> Result<()> {
+    ensure_review_query_indexes().await?;
+    ensure_review_workflow_history_schema().await?;
     Ok(())
 }

@@ -13,6 +13,8 @@ export type TaskType =
   | 'DataParsingWizard'
   | 'RefnoModelGeneration'
   | 'ModelExport'
+  | 'StartManagedSite'
+  | 'DeployManagedSite'
   | { Custom: string }
 
 export type TaskStatus =
@@ -102,6 +104,8 @@ export interface TaskInfo {
   estimated_duration: number | null
   actual_duration: number | null
   metadata: unknown | null
+  site_id?: string | null
+  site_label?: string | null
 }
 
 export const TASK_TYPE_LABELS: Record<string, string> = {
@@ -119,6 +123,8 @@ export const TASK_TYPE_LABELS: Record<string, string> = {
   DataParsingWizard: '数据解析向导',
   RefnoModelGeneration: 'Refno 模型生成',
   ModelExport: '模型导出',
+  StartManagedSite: '启动受管站点',
+  DeployManagedSite: '完整部署受管站点',
 }
 
 export const PRIORITY_LABELS: Record<TaskPriority, string> = {

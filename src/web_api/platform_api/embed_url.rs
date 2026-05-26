@@ -3,9 +3,9 @@
 use axum::{extract::Json, http::StatusCode, response::IntoResponse};
 use tracing::{info, warn};
 
-use crate::web_api::jwt_auth::{Role, create_token, decode_token_unsafe, generate_form_id};
 #[cfg(feature = "review-internal-workflow")]
 use crate::web_api::jwt_auth::normalize_workflow_mode;
+use crate::web_api::jwt_auth::{Role, create_token, decode_token_unsafe, generate_form_id};
 
 use super::auth::verify_s2s_token;
 use super::config::PLATFORM_CONFIG;

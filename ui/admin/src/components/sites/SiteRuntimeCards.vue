@@ -8,7 +8,7 @@ defineProps<{
 </script>
 
 <template>
-  <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+  <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
     <div class="rounded-lg border border-border bg-card p-4">
       <div class="text-sm text-muted-foreground">当前阶段</div>
       <div class="mt-1 text-lg font-semibold">{{ runtime?.current_stage_label ?? site?.status ?? '-' }}</div>
@@ -27,6 +27,13 @@ defineProps<{
         {{ runtime?.web_running ? '运行中' : '未启动' }}
       </div>
       <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.web_pid ?? '-' }} · 端口: {{ site?.web_port }}</div>
+    </div>
+    <div class="rounded-lg border border-border bg-card p-4">
+      <div class="text-sm text-muted-foreground">Viewer</div>
+      <div class="mt-1 text-lg font-semibold" :class="runtime?.viewer_running ? 'text-green-600' : 'text-muted-foreground'">
+        {{ runtime?.viewer_running ? '运行中' : '未启动' }}
+      </div>
+      <div class="text-xs text-muted-foreground mt-1">PID: {{ runtime?.viewer_pid ?? '-' }} · 端口: {{ runtime?.viewer_port ?? site?.viewer_port ?? '-' }}</div>
     </div>
     <div class="rounded-lg border border-border bg-card p-4">
       <div class="text-sm text-muted-foreground">解析状态</div>

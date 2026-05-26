@@ -39,16 +39,26 @@ export interface ManagedProjectSite {
   manual_db_nums: number[]
   parse_db_types: string[]
   force_rebuild_system_db: boolean
+  gen_model: boolean
+  gen_mesh: boolean
+  gen_spatial_tree: boolean
+  apply_boolean_operation: boolean
+  mesh_tol_ratio: number
+  export_json: boolean
+  export_parquet: boolean
   config_path: string
   runtime_dir: string
   db_data_path: string
   db_port: number
   web_port: number
+  viewer_port?: number | null
   bind_host: string
   public_base_url?: string | null
   associated_project?: string | null
   db_pid: number | null
   web_pid: number | null
+  viewer_pid?: number | null
+  viewer_url?: string | null
   parse_pid: number | null
   status: ManagedSiteStatus
   parse_status: ManagedSiteParseStatus
@@ -62,6 +72,10 @@ export interface ManagedProjectSite {
   parse_plan: ManagedSiteParsePlan
   risk_level: ManagedSiteRiskLevel
   risk_reasons: string[]
+  auto_deploy?: boolean
+  deployment_submitted?: boolean
+  deployment_error?: string | null
+  deployment_task_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -76,6 +90,7 @@ export interface ManagedSiteProcessResource {
 export interface ManagedSiteResourceMetrics {
   db_process: ManagedSiteProcessResource
   web_process: ManagedSiteProcessResource
+  viewer_process?: ManagedSiteProcessResource
   parse_process: ManagedSiteProcessResource
   runtime_dir_size_bytes: number
   data_dir_size_bytes: number
@@ -96,19 +111,26 @@ export interface ManagedSiteRuntimeStatus {
   current_stage_detail: string | null
   db_running: boolean
   web_running: boolean
+  viewer_running?: boolean
   parse_running: boolean
   db_pid: number | null
   web_pid: number | null
+  viewer_pid?: number | null
   parse_pid: number | null
-  db_port: number
-  web_port: number
+  db_port?: number
+  web_port?: number
+  auto_deploy?: boolean
+  viewer_port?: number | null
+  viewer_url?: string | null
   entry_url: string | null
   local_entry_url?: string | null
   public_entry_url?: string | null
   db_port_conflict?: boolean
   web_port_conflict?: boolean
+  viewer_port_conflict?: boolean
   db_conflict_pids?: number[]
   web_conflict_pids?: number[]
+  viewer_conflict_pids?: number[]
   last_error: string | null
   active_log_kind: string | null
   last_log_at: string | null
@@ -145,8 +167,10 @@ export interface ManagedSiteActivitySummary {
 export interface ManagedSiteLogsResponse {
   site_id: string
   parse_log: string[]
+  generate_log?: string[]
   db_log: string[]
   web_log: string[]
+  viewer_log?: string[]
   streams: ManagedSiteLogStreamSummary[]
 }
 
@@ -162,6 +186,52 @@ export interface ManagedSiteLogStreamSummary {
   last_key_log: string | null
 }
 
+export type ManagedSitePreflightStatus = 'pass' | 'warning' | 'blocking'
+
+export interface ManagedSitePreflightCheck {
+  key: string
+  label: string
+  status: ManagedSitePreflightStatus
+  message: string
+  detail?: string | null
+  action_hint?: string | null
+  pids: number[]
+}
+
+export interface ManagedSitePreflightReport {
+  site_id: string
+  ready: boolean
+  blocking_count: number
+  warning_count: number
+  updated_at: string
+  checks: ManagedSitePreflightCheck[]
+}
+
+export interface ManagedSiteDeployValidationCheck {
+  key: string
+  label: string
+  status: string
+  message: string
+  detail?: string | null
+  url?: string | null
+  bytes?: number | null
+}
+
+export interface ManagedSiteDeployValidationReport {
+  site_id: string
+  exists: boolean
+  checked_at?: string | null
+  blocking_count: number
+  warning_count: number
+  checks: ManagedSiteDeployValidationCheck[]
+}
+
+export interface ManagedSiteActionResponse {
+  site_id: string
+  action: string
+  task_id?: string
+}
+
 export interface CreateManagedSiteRequest {
   project_name: string
   project_path: string
@@ -169,8 +239,16 @@ export interface CreateManagedSiteRequest {
   manual_db_nums?: number[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
-  db_port: number
-  web_port: number
+  gen_model?: boolean
+  gen_mesh?: boolean
+  gen_spatial_tree?: boolean
+  apply_boolean_operation?: boolean
+  mesh_tol_ratio?: number
+  export_json?: boolean
+  export_parquet?: boolean
+  db_port?: number
+  web_port?: number
+  auto_deploy?: boolean
   bind_host?: string
   public_base_url?: string
   associated_project?: string
@@ -185,6 +263,13 @@ export interface UpdateManagedSiteRequest {
   manual_db_nums?: number[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
+  gen_model?: boolean
+  gen_mesh?: boolean
+  gen_spatial_tree?: boolean
+  apply_boolean_operation?: boolean
+  mesh_tol_ratio?: number
+  export_json?: boolean
+  export_parquet?: boolean
   db_port?: number
   web_port?: number
   bind_host?: string

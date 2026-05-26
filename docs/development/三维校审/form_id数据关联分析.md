@@ -1,5 +1,7 @@
 # form_id 数据关联分析
 
+> 当前性说明（2026-05-14）：本文仍可作为 `form_id` 数据关联背景资料；外部流程默认模式、`nextStep` 必须由 PMS 显式传入、`return` 不查批注状态等最新流程契约，请以 `docs/架构文档/三维校审外部流程架构说明.md` 和 `docs/prd/三维校审外部流程PRD.md` 为准。
+>
 > 分析 `POST /api/review/embed-url` 返回的 `form_id` 在三维校审流程中的数据关联能力
 
 ## 1. form_id 的生成与确定

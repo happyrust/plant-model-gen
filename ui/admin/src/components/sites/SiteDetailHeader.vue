@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { ArrowLeft, ExternalLink, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square } from 'lucide-vue-next'
+import { ArrowLeft, Cpu, ExternalLink, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square } from 'lucide-vue-next'
 import type { ManagedProjectSite } from '@/types/site'
 import {
+  canDeploySite,
   canEditSite,
+  canGenerateSite,
   canParseSite,
   canRestartSite,
   canStartSite,
@@ -30,6 +32,8 @@ function actionLabel() {
   if (action === 'stop') return '停止中...'
   if (action === 'restart') return '重启中...'
   if (action === 'parse') return '解析中...'
+  if (action === 'generate') return '生成中...'
+  if (action === 'deploy') return '部署中...'
   return '处理中...'
 }
 
@@ -39,6 +43,8 @@ defineEmits<{
   stop: []
   restart: []
   parse: []
+  generate: []
+  deploy: []
   refresh: []
   openViewer: []
   edit: []
@@ -55,6 +61,12 @@ function canRestart() {
 }
 function canParse() {
   return props.site ? canParseSite(props.site) : false
+}
+function canGenerate() {
+  return props.site ? canGenerateSite(props.site) : false
+}
+function canDeploy() {
+  return props.site ? canDeploySite(props.site) : false
 }
 function canEdit() {
   return props.site ? canEditSite(props.site) : false
@@ -118,6 +130,22 @@ function canEdit() {
           class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
         >
           <RefreshCw class="h-4 w-4" /> 解析
+        </button>
+        <button
+          v-if="canGenerate()"
+          @click="$emit('generate')"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
+          title="解析未完成时会先解析，再执行模型生成"
+        >
+          <Cpu class="h-4 w-4" /> 生成
+        </button>
+        <button
+          v-if="canDeploy()"
+          @click="$emit('deploy')"
+          class="inline-flex h-9 items-center gap-2 rounded-md bg-blue-600 px-4 text-sm font-medium text-white shadow hover:bg-blue-700 transition-colors"
+          title="完整部署：按配置解析、生成模型并启动站点"
+        >
+          <Play class="h-4 w-4" /> 部署
         </button>
         <button
           v-if="canStart()"

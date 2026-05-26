@@ -3,10 +3,12 @@ import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Cpu, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
+  canDeploySite,
   canEditSite,
+  canGenerateSite,
   canParseSite,
   canRestartSite,
   canStartSite,
@@ -148,6 +150,8 @@ const riskConfig: Record<ManagedSiteRiskLevel, { class: string; label: string }>
 const canStart = canStartSite
 const canStop = canStopSite
 const canParse = canParseSite
+const canGenerate = canGenerateSite
+const canDeploy = canDeploySite
 const canRestart = canRestartSite
 const canDelete = canDeleteSite
 const canEdit = canEditSite
@@ -216,6 +220,22 @@ async function handleRestart(siteId: string) {
 async function handleParse(siteId: string) {
   try {
     await sitesStore.parseSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleGenerate(siteId: string) {
+  try {
+    await sitesStore.generateSite(siteId)
+  } catch {
+    // 错误已写入 store
+  }
+}
+
+async function handleDeploy(siteId: string) {
+  try {
+    await sitesStore.deploySite(siteId)
   } catch {
     // 错误已写入 store
   }
@@ -357,10 +377,18 @@ async function handleParse(siteId: string) {
             <div v-if="isPending(site.site_id)" class="flex items-center justify-end gap-2">
               <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
               <span class="text-xs text-muted-foreground">
-                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : '处理中' }}
+                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : pendingAction(site.site_id) === 'generate' ? '生成中' : pendingAction(site.site_id) === 'deploy' ? '部署中' : '处理中' }}
               </span>
             </div>
             <div v-else class="flex items-center justify-end gap-1">
+              <button
+                v-if="canDeploy(site)"
+                @click="handleDeploy(site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="完整部署（解析/生成/启动）"
+              >
+                <Play class="h-3.5 w-3.5 text-blue-600" />
+              </button>
               <button
                 v-if="canStart(site)"
                 @click="handleStart(site.site_id)"
@@ -392,6 +420,14 @@ async function handleParse(siteId: string) {
                 title="解析"
               >
                 <RefreshCw class="h-3.5 w-3.5" />
+              </button>
+              <button
+                v-if="canGenerate(site)"
+                @click="handleGenerate(site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="生成模型（未解析时会先解析）"
+              >
+                <Cpu class="h-3.5 w-3.5 text-cyan-600" />
               </button>
               <button
                 v-if="site.status === 'Running' && buildViewerUrl(site)"

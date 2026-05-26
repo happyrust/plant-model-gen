@@ -1,6 +1,6 @@
 # 三维校审流程 · Mermaid 配图源
 
-配图配套文档见 `../三维校审流程与批注对话开发文档.md`。所有 `*.mmd` 文件均通过 `mermaid` 技能 `validate.sh` 验证（Mermaid CLI 渲染通过）。
+配图配套文档优先见 `../三维校审外部流程架构说明.md`。已有旧图源曾通过 `mermaid` 技能 `validate.sh` 验证；新增 external 图源为 Mermaid 源文件，当前未导出 SVG/PNG。
 
 ## 导出单张 SVG
 
@@ -37,3 +37,6 @@ done
 | 10 | `10-pms-integration.mmd` | sequenceDiagram | PMS 入站集成时序 |
 | 11 | `11-component-tree.mmd` | flowchart | Vue 组件树 + Composable 分层 |
 | 12 | `12-rbac-matrix.mmd` | flowchart | 角色 → 操作 RBAC 矩阵 |
+| 13 | `13-external-workflow-architecture.mmd` | flowchart | 当前 external 默认模式系统边界 |
+| 14 | `14-external-workflow-sequence.mmd` | sequenceDiagram | PMS `pre_action -> verify -> changed -> sync` 时序 |
+| 15 | `15-external-contract-boundaries.mmd` | flowchart | PMS 与 Plant3D 事实源边界和禁止项 |

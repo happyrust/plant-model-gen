@@ -5,12 +5,15 @@ import type {
   ManagedSiteRuntimeStatus,
   ManagedSiteLogsResponse,
   ManagedSiteParsePlan,
+  ManagedSitePreflightReport,
+  ManagedSiteDeployValidationReport,
+  ManagedSiteActionResponse,
   CreateManagedSiteRequest,
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
 } from '@/types/site'
 
-export type ManagedSiteLogKind = 'parse' | 'db' | 'web'
+export type ManagedSiteLogKind = 'parse' | 'generate' | 'db' | 'web' | 'viewer'
 
 export interface TailLogResponse {
   kind: ManagedSiteLogKind
@@ -57,28 +60,40 @@ export const sitesApi = {
       payload as unknown as Record<string, unknown>,
     ),
 
+  preflight: (id: string) =>
+    apiPost<ManagedSitePreflightReport>(`/api/admin/sites/${id}/preflight`),
+
   update: (id: string, payload: UpdateManagedSiteRequest) =>
     apiPut<ManagedProjectSite>(`/api/admin/sites/${id}`, payload as unknown as Record<string, unknown>),
 
   delete: (id: string) => apiDelete<{ site_id: string; deleted: boolean }>(`/api/admin/sites/${id}`),
 
   parse: (id: string) =>
-    apiPostRaw<{ site_id: string; action: string }>(`/api/admin/sites/${id}/parse`),
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/parse`),
+
+  generate: (id: string) =>
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/generate`),
+
+  deploy: (id: string) =>
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/deploy`),
 
   start: (id: string) =>
-    apiPostRaw<{ site_id: string; action: string }>(`/api/admin/sites/${id}/start`),
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/start`),
 
   stop: (id: string) =>
     apiPost<ManagedProjectSite>(`/api/admin/sites/${id}/stop`),
 
   restart: (id: string) =>
-    apiPostRaw<{ site_id: string; action: string }>(`/api/admin/sites/${id}/restart`),
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/restart`),
 
   runtime: (id: string) =>
     apiGet<ManagedSiteRuntimeStatus>(`/api/admin/sites/${id}/runtime`),
 
   logs: (id: string) =>
     apiGet<ManagedSiteLogsResponse>(`/api/admin/sites/${id}/logs`),
+
+  deployValidation: (id: string) =>
+    apiGet<ManagedSiteDeployValidationReport>(`/api/admin/sites/${id}/deploy-validation`),
 
   /**
    * D5 / Sprint D · 单类日志的分页尾部

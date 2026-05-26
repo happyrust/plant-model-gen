@@ -351,6 +351,10 @@ pub async fn start_web_server_with_config(
             Ok(_) => println!("✅ review schema/index 后台预热完成"),
             Err(error) => eprintln!("⚠️ review schema/index 后台预热失败: {}", error),
         }
+        match crate::web_api::platform_api::review_form::warm_review_forms_schema().await {
+            Ok(_) => println!("✅ review_forms schema 后台预热完成"),
+            Err(error) => eprintln!("⚠️ review_forms schema 后台预热失败: {}", error),
+        }
     });
     let config_name_for_init = config_name.clone();
     let startup_ns = db_option.surreal_ns.clone();

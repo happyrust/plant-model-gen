@@ -29,7 +29,7 @@ use crate::web_api::platform_api::{
 };
 use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
 use crate::web_api::review_db::{
-    await_review_query, await_review_query_long, fresh_review_db, review_primary_db,
+    await_review_query, await_review_query_long, fresh_review_db,
     review_workflow_history_schema_ready,
 };
 use axum::extract::Extension;
@@ -1468,9 +1468,9 @@ pub fn create_review_api_routes() -> Router {
                 db_option.surreal_ns, db_option.project_name, error
             );
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({
-                    "code": 500,
+                    "code": 504,
                     "message": format!("校审数据库上下文切换失败: {}", error),
                 })),
             ));
@@ -1847,30 +1847,25 @@ async fn create_task(
                 if refno.is_empty() || !seen_refnos.insert(refno.to_string()) {
                     continue;
                 }
-                match timeout(
-                    Duration::from_secs(2),
-                    review_primary_db()
-                        .query(
-                            r#"
-                            CREATE ONLY review_form_model SET
-                                form_id = $form_id,
-                                model_refno = $model_refno,
-                                created_at = time::now()
-                            "#,
-                        )
-                        .bind(("form_id", form_id.clone()))
-                        .bind(("model_refno", refno.to_string())),
+                match await_review_query(
+                    "review.form_model.backfill_create",
+                    db.query(
+                        r#"
+                        CREATE ONLY review_form_model SET
+                            form_id = $form_id,
+                            model_refno = $model_refno,
+                            created_at = time::now()
+                        "#,
+                    )
+                    .bind(("form_id", form_id.clone()))
+                    .bind(("model_refno", refno.to_string())),
                 )
                 .await
                 {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => warn!(
+                    Ok(_) => {}
+                    Err(error) => warn!(
                         "Failed to backfill review_form_model after create_task, form_id={}, refno={}: {}",
                         form_id, refno, error
-                    ),
-                    Err(_) => warn!(
-                        "Timed out backfilling review_form_model after create_task, form_id={}, refno={}",
-                        form_id, refno
                     ),
                 }
             }
@@ -5336,6 +5331,20 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         .map(|s| s.to_string());
 
     let mut resolved_model_refnos = model_refnos.unwrap_or_default();
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("upload_attachment: failed to connect review db: {}", e);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(AttachmentUploadResponse {
+                    success: false,
+                    attachment: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
 
     if resolved_form_id.is_none() {
         if let Some(tid) = task_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -5346,10 +5355,11 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
             }
 
             let sql = "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-            if let Ok(mut resp) = review_primary_db()
-                .query(sql)
-                .bind(("id", tid.to_string()))
-                .await
+            if let Ok(mut resp) = await_review_query(
+                "review.attachments.task_lookup",
+                db.query(sql).bind(("id", tid.to_string())),
+            )
+            .await
             {
                 let rows: Vec<TaskLookupRow> = resp.take(0).unwrap_or_default();
                 if let Some(row) = rows.into_iter().next() {
@@ -5415,16 +5425,18 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         }
     "#;
 
-    if let Err(e) = review_primary_db()
-        .query(insert_sql)
-        .bind(("form_id", resolved_form_id))
-        .bind(("model_refnos", resolved_model_refnos))
-        .bind(("file_id", attachment_id.clone()))
-        .bind(("file_type", resolved_file_type))
-        .bind(("download_url", url.clone()))
-        .bind(("description", resolved_description))
-        .bind(("file_ext", file_ext_with_dot))
-        .await
+    if let Err(e) = await_review_query(
+        "review.attachments.insert",
+        db.query(insert_sql)
+            .bind(("form_id", resolved_form_id))
+            .bind(("model_refnos", resolved_model_refnos))
+            .bind(("file_id", attachment_id.clone()))
+            .bind(("file_type", resolved_file_type))
+            .bind(("download_url", url.clone()))
+            .bind(("description", resolved_description))
+            .bind(("file_ext", file_ext_with_dot)),
+    )
+    .await
     {
         warn!("Failed to insert review_attachment: {}", e);
         return (
@@ -5469,20 +5481,34 @@ async fn delete_attachment(Path(attachment_id): Path<String>) -> impl IntoRespon
     let upload_dir = "assets/review_attachments";
     let extensions = ["png", "jpg", "jpeg", "gif", "pdf", "bin"];
     let mut deleted = false;
+    let db = match fresh_review_db().await {
+        Ok(db) => Some(db),
+        Err(e) => {
+            warn!(
+                "delete_attachment: failed to connect review db, will only try local file deletion: {}",
+                e
+            );
+            None
+        }
+    };
 
     // 优先使用 DB 中记录的 file_ext
     let mut db_ext: Option<String> = None;
-    if let Ok(mut resp) = review_primary_db()
-        .query("SELECT file_ext FROM review_attachment WHERE file_id = $file_id LIMIT 1")
-        .bind(("file_id", attachment_id.clone()))
+    if let Some(db) = &db {
+        if let Ok(mut resp) = await_review_query(
+            "review.attachments.ext_lookup",
+            db.query("SELECT file_ext FROM review_attachment WHERE file_id = $file_id LIMIT 1")
+                .bind(("file_id", attachment_id.clone())),
+        )
         .await
-    {
-        #[derive(Debug, Deserialize, SurrealValue)]
-        struct ExtRow {
-            file_ext: Option<String>,
+        {
+            #[derive(Debug, Deserialize, SurrealValue)]
+            struct ExtRow {
+                file_ext: Option<String>,
+            }
+            let rows: Vec<ExtRow> = resp.take(0).unwrap_or_default();
+            db_ext = rows.into_iter().next().and_then(|r| r.file_ext);
         }
-        let rows: Vec<ExtRow> = resp.take(0).unwrap_or_default();
-        db_ext = rows.into_iter().next().and_then(|r| r.file_ext);
     }
 
     if let Some(ext) = db_ext.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -5512,15 +5538,19 @@ async fn delete_attachment(Path(attachment_id): Path<String>) -> impl IntoRespon
         }
     }
 
-    let _ = review_primary_db()
-        .query(
-            r#"
+    if let Some(db) = &db {
+        let _ = await_review_query(
+            "review.attachments.delete",
+            db.query(
+                r#"
             LET $ids = SELECT VALUE id FROM review_attachment WHERE file_id = $file_id;
             DELETE $ids;
             "#,
+            )
+            .bind(("file_id", attachment_id.clone())),
         )
-        .bind(("file_id", attachment_id.clone()))
         .await;
+    }
 
     if deleted {
         (
@@ -5593,12 +5623,29 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
         )
     };
 
-    let mut q = review_primary_db().query(&sql);
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for export: {}", e);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ExportResponse {
+                    success: false,
+                    tasks: vec![],
+                    comments: None,
+                    records: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let mut q = db.query(&sql);
     if use_ids_param {
         q = q.bind(("task_ids", request.task_ids.clone().unwrap_or_default()));
     }
 
-    let tasks: Vec<ReviewTask> = match q.await {
+    let tasks: Vec<ReviewTask> = match await_review_query("review.sync.export.tasks", q).await {
         Ok(mut resp) => {
             let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
             rows.into_iter().map(|r| r.to_review_task()).collect()
@@ -5637,7 +5684,7 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
         }
 
         let sql = "SELECT * FROM review_comments ORDER BY created_at ASC LIMIT 10000";
-        match review_primary_db().query(sql).await {
+        match await_review_query_long("review.sync.export.comments", db.query(sql)).await {
             Ok(mut resp) => {
                 let rows: Vec<CommentRow> = resp.take(0).unwrap_or_default();
                 Some(
@@ -5672,10 +5719,11 @@ async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResp
             Some(vec![])
         } else {
             let sql = "SELECT * FROM review_records WHERE task_id IN $task_ids ORDER BY confirmed_at ASC LIMIT 10000";
-            match review_primary_db()
-                .query(sql)
-                .bind(("task_ids", task_ids))
-                .await
+            match await_review_query_long(
+                "review.sync.export.records",
+                db.query(sql).bind(("task_ids", task_ids)),
+            )
+            .await
             {
                 Ok(mut resp) => {
                     let rows: Vec<ReviewRecordRow> = resp.take(0).unwrap_or_default();
@@ -5733,14 +5781,30 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
     let overwrite = request.overwrite.unwrap_or(false);
     let mut imported = 0;
     let mut skipped = 0;
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for import: {}", e);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ImportResponse {
+                    success: false,
+                    imported_count: 0,
+                    skipped_count: 0,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
 
     for task in request.tasks {
         // 检查任务是否已存在
         let check_sql = "SELECT id FROM review_tasks WHERE record::id(id) = $id";
-        let exists = match review_primary_db()
-            .query(check_sql)
-            .bind(("id", task.id.clone()))
-            .await
+        let exists = match await_review_query(
+            "review.sync.import.exists",
+            db.query(check_sql).bind(("id", task.id.clone())),
+        )
+        .await
         {
             Ok(mut resp) => {
                 let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
@@ -5783,21 +5847,23 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
                 updated_at = time::now()"#
         };
 
-        let result = review_primary_db()
-            .query(sql)
-            .bind(("id", task.id.clone()))
-            .bind(("form_id", task.form_id.clone()))
-            .bind(("title", task.title.clone()))
-            .bind(("description", task.description.clone()))
-            .bind(("model_name", task.model_name.clone()))
-            .bind(("status", task.status.clone()))
-            .bind(("priority", task.priority.clone()))
-            .bind(("requester_id", task.requester_id.clone()))
-            .bind(("requester_name", task.requester_name.clone()))
-            .bind(("reviewer_id", task.reviewer_id.clone()))
-            .bind(("reviewer_name", task.reviewer_name.clone()))
-            .bind(("current_node", task.current_node.clone()))
-            .await;
+        let result = await_review_query(
+            "review.sync.import.upsert_task",
+            db.query(sql)
+                .bind(("id", task.id.clone()))
+                .bind(("form_id", task.form_id.clone()))
+                .bind(("title", task.title.clone()))
+                .bind(("description", task.description.clone()))
+                .bind(("model_name", task.model_name.clone()))
+                .bind(("status", task.status.clone()))
+                .bind(("priority", task.priority.clone()))
+                .bind(("requester_id", task.requester_id.clone()))
+                .bind(("requester_name", task.requester_name.clone()))
+                .bind(("reviewer_id", task.reviewer_id.clone()))
+                .bind(("reviewer_name", task.reviewer_name.clone()))
+                .bind(("current_node", task.current_node.clone())),
+        )
+        .await;
 
         match result {
             Ok(_) => {
@@ -5824,8 +5890,9 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
                         if comp.ref_no.trim().is_empty() {
                             continue;
                         }
-                        let _ = review_primary_db()
-                            .query(
+                        let _ = await_review_query(
+                            "review.form_model.backfill_import",
+                            db.query(
                                 r#"
                                 CREATE ONLY review_form_model SET
                                     form_id = $form_id,
@@ -5834,8 +5901,9 @@ async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResp
                                 "#,
                             )
                             .bind(("form_id", task.form_id.clone()))
-                            .bind(("model_refno", comp.ref_no.clone()))
-                            .await;
+                            .bind(("model_refno", comp.ref_no.clone())),
+                        )
+                        .await;
                     }
                 }
                 imported += 1;

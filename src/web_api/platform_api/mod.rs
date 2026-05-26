@@ -37,7 +37,7 @@ async fn ensure_review_db_context(request: Request, next: Next) -> Result<Respon
             "platform review primary db context ensure failed: ns={}, db={}, error={}",
             db_option.surreal_ns, db_option.project_name, error
         );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(StatusCode::GATEWAY_TIMEOUT);
     }
 
     Ok(next.run(request).await)

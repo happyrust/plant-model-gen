@@ -85,7 +85,7 @@ where
     .await
 }
 
-async fn await_review_ddl<F>(operation: &'static str, fut: F) -> Result<IndexedResults>
+pub(crate) async fn await_review_ddl<F>(operation: &'static str, fut: F) -> Result<IndexedResults>
 where
     F: IntoFuture<Output = std::result::Result<IndexedResults, surrealdb::Error>>,
 {

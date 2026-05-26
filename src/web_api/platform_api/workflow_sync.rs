@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::web_api::review_annotation_state::load_annotation_states_by_task;
 use crate::web_api::review_api::{ReviewTask, get_node_display_name};
 use crate::web_api::review_db::{
-    ensure_review_workflow_history_schema, fresh_review_db, review_primary_db,
+    await_review_query, fresh_review_db, review_workflow_history_schema_ready,
 };
 
 use super::annotation_check::{
@@ -300,11 +300,10 @@ struct WorkflowMutationWrite {
 async fn apply_workflow_mutation_transaction(
     write: WorkflowMutationWrite,
 ) -> Result<(), WorkflowSyncActionError> {
-    if let Err(e) = ensure_review_workflow_history_schema().await {
-        return Err(WorkflowSyncActionError::plain(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("初始化 review_workflow_history schema 失败: {}", e),
-        ));
+    if !review_workflow_history_schema_ready() {
+        warn!(
+            "[WORKFLOW_SYNC.mutation] workflow history schema warmup is not ready; continuing without blocking request"
+        );
     }
 
     let form_status = derive_review_form_status_from_task_status(write.next_status);
@@ -366,63 +365,71 @@ async fn apply_workflow_mutation_transaction(
     "#;
 
     let form_id_for_error = write.form_id.clone();
-    review_primary_db()
-        .query(sql)
-        .bind(("task_id", write.task_id))
-        .bind(("form_id", write.form_id))
-        .bind(("project_id", write.project_id))
-        .bind(("requester_id", write.requester_id))
-        .bind(("expected_current_node", write.expected_current_node))
-        .bind(("expected_status", write.expected_status))
-        .bind(("next_node", write.next_node))
-        .bind(("status", write.next_status))
-        .bind(("checker_id", write.checker_id))
-        .bind(("checker_name", write.checker_name))
-        .bind(("reviewer_id", write.reviewer_id))
-        .bind(("reviewer_name", write.reviewer_name))
-        .bind(("approver_id", write.approver_id))
-        .bind(("approver_name", write.approver_name))
-        .bind(("return_reason", write.return_reason))
-        .bind(("form_status", form_status))
-        .bind(("form_source", write.form_source))
-        .bind(("history_target_node", write.history_target_node))
-        .bind(("history_action", write.history_action))
-        .bind(("history_actor_id", write.history_actor_id))
-        .bind(("history_actor_name", write.history_actor_name))
-        .bind(("history_actor_role", write.history_actor_role))
-        .bind(("history_source", write.history_source))
-        .bind(("history_comment", write.history_comment))
-        .await
-        .and_then(|response| response.check())
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("WORKFLOW_STATE_CHANGED") {
-                return WorkflowSyncActionError::blocked(
-                    StatusCode::CONFLICT,
-                    "单据状态已变化，请刷新后重试",
-                    None,
-                    None,
-                    None,
-                    "refresh",
-                )
-                .with_error_code("WORKFLOW_STATE_CHANGED");
-            }
-            if message.contains("REVIEW_FORM_NOT_FOUND") {
-                return WorkflowSyncActionError::plain(
-                    StatusCode::CONFLICT,
-                    format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
-                )
-                .with_error_code("REVIEW_FORM_NOT_FOUND");
-            }
-            WorkflowSyncActionError::plain(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!(
-                    "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
-                    message
-                ),
+    let db = fresh_review_db().await.map_err(|error| {
+        WorkflowSyncActionError::plain(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("获取校审数据库独立连接失败: {}", error),
+        )
+    })?;
+    await_review_query(
+        "workflow_sync.mutation",
+        db.query(sql)
+            .bind(("task_id", write.task_id))
+            .bind(("form_id", write.form_id))
+            .bind(("project_id", write.project_id))
+            .bind(("requester_id", write.requester_id))
+            .bind(("expected_current_node", write.expected_current_node))
+            .bind(("expected_status", write.expected_status))
+            .bind(("next_node", write.next_node))
+            .bind(("status", write.next_status))
+            .bind(("checker_id", write.checker_id))
+            .bind(("checker_name", write.checker_name))
+            .bind(("reviewer_id", write.reviewer_id))
+            .bind(("reviewer_name", write.reviewer_name))
+            .bind(("approver_id", write.approver_id))
+            .bind(("approver_name", write.approver_name))
+            .bind(("return_reason", write.return_reason))
+            .bind(("form_status", form_status))
+            .bind(("form_source", write.form_source))
+            .bind(("history_target_node", write.history_target_node))
+            .bind(("history_action", write.history_action))
+            .bind(("history_actor_id", write.history_actor_id))
+            .bind(("history_actor_name", write.history_actor_name))
+            .bind(("history_actor_role", write.history_actor_role))
+            .bind(("history_source", write.history_source))
+            .bind(("history_comment", write.history_comment)),
+    )
+    .await
+    .and_then(|response| response.check().map_err(anyhow::Error::from))
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("WORKFLOW_STATE_CHANGED") {
+            return WorkflowSyncActionError::blocked(
+                StatusCode::CONFLICT,
+                "单据状态已变化，请刷新后重试",
+                None,
+                None,
+                None,
+                "refresh",
             )
-            .with_error_code("WORKFLOW_MUTATION_TRANSACTION_FAILED")
-        })?;
+            .with_error_code("WORKFLOW_STATE_CHANGED");
+        }
+        if message.contains("REVIEW_FORM_NOT_FOUND") {
+            return WorkflowSyncActionError::plain(
+                StatusCode::CONFLICT,
+                format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
+            )
+            .with_error_code("REVIEW_FORM_NOT_FOUND");
+        }
+        WorkflowSyncActionError::plain(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
+                message
+            ),
+        )
+        .with_error_code("WORKFLOW_MUTATION_TRANSACTION_FAILED")
+    })?;
 
     Ok(())
 }
@@ -2263,15 +2270,17 @@ async fn apply_workflow_stop(
 
 async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
     let db = fresh_review_db().await?;
-    let mut response = db
-        .query(
+    let mut response = await_review_query(
+        "workflow_sync.models",
+        db.query(
             r#"
             SELECT VALUE model_refno FROM review_form_model
             WHERE form_id = $form_id AND model_refno != NONE
             "#,
         )
-        .bind(("form_id", form_id.to_string()))
-        .await?;
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
 
     let rows: Vec<Option<String>> = response.take(0)?;
     Ok(rows
@@ -2284,16 +2293,18 @@ async fn query_workflow_models(form_id: &str) -> anyhow::Result<Vec<String>> {
 
 async fn query_workflow_attachments(form_id: &str) -> anyhow::Result<Vec<WorkflowAttachment>> {
     let db = fresh_review_db().await?;
-    let mut response = db
-        .query(
+    let mut response = await_review_query(
+        "workflow_sync.attachments",
+        db.query(
             r#"
             SELECT model_refnos, file_id, file_type, download_url, description, file_ext
             FROM review_attachment
             WHERE form_id = $form_id
             "#,
         )
-        .bind(("form_id", form_id.to_string()))
-        .await?;
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
 
     #[derive(Debug, serde::Deserialize, SurrealValue)]
     struct AttachmentRow {
@@ -2341,8 +2352,9 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
     }
 
     let db = fresh_review_db().await?;
-    let mut response = db
-        .query(
+    let mut response = await_review_query(
+        "workflow_sync.records_by_form",
+        db.query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
             FROM review_records
@@ -2350,8 +2362,9 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
             ORDER BY confirmed_at DESC
             "#,
         )
-        .bind(("form_id", form_id.to_string()))
-        .await?;
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
 
     let rows: Vec<RecordRow> = response.take(0)?;
     Ok(rows
@@ -2390,8 +2403,9 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
     }
 
     let db = fresh_review_db().await?;
-    let mut response = db
-        .query(
+    let mut response = await_review_query(
+        "workflow_sync.records_by_task",
+        db.query(
             r#"
             SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
             FROM review_records
@@ -2399,8 +2413,9 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
             ORDER BY confirmed_at DESC
             "#,
         )
-        .bind(("task_id", task_id.to_string()))
-        .await?;
+        .bind(("task_id", task_id.to_string())),
+    )
+    .await?;
 
     let rows: Vec<RecordRow> = response.take(0)?;
     Ok(rows
@@ -2442,8 +2457,9 @@ async fn query_annotation_comments(
     let mut comments = Vec::new();
     for annotation_id in annotation_ids {
         let db = fresh_review_db().await?;
-        let mut response = db
-            .query(
+        let mut response = await_review_query(
+            "workflow_sync.annotation_comments",
+            db.query(
                 r#"
                 SELECT id, annotation_id, annotation_type, author_id, author_name, author_role, content, reply_to_id, created_at
                 FROM review_comments
@@ -2451,8 +2467,9 @@ async fn query_annotation_comments(
                 ORDER BY created_at ASC
                 "#,
             )
-            .bind(("annotation_id", annotation_id.to_string()))
-            .await?;
+            .bind(("annotation_id", annotation_id.to_string())),
+        )
+        .await?;
 
         let rows: Vec<CommentRow> = response.take(0)?;
         comments.extend(rows.into_iter().map(|row| {

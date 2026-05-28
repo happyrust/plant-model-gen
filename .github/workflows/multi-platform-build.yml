@@ -135,6 +135,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
       
       - name: Build library
+        if: matrix.artifact_name != 'linux-x64'
         run: |
           cargo build --release --lib --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
         shell: bash

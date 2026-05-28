@@ -13,6 +13,7 @@ on:
         options:
           - all
           - linux-x64
+          - centos-7.9-x64
           - macos-x64
           - macos-arm64
           - windows-x64
@@ -21,6 +22,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTC_WRAPPER: ""
+  STANDARD_FEATURES: ws,sqlite-index,surreal-save,web_server
+  DEPLOY_FEATURES: ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export
 
 jobs:
   select-platforms:
@@ -35,19 +38,22 @@ jobs:
           selected="${{ github.event_name == 'push' && 'all' || inputs.platform }}"
           case "$selected" in
             all)
-              matrix='{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"linux-x64"},{"os":"macos-latest","target":"x86_64-apple-darwin","artifact_name":"macos-x64"},{"os":"macos-latest","target":"aarch64-apple-darwin","artifact_name":"macos-arm64"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","artifact_name":"windows-x64"}]}'
+              matrix='{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"linux-x64","target_system":"ubuntu-22.04","deploy_ready":"true"},{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"centos-7.9-x64","target_system":"centos-7.9","deploy_ready":"true","legacy_linux":"true"},{"os":"macos-latest","target":"x86_64-apple-darwin","artifact_name":"macos-x64","target_system":"macos-x64","deploy_ready":"false"},{"os":"macos-latest","target":"aarch64-apple-darwin","artifact_name":"macos-arm64","target_system":"macos-arm64","deploy_ready":"false"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","artifact_name":"windows-x64","target_system":"windows-x64","deploy_ready":"false"}]}'
               ;;
             linux-x64)
-              matrix='{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"linux-x64"}]}'
+              matrix='{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"linux-x64","target_system":"ubuntu-22.04","deploy_ready":"true"}]}'
+              ;;
+            centos-7.9-x64)
+              matrix='{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","artifact_name":"centos-7.9-x64","target_system":"centos-7.9","deploy_ready":"true","legacy_linux":"true"}]}'
               ;;
             macos-x64)
-              matrix='{"include":[{"os":"macos-latest","target":"x86_64-apple-darwin","artifact_name":"macos-x64"}]}'
+              matrix='{"include":[{"os":"macos-latest","target":"x86_64-apple-darwin","artifact_name":"macos-x64","target_system":"macos-x64","deploy_ready":"false"}]}'
               ;;
             macos-arm64)
-              matrix='{"include":[{"os":"macos-latest","target":"aarch64-apple-darwin","artifact_name":"macos-arm64"}]}'
+              matrix='{"include":[{"os":"macos-latest","target":"aarch64-apple-darwin","artifact_name":"macos-arm64","target_system":"macos-arm64","deploy_ready":"false"}]}'
               ;;
             windows-x64)
-              matrix='{"include":[{"os":"windows-latest","target":"x86_64-pc-windows-msvc","artifact_name":"windows-x64"}]}'
+              matrix='{"include":[{"os":"windows-latest","target":"x86_64-pc-windows-msvc","artifact_name":"windows-x64","target_system":"windows-x64","deploy_ready":"false"}]}'
               ;;
             *)
               echo "Unsupported platform: $selected" >&2
@@ -114,20 +120,48 @@ jobs:
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v2
       
-      - name: Build web_server (standard)
-        if: matrix.artifact_name != 'linux-x64'
+      - name: Build binaries (standard)
+        if: matrix.deploy_ready != 'true'
         run: |
-          cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
+          cargo build --release --bin web_server --bin aios-database --target ${{ matrix.target }} --no-default-features --features "$STANDARD_FEATURES"
         shell: bash
         env:
           GIT_ASKPASS: /tmp/git-askpass.sh
           GIT_TERMINAL_PROMPT: 0
           GH_TOKEN: ${{ secrets.GH_PAT }}
       
-      - name: Build web_server (Linux deploy-ready)
+      - name: Build binaries (Ubuntu deploy-ready)
         if: matrix.artifact_name == 'linux-x64'
         run: |
-          cargo build --release --bin web_server --target ${{ matrix.target }} --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
+          cargo build --release --bin web_server --bin aios-database --target ${{ matrix.target }} --no-default-features --features "$DEPLOY_FEATURES"
+        shell: bash
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Build binaries (CentOS 7.9 deploy-ready)
+        if: matrix.artifact_name == 'centos-7.9-x64'
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e GH_TOKEN \
+            -e GIT_TERMINAL_PROMPT=0 \
+            -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
+            -e DEPLOY_FEATURES="$DEPLOY_FEATURES" \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              host_ids="$(stat -c "%u:%g" /workspace)"
+              git config --global --add safe.directory /workspace
+              git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+              source "$HOME/.cargo/env"
+              rustup target add x86_64-unknown-linux-gnu
+              cargo build --release --bin web_server --bin aios-database --target x86_64-unknown-linux-gnu --no-default-features --features "$DEPLOY_FEATURES"
+              chown -R "$host_ids" target/x86_64-unknown-linux-gnu/release
+            '
         shell: bash
         env:
           GIT_ASKPASS: /tmp/git-askpass.sh
@@ -135,9 +169,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
       
       - name: Build library
-        if: matrix.artifact_name != 'linux-x64'
+        if: matrix.deploy_ready != 'true'
         run: |
-          cargo build --release --lib --target ${{ matrix.target }} --no-default-features --features ws,sqlite-index,surreal-save,web_server
+          cargo build --release --lib --target ${{ matrix.target }} --no-default-features --features "$STANDARD_FEATURES"
         shell: bash
         env:
           GIT_ASKPASS: /tmp/git-askpass.sh
@@ -149,20 +183,27 @@ jobs:
           mkdir -p release-package
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/${{ matrix.target }}/release/web_server.exe release-package/
+            cp target/${{ matrix.target }}/release/aios-database.exe release-package/
             cp target/${{ matrix.target }}/release/aios_database.dll release-package/ 2>/dev/null || true
           else
             cp target/${{ matrix.target }}/release/web_server release-package/
+            cp target/${{ matrix.target }}/release/aios-database release-package/
             cp target/${{ matrix.target }}/release/libaios_database.* release-package/ 2>/dev/null || true
           fi
           echo "Build Date: $(date '+%Y-%m-%d %H:%M:%S')" > release-package/BUILD_INFO.txt
           echo "Commit: ${{ github.sha }}" >> release-package/BUILD_INFO.txt
           echo "Branch: ${{ github.ref_name }}" >> release-package/BUILD_INFO.txt
           echo "Target: ${{ matrix.target }}" >> release-package/BUILD_INFO.txt
-          if [ "${{ matrix.artifact_name }}" = "linux-x64" ]; then
-            echo "Features: ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export" >> release-package/BUILD_INFO.txt
+          echo "Artifact: ${{ matrix.artifact_name }}" >> release-package/BUILD_INFO.txt
+          echo "Target System: ${{ matrix.target_system }}" >> release-package/BUILD_INFO.txt
+          if [ "${{ matrix.deploy_ready }}" = "true" ]; then
+            echo "Features: $DEPLOY_FEATURES" >> release-package/BUILD_INFO.txt
             echo "Deploy-Ready: true" >> release-package/BUILD_INFO.txt
+            if [ "${{ matrix.artifact_name }}" = "centos-7.9-x64" ]; then
+              echo "Linux ABI: manylinux2014 / CentOS 7 compatible glibc baseline" >> release-package/BUILD_INFO.txt
+            fi
           else
-            echo "Features: ws,sqlite-index,surreal-save,web_server" >> release-package/BUILD_INFO.txt
+            echo "Features: $STANDARD_FEATURES" >> release-package/BUILD_INFO.txt
             echo "Deploy-Ready: false" >> release-package/BUILD_INFO.txt
           fi
         shell: bash

@@ -161,6 +161,7 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
               source "$HOME/.cargo/env"
               rustup target add x86_64-unknown-linux-gnu
+              export CMAKE_GENERATOR="Unix Makefiles"
               cargo build --release --bin web_server --bin aios-database --target x86_64-unknown-linux-gnu --no-default-features --features "$DEPLOY_FEATURES"
               chown -R "$host_ids" target/x86_64-unknown-linux-gnu/release
             '

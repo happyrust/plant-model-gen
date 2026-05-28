@@ -1187,16 +1187,28 @@ pub struct ManagedSiteLogsResponse {
     pub streams: Vec<ManagedSiteLogStreamSummary>,
 }
 
-/// 受管站点远端 Linux 部署目标。
+/// 远端离线部署目标操作系统。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRemoteTargetOs {
+    #[default]
+    Ubuntu22,
+    Centos79,
+    Windows,
+}
+
+/// 受管站点远端部署目标。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ManagedRemoteTarget {
     pub id: String,
     pub name: String,
+    pub target_os: ManagedRemoteTargetOs,
     pub host: String,
     pub ssh_port: u16,
     pub ssh_user: String,
     pub password_env: String,
+    pub ssh_password: Option<String>,
     pub remote_root: String,
     pub remote_db_path: String,
     pub remote_web_port: u16,
@@ -1204,6 +1216,19 @@ pub struct ManagedRemoteTarget {
     pub public_base_url: Option<String>,
     pub surreal_bin: String,
     pub remote_web_bin: String,
+    pub auto_prepare: bool,
+    pub upload_web_server: bool,
+    pub upload_surreal: bool,
+    pub upload_resource: bool,
+    pub upload_viewer: bool,
+    pub open_firewall: bool,
+    pub allowed_cidrs: Vec<String>,
+    pub web_bind_host: String,
+    pub db_bind_host: String,
+    pub local_web_bin: Option<String>,
+    pub local_surreal_bin: Option<String>,
+    pub local_resource_dir: Option<String>,
+    pub local_viewer_dir: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1212,11 +1237,13 @@ impl Default for ManagedRemoteTarget {
     fn default() -> Self {
         Self {
             id: "default".to_string(),
-            name: "默认 Linux 目标".to_string(),
+            name: "默认 Ubuntu22 目标".to_string(),
+            target_os: ManagedRemoteTargetOs::Ubuntu22,
             host: "123.57.182.243".to_string(),
             ssh_port: 22,
             ssh_user: "root".to_string(),
             password_env: "REMOTE_PASS".to_string(),
+            ssh_password: None,
             remote_root: "/opt/plant3d/sites".to_string(),
             remote_db_path: String::new(),
             remote_web_port: 3100,
@@ -1224,19 +1251,34 @@ impl Default for ManagedRemoteTarget {
             public_base_url: None,
             surreal_bin: "/usr/local/bin/surreal".to_string(),
             remote_web_bin: "/root/web_server".to_string(),
+            auto_prepare: true,
+            upload_web_server: false,
+            upload_surreal: false,
+            upload_resource: false,
+            upload_viewer: false,
+            open_firewall: true,
+            allowed_cidrs: vec!["0.0.0.0/0".to_string()],
+            web_bind_host: "0.0.0.0".to_string(),
+            db_bind_host: "127.0.0.1".to_string(),
+            local_web_bin: None,
+            local_surreal_bin: None,
+            local_resource_dir: None,
+            local_viewer_dir: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
     }
 }
 
-/// 创建或更新远端目标请求。密码只通过 password_env 引用，不落库。
+/// 创建或更新远端目标请求。测试阶段允许保存 ssh_password，生产化前需替换为更安全的凭据存储。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedRemoteTargetRequest {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub target_os: Option<ManagedRemoteTargetOs>,
     #[serde(default)]
     pub host: Option<String>,
     #[serde(default)]
@@ -1245,6 +1287,8 @@ pub struct ManagedRemoteTargetRequest {
     pub ssh_user: Option<String>,
     #[serde(default)]
     pub password_env: Option<String>,
+    #[serde(default)]
+    pub ssh_password: Option<String>,
     #[serde(default)]
     pub remote_root: Option<String>,
     #[serde(default)]
@@ -1259,6 +1303,32 @@ pub struct ManagedRemoteTargetRequest {
     pub surreal_bin: Option<String>,
     #[serde(default)]
     pub remote_web_bin: Option<String>,
+    #[serde(default)]
+    pub auto_prepare: Option<bool>,
+    #[serde(default)]
+    pub upload_web_server: Option<bool>,
+    #[serde(default)]
+    pub upload_surreal: Option<bool>,
+    #[serde(default)]
+    pub upload_resource: Option<bool>,
+    #[serde(default)]
+    pub upload_viewer: Option<bool>,
+    #[serde(default)]
+    pub open_firewall: Option<bool>,
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub web_bind_host: Option<String>,
+    #[serde(default)]
+    pub db_bind_host: Option<String>,
+    #[serde(default)]
+    pub local_web_bin: Option<String>,
+    #[serde(default)]
+    pub local_surreal_bin: Option<String>,
+    #[serde(default)]
+    pub local_resource_dir: Option<String>,
+    #[serde(default)]
+    pub local_viewer_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1273,6 +1343,10 @@ pub struct ManagedRemoteDeployRequest {
 pub struct ManagedRemoteDeployStatus {
     pub site_id: String,
     pub target_id: String,
+    pub deploy_id: Option<String>,
+    pub deploy_task_id: Option<String>,
+    pub deployment_mode: Option<String>,
+    pub degraded: bool,
     pub status: String,
     pub current_step: String,
     pub remote_entry_url: Option<String>,

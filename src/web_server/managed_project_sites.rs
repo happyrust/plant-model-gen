@@ -32,8 +32,8 @@ use tokio::task;
 use super::models::{
     AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite,
     ManagedRemoteDeployRequest, ManagedRemoteDeployStatus, ManagedRemoteTarget,
-    ManagedRemoteTargetRequest, ManagedSiteActivitySummary, ManagedSiteDbMode,
-    ManagedSiteDeployValidationCheck, ManagedSiteDeployValidationReport,
+    ManagedRemoteTargetOs, ManagedRemoteTargetRequest, ManagedSiteActivitySummary,
+    ManagedSiteDbMode, ManagedSiteDeployValidationCheck, ManagedSiteDeployValidationReport,
     ManagedSiteLogStreamSummary, ManagedSiteLogsResponse, ManagedSiteParseHealth,
     ManagedSiteParseHealthStatus, ManagedSiteParsePlan, ManagedSiteParsePlanMode,
     ManagedSiteParseStatus, ManagedSitePreflightCheck, ManagedSitePreflightReport,
@@ -50,6 +50,8 @@ const REMOTE_TARGETS_TABLE: &str = "managed_remote_targets";
 const REMOTE_DEPLOY_STATUS_TABLE: &str = "managed_remote_deploy_status";
 const ADMIN_RUNTIME_ROOT: &str = "runtime/admin_sites";
 const LOG_LINES_LIMIT: usize = 120;
+
+static REMOTE_DEPLOY_PASSWORDS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 // 机器与进程告警阈值。
 const MACHINE_WARNING_CPU: f32 = 85.0;
@@ -1621,6 +1623,14 @@ fn row_bool_or(row: &rusqlite::Row<'_>, column: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn row_bool_index(row: &rusqlite::Row<'_>, index: usize, default: bool) -> bool {
+    row.get::<_, Option<i64>>(index)
+        .ok()
+        .flatten()
+        .map(|value| value != 0)
+        .unwrap_or(default)
+}
+
 fn row_f64_or(row: &rusqlite::Row<'_>, column: &str, default: f64) -> f64 {
     row.get::<_, Option<f64>>(column)
         .ok()
@@ -1764,10 +1774,12 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS {remote_targets} (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            target_os TEXT NOT NULL DEFAULT 'ubuntu22',
             host TEXT NOT NULL,
             ssh_port INTEGER NOT NULL,
             ssh_user TEXT NOT NULL,
             password_env TEXT NOT NULL,
+            ssh_password TEXT,
             remote_root TEXT NOT NULL,
             remote_db_path TEXT NOT NULL,
             remote_web_port INTEGER NOT NULL,
@@ -1775,12 +1787,29 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             public_base_url TEXT,
             surreal_bin TEXT NOT NULL,
             remote_web_bin TEXT NOT NULL DEFAULT '/root/web_server',
+            auto_prepare INTEGER NOT NULL DEFAULT 1,
+            upload_web_server INTEGER NOT NULL DEFAULT 0,
+            upload_surreal INTEGER NOT NULL DEFAULT 0,
+            upload_resource INTEGER NOT NULL DEFAULT 0,
+            upload_viewer INTEGER NOT NULL DEFAULT 0,
+            open_firewall INTEGER NOT NULL DEFAULT 1,
+            allowed_cidrs_json TEXT NOT NULL DEFAULT '["0.0.0.0/0"]',
+            web_bind_host TEXT NOT NULL DEFAULT '0.0.0.0',
+            db_bind_host TEXT NOT NULL DEFAULT '127.0.0.1',
+            local_web_bin TEXT,
+            local_surreal_bin TEXT,
+            local_resource_dir TEXT,
+            local_viewer_dir TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS {remote_status} (
             site_id TEXT PRIMARY KEY,
             target_id TEXT NOT NULL,
+            deploy_id TEXT,
+            deploy_task_id TEXT,
+            deployment_mode TEXT,
+            degraded INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             current_step TEXT NOT NULL,
             remote_entry_url TEXT,
@@ -1798,6 +1827,36 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         "remote_web_bin",
         "TEXT NOT NULL DEFAULT '/root/web_server'",
     )?;
+    for (column, column_type) in [
+        ("target_os", "TEXT NOT NULL DEFAULT 'ubuntu22'"),
+        ("ssh_password", "TEXT"),
+        ("auto_prepare", "INTEGER NOT NULL DEFAULT 1"),
+        ("upload_web_server", "INTEGER NOT NULL DEFAULT 0"),
+        ("upload_surreal", "INTEGER NOT NULL DEFAULT 0"),
+        ("upload_resource", "INTEGER NOT NULL DEFAULT 0"),
+        ("upload_viewer", "INTEGER NOT NULL DEFAULT 0"),
+        ("open_firewall", "INTEGER NOT NULL DEFAULT 1"),
+        (
+            "allowed_cidrs_json",
+            "TEXT NOT NULL DEFAULT '[\"0.0.0.0/0\"]'",
+        ),
+        ("web_bind_host", "TEXT NOT NULL DEFAULT '0.0.0.0'"),
+        ("db_bind_host", "TEXT NOT NULL DEFAULT '127.0.0.1'"),
+        ("local_web_bin", "TEXT"),
+        ("local_surreal_bin", "TEXT"),
+        ("local_resource_dir", "TEXT"),
+        ("local_viewer_dir", "TEXT"),
+    ] {
+        ensure_table_column_exists(conn, REMOTE_TARGETS_TABLE, column, column_type)?;
+    }
+    for (column, column_type) in [
+        ("deploy_id", "TEXT"),
+        ("deploy_task_id", "TEXT"),
+        ("deployment_mode", "TEXT"),
+        ("degraded", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        ensure_table_column_exists(conn, REMOTE_DEPLOY_STATUS_TABLE, column, column_type)?;
+    }
 
     let mut current_version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -2039,13 +2098,25 @@ fn load_site_and_credentials(site_id: &str) -> Result<(ManagedProjectSite, Strin
 }
 
 fn row_to_remote_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedRemoteTarget> {
+    let allowed_cidrs_json: String = row
+        .get("allowed_cidrs_json")
+        .unwrap_or_else(|_| "[\"0.0.0.0/0\"]".to_string());
+    let allowed_cidrs = serde_json::from_str::<Vec<String>>(&allowed_cidrs_json)
+        .unwrap_or_else(|_| vec!["0.0.0.0/0".to_string()]);
     Ok(ManagedRemoteTarget {
         id: row.get("id")?,
         name: row.get("name")?,
+        target_os: row
+            .get::<_, Option<String>>("target_os")
+            .unwrap_or(None)
+            .as_deref()
+            .map(remote_target_os_from_str)
+            .unwrap_or_default(),
         host: row.get("host")?,
         ssh_port: row.get::<_, i64>("ssh_port")? as u16,
         ssh_user: row.get("ssh_user")?,
         password_env: row.get("password_env")?,
+        ssh_password: row.get("ssh_password").unwrap_or(None),
         remote_root: row.get("remote_root")?,
         remote_db_path: row.get("remote_db_path")?,
         remote_web_port: row.get::<_, i64>("remote_web_port")? as u16,
@@ -2053,6 +2124,27 @@ fn row_to_remote_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedRemo
         public_base_url: row.get("public_base_url")?,
         surreal_bin: row.get("surreal_bin")?,
         remote_web_bin: row.get("remote_web_bin")?,
+        auto_prepare: row_bool_or(row, "auto_prepare", true),
+        upload_web_server: row_bool_or(row, "upload_web_server", false),
+        upload_surreal: row_bool_or(row, "upload_surreal", false),
+        upload_resource: row_bool_or(row, "upload_resource", false),
+        upload_viewer: row_bool_or(row, "upload_viewer", false),
+        open_firewall: row_bool_or(row, "open_firewall", true),
+        allowed_cidrs,
+        web_bind_host: row
+            .get::<_, Option<String>>("web_bind_host")
+            .unwrap_or(None)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_string()),
+        db_bind_host: row
+            .get::<_, Option<String>>("db_bind_host")
+            .unwrap_or(None)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        local_web_bin: row.get("local_web_bin").unwrap_or(None),
+        local_surreal_bin: row.get("local_surreal_bin").unwrap_or(None),
+        local_resource_dir: row.get("local_resource_dir").unwrap_or(None),
+        local_viewer_dir: row.get("local_viewer_dir").unwrap_or(None),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
@@ -2068,12 +2160,70 @@ fn default_remote_target_for_site(site_id: &str) -> ManagedRemoteTarget {
     }
 }
 
+fn normalize_remote_allowed_cidrs(values: Vec<String>) -> Vec<String> {
+    let mut normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        normalized.push("0.0.0.0/0".to_string());
+    }
+    normalized
+}
+
+fn normalize_remote_bind_host(value: String, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_optional_path(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn remote_os_defaults(
+    os: ManagedRemoteTargetOs,
+    site_id: &str,
+) -> (&'static str, String, String, String, String) {
+    match os {
+        ManagedRemoteTargetOs::Windows => (
+            "默认 Windows 目标",
+            "C:/Plant3D/sites".to_string(),
+            format!("C:/Plant3D/runtime/surrealdb/{site_id}.db"),
+            "C:/Plant3D/bin/surreal/surreal.exe".to_string(),
+            "C:/Plant3D/bin/web_server.exe".to_string(),
+        ),
+        ManagedRemoteTargetOs::Centos79 => (
+            "默认 CentOS 7.9 目标",
+            "/opt/plant3d/sites".to_string(),
+            format!("/root/surreal_data/{site_id}.db"),
+            "/usr/local/bin/surreal".to_string(),
+            "/root/web_server".to_string(),
+        ),
+        ManagedRemoteTargetOs::Ubuntu22 => (
+            "默认 Ubuntu22 目标",
+            "/opt/plant3d/sites".to_string(),
+            format!("/root/surreal_data/{site_id}.db"),
+            "/usr/local/bin/surreal".to_string(),
+            "/root/web_server".to_string(),
+        ),
+    }
+}
+
 fn normalize_remote_target(mut target: ManagedRemoteTarget, site_id: &str) -> ManagedRemoteTarget {
+    let (default_name, default_root, default_db_path, default_surreal, default_web) =
+        remote_os_defaults(target.target_os, site_id);
     if target.id.trim().is_empty() {
         target.id = "default".to_string();
     }
     if target.name.trim().is_empty() {
-        target.name = "默认 Linux 目标".to_string();
+        target.name = default_name.to_string();
     }
     if target.host.trim().is_empty() {
         target.host = "123.57.182.243".to_string();
@@ -2088,10 +2238,10 @@ fn normalize_remote_target(mut target: ManagedRemoteTarget, site_id: &str) -> Ma
         target.password_env = "REMOTE_PASS".to_string();
     }
     if target.remote_root.trim().is_empty() {
-        target.remote_root = "/opt/plant3d/sites".to_string();
+        target.remote_root = default_root;
     }
     if target.remote_db_path.trim().is_empty() {
-        target.remote_db_path = format!("/root/surreal_data/{site_id}.db");
+        target.remote_db_path = default_db_path;
     }
     if target.remote_web_port == 0 {
         target.remote_web_port = 3100;
@@ -2100,11 +2250,18 @@ fn normalize_remote_target(mut target: ManagedRemoteTarget, site_id: &str) -> Ma
         target.remote_db_port = 8020;
     }
     if target.surreal_bin.trim().is_empty() {
-        target.surreal_bin = "/usr/local/bin/surreal".to_string();
+        target.surreal_bin = default_surreal;
     }
     if target.remote_web_bin.trim().is_empty() {
-        target.remote_web_bin = "/root/web_server".to_string();
+        target.remote_web_bin = default_web;
     }
+    target.allowed_cidrs = normalize_remote_allowed_cidrs(target.allowed_cidrs);
+    target.web_bind_host = normalize_remote_bind_host(target.web_bind_host, "0.0.0.0");
+    target.db_bind_host = normalize_remote_bind_host(target.db_bind_host, "127.0.0.1");
+    target.local_web_bin = normalize_optional_path(target.local_web_bin);
+    target.local_surreal_bin = normalize_optional_path(target.local_surreal_bin);
+    target.local_resource_dir = normalize_optional_path(target.local_resource_dir);
+    target.local_viewer_dir = normalize_optional_path(target.local_viewer_dir);
     target
 }
 
@@ -2119,6 +2276,9 @@ fn apply_remote_target_request(
     if let Some(value) = req.name.filter(|value| !value.trim().is_empty()) {
         target.name = value;
     }
+    if let Some(value) = req.target_os {
+        target.target_os = value;
+    }
     if let Some(value) = req.host.filter(|value| !value.trim().is_empty()) {
         target.host = value;
     }
@@ -2130,6 +2290,9 @@ fn apply_remote_target_request(
     }
     if let Some(value) = req.password_env.filter(|value| !value.trim().is_empty()) {
         target.password_env = value;
+    }
+    if let Some(value) = req.ssh_password.filter(|value| !value.trim().is_empty()) {
+        target.ssh_password = Some(value);
     }
     if let Some(value) = req.remote_root.filter(|value| !value.trim().is_empty()) {
         target.remote_root = value;
@@ -2152,6 +2315,45 @@ fn apply_remote_target_request(
     if let Some(value) = req.remote_web_bin.filter(|value| !value.trim().is_empty()) {
         target.remote_web_bin = value;
     }
+    if let Some(value) = req.auto_prepare {
+        target.auto_prepare = value;
+    }
+    if let Some(value) = req.upload_web_server {
+        target.upload_web_server = value;
+    }
+    if let Some(value) = req.upload_surreal {
+        target.upload_surreal = value;
+    }
+    if let Some(value) = req.upload_resource {
+        target.upload_resource = value;
+    }
+    if let Some(value) = req.upload_viewer {
+        target.upload_viewer = value;
+    }
+    if let Some(value) = req.open_firewall {
+        target.open_firewall = value;
+    }
+    if let Some(values) = req.allowed_cidrs {
+        target.allowed_cidrs = values;
+    }
+    if let Some(value) = req.web_bind_host {
+        target.web_bind_host = value;
+    }
+    if let Some(value) = req.db_bind_host {
+        target.db_bind_host = value;
+    }
+    if req.local_web_bin.is_some() {
+        target.local_web_bin = normalize_optional_path(req.local_web_bin);
+    }
+    if req.local_surreal_bin.is_some() {
+        target.local_surreal_bin = normalize_optional_path(req.local_surreal_bin);
+    }
+    if req.local_resource_dir.is_some() {
+        target.local_resource_dir = normalize_optional_path(req.local_resource_dir);
+    }
+    if req.local_viewer_dir.is_some() {
+        target.local_viewer_dir = normalize_optional_path(req.local_viewer_dir);
+    }
     normalize_remote_target(target, site_id)
 }
 
@@ -2166,21 +2368,30 @@ fn load_remote_target_with_conn(
 }
 
 fn persist_remote_target_with_conn(conn: &Connection, target: &ManagedRemoteTarget) -> Result<()> {
+    let allowed_cidrs_json = serde_json::to_string(&target.allowed_cidrs)?;
     conn.execute(
         &format!(
             "INSERT OR REPLACE INTO {REMOTE_TARGETS_TABLE} (
-                id, name, host, ssh_port, ssh_user, password_env, remote_root, remote_db_path,
+                id, name, target_os, host, ssh_port, ssh_user, password_env, ssh_password, remote_root, remote_db_path,
                 remote_web_port, remote_db_port, public_base_url, surreal_bin, remote_web_bin,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                auto_prepare, upload_web_server, upload_surreal, upload_resource, upload_viewer,
+                open_firewall, allowed_cidrs_json, web_bind_host, db_bind_host, local_web_bin,
+                local_surreal_bin, local_resource_dir, local_viewer_dir, created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                ?26, ?27, ?28, ?29, ?30
+            )"
         ),
         params![
             &target.id,
             &target.name,
+            remote_target_os_to_str(target.target_os),
             &target.host,
             target.ssh_port as i64,
             &target.ssh_user,
             &target.password_env,
+            &target.ssh_password,
             &target.remote_root,
             &target.remote_db_path,
             target.remote_web_port as i64,
@@ -2188,6 +2399,19 @@ fn persist_remote_target_with_conn(conn: &Connection, target: &ManagedRemoteTarg
             &target.public_base_url,
             &target.surreal_bin,
             &target.remote_web_bin,
+            target.auto_prepare as i64,
+            target.upload_web_server as i64,
+            target.upload_surreal as i64,
+            target.upload_resource as i64,
+            target.upload_viewer as i64,
+            target.open_firewall as i64,
+            &allowed_cidrs_json,
+            &target.web_bind_host,
+            &target.db_bind_host,
+            &target.local_web_bin,
+            &target.local_surreal_bin,
+            &target.local_resource_dir,
+            &target.local_viewer_dir,
             &target.created_at,
             &target.updated_at,
         ],
@@ -2214,6 +2438,11 @@ fn resolve_remote_target(
         } else {
             normalize_remote_target(base, site_id)
         };
+        if let Some(password) = target.ssh_password.as_deref() {
+            remember_remote_password(site_id, &target.id, password);
+        } else {
+            target.ssh_password = remembered_remote_password(site_id, &target.id);
+        }
         let now = now_rfc3339();
         if target.created_at.trim().is_empty() {
             target.created_at = now.clone();
@@ -2261,21 +2490,26 @@ pub fn upsert_remote_target(req: ManagedRemoteTargetRequest) -> Result<ManagedRe
 pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStatus> {
     with_conn(|conn| {
         let sql = format!(
-            "SELECT site_id, target_id, status, current_step, remote_entry_url, checked_at, last_error, checks_json
+            "SELECT site_id, target_id, deploy_id, deploy_task_id, deployment_mode, degraded,
+                    status, current_step, remote_entry_url, checked_at, last_error, checks_json
              FROM {REMOTE_DEPLOY_STATUS_TABLE} WHERE site_id = ?1"
         );
         let status = conn
             .query_row(&sql, [site_id], |row| {
-                let checks_json: String = row.get(7)?;
+                let checks_json: String = row.get(11)?;
                 let checks = serde_json::from_str(&checks_json).unwrap_or_default();
                 Ok(ManagedRemoteDeployStatus {
                     site_id: row.get(0)?,
                     target_id: row.get(1)?,
-                    status: row.get(2)?,
-                    current_step: row.get(3)?,
-                    remote_entry_url: row.get(4)?,
-                    checked_at: row.get(5)?,
-                    last_error: row.get(6)?,
+                    deploy_id: row.get(2)?,
+                    deploy_task_id: row.get(3)?,
+                    deployment_mode: row.get(4)?,
+                    degraded: row_bool_index(row, 5, false),
+                    status: row.get(6)?,
+                    current_step: row.get(7)?,
+                    remote_entry_url: row.get(8)?,
+                    checked_at: row.get(9)?,
+                    last_error: row.get(10)?,
                     checks,
                 })
             })
@@ -2283,6 +2517,10 @@ pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStat
         Ok(status.unwrap_or_else(|| ManagedRemoteDeployStatus {
             site_id: site_id.to_string(),
             target_id: "default".to_string(),
+            deploy_id: None,
+            deploy_task_id: None,
+            deployment_mode: None,
+            degraded: false,
             status: "idle".to_string(),
             current_step: "尚未远端部署".to_string(),
             remote_entry_url: None,
@@ -2299,12 +2537,17 @@ fn save_remote_deploy_status(status: &ManagedRemoteDeployStatus) -> Result<()> {
         conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO {REMOTE_DEPLOY_STATUS_TABLE} (
-                    site_id, target_id, status, current_step, remote_entry_url, checked_at, last_error, checks_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                    site_id, target_id, deploy_id, deploy_task_id, deployment_mode, degraded,
+                    status, current_step, remote_entry_url, checked_at, last_error, checks_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
             params![
                 &status.site_id,
                 &status.target_id,
+                &status.deploy_id,
+                &status.deploy_task_id,
+                &status.deployment_mode,
+                status.degraded as i64,
                 &status.status,
                 &status.current_step,
                 &status.remote_entry_url,
@@ -6451,18 +6694,92 @@ pub async fn deploy_site(site_id: String) -> Result<()> {
     Ok(())
 }
 
-fn command_exists(name: &str) -> bool {
-    std::process::Command::new(name)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success() || status.code().is_some())
-        .unwrap_or(false)
-}
-
 fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn remote_target_os_to_str(os: ManagedRemoteTargetOs) -> &'static str {
+    match os {
+        ManagedRemoteTargetOs::Ubuntu22 => "ubuntu22",
+        ManagedRemoteTargetOs::Centos79 => "centos79",
+        ManagedRemoteTargetOs::Windows => "windows",
+    }
+}
+
+fn remote_target_os_from_str(value: &str) -> ManagedRemoteTargetOs {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "centos79" | "centos7.9" | "centos" => ManagedRemoteTargetOs::Centos79,
+        "windows" | "win" | "win64" => ManagedRemoteTargetOs::Windows,
+        _ => ManagedRemoteTargetOs::Ubuntu22,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteExecutionMode {
+    Root,
+    Sudo,
+    User,
+}
+
+impl RemoteExecutionMode {
+    fn status_label(self) -> &'static str {
+        match self {
+            RemoteExecutionMode::Root => "root",
+            RemoteExecutionMode::Sudo => "sudo",
+            RemoteExecutionMode::User => "user",
+        }
+    }
+
+    fn degraded(self) -> bool {
+        matches!(self, RemoteExecutionMode::User)
+    }
+
+    fn privileged_shell(self, script: &str) -> String {
+        match self {
+            RemoteExecutionMode::Root | RemoteExecutionMode::User => script.to_string(),
+            RemoteExecutionMode::Sudo => format!("sudo -n sh -c {}", sh_quote(script)),
+        }
+    }
+}
+
+fn remote_execution_mode_from_output(output: &str) -> RemoteExecutionMode {
+    match output.trim().lines().last().unwrap_or_default().trim() {
+        "root" => RemoteExecutionMode::Root,
+        "sudo" => RemoteExecutionMode::Sudo,
+        _ => RemoteExecutionMode::User,
+    }
+}
+
+async fn detect_remote_execution_mode(target: &ManagedRemoteTarget) -> Result<RemoteExecutionMode> {
+    let output = run_ssh(
+        target,
+        "set -e; if [ \"$(id -u)\" = \"0\" ]; then echo root; elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then echo sudo; else echo user; fi",
+    )
+    .await?;
+    Ok(remote_execution_mode_from_output(&output))
+}
+
+fn remote_password_cache_key(site_id: &str, target_id: &str) -> String {
+    format!("{site_id}:{target_id}")
+}
+
+fn remember_remote_password(site_id: &str, target_id: &str, password: &str) {
+    let password = password.trim();
+    if password.is_empty() {
+        return;
+    }
+    let key = remote_password_cache_key(site_id, target_id);
+    let cache = REMOTE_DEPLOY_PASSWORDS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, password.to_string());
+    }
+}
+
+fn remembered_remote_password(site_id: &str, target_id: &str) -> Option<String> {
+    let key = remote_password_cache_key(site_id, target_id);
+    REMOTE_DEPLOY_PASSWORDS
+        .get()
+        .and_then(|cache| cache.lock().ok()?.get(&key).cloned())
 }
 
 fn remote_site_dir(target: &ManagedRemoteTarget, site_id: &str) -> String {
@@ -6477,119 +6794,591 @@ fn remote_entry_url(target: &ManagedRemoteTarget) -> String {
         .unwrap_or_else(|| format!("http://{}:{}", target.host, target.remote_web_port))
 }
 
+fn remote_site_token(site_id: &str, deploy_id: Option<&str>) -> String {
+    format!("{site_id}:{}", deploy_id.unwrap_or("unknown"))
+}
+
 fn ssh_target(target: &ManagedRemoteTarget) -> String {
     format!("{}@{}", target.ssh_user, target.host)
 }
 
 fn command_env_password(target: &ManagedRemoteTarget) -> Result<String> {
+    if let Some(password) = target
+        .ssh_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(password.to_string());
+    }
     std::env::var(&target.password_env)
         .with_context(|| format!("远端部署密码环境变量未设置: {}", target.password_env))
 }
 
+fn connect_native_ssh(target: &ManagedRemoteTarget) -> Result<ssh2::Session> {
+    let password = command_env_password(target)?;
+    let tcp = TcpStream::connect((target.host.as_str(), target.ssh_port))
+        .with_context(|| format!("连接远端 SSH 失败: {}:{}", target.host, target.ssh_port))?;
+    let timeout = Some(Duration::from_secs(30));
+    let _ = tcp.set_read_timeout(timeout);
+    let _ = tcp.set_write_timeout(timeout);
+
+    let mut session = ssh2::Session::new().context("创建原生 SSH session 失败")?;
+    session.set_tcp_stream(tcp);
+    session.handshake().context("SSH 握手失败")?;
+    session
+        .userauth_password(&target.ssh_user, &password)
+        .with_context(|| format!("SSH 密码认证失败: {}", ssh_target(target)))?;
+    if !session.authenticated() {
+        bail!("SSH 认证未通过: {}", ssh_target(target));
+    }
+    Ok(session)
+}
+
+fn exec_native_ssh(session: &ssh2::Session, remote_cmd: &str) -> Result<String> {
+    let mut channel = session.channel_session().context("创建 SSH channel 失败")?;
+    channel
+        .exec(remote_cmd)
+        .with_context(|| format!("执行远端命令失败: {remote_cmd}"))?;
+    let mut stdout = String::new();
+    channel
+        .read_to_string(&mut stdout)
+        .context("读取远端命令 stdout 失败")?;
+    let mut stderr = String::new();
+    channel
+        .stderr()
+        .read_to_string(&mut stderr)
+        .context("读取远端命令 stderr 失败")?;
+    channel.wait_close().context("等待远端命令结束失败")?;
+    let exit_status = channel.exit_status().unwrap_or(-1);
+    if exit_status == 0 {
+        Ok(stdout.trim().to_string())
+    } else {
+        bail!(
+            "SSH 命令失败: status={exit_status}; stderr={}; stdout={}",
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+}
+
 async fn run_ssh(target: &ManagedRemoteTarget, remote_cmd: &str) -> Result<String> {
-    let password = command_env_password(target)?;
-    let mut cmd = Command::new("sshpass");
-    cmd.env("SSHPASS", password)
-        .arg("-e")
-        .arg("ssh")
-        .arg("-o")
-        .arg("PreferredAuthentications=password")
-        .arg("-o")
-        .arg("PubkeyAuthentication=no")
-        .arg("-o")
-        .arg("KbdInteractiveAuthentication=no")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-p")
-        .arg(target.ssh_port.to_string())
-        .arg(ssh_target(target))
-        .arg(remote_cmd);
-    let output = cmd.output().await.context("执行 SSH 失败")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        bail!(
-            "SSH 命令失败: status={:?}; stderr={}; stdout={}",
-            output.status.code(),
-            stderr,
-            stdout
-        );
-    }
+    let target = target.clone();
+    let remote_cmd = remote_cmd.to_string();
+    task::spawn_blocking(move || {
+        let session = connect_native_ssh(&target)?;
+        exec_native_ssh(&session, &remote_cmd)
+    })
+    .await
+    .context("执行原生 SSH 任务失败")?
 }
 
-async fn run_rsync_db(site: &ManagedProjectSite, target: &ManagedRemoteTarget) -> Result<()> {
-    let password = command_env_password(target)?;
-    let source = Path::new(&site.db_data_path);
-    let source_arg = if source.is_dir() {
-        format!("{}/", source.to_string_lossy().replace('\\', "/"))
+fn normalize_remote_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn ensure_safe_remote_delete_dir(remote_path: &str) -> Result<String> {
+    let normalized = normalize_remote_path(remote_path);
+    if normalized.is_empty()
+        || normalized == "/"
+        || normalized == "."
+        || normalized == "~"
+        || normalized.contains('\0')
+        || normalized.contains('*')
+    {
+        bail!("拒绝清理危险远端路径: {remote_path}");
+    }
+    if !normalized.starts_with('/') {
+        bail!("Linux 远端路径必须是绝对路径: {remote_path}");
+    }
+    if normalized.matches('/').count() < 2 {
+        bail!("远端路径层级过浅，拒绝清理: {remote_path}");
+    }
+    Ok(normalized)
+}
+
+fn remote_join(base: &str, rel: &Path) -> String {
+    let mut out = normalize_remote_path(base);
+    for component in rel.components() {
+        let value = component.as_os_str().to_string_lossy();
+        if value.is_empty() || value == "." {
+            continue;
+        }
+        out.push('/');
+        out.push_str(&value.replace('\\', "/"));
+    }
+    out
+}
+
+fn create_remote_dir_recursive(sftp: &ssh2::Sftp, remote_dir: &str) -> Result<()> {
+    let remote_dir = normalize_remote_path(remote_dir);
+    if remote_dir.is_empty() || remote_dir == "/" {
+        return Ok(());
+    }
+    let mut current = String::new();
+    for part in remote_dir.split('/').filter(|part| !part.is_empty()) {
+        current.push('/');
+        current.push_str(part);
+        let _ = sftp.mkdir(Path::new(&current), 0o755);
+    }
+    Ok(())
+}
+
+fn upload_file_native(sftp: &ssh2::Sftp, local_path: &Path, remote_path: &str) -> Result<()> {
+    let parent = remote_parent_dir(remote_path, "/tmp");
+    create_remote_dir_recursive(sftp, &parent)?;
+    let mut local = fs::File::open(local_path)
+        .with_context(|| format!("打开本地上传文件失败: {}", local_path.display()))?;
+    let mut remote = sftp
+        .create(Path::new(remote_path))
+        .with_context(|| format!("创建远端文件失败: {remote_path}"))?;
+    std::io::copy(&mut local, &mut remote)
+        .with_context(|| format!("上传文件失败: {} -> {remote_path}", local_path.display()))?;
+    Ok(())
+}
+
+fn upload_path_native_sync(
+    local_path: &Path,
+    target: &ManagedRemoteTarget,
+    remote_path: &str,
+    copy_contents: bool,
+    delete_extra: bool,
+) -> Result<()> {
+    let session = connect_native_ssh(target)?;
+    if delete_extra {
+        let safe_dir = ensure_safe_remote_delete_dir(remote_path)?;
+        exec_native_ssh(
+            &session,
+            &format!(
+                "set -e; rm -rf {}; mkdir -p {}",
+                sh_quote(&safe_dir),
+                sh_quote(&safe_dir)
+            ),
+        )?;
+    } else if local_path.is_dir() {
+        exec_native_ssh(
+            &session,
+            &format!("set -e; mkdir -p {}", sh_quote(remote_path)),
+        )?;
     } else {
-        source.to_string_lossy().replace('\\', "/")
+        let parent = remote_parent_dir(remote_path, "/tmp");
+        exec_native_ssh(&session, &format!("set -e; mkdir -p {}", sh_quote(&parent)))?;
+    }
+
+    let sftp = session.sftp().context("创建 SFTP session 失败")?;
+    if local_path.is_file() {
+        upload_file_native(&sftp, local_path, remote_path)?;
+        return Ok(());
+    }
+    if !local_path.is_dir() {
+        bail!("本地上传路径不存在: {}", local_path.display());
+    }
+
+    let remote_root = normalize_remote_path(remote_path);
+    create_remote_dir_recursive(&sftp, &remote_root)?;
+    let base = if copy_contents {
+        local_path.to_path_buf()
+    } else {
+        local_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| local_path.to_path_buf())
     };
-    let remote_dest = format!("{}:{}/", ssh_target(target), target.remote_db_path);
-    let ssh_cmd = format!(
-        "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {}",
-        target.ssh_port
-    );
-    let mut cmd = Command::new("sshpass");
-    cmd.env("SSHPASS", password)
-        .arg("-e")
-        .arg("rsync")
-        .arg("-az")
-        .arg("--delete")
-        .arg("--partial")
-        .arg("--info=progress2")
-        .arg("-e")
-        .arg(ssh_cmd)
-        .arg(source_arg)
-        .arg(remote_dest);
-    let output = cmd.output().await.context("执行 rsync 上传数据库失败")?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "rsync 上传数据库失败: status={:?}; stderr={}; stdout={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-            String::from_utf8_lossy(&output.stdout).trim()
-        );
+    for entry in walkdir::WalkDir::new(local_path).follow_links(false) {
+        let entry =
+            entry.with_context(|| format!("遍历本地上传目录失败: {}", local_path.display()))?;
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(&base)
+            .with_context(|| format!("计算上传相对路径失败: {}", path.display()))?;
+        if copy_contents && rel.as_os_str().is_empty() {
+            continue;
+        }
+        let remote = remote_join(&remote_root, rel);
+        if entry.file_type().is_dir() {
+            create_remote_dir_recursive(&sftp, &remote)?;
+        } else if entry.file_type().is_file() {
+            upload_file_native(&sftp, path, &remote)?;
+        }
     }
+    Ok(())
 }
 
-async fn run_rsync_file(
+async fn upload_path_native(
+    local_path: &Path,
+    target: &ManagedRemoteTarget,
+    remote_path: &str,
+    copy_contents: bool,
+    delete_extra: bool,
+) -> Result<()> {
+    let local_path = local_path.to_path_buf();
+    let target = target.clone();
+    let remote_path = remote_path.to_string();
+    task::spawn_blocking(move || {
+        upload_path_native_sync(
+            &local_path,
+            &target,
+            &remote_path,
+            copy_contents,
+            delete_extra,
+        )
+    })
+    .await
+    .context("执行原生 SFTP 上传任务失败")?
+}
+
+async fn upload_db_native(site: &ManagedProjectSite, target: &ManagedRemoteTarget) -> Result<()> {
+    let source = Path::new(&site.db_data_path);
+    if !source.exists() {
+        bail!("本地数据库目录不存在: {}", source.display());
+    }
+    upload_path_native(
+        source,
+        target,
+        &target.remote_db_path,
+        source.is_dir(),
+        true,
+    )
+    .await
+}
+
+async fn upload_file_native_async(
     local_path: &Path,
     target: &ManagedRemoteTarget,
     remote_path: &str,
 ) -> Result<()> {
-    let password = command_env_password(target)?;
-    let ssh_cmd = format!(
-        "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {}",
-        target.ssh_port
-    );
-    let mut cmd = Command::new("sshpass");
-    cmd.env("SSHPASS", password)
-        .arg("-e")
-        .arg("rsync")
-        .arg("-az")
-        .arg("--partial")
-        .arg("-e")
-        .arg(ssh_cmd)
-        .arg(local_path.to_string_lossy().to_string())
-        .arg(format!("{}:{}", ssh_target(target), remote_path));
-    let output = cmd.output().await.context("执行 rsync 上传文件失败")?;
-    if output.status.success() {
-        Ok(())
+    upload_path_native(local_path, target, remote_path, false, false).await
+}
+
+async fn upload_resource_path_native(
+    local_path: &Path,
+    target: &ManagedRemoteTarget,
+    remote_path: &str,
+    copy_contents: bool,
+    delete_extra: bool,
+) -> Result<()> {
+    upload_path_native(local_path, target, remote_path, copy_contents, delete_extra).await
+}
+
+fn remote_parent_dir(remote_path: &str, default: &str) -> String {
+    let trimmed = remote_path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => trimmed[..idx].to_string(),
+        None => default.to_string(),
+    }
+}
+
+fn path_is_windows_exe(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("exe"))
+        .unwrap_or(false)
+}
+
+fn find_runtime_artifact(file_name: &str) -> Option<PathBuf> {
+    let runtime = repo_root().ok()?.join("runtime");
+    let mut candidates = fs::read_dir(runtime)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(file_name))
+        .filter(|path| path.exists() && path.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        path.metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    });
+    candidates.pop()
+}
+
+fn resolve_local_web_bin(target: &ManagedRemoteTarget) -> Result<Option<PathBuf>> {
+    if !target.upload_web_server {
+        return Ok(None);
+    }
+    if let Some(path) = target.local_web_bin.as_deref() {
+        let path = PathBuf::from(path);
+        if path.exists() && path.is_file() {
+            return Ok(Some(path));
+        }
+        bail!("本地 web_server 产物不存在: {}", path.display());
+    }
+    let repo = repo_root()?;
+    let current = current_exe_path().ok();
+    let mut candidates = vec![
+        repo.join("target/x86_64-unknown-linux-gnu/release/web_server"),
+        repo.join("target/release/web_server"),
+    ];
+    if let Some(path) = find_runtime_artifact("web_server") {
+        candidates.push(path);
+    }
+    if let Some(path) = current.filter(|path| !path_is_windows_exe(path)) {
+        candidates.push(path);
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!("未找到可上传的 Linux web_server，请设置 local_web_bin 或先准备 Linux 产物")
+        })
+}
+
+fn resolve_local_surreal_bin(target: &ManagedRemoteTarget) -> Result<Option<PathBuf>> {
+    if !target.upload_surreal {
+        return Ok(None);
+    }
+    if let Some(path) = target.local_surreal_bin.as_deref() {
+        let path = PathBuf::from(path);
+        if path.exists() && path.is_file() {
+            return Ok(Some(path));
+        }
+        bail!("本地 SurrealDB 产物不存在: {}", path.display());
+    }
+    let repo = repo_root()?;
+    let mut candidates = vec![
+        repo.join("tools/surrealdb/linux/surreal"),
+        repo.join("tools/surrealdb/surreal"),
+    ];
+    if let Some(path) = bundled_surreal_binary().filter(|path| !path_is_windows_exe(path)) {
+        candidates.push(path);
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!("未找到可上传的 Linux surreal，请设置 local_surreal_bin 或关闭 upload_surreal")
+        })
+}
+
+fn resolve_local_resource_dir(target: &ManagedRemoteTarget) -> Result<Option<PathBuf>> {
+    if !target.upload_resource {
+        return Ok(None);
+    }
+    let path = target
+        .local_resource_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("resource/surreal")
+        });
+    if path.exists() && path.is_dir() {
+        Ok(Some(path))
+    } else {
+        bail!("本地 resource/surreal 目录不存在: {}", path.display());
+    }
+}
+
+fn resolve_local_viewer_dir(target: &ManagedRemoteTarget) -> Result<Option<PathBuf>> {
+    if !target.upload_viewer {
+        return Ok(None);
+    }
+    let path = target
+        .local_viewer_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("viewer")
+        });
+    if path.join("index.html").exists() {
+        Ok(Some(path))
     } else {
         bail!(
-            "rsync 上传文件失败: status={:?}; stderr={}; stdout={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-            String::from_utf8_lossy(&output.stdout).trim()
+            "本地 viewer 目录不存在或缺少 index.html: {}",
+            path.display()
         );
     }
+}
+
+fn push_remote_local_artifact_check(
+    checks: &mut Vec<ManagedSitePreflightCheck>,
+    key: &str,
+    label: &str,
+    result: Result<Option<PathBuf>>,
+) {
+    match result {
+        Ok(Some(path)) => checks.push(preflight_pass(
+            key,
+            label,
+            format!("本地上传源可用: {}", path.display()),
+            Some(path.display().to_string()),
+        )),
+        Ok(None) => checks.push(preflight_pass(
+            key,
+            label,
+            "未启用上传，跳过本地源检查",
+            None,
+        )),
+        Err(err) => checks.push(preflight_blocking(
+            key,
+            label,
+            err.to_string(),
+            None,
+            Some("补齐本地 Linux 产物路径或关闭对应上传开关".to_string()),
+            Vec::new(),
+        )),
+    }
+}
+
+fn remote_firewall_command(target: &ManagedRemoteTarget, mode: RemoteExecutionMode) -> String {
+    if !target.open_firewall {
+        return "echo FIREWALL_SKIPPED".to_string();
+    }
+    if mode == RemoteExecutionMode::User {
+        return "echo FIREWALL_SKIPPED_USER_MODE".to_string();
+    }
+    let mut cmd = String::from("if command -v ufw >/dev/null 2>&1; then ");
+    for cidr in normalize_remote_allowed_cidrs(target.allowed_cidrs.clone()) {
+        if cidr == "0.0.0.0/0" || cidr == "::/0" {
+            cmd.push_str(&format!(
+                "ufw allow {}/tcp >/dev/null 2>&1 || true; ",
+                target.remote_web_port
+            ));
+        } else {
+            cmd.push_str(&format!(
+                "ufw allow from {} to any port {} proto tcp >/dev/null 2>&1 || true; ",
+                sh_quote(&cidr),
+                target.remote_web_port
+            ));
+        }
+    }
+    cmd.push_str("echo FIREWALL_UFW_CONFIGURED; ");
+    cmd.push_str("elif command -v firewall-cmd >/dev/null 2>&1; then ");
+    cmd.push_str(&format!(
+        "firewall-cmd --permanent --add-port={}/tcp >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true; echo FIREWALLD_CONFIGURED; ",
+        target.remote_web_port
+    ));
+    cmd.push_str("else echo FIREWALL_TOOL_MISSING; fi");
+    mode.privileged_shell(&cmd)
+}
+
+fn remote_prepare_dirs_command(
+    target: &ManagedRemoteTarget,
+    site_dir: &str,
+    mode: RemoteExecutionMode,
+) -> String {
+    let db_parent = remote_parent_dir(&target.remote_db_path, "/root/surreal_data");
+    let web_parent = remote_parent_dir(&target.remote_web_bin, "/root");
+    let surreal_parent = remote_parent_dir(&target.surreal_bin, "/usr/local/bin");
+    let runtime_dirs = if mode == RemoteExecutionMode::User {
+        format!(
+            " {site_dir}/runtime/pids {site_dir}/runtime/logs",
+            site_dir = sh_quote(site_dir)
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "set -e; mkdir -p {site_dir} {db_parent} {web_parent} {surreal_parent} {resource_dir} {viewer_dir}",
+        site_dir = sh_quote(site_dir),
+        db_parent = sh_quote(&db_parent),
+        web_parent = sh_quote(&web_parent),
+        surreal_parent = sh_quote(&surreal_parent),
+        resource_dir = sh_quote(&format!("{site_dir}/resource/surreal")),
+        viewer_dir = sh_quote(&format!("{site_dir}/viewer")),
+    );
+    mode.privileged_shell(&format!("{script}{runtime_dirs}"))
+}
+
+async fn prepare_remote_server(
+    site_id: &str,
+    target: &ManagedRemoteTarget,
+    mode: RemoteExecutionMode,
+) -> Result<Vec<ManagedSitePreflightCheck>> {
+    let site_dir = remote_site_dir(target, site_id);
+    let local_web_bin = resolve_local_web_bin(target)?;
+    let local_surreal_bin = resolve_local_surreal_bin(target)?;
+    let local_resource_dir = resolve_local_resource_dir(target)?;
+    let local_viewer_dir = resolve_local_viewer_dir(target)?;
+    let mut checks = Vec::new();
+
+    run_ssh(
+        target,
+        &remote_prepare_dirs_command(target, &site_dir, mode),
+    )
+    .await?;
+    checks.push(preflight_pass(
+        "remote_prepare_dirs",
+        "远端目录",
+        "远端运行目录已创建",
+        Some(site_dir.clone()),
+    ));
+
+    if let Some(path) = local_web_bin {
+        upload_resource_path_native(&path, target, &target.remote_web_bin, false, false).await?;
+        run_ssh(
+            target,
+            &format!("set -e; chmod +x {}", sh_quote(&target.remote_web_bin)),
+        )
+        .await?;
+        checks.push(preflight_pass(
+            "remote_upload_web_server",
+            "上传 web_server",
+            "web_server 已上传并授予执行权限",
+            Some(target.remote_web_bin.clone()),
+        ));
+    }
+
+    if let Some(path) = local_surreal_bin {
+        upload_resource_path_native(&path, target, &target.surreal_bin, false, false).await?;
+        run_ssh(
+            target,
+            &format!("set -e; chmod +x {}", sh_quote(&target.surreal_bin)),
+        )
+        .await?;
+        checks.push(preflight_pass(
+            "remote_upload_surreal",
+            "上传 SurrealDB",
+            "SurrealDB 已上传并授予执行权限",
+            Some(target.surreal_bin.clone()),
+        ));
+    }
+
+    if let Some(path) = local_resource_dir {
+        let remote_resource = format!("{site_dir}/resource/surreal");
+        upload_resource_path_native(&path, target, &remote_resource, true, true).await?;
+        checks.push(preflight_pass(
+            "remote_upload_resource",
+            "上传 resource/surreal",
+            "Surreal 初始化脚本已同步",
+            Some(remote_resource),
+        ));
+    }
+
+    if let Some(path) = local_viewer_dir {
+        let remote_viewer = format!("{site_dir}/viewer");
+        upload_resource_path_native(&path, target, &remote_viewer, true, true).await?;
+        checks.push(preflight_pass(
+            "remote_upload_viewer",
+            "上传 Viewer",
+            "Viewer 静态资源已同步",
+            Some(remote_viewer),
+        ));
+    }
+
+    let firewall_output = run_ssh(target, &remote_firewall_command(target, mode)).await?;
+    checks.push(preflight_pass(
+        "remote_firewall",
+        "远端防火墙",
+        if mode == RemoteExecutionMode::User {
+            "普通用户模式跳过防火墙配置"
+        } else if target.open_firewall {
+            "Web 端口防火墙配置已执行"
+        } else {
+            "未启用自动防火墙配置"
+        },
+        Some(firewall_output),
+    ));
+
+    Ok(checks)
 }
 
 fn build_remote_site_config(
@@ -6612,7 +7401,7 @@ fn build_remote_site_config(
 
     let web_server = ensure_table(table, "web_server");
     set_toml_integer(web_server, "port", target.remote_web_port as i64);
-    set_toml_string(web_server, "bind_host", "0.0.0.0");
+    set_toml_string(web_server, "bind_host", target.web_bind_host.clone());
     set_toml_string(web_server, "public_base_url", remote_entry_url(target));
     set_toml_string(web_server, "frontend_url", remote_entry_url(target));
     set_toml_string(
@@ -6630,7 +7419,7 @@ fn build_remote_site_config(
     set_toml_string(
         web_server,
         "surreal_bind",
-        format!("0.0.0.0:{}", target.remote_db_port),
+        format!("{}:{}", target.db_bind_host, target.remote_db_port),
     );
     set_toml_string(web_server, "surreal_user", db_user.to_string());
     set_toml_string(web_server, "surreal_password", db_password.to_string());
@@ -6657,11 +7446,14 @@ async fn install_remote_services(
     target: &ManagedRemoteTarget,
     db_user: &str,
     db_password: &str,
+    deploy_id: Option<&str>,
+    mode: RemoteExecutionMode,
 ) -> Result<()> {
     let site_dir = remote_site_dir(target, &site.site_id);
     let remote_config = format!("{site_dir}/DbOption.toml");
     let (surreal_unit, web_unit) = remote_service_unit_names(&site.site_id);
     let web_bin = target.remote_web_bin.trim();
+    let site_token = remote_site_token(&site.site_id, deploy_id);
     let surreal_unit_content = format!(
         r#"[Unit]
 Description=Plant3D SurrealDB {site_id}
@@ -6670,7 +7462,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={surreal_bin} start --log info --user {db_user} --pass {db_password} --bind 0.0.0.0:{db_port} rocksdb://{db_path}
+ExecStart={surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} rocksdb://{db_path}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -6682,6 +7474,7 @@ WantedBy=multi-user.target
         surreal_bin = target.surreal_bin,
         db_user = db_user,
         db_password = db_password,
+        db_bind = target.db_bind_host,
         db_port = target.remote_db_port,
         db_path = target.remote_db_path
     );
@@ -6694,6 +7487,10 @@ Wants=network-online.target {surreal_unit}
 [Service]
 Type=simple
 WorkingDirectory={site_dir}
+Environment=PLANT3D_DEPLOY_ID={deploy_id}
+Environment=PLANT3D_DEPLOYMENT_MODE={deployment_mode}
+Environment=PLANT3D_DEPLOY_DEGRADED=false
+Environment=PLANT3D_SITE_TOKEN={site_token}
 ExecStart={web_bin} --config {config_no_ext}
 Restart=on-failure
 RestartSec=5
@@ -6705,33 +7502,217 @@ WantedBy=multi-user.target
         site_id = site.site_id,
         surreal_unit = surreal_unit,
         site_dir = site_dir,
+        deploy_id = deploy_id.unwrap_or("unknown"),
+        deployment_mode = mode.status_label(),
+        site_token = site_token,
         web_bin = web_bin,
         config_no_ext = remote_config.trim_end_matches(".toml")
     );
-    let cmd = format!(
+    let script = format!(
         "set -e; mkdir -p {site_dir} {db_parent}; cat > /etc/systemd/system/{surreal_unit} <<'EOF_SUR'\n{surreal_unit_content}EOF_SUR\ncat > /etc/systemd/system/{web_unit} <<'EOF_WEB'\n{web_unit_content}EOF_WEB\nsystemctl daemon-reload",
         site_dir = sh_quote(&site_dir),
-        db_parent = sh_quote(
-            Path::new(&target.remote_db_path)
-                .parent()
-                .and_then(|p| p.to_str())
-                .unwrap_or("/root/surreal_data")
-        ),
+        db_parent = sh_quote(&remote_parent_dir(
+            &target.remote_db_path,
+            "/root/surreal_data"
+        )),
         surreal_unit = surreal_unit,
         web_unit = web_unit,
         surreal_unit_content = surreal_unit_content,
         web_unit_content = web_unit_content,
     );
+    run_ssh(target, &mode.privileged_shell(&script)).await?;
+    Ok(())
+}
+
+async fn restart_remote_services(
+    site_id: &str,
+    target: &ManagedRemoteTarget,
+    mode: RemoteExecutionMode,
+) -> Result<()> {
+    let (surreal_unit, web_unit) = remote_service_unit_names(site_id);
+    let script = format!(
+        "set -e; systemctl stop {web_unit} 2>/dev/null || true; systemctl stop {surreal_unit} 2>/dev/null || true; systemctl enable --now {surreal_unit}; sleep 2; systemctl enable --now {web_unit}; sleep 2; systemctl is-active {surreal_unit}; systemctl is-active {web_unit}",
+        web_unit = web_unit,
+        surreal_unit = surreal_unit
+    );
+    run_ssh(target, &mode.privileged_shell(&script)).await?;
+    Ok(())
+}
+
+fn remote_user_script_paths(site_dir: &str) -> (String, String, String) {
+    (
+        format!("{site_dir}/start.sh"),
+        format!("{site_dir}/stop.sh"),
+        format!("{site_dir}/status.sh"),
+    )
+}
+
+fn user_mode_start_script(
+    site: &ManagedProjectSite,
+    target: &ManagedRemoteTarget,
+    db_user: &str,
+    db_password: &str,
+    deploy_id: Option<&str>,
+) -> String {
+    let site_dir = remote_site_dir(target, &site.site_id);
+    let remote_config = format!("{site_dir}/DbOption.toml");
+    let deploy_id = deploy_id.unwrap_or("unknown");
+    let site_token = remote_site_token(&site.site_id, Some(deploy_id));
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+SITE_DIR={site_dir}
+PID_DIR="$SITE_DIR/runtime/pids"
+LOG_DIR="$SITE_DIR/runtime/logs"
+DB_PID_FILE="$PID_DIR/surreal.pid"
+WEB_PID_FILE="$PID_DIR/web_server.pid"
+mkdir -p "$PID_DIR" "$LOG_DIR"
+
+is_running() {{
+  local pid_file="$1"
+  [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1
+}}
+
+if is_running "$DB_PID_FILE"; then
+  echo "surreal already running: $(cat "$DB_PID_FILE")"
+else
+  rm -f "$DB_PID_FILE"
+  nohup {surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} rocksdb://{db_path} >> "$LOG_DIR/surreal.log" 2>&1 &
+  echo $! > "$DB_PID_FILE"
+fi
+
+sleep 2
+
+if is_running "$WEB_PID_FILE"; then
+  echo "web_server already running: $(cat "$WEB_PID_FILE")"
+else
+  rm -f "$WEB_PID_FILE"
+  PLANT3D_DEPLOY_ID={deploy_id} \
+  PLANT3D_DEPLOYMENT_MODE=user \
+  PLANT3D_DEPLOY_DEGRADED=true \
+  PLANT3D_SITE_TOKEN={site_token} \
+  nohup {web_bin} --config {config_no_ext} >> "$LOG_DIR/web_server.log" 2>&1 &
+  echo $! > "$WEB_PID_FILE"
+fi
+
+"$SITE_DIR/status.sh"
+"#,
+        site_dir = sh_quote(&site_dir),
+        surreal_bin = sh_quote(&target.surreal_bin),
+        db_user = sh_quote(db_user),
+        db_password = sh_quote(db_password),
+        db_bind = sh_quote(&target.db_bind_host),
+        db_port = target.remote_db_port,
+        db_path = sh_quote(&target.remote_db_path),
+        deploy_id = sh_quote(deploy_id),
+        site_token = sh_quote(&site_token),
+        web_bin = sh_quote(&target.remote_web_bin),
+        config_no_ext = sh_quote(remote_config.trim_end_matches(".toml")),
+    )
+}
+
+fn user_mode_stop_script() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+SITE_DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_DIR="$SITE_DIR/runtime/pids"
+
+stop_pid_file() {
+  local label="$1"
+  local pid_file="$2"
+  if [ ! -f "$pid_file" ]; then
+    echo "$label not running"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [ -z "$pid" ] || ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$pid_file"
+    echo "$label stale pid cleared"
+    return 0
+  fi
+  kill "$pid" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5; do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      rm -f "$pid_file"
+      echo "$label stopped"
+      return 0
+    fi
+    sleep 1
+  done
+  kill -9 "$pid" >/dev/null 2>&1 || true
+  rm -f "$pid_file"
+  echo "$label killed"
+}
+
+stop_pid_file web_server "$PID_DIR/web_server.pid"
+stop_pid_file surreal "$PID_DIR/surreal.pid"
+"#
+    .to_string()
+}
+
+fn user_mode_status_script() -> String {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+SITE_DIR="$(cd "$(dirname "$0")" && pwd)"
+PID_DIR="$SITE_DIR/runtime/pids"
+
+status_pid_file() {
+  local label="$1"
+  local pid_file="$2"
+  if [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1; then
+    echo "$label=running pid=$(cat "$pid_file")"
+  else
+    echo "$label=stopped"
+    return 1
+  fi
+}
+
+db_ok=0
+web_ok=0
+status_pid_file surreal "$PID_DIR/surreal.pid" || db_ok=1
+status_pid_file web_server "$PID_DIR/web_server.pid" || web_ok=1
+exit $((db_ok + web_ok))
+"#
+    .to_string()
+}
+
+async fn install_remote_user_scripts(
+    site: &ManagedProjectSite,
+    target: &ManagedRemoteTarget,
+    db_user: &str,
+    db_password: &str,
+    deploy_id: Option<&str>,
+) -> Result<()> {
+    let site_dir = remote_site_dir(target, &site.site_id);
+    let (start_path, stop_path, status_path) = remote_user_script_paths(&site_dir);
+    let start_script = user_mode_start_script(site, target, db_user, db_password, deploy_id);
+    let stop_script = user_mode_stop_script();
+    let status_script = user_mode_status_script();
+    let cmd = format!(
+        "set -e; mkdir -p {site_dir} {pid_dir} {log_dir}; cat > {start_path} <<'EOF_START'\n{start_script}EOF_START\ncat > {stop_path} <<'EOF_STOP'\n{stop_script}EOF_STOP\ncat > {status_path} <<'EOF_STATUS'\n{status_script}EOF_STATUS\nchmod +x {start_path} {stop_path} {status_path}",
+        site_dir = sh_quote(&site_dir),
+        pid_dir = sh_quote(&format!("{site_dir}/runtime/pids")),
+        log_dir = sh_quote(&format!("{site_dir}/runtime/logs")),
+        start_path = sh_quote(&start_path),
+        stop_path = sh_quote(&stop_path),
+        status_path = sh_quote(&status_path),
+        start_script = start_script,
+        stop_script = stop_script,
+        status_script = status_script,
+    );
     run_ssh(target, &cmd).await?;
     Ok(())
 }
 
-async fn restart_remote_services(site_id: &str, target: &ManagedRemoteTarget) -> Result<()> {
-    let (surreal_unit, web_unit) = remote_service_unit_names(site_id);
+async fn restart_remote_user_scripts(site_id: &str, target: &ManagedRemoteTarget) -> Result<()> {
+    let site_dir = remote_site_dir(target, site_id);
+    let (start_path, stop_path, status_path) = remote_user_script_paths(&site_dir);
     let cmd = format!(
-        "set -e; systemctl stop {web_unit} 2>/dev/null || true; systemctl stop {surreal_unit} 2>/dev/null || true; systemctl enable --now {surreal_unit}; sleep 2; systemctl enable --now {web_unit}; sleep 2; systemctl is-active {surreal_unit}; systemctl is-active {web_unit}",
-        web_unit = web_unit,
-        surreal_unit = surreal_unit
+        "set -e; if [ -x {stop_path} ]; then {stop_path} || true; fi; {start_path}; sleep 2; {status_path}",
+        stop_path = sh_quote(&stop_path),
+        start_path = sh_quote(&start_path),
+        status_path = sh_quote(&status_path),
     );
     run_ssh(target, &cmd).await?;
     Ok(())
@@ -6818,7 +7799,90 @@ async fn validate_remote_http(site_id: &str, target: &ManagedRemoteTarget) -> Re
     if !remote_site_id.is_empty() && remote_site_id != site_id {
         bail!("远端站点身份不一致: expected={site_id}, actual={remote_site_id}");
     }
+    let agent_status_url = format!("{base_url}/api/site/agent-status");
+    client
+        .get(&agent_status_url)
+        .send()
+        .await
+        .with_context(|| format!("请求远端站点 Agent 状态失败: {agent_status_url}"))?
+        .error_for_status()
+        .context("远端站点 Agent 状态 HTTP 状态异常")?;
+    if target.upload_viewer {
+        let viewer_url = format!("{base_url}/viewer/");
+        client
+            .get(&viewer_url)
+            .send()
+            .await
+            .with_context(|| format!("请求远端 Viewer 失败: {viewer_url}"))?
+            .error_for_status()
+            .with_context(|| format!("远端 Viewer HTTP 状态异常: {viewer_url}"))?;
+    }
     Ok(())
+}
+
+pub async fn remote_prepare_site(
+    site_id: &str,
+    req: Option<ManagedRemoteDeployRequest>,
+) -> Result<ManagedRemoteDeployStatus> {
+    get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let target = resolve_remote_target(site_id, req)?;
+    let mode = detect_remote_execution_mode(&target).await?;
+    let mut status = ManagedRemoteDeployStatus {
+        site_id: site_id.to_string(),
+        target_id: target.id.clone(),
+        deploy_id: Some(format!(
+            "remote-{site_id}-{}",
+            chrono::Utc::now().timestamp()
+        )),
+        deploy_task_id: None,
+        deployment_mode: Some(mode.status_label().to_string()),
+        degraded: mode.degraded(),
+        status: "running".to_string(),
+        current_step: "remote_prepare".to_string(),
+        remote_entry_url: Some(remote_entry_url(&target)),
+        checked_at: now_rfc3339(),
+        last_error: None,
+        checks: Vec::new(),
+    };
+    save_remote_deploy_status(&status)?;
+
+    match prepare_remote_server(site_id, &target, mode).await {
+        Ok(mut checks) => {
+            if mode == RemoteExecutionMode::User {
+                checks.push(preflight_warning(
+                    "remote_user_mode_degraded",
+                    "普通用户降级部署",
+                    "目标用户无 root/sudo，已跳过 systemd 和防火墙等系统级配置",
+                    None,
+                    Some("使用 start.sh/stop.sh/status.sh 管理进程；不承诺开机自启".to_string()),
+                    Vec::new(),
+                ));
+            }
+            status.status = "prepared".to_string();
+            status.current_step = "远端服务器准备完成".to_string();
+            status.checked_at = now_rfc3339();
+            status.checks = checks;
+            status.last_error = None;
+            save_remote_deploy_status(&status)?;
+            Ok(status)
+        }
+        Err(err) => {
+            status.status = "failed".to_string();
+            status.current_step = "远端服务器准备失败".to_string();
+            status.checked_at = now_rfc3339();
+            status.last_error = Some(err.to_string());
+            status.checks = vec![preflight_blocking(
+                "remote_prepare",
+                "远端服务器准备",
+                err.to_string(),
+                Some(format!("{}@{}", target.ssh_user, target.host)),
+                Some("检查 SSH 权限、本地产物路径、远端目录和防火墙工具".to_string()),
+                Vec::new(),
+            )];
+            let _ = save_remote_deploy_status(&status);
+            Err(err)
+        }
+    }
 }
 
 pub async fn remote_preflight_site(
@@ -6828,6 +7892,24 @@ pub async fn remote_preflight_site(
     let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
     let target = resolve_remote_target(site_id, req)?;
     let mut checks = Vec::new();
+
+    if target.target_os == ManagedRemoteTargetOs::Windows {
+        checks.push(preflight_blocking(
+            "target_os_windows",
+            "目标操作系统",
+            "Windows 目标已可在向导中选择，但当前远端执行器仍是 Linux/systemd 命令，暂不直接执行",
+            Some("windows".to_string()),
+            Some("下一步需要补 Windows OpenSSH + PowerShell 服务安装适配器".to_string()),
+            Vec::new(),
+        ));
+    } else {
+        checks.push(preflight_pass(
+            "target_os",
+            "目标操作系统",
+            format!("使用 {:?} 的 Linux/systemd 部署适配器", target.target_os),
+            Some(remote_target_os_to_str(target.target_os).to_string()),
+        ));
+    }
 
     if site.parse_status == ManagedSiteParseStatus::Running {
         checks.push(preflight_blocking(
@@ -6887,27 +7969,26 @@ pub async fn remote_preflight_site(
         ));
     }
 
-    for cmd in ["sshpass", "rsync", "ssh"] {
-        if command_exists(cmd) {
-            checks.push(preflight_pass(
-                &format!("cmd_{cmd}"),
-                &format!("本机命令 {cmd}"),
-                "命令可用",
-                None,
-            ));
-        } else {
-            checks.push(preflight_blocking(
-                &format!("cmd_{cmd}"),
-                &format!("本机命令 {cmd}"),
-                format!("远端部署需要本机可执行 {cmd}"),
-                None,
-                Some("安装 sshpass/rsync/ssh 后重试".to_string()),
-                Vec::new(),
-            ));
-        }
-    }
+    checks.push(preflight_pass(
+        "native_ssh_sftp",
+        "Rust 原生 SSH/SFTP",
+        "远端命令和文件上传使用内置 ssh2/SFTP，不再依赖本机 sshpass/ssh/rsync 命令",
+        None,
+    ));
 
-    if std::env::var(&target.password_env)
+    if target
+        .ssh_password
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        checks.push(preflight_pass(
+            "ssh_password",
+            "SSH 密码",
+            "已配置 SSH 密码（测试阶段允许落库）",
+            None,
+        ));
+    } else if std::env::var(&target.password_env)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
     {
@@ -6928,32 +8009,141 @@ pub async fn remote_preflight_site(
         ));
     }
 
+    push_remote_local_artifact_check(
+        &mut checks,
+        "local_web_server_artifact",
+        "本地 web_server 产物",
+        resolve_local_web_bin(&target),
+    );
+    push_remote_local_artifact_check(
+        &mut checks,
+        "local_surreal_artifact",
+        "本地 SurrealDB 产物",
+        resolve_local_surreal_bin(&target),
+    );
+    push_remote_local_artifact_check(
+        &mut checks,
+        "local_resource_artifact",
+        "本地 resource/surreal",
+        resolve_local_resource_dir(&target),
+    );
+    push_remote_local_artifact_check(
+        &mut checks,
+        "local_viewer_artifact",
+        "本地 Viewer",
+        resolve_local_viewer_dir(&target),
+    );
+
+    if !matches!(
+        target.db_bind_host.as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    ) {
+        checks.push(preflight_warning(
+            "remote_db_bind_host",
+            "远端数据库监听地址",
+            format!(
+                "SurrealDB 将监听 {}:{}，建议默认只绑定 127.0.0.1",
+                target.db_bind_host, target.remote_db_port
+            ),
+            None,
+            Some("除非明确需要外部访问数据库，否则保持 db_bind_host=127.0.0.1".to_string()),
+            Vec::new(),
+        ));
+    }
+
+    let mut remote_mode = None;
     if checks
         .iter()
         .all(|check| check.status != ManagedSitePreflightStatus::Blocking)
     {
+        match detect_remote_execution_mode(&target).await {
+            Ok(mode) => {
+                let status = if mode == RemoteExecutionMode::User {
+                    ManagedSitePreflightStatus::Warning
+                } else {
+                    ManagedSitePreflightStatus::Pass
+                };
+                checks.push(ManagedSitePreflightCheck {
+                    key: "remote_execution_mode".to_string(),
+                    label: "远端执行模式".to_string(),
+                    status,
+                    message: match mode {
+                        RemoteExecutionMode::Root => "SSH 用户为 root，将使用 systemd 完整部署".to_string(),
+                        RemoteExecutionMode::Sudo => {
+                            "SSH 用户可免密 sudo，将使用 systemd 完整部署".to_string()
+                        }
+                        RemoteExecutionMode::User => {
+                            "SSH 用户无免密 sudo，将使用脚本降级部署".to_string()
+                        }
+                    },
+                    detail: Some(mode.status_label().to_string()),
+                    action_hint: (mode == RemoteExecutionMode::User).then(|| {
+                        "需确认 remote_root/remote_db_path/web_server/surreal 路径当前用户可读写；不会配置 systemd/防火墙/开机自启".to_string()
+                    }),
+                    pids: Vec::new(),
+                });
+                remote_mode = Some(mode);
+            }
+            Err(err) => checks.push(preflight_blocking(
+                "remote_execution_mode",
+                "远端执行模式",
+                err.to_string(),
+                Some(format!("{}@{}", target.ssh_user, target.host)),
+                Some("检查 SSH 账号、密码和 sudo 配置".to_string()),
+                Vec::new(),
+            )),
+        }
+    }
+
+    if checks
+        .iter()
+        .all(|check| check.status != ManagedSitePreflightStatus::Blocking)
+    {
+        let mode = remote_mode.unwrap_or(RemoteExecutionMode::User);
         let (surreal_unit, web_unit) = remote_service_unit_names(site_id);
-        match run_ssh(
-            &target,
-            &format!(
-                "set -e; surreal={surreal}; web_bin={web_bin}; if [ -x \"$surreal\" ]; then echo \"surreal=$surreal\"; else command -v \"$surreal\"; fi; [ -x \"$web_bin\" ] || (echo WEB_BIN_MISSING:$web_bin; exit 43); echo \"web_bin=$web_bin\"; mkdir -p {root} {db_parent}; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{db_port}[[:space:]]' && ! systemctl is-active --quiet {surreal_unit}; then echo DB_PORT_IN_USE; exit 44; fi; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{web_port}[[:space:]]' && ! systemctl is-active --quiet {web_unit}; then echo WEB_PORT_IN_USE; exit 45; fi; df -Pk {root} | tail -1",
+        let surreal_required = !(target.auto_prepare && target.upload_surreal);
+        let web_required = !(target.auto_prepare && target.upload_web_server);
+        let surreal_parent = remote_parent_dir(&target.surreal_bin, "/usr/local/bin");
+        let web_parent = remote_parent_dir(&target.remote_web_bin, "/root");
+        let db_parent = remote_parent_dir(&target.remote_db_path, "/root/surreal_data");
+        let site_dir = remote_site_dir(&target, site_id);
+        let script = if mode == RemoteExecutionMode::User {
+            format!(
+                "set -e; surreal={surreal}; web_bin={web_bin}; mkdir -p {root} {site_dir} {db_parent} {surreal_parent} {web_parent} {pid_dir} {log_dir}; if [ -x \"$surreal\" ]; then echo \"surreal=$surreal\"; elif command -v \"$surreal\" >/dev/null 2>&1; then command -v \"$surreal\"; elif [ {surreal_required} -eq 1 ]; then echo SURREAL_MISSING:$surreal; exit 43; else echo SURREAL_WILL_UPLOAD:$surreal; fi; if [ -x \"$web_bin\" ]; then echo \"web_bin=$web_bin\"; elif [ {web_required} -eq 1 ]; then echo WEB_BIN_MISSING:$web_bin; exit 44; else echo WEB_BIN_WILL_UPLOAD:$web_bin; fi; db_pid={db_pid_file}; web_pid={web_pid_file}; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{db_port}[[:space:]]' && ! ([ -f \"$db_pid\" ] && kill -0 \"$(cat \"$db_pid\")\" >/dev/null 2>&1); then echo DB_PORT_IN_USE; exit 45; fi; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{web_port}[[:space:]]' && ! ([ -f \"$web_pid\" ] && kill -0 \"$(cat \"$web_pid\")\" >/dev/null 2>&1); then echo WEB_PORT_IN_USE; exit 46; fi; df -Pk {root} | tail -1; echo USER_MODE_READY",
                 surreal = sh_quote(&target.surreal_bin),
                 web_bin = sh_quote(&target.remote_web_bin),
                 root = sh_quote(&target.remote_root),
-                db_parent = sh_quote(
-                    Path::new(&target.remote_db_path)
-                        .parent()
-                        .and_then(|p| p.to_str())
-                        .unwrap_or("/root/surreal_data")
-                ),
+                site_dir = sh_quote(&site_dir),
+                db_parent = sh_quote(&db_parent),
+                surreal_parent = sh_quote(&surreal_parent),
+                web_parent = sh_quote(&web_parent),
+                pid_dir = sh_quote(&format!("{site_dir}/runtime/pids")),
+                log_dir = sh_quote(&format!("{site_dir}/runtime/logs")),
+                db_pid_file = sh_quote(&format!("{site_dir}/runtime/pids/surreal.pid")),
+                web_pid_file = sh_quote(&format!("{site_dir}/runtime/pids/web_server.pid")),
+                surreal_required = if surreal_required { 1 } else { 0 },
+                web_required = if web_required { 1 } else { 0 },
+                db_port = target.remote_db_port,
+                web_port = target.remote_web_port,
+            )
+        } else {
+            mode.privileged_shell(&format!(
+                "set -e; surreal={surreal}; web_bin={web_bin}; mkdir -p {root} {db_parent} {surreal_parent} {web_parent}; if [ -x \"$surreal\" ]; then echo \"surreal=$surreal\"; elif command -v \"$surreal\" >/dev/null 2>&1; then command -v \"$surreal\"; elif [ {surreal_required} -eq 1 ]; then echo SURREAL_MISSING:$surreal; exit 43; else echo SURREAL_WILL_UPLOAD:$surreal; fi; if [ -x \"$web_bin\" ]; then echo \"web_bin=$web_bin\"; elif [ {web_required} -eq 1 ]; then echo WEB_BIN_MISSING:$web_bin; exit 44; else echo WEB_BIN_WILL_UPLOAD:$web_bin; fi; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{db_port}[[:space:]]' && ! systemctl is-active --quiet {surreal_unit}; then echo DB_PORT_IN_USE; exit 45; fi; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{web_port}[[:space:]]' && ! systemctl is-active --quiet {web_unit}; then echo WEB_PORT_IN_USE; exit 46; fi; df -Pk {root} | tail -1",
+                surreal = sh_quote(&target.surreal_bin),
+                web_bin = sh_quote(&target.remote_web_bin),
+                root = sh_quote(&target.remote_root),
+                db_parent = sh_quote(&db_parent),
+                surreal_parent = sh_quote(&surreal_parent),
+                web_parent = sh_quote(&web_parent),
+                surreal_required = if surreal_required { 1 } else { 0 },
+                web_required = if web_required { 1 } else { 0 },
                 db_port = target.remote_db_port,
                 web_port = target.remote_web_port,
                 surreal_unit = surreal_unit,
                 web_unit = web_unit,
-            ),
-        )
-        .await
-        {
+            ))
+        };
+        match run_ssh(&target, &script).await {
             Ok(out) => checks.push(preflight_pass(
                 "remote_machine",
                 "远端机器",
@@ -6982,6 +8172,12 @@ pub async fn remote_preflight_site(
     let status = ManagedRemoteDeployStatus {
         site_id: site_id.to_string(),
         target_id: target.id.clone(),
+        deploy_id: None,
+        deploy_task_id: None,
+        deployment_mode: remote_mode.map(|mode| mode.status_label().to_string()),
+        degraded: remote_mode
+            .map(RemoteExecutionMode::degraded)
+            .unwrap_or(false),
         status: if blocking_count == 0 {
             "ready".to_string()
         } else {
@@ -7000,6 +8196,14 @@ pub async fn remote_preflight_site(
 pub async fn remote_deploy_site(
     site_id: String,
     req: Option<ManagedRemoteDeployRequest>,
+) -> Result<ManagedRemoteDeployStatus> {
+    remote_deploy_site_with_task_id(site_id, req, None).await
+}
+
+pub async fn remote_deploy_site_with_task_id(
+    site_id: String,
+    req: Option<ManagedRemoteDeployRequest>,
+    task_id: Option<String>,
 ) -> Result<ManagedRemoteDeployStatus> {
     let request = match req {
         Some(req) => Some(req),
@@ -7023,6 +8227,31 @@ pub async fn remote_deploy_site(
     if status.status == "blocked" {
         bail!("远端部署预检未通过: {}", status.current_step);
     }
+    let mode = detect_remote_execution_mode(&target).await?;
+    status.deploy_id = Some(format!(
+        "remote-{site_id}-{}",
+        chrono::Utc::now().timestamp()
+    ));
+    status.deploy_task_id = task_id;
+    status.deployment_mode = Some(mode.status_label().to_string());
+    status.degraded = mode.degraded();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    if target.auto_prepare {
+        status.status = "running".to_string();
+        status.current_step = "remote_prepare".to_string();
+        status.checked_at = now_rfc3339();
+        save_remote_deploy_status(&status)?;
+        let prepared = remote_prepare_site(
+            &site_id,
+            Some(ManagedRemoteDeployRequest {
+                target_id: Some(target.id.clone()),
+                target: None,
+            }),
+        )
+        .await?;
+        status.checks = prepared.checks;
+    }
     let (site, db_user, db_password) = load_site_and_credentials(&site_id)?;
     status.status = "running".to_string();
     status.current_step = "preflight".to_string();
@@ -7042,27 +8271,34 @@ pub async fn remote_deploy_site(
     status.checked_at = now_rfc3339();
     save_remote_deploy_status(&status)?;
     let (surreal_unit, web_unit) = remote_service_unit_names(&site_id);
-    run_ssh(
-        &target,
-        &format!(
+    let stop_script = if mode == RemoteExecutionMode::User {
+        let (_, stop_path, _) = remote_user_script_paths(&site_dir);
+        format!(
+            "set -e; if [ -x {stop_path} ]; then {stop_path} || true; fi; mkdir -p {site_dir} {db_parent} {pid_dir} {log_dir}",
+            stop_path = sh_quote(&stop_path),
+            site_dir = sh_quote(&site_dir),
+            db_parent = sh_quote(&remote_parent_dir(
+                &target.remote_db_path,
+                "/root/surreal_data"
+            )),
+            pid_dir = sh_quote(&format!("{site_dir}/runtime/pids")),
+            log_dir = sh_quote(&format!("{site_dir}/runtime/logs")),
+        )
+    } else {
+        mode.privileged_shell(&format!(
             "set -e; systemctl stop {web_unit} 2>/dev/null || true; systemctl stop {surreal_unit} 2>/dev/null || true; mkdir -p {site_dir} {db_parent}",
             web_unit = web_unit,
             surreal_unit = surreal_unit,
             site_dir = sh_quote(&site_dir),
-            db_parent = sh_quote(
-                Path::new(&target.remote_db_path)
-                    .parent()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("/root/surreal_data")
-            )
-        ),
-    )
-    .await?;
+            db_parent = sh_quote(&remote_parent_dir(&target.remote_db_path, "/root/surreal_data"))
+        ))
+    };
+    run_ssh(&target, &stop_script).await?;
 
     status.current_step = "upload".to_string();
     status.checked_at = now_rfc3339();
     save_remote_deploy_status(&status)?;
-    run_rsync_db(&site, &target).await?;
+    upload_db_native(&site, &target).await?;
 
     status.current_step = "remote_config".to_string();
     status.checked_at = now_rfc3339();
@@ -7072,18 +8308,41 @@ pub async fn remote_deploy_site(
     fs::create_dir_all(&local_remote_dir)?;
     let local_remote_config = local_remote_dir.join("DbOption.remote.toml");
     write_file_atomic(&local_remote_config, &remote_config)?;
-    run_rsync_file(
+    upload_file_native_async(
         &local_remote_config,
         &target,
         &format!("{site_dir}/DbOption.toml"),
     )
     .await?;
-    install_remote_services(&site, &target, &db_user, &db_password).await?;
+    if mode == RemoteExecutionMode::User {
+        install_remote_user_scripts(
+            &site,
+            &target,
+            &db_user,
+            &db_password,
+            status.deploy_id.as_deref(),
+        )
+        .await?;
+    } else {
+        install_remote_services(
+            &site,
+            &target,
+            &db_user,
+            &db_password,
+            status.deploy_id.as_deref(),
+            mode,
+        )
+        .await?;
+    }
 
     status.current_step = "remote_start".to_string();
     status.checked_at = now_rfc3339();
     save_remote_deploy_status(&status)?;
-    restart_remote_services(&site_id, &target).await?;
+    if mode == RemoteExecutionMode::User {
+        restart_remote_user_scripts(&site_id, &target).await?;
+    } else {
+        restart_remote_services(&site_id, &target, mode).await?;
+    }
 
     status.current_step = "validation".to_string();
     status.checked_at = now_rfc3339();
@@ -7091,7 +8350,11 @@ pub async fn remote_deploy_site(
     validate_remote_http(&site_id, &target).await?;
 
     status.status = "completed".to_string();
-    status.current_step = "远端部署完成".to_string();
+    status.current_step = if mode == RemoteExecutionMode::User {
+        "远端部署完成（普通用户降级模式）".to_string()
+    } else {
+        "远端部署完成".to_string()
+    };
     status.remote_entry_url = Some(remote_entry_url(&target));
     status.checked_at = now_rfc3339();
     status.last_error = None;

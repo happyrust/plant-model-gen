@@ -78,11 +78,17 @@ export const sitesApi = {
   remotePreflight: (id: string, payload: ManagedRemoteDeployRequest = {}) =>
     apiPost<ManagedRemoteDeployStatus>(`/api/admin/sites/${id}/remote-preflight`, payload as unknown as Record<string, unknown>),
 
+  remotePrepare: (id: string, payload: ManagedRemoteDeployRequest = {}) =>
+    apiPost<ManagedRemoteDeployStatus>(`/api/admin/sites/${id}/remote-prepare`, payload as unknown as Record<string, unknown>),
+
   remoteDeploy: (id: string, payload: ManagedRemoteDeployRequest = {}) =>
     apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/remote-deploy`, payload as unknown as Record<string, unknown>),
 
   remoteDeployStatus: (id: string) =>
     apiGet<ManagedRemoteDeployStatus>(`/api/admin/sites/${id}/remote-deploy/status`),
+
+  remoteAgentStatus: (id: string) =>
+    apiGet<Record<string, unknown>>(`/api/admin/sites/${id}/remote-agent-status`),
 
   update: (id: string, payload: UpdateManagedSiteRequest) =>
     apiPut<ManagedProjectSite>(`/api/admin/sites/${id}`, payload as unknown as Record<string, unknown>),

@@ -22,7 +22,7 @@ const router = createRouter({
       component: () => import('@/components/layout/MainLayout.vue'),
       meta: { requiresAuth: true },
       children: [
-        { path: '', redirect: '/sites' },
+        { path: '', redirect: '/offline-deploy' },
         {
           path: 'sites',
           name: 'sites',
@@ -32,6 +32,11 @@ const router = createRouter({
           path: 'registry',
           name: 'registry',
           component: () => import('@/views/RegistrySitesView.vue'),
+        },
+        {
+          path: 'offline-deploy',
+          name: 'offline-deploy',
+          component: () => import('@/views/OfflineDeployView.vue'),
         },
         {
           path: 'sites/:id',

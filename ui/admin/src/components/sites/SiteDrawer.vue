@@ -155,6 +155,8 @@ const form = ref<CreateManagedSiteRequest>({
   mesh_tol_ratio: 3.0,
   export_json: false,
   export_parquet: true,
+  pipeline_db_mode: 'file',
+  runtime_db_mode: 'ws',
   db_port: DEFAULT_DB_PORT,
   web_port: DEFAULT_WEB_PORT,
   bind_host: '127.0.0.1',
@@ -226,6 +228,8 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         mesh_tol_ratio: s.mesh_tol_ratio ?? 3.0,
         export_json: s.export_json ?? false,
         export_parquet: s.export_parquet ?? true,
+        pipeline_db_mode: s.pipeline_db_mode ?? 'file',
+        runtime_db_mode: s.runtime_db_mode ?? 'ws',
         db_port: s.db_port,
         web_port: s.web_port,
         bind_host: s.bind_host || '127.0.0.1',
@@ -261,6 +265,8 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       mesh_tol_ratio: 3.0,
       export_json: false,
       export_parquet: true,
+      pipeline_db_mode: 'file',
+      runtime_db_mode: 'ws',
       db_port: DEFAULT_DB_PORT,
       web_port: DEFAULT_WEB_PORT,
       bind_host: '127.0.0.1',
@@ -553,6 +559,24 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                   >
                     {{ portStatusLabel(portStatuses.web_port) }}
                   </p>
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">解析/生成 DB 模式</label>
+                  <select v-model="form.pipeline_db_mode" :class="inputClass">
+                    <option value="file">file（默认，离线文件）</option>
+                    <option value="ws">ws（连接服务）</option>
+                  </select>
+                  <p class="text-xs text-muted-foreground">解析和模型生成默认使用 file，避免依赖已启动站点。</p>
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">站点运行 DB 模式</label>
+                  <select v-model="form.runtime_db_mode" :class="inputClass">
+                    <option value="ws">ws（默认，启动站点服务）</option>
+                    <option value="file">file（单进程文件）</option>
+                  </select>
+                  <p class="text-xs text-muted-foreground">正式启动站点默认使用 ws，由站点进程连接 SurrealDB 服务。</p>
                 </div>
               </div>
               <div class="space-y-2">

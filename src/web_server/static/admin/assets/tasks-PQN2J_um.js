@@ -1,0 +1,1 @@
+import{n as e,r as t}from"./client-Cmn79SPa.js";var n={list:t=>e(`/api/admin/tasks`,{query:t}),get:t=>e(`/api/admin/tasks/${t}`),create:e=>t(`/api/admin/tasks`,e),cancel:e=>t(`/api/admin/tasks/${e}/cancel`),retry:e=>t(`/api/admin/tasks/${e}/retry`)};export{n as t};

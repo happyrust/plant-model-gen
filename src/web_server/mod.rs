@@ -928,6 +928,10 @@ pub async fn start_web_server_with_config(
         )
         // 部署站点管理 API（一 web_server 进程对应一个运行站点；多站点 = 多进程 + 不同监听 IP/端口）
         .route("/api/site/identity", get(handlers::api_get_site_identity))
+        .route(
+            "/api/site/agent-status",
+            get(handlers::api_get_site_agent_status),
+        )
         // 站点清单（公开只读，且不返回 DB 凭据 / 项目路径等敏感字段）
         .route("/api/sites", get(handlers::api_get_public_deployment_sites))
         .route(

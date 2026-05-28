@@ -520,8 +520,12 @@ async fn dispatch_admin_task(task_id: String) {
         (TaskType::RemoteDeployManagedSite, Some(sid)) => {
             mark_task_running(&mut stored.task, "远端部署：preflight", 10.0);
             let _ = save_task(&stored.task, stored.site_id.as_deref());
-            match crate::web_server::managed_project_sites::remote_deploy_site(sid.to_string(), None)
-                .await
+            match crate::web_server::managed_project_sites::remote_deploy_site_with_task_id(
+                sid.to_string(),
+                None,
+                Some(stored.task.id.clone()),
+            )
+            .await
             {
                 Ok(status) => {
                     mark_task_completed(

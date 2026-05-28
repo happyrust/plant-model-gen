@@ -19,13 +19,17 @@ export type ManagedSiteParsePlanMode = 'Full' | 'Bootstrap' | 'RebuildSystem' | 
 export type ManagedSiteDbMode = 'file' | 'ws'
 
 
+export type ManagedRemoteTargetOs = 'ubuntu22' | 'centos79' | 'windows'
+
 export interface ManagedRemoteTarget {
   id: string
   name: string
+  target_os: ManagedRemoteTargetOs
   host: string
   ssh_port: number
   ssh_user: string
   password_env: string
+  ssh_password?: string | null
   remote_root: string
   remote_db_path: string
   remote_web_port: number
@@ -33,6 +37,19 @@ export interface ManagedRemoteTarget {
   public_base_url?: string | null
   surreal_bin: string
   remote_web_bin: string
+  auto_prepare: boolean
+  upload_web_server: boolean
+  upload_surreal: boolean
+  upload_resource: boolean
+  upload_viewer: boolean
+  open_firewall: boolean
+  allowed_cidrs: string[]
+  web_bind_host: string
+  db_bind_host: string
+  local_web_bin?: string | null
+  local_surreal_bin?: string | null
+  local_resource_dir?: string | null
+  local_viewer_dir?: string | null
   created_at: string
   updated_at: string
 }
@@ -40,10 +57,12 @@ export interface ManagedRemoteTarget {
 export interface ManagedRemoteTargetRequest {
   id?: string | null
   name?: string | null
+  target_os?: ManagedRemoteTargetOs | null
   host?: string | null
   ssh_port?: number | null
   ssh_user?: string | null
   password_env?: string | null
+  ssh_password?: string | null
   remote_root?: string | null
   remote_db_path?: string | null
   remote_web_port?: number | null
@@ -51,6 +70,19 @@ export interface ManagedRemoteTargetRequest {
   public_base_url?: string | null
   surreal_bin?: string | null
   remote_web_bin?: string | null
+  auto_prepare?: boolean | null
+  upload_web_server?: boolean | null
+  upload_surreal?: boolean | null
+  upload_resource?: boolean | null
+  upload_viewer?: boolean | null
+  open_firewall?: boolean | null
+  allowed_cidrs?: string[] | null
+  web_bind_host?: string | null
+  db_bind_host?: string | null
+  local_web_bin?: string | null
+  local_surreal_bin?: string | null
+  local_resource_dir?: string | null
+  local_viewer_dir?: string | null
 }
 
 export interface ManagedRemoteDeployRequest {
@@ -61,6 +93,10 @@ export interface ManagedRemoteDeployRequest {
 export interface ManagedRemoteDeployStatus {
   site_id: string
   target_id: string
+  deploy_id?: string | null
+  deploy_task_id?: string | null
+  deployment_mode?: string | null
+  degraded: boolean
   status: string
   current_step: string
   remote_entry_url?: string | null

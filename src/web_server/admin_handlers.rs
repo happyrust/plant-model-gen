@@ -47,12 +47,20 @@ pub fn create_admin_routes() -> Router {
             post(remote_preflight_site),
         )
         .route(
+            "/api/admin/sites/{id}/remote-prepare",
+            post(remote_prepare_site),
+        )
+        .route(
             "/api/admin/sites/{id}/remote-deploy",
             get(get_remote_deploy_status).post(remote_deploy_site),
         )
         .route(
             "/api/admin/sites/{id}/remote-deploy/status",
             get(get_remote_deploy_status),
+        )
+        .route(
+            "/api/admin/sites/{id}/remote-agent-status",
+            get(get_remote_agent_status),
         )
         .route("/api/admin/sites/{id}/parse", post(parse_site))
         .route("/api/admin/sites/{id}/generate", post(generate_site))
@@ -272,6 +280,17 @@ pub async fn remote_preflight_site(
     }
 }
 
+pub async fn remote_prepare_site(
+    Path(site_id): Path<String>,
+    payload: Option<Json<ManagedRemoteDeployRequest>>,
+) -> impl IntoResponse {
+    let request = payload.map(|Json(value)| value);
+    match managed_sites::remote_prepare_site(&site_id, request).await {
+        Ok(report) => admin_response::ok("远端服务器准备完成", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
 pub async fn remote_deploy_site(
     Path(site_id): Path<String>,
     payload: Option<Json<ManagedRemoteDeployRequest>>,
@@ -294,6 +313,54 @@ pub async fn get_remote_deploy_status(Path(site_id): Path<String>) -> impl IntoR
     match managed_sites::get_remote_deploy_status(&site_id) {
         Ok(status) => admin_response::ok("获取远端部署状态成功", status),
         Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn get_remote_agent_status(Path(site_id): Path<String>) -> impl IntoResponse {
+    let status = match managed_sites::get_remote_deploy_status(&site_id) {
+        Ok(status) => status,
+        Err(err) => return admin_response::managed_error(err.to_string()),
+    };
+    let Some(remote_entry_url) = status.remote_entry_url.as_deref() else {
+        return admin_response::managed_error(
+            "当前站点尚无远端访问地址，无法拉取 Agent 状态".to_string(),
+        );
+    };
+    let base_url = remote_entry_url.trim_end_matches('/');
+    let url = format!("{base_url}/api/site/agent-status");
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return admin_response::managed_error(format!("创建 HTTP client 失败: {err}")),
+    };
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            let status_code = resp.status();
+            match resp.error_for_status() {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(agent_status) => admin_response::ok(
+                        "获取远端 Agent 状态成功",
+                        json!({
+                            "site_id": site_id,
+                            "remote_entry_url": remote_entry_url,
+                            "agent_status_url": url,
+                            "checked_at": chrono::Utc::now().to_rfc3339(),
+                            "agent_status": agent_status,
+                        }),
+                    ),
+                    Err(err) => admin_response::managed_error(format!(
+                        "远端 Agent 状态 JSON 解析失败: {err}"
+                    )),
+                },
+                Err(err) => admin_response::managed_error(format!(
+                    "远端 Agent 状态 HTTP 异常: status={status_code}; {err}"
+                )),
+            }
+        }
+        Err(err) => admin_response::managed_error(format!("请求远端 Agent 状态失败: {err}")),
     }
 }
 

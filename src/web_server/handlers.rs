@@ -2458,6 +2458,153 @@ pub async fn api_get_site_identity() -> Json<serde_json::Value> {
     Json(crate::web_server::web_listen::site_identity_json())
 }
 
+fn disk_resource_for_path(path: &StdPath) -> serde_json::Value {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let best_disk = disks.list().iter().fold(None, |best, disk| {
+        if !path.starts_with(disk.mount_point()) {
+            return best;
+        }
+        let depth = disk.mount_point().components().count();
+        match best {
+            Some((best_depth, value)) if best_depth >= depth => Some((best_depth, value)),
+            _ => {
+                let total = disk.total_space();
+                let available = disk.available_space();
+                let usage_percent = if total == 0 {
+                    0.0
+                } else {
+                    ((total.saturating_sub(available)) as f32 / total as f32) * 100.0
+                };
+                Some((
+                    depth,
+                    json!({
+                        "mount_point": disk.mount_point().display().to_string(),
+                        "total_bytes": total,
+                        "available_bytes": available,
+                        "usage_percent": usage_percent,
+                    }),
+                ))
+            }
+        }
+    });
+    best_disk
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| json!({ "mount_point": null, "total_bytes": null, "available_bytes": null, "usage_percent": null }))
+}
+
+async fn probe_viewer_health() -> serde_json::Value {
+    let viewer_index = StdPath::new("viewer/index.html");
+    let static_present = viewer_index.exists();
+    let viewer_url = crate::web_server::web_listen::get_web_listen()
+        .map(|(_, port)| format!("http://127.0.0.1:{port}/viewer/"));
+
+    let mut http_ok = None;
+    let mut http_status = None;
+    if let Some(url) = viewer_url.as_deref() {
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .timeout(StdDuration::from_secs(2))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                return json!({
+                    "status": if static_present { "static_present" } else { "unknown" },
+                    "static_present": static_present,
+                    "url": url,
+                    "error": err.to_string(),
+                });
+            }
+        };
+        match client.get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                http_ok = Some(status.is_success());
+                http_status = Some(status.as_u16());
+            }
+            Err(err) => {
+                return json!({
+                    "status": if static_present { "static_present" } else { "unreachable" },
+                    "static_present": static_present,
+                    "url": url,
+                    "error": err.to_string(),
+                });
+            }
+        }
+    }
+
+    let status = if http_ok == Some(true) {
+        "ok"
+    } else if static_present {
+        "static_present"
+    } else {
+        "missing"
+    };
+    json!({
+        "status": status,
+        "static_present": static_present,
+        "index_path": viewer_index.display().to_string(),
+        "url": viewer_url,
+        "http_ok": http_ok,
+        "http_status": http_status,
+    })
+}
+
+/// 远端站点 agent 状态：中心端轮询该接口获取部署身份与基础健康信息。
+pub async fn api_get_site_agent_status(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Json(system_status) = get_system_status(State(state)).await?;
+    let identity = crate::web_server::web_listen::site_identity_json();
+    let site_token = std::env::var("PLANT3D_SITE_TOKEN")
+        .or_else(|_| std::env::var("SITE_TOKEN"))
+        .unwrap_or_default();
+    let site_token_source = if std::env::var("PLANT3D_SITE_TOKEN").is_ok() {
+        "PLANT3D_SITE_TOKEN"
+    } else {
+        "SITE_TOKEN"
+    };
+    let viewer = probe_viewer_health().await;
+    let viewer_health = viewer
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    Ok(Json(json!({
+        "kind": "plant3d_site_agent",
+        "identity": identity,
+        "deploy": {
+            "deploy_id": std::env::var("PLANT3D_DEPLOY_ID").ok(),
+            "deployment_mode": std::env::var("PLANT3D_DEPLOYMENT_MODE").unwrap_or_else(|_| "local".to_string()),
+            "degraded": std::env::var("PLANT3D_DEPLOY_DEGRADED")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "health": {
+            "database_connected": system_status.database_connected,
+            "surrealdb_connected": system_status.surrealdb_connected,
+            "viewer_health": viewer_health,
+            "viewer": viewer,
+        },
+        "runtime": {
+            "uptime_secs": system_status.uptime.as_secs(),
+            "cpu_usage": system_status.cpu_usage,
+            "memory_usage": system_status.memory_usage,
+            "active_tasks": system_status.active_tasks,
+            "queued_task_count": system_status.queued_task_count,
+            "cwd": cwd.display().to_string(),
+            "disk": disk_resource_for_path(&cwd),
+        },
+        "auth": {
+            "site_token_configured": !site_token.trim().is_empty(),
+            "site_token_source": site_token_source,
+            "site_token_length": site_token.len(),
+        }
+    })))
+}
+
 fn registry_error(
     status: StatusCode,
     message: impl Into<String>,

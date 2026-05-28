@@ -1,6 +1,6 @@
 [package]
 name = "aios-database"
-version = "0.3.32"
+version = "0.3.33"
 edition = "2024"
 default-run = "aios-database"
 
@@ -296,6 +296,10 @@ web_server = [
     "aios_core/web_server",
     "sqlite-index",
 ] #Web UI功能
+
+# CentOS 7.9 only ships OpenSSL 1.0.2, which is too old for openssl-sys 0.9.116.
+# Enable this only for the CentOS deploy-ready CI job to build libssh2 against vendored OpenSSL.
+ssh2-vendored-openssl = ["ssh2/vendored-openssl"]
 
 sqlite-index = ["dep:rusqlite", "dep:tokio-util", "aios_core/sqlite"] # SQLite RTree 空间索引功能
 rvm-import = ["dep:rvm-rs", "sqlite-index"]

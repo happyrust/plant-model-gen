@@ -165,9 +165,9 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
               source "$HOME/.cargo/env"
               rustup target add x86_64-unknown-linux-gnu
-              yum install -y openssl-devel pkgconfig
+              yum install -y perl-core pkgconfig
               export CMAKE_GENERATOR="Unix Makefiles"
-              cargo build --release --bin web_server --bin aios-database --target x86_64-unknown-linux-gnu --no-default-features --features "$DEPLOY_FEATURES"
+              cargo build --release --bin web_server --bin aios-database --target x86_64-unknown-linux-gnu --no-default-features --features "$DEPLOY_FEATURES,ssh2-vendored-openssl"
               chown -R "$host_ids" target/x86_64-unknown-linux-gnu/release
             '
         shell: bash

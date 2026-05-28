@@ -71,6 +71,7 @@ fn task_type_label(task_type: &TaskType) -> &'static str {
         TaskType::ModelExport => "模型导出",
         TaskType::StartManagedSite => "启动受管站点",
         TaskType::DeployManagedSite => "完整部署受管站点",
+        TaskType::RemoteDeployManagedSite => "远端部署受管站点",
         TaskType::Custom(_) => "自定义任务",
     }
 }

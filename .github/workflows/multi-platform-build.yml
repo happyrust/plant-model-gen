@@ -143,9 +143,11 @@ jobs:
       - name: Build binaries (CentOS 7.9 deploy-ready)
         if: matrix.artifact_name == 'centos-7.9-x64'
         run: |
+          workspace_parent="$(dirname "$GITHUB_WORKSPACE")"
+          workspace_name="$(basename "$GITHUB_WORKSPACE")"
           docker run --rm \
-            -v "$PWD:/workspace" \
-            -w /workspace \
+            -v "$workspace_parent:/ci-work" \
+            -w "/ci-work/$workspace_name" \
             -e GH_TOKEN \
             -e GIT_TERMINAL_PROMPT=0 \
             -e CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -153,8 +155,8 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail
-              host_ids="$(stat -c "%u:%g" /workspace)"
-              git config --global --add safe.directory /workspace
+              host_ids="$(stat -c "%u:%g" .)"
+              git config --global --add safe.directory "$(pwd)"
               git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
               source "$HOME/.cargo/env"

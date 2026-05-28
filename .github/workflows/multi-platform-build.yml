@@ -165,8 +165,18 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
               source "$HOME/.cargo/env"
               rustup target add x86_64-unknown-linux-gnu
-              yum install -y perl-core pkgconfig
-              export CMAKE_GENERATOR="Unix Makefiles"
+              yum install -y perl-core pkgconfig unzip
+              # manifold-rs 的 build.rs 硬编码 env::set_var("CMAKE_GENERATOR", "Ninja")，
+              # 会覆盖任何 CMAKE_GENERATOR 环境变量，因此容器内必须装 Ninja；manylinux2014
+              # 未自带 ninja 且 python3 不在默认 PATH，改用预编译静态二进制最稳。
+              curl --proto "=https" --tlsv1.2 -sSfL https://github.com/ninja-build/ninja/releases/download/v1.11.1/ninja-linux.zip -o /tmp/ninja.zip
+              unzip -o /tmp/ninja.zip -d /usr/local/bin
+              chmod +x /usr/local/bin/ninja
+              ninja --version
+              # manylinux2014(CentOS7 baseline) 不带 lld，但仓库 .cargo/config.toml 对
+              # x86_64-unknown-linux-gnu 强制 -fuse-ld=lld；该容器内改用默认 GNU ld，
+              # 避免链接阶段报找不到 ld.lld。
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=""
               cargo build --release --bin web_server --bin aios-database --target x86_64-unknown-linux-gnu --no-default-features --features "$DEPLOY_FEATURES,ssh2-vendored-openssl"
               chown -R "$host_ids" target/x86_64-unknown-linux-gnu/release
             '

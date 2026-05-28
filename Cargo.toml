@@ -1,6 +1,6 @@
 [package]
 name = "aios-database"
-version = "0.3.30"
+version = "0.3.31"
 edition = "2024"
 default-run = "aios-database"
 
@@ -75,7 +75,7 @@ surrealdb = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1"
 ] }
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
 surrealdb-types = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1" }
-pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1", features = ["sync-archive"] }
+pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
 # gen-xkt = { path = "../gen-xkt" }
 rvm-rs = { git = "https://github.com/happyrust/rvm-rs", optional = true }
 

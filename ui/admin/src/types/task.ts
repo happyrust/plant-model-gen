@@ -15,6 +15,7 @@ export type TaskType =
   | 'ModelExport'
   | 'StartManagedSite'
   | 'DeployManagedSite'
+  | 'RemoteDeployManagedSite'
   | { Custom: string }
 
 export type TaskStatus =
@@ -125,6 +126,7 @@ export const TASK_TYPE_LABELS: Record<string, string> = {
   ModelExport: '模型导出',
   StartManagedSite: '启动受管站点',
   DeployManagedSite: '完整部署受管站点',
+  RemoteDeployManagedSite: '远端部署受管站点',
 }
 
 export const PRIORITY_LABELS: Record<TaskPriority, string> = {

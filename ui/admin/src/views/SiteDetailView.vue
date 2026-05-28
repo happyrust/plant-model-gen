@@ -36,6 +36,8 @@ import type {
   ManagedSiteDeployValidationCheck,
   ManagedSiteDeployValidationReport,
   ManagedSiteLogsResponse,
+  ManagedRemoteDeployStatus,
+  ManagedRemoteTargetRequest,
   ManagedSitePreflightCheck,
   ManagedSitePreflightReport,
   ManagedSiteProcessResource,
@@ -54,17 +56,36 @@ const logsData = ref<ManagedSiteLogsResponse | null>(null)
 const preflight = ref<ManagedSitePreflightReport | null>(null)
 const deployValidation = ref<ManagedSiteDeployValidationReport | null>(null)
 const deployTask = ref<TaskInfo | null>(null)
+const remoteDeployStatus = ref<ManagedRemoteDeployStatus | null>(null)
+const remoteTargetForm = ref<ManagedRemoteTargetRequest>({
+  id: 'default',
+  name: '默认 Linux 目标',
+  host: '123.57.182.243',
+  ssh_port: 22,
+  ssh_user: 'root',
+  password_env: 'REMOTE_PASS',
+  remote_root: '/opt/plant3d/sites',
+  remote_db_path: '',
+  remote_web_port: 3100,
+  remote_db_port: 8020,
+  public_base_url: '',
+  surreal_bin: '/usr/local/bin/surreal',
+  remote_web_bin: '/root/web_server',
+})
 const siteError = ref('')
 const runtimeError = ref('')
 const logsError = ref('')
 const preflightError = ref('')
 const deployValidationError = ref('')
 const deployTaskError = ref('')
+const remoteDeployError = ref('')
 const reconcileError = ref('')
 const reconcileActions = ref<string[]>([])
 const preflightLoading = ref(false)
 const deployValidationLoading = ref(false)
 const deployTaskLoading = ref(false)
+const remotePreflightLoading = ref(false)
+const remoteDeployLoading = ref(false)
 const reconcileLoading = ref(false)
 type DetailTab = 'overview' | 'deploy'
 
@@ -149,6 +170,8 @@ const matchedPreset = computed(() => matchParsePreset(
 ))
 const deployProgressSteps = computed(() => buildDeployProgressSteps())
 const deployTaskPercent = computed(() => Math.round(deployTask.value?.progress.percentage ?? 0))
+const remoteBlockingCount = computed(() => remoteDeployStatus.value?.checks.filter((check) => check.status === 'blocking').length ?? 0)
+const remoteWarningCount = computed(() => remoteDeployStatus.value?.checks.filter((check) => check.status === 'warning').length ?? 0)
 const needsReconcile = computed(() => {
   const r = runtime.value
   if (!r) return false
@@ -382,6 +405,50 @@ async function fetchDeployTask() {
     deployTaskError.value = extractErrorMessage(err)
   } finally {
     deployTaskLoading.value = false
+  }
+}
+
+
+async function fetchRemoteDeployStatus() {
+  if (!siteId.value) return
+  try {
+    remoteDeployStatus.value = await sitesApi.remoteDeployStatus(siteId.value)
+    remoteDeployError.value = ''
+  } catch (err: unknown) {
+    remoteDeployError.value = extractErrorMessage(err)
+  }
+}
+
+async function handleRemotePreflight() {
+  if (!siteId.value) return
+  remotePreflightLoading.value = true
+  try {
+    remoteDeployStatus.value = await sitesApi.remotePreflight(siteId.value, { target: remoteTargetForm.value })
+    remoteDeployError.value = ''
+  } catch (err: unknown) {
+    remoteDeployError.value = extractErrorMessage(err)
+  } finally {
+    remotePreflightLoading.value = false
+  }
+}
+
+async function handleRemoteDeploy() {
+  if (!siteId.value) return
+  remoteDeployLoading.value = true
+  try {
+    remoteDeployStatus.value = await sitesApi.remotePreflight(siteId.value, { target: remoteTargetForm.value })
+    if (remoteDeployStatus.value.status === 'blocked') return
+    const submitted = await sitesApi.remoteDeploy(siteId.value, { target: remoteTargetForm.value })
+    if (submitted.data?.task_id) {
+      await setDeployTaskId(submitted.data.task_id)
+      await fetchDeployTask()
+    }
+    await fetchRemoteDeployStatus()
+    remoteDeployError.value = ''
+  } catch (err: unknown) {
+    remoteDeployError.value = extractErrorMessage(err)
+  } finally {
+    remoteDeployLoading.value = false
   }
 }
 
@@ -710,6 +777,7 @@ async function handleDeploy() {
     await fetchAll()
     await fetchPreflight()
     await fetchDeployValidation()
+    await fetchRemoteDeployStatus()
   } catch {
     // 错误已写入 store，页面横幅会显示
   }
@@ -759,6 +827,7 @@ const { start: startDeployTaskPolling } = usePolling(async () => {
   if (deployTask.value?.status === 'Completed' || deployTask.value?.status === 'Failed' || deployTask.value?.status === 'Cancelled') {
     await fetchAll()
     await fetchDeployValidation()
+    await fetchRemoteDeployStatus()
   }
 }, 3000)
 
@@ -767,6 +836,7 @@ onMounted(async () => {
   if (activeTab.value === 'deploy') {
     await fetchPreflight()
     await fetchDeployValidation()
+    await fetchRemoteDeployStatus()
   }
   startPolling()
   startDeployTaskPolling()
@@ -1259,6 +1329,115 @@ onMounted(async () => {
               <span>{{ step.label }}</span>
             </div>
             <div class="mt-2 text-xs opacity-80">{{ step.detail }}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rounded-lg border border-border bg-card p-5">
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 class="text-base font-medium">远端 Linux 部署</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              上传当前站点 RocksDB 到 Linux，并启动远端 SurrealDB + web_server。
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              :disabled="remotePreflightLoading || remoteDeployLoading"
+              @click="handleRemotePreflight"
+              class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              <Loader2 v-if="remotePreflightLoading" class="h-3.5 w-3.5 animate-spin" />
+              {{ remotePreflightLoading ? '检查中...' : '远端预检' }}
+            </button>
+            <button
+              :disabled="remoteDeployLoading || remotePreflightLoading"
+              @click="handleRemoteDeploy"
+              class="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+              <Loader2 v-if="remoteDeployLoading" class="h-3.5 w-3.5 animate-spin" />
+              {{ remoteDeployLoading ? '提交中...' : '远端一键部署' }}
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="remoteDeployError"
+          class="mb-4 rounded-lg border border-destructive/50 bg-destructive/5 px-4 py-3 text-sm text-destructive"
+        >
+          远端部署失败：{{ remoteDeployError }}
+        </div>
+
+        <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>主机</span>
+            <input v-model="remoteTargetForm.host" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>SSH 用户</span>
+            <input v-model="remoteTargetForm.ssh_user" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>密码环境变量</span>
+            <input v-model="remoteTargetForm.password_env" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>Surreal 路径</span>
+            <input v-model="remoteTargetForm.surreal_bin" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>Web Server 路径</span>
+            <input v-model="remoteTargetForm.remote_web_bin" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>远端根目录</span>
+            <input v-model="remoteTargetForm.remote_root" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>远端 DB 路径</span>
+            <input v-model="remoteTargetForm.remote_db_path" :placeholder="`/root/surreal_data/${site.site_id}.db`" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>DB 端口</span>
+            <input v-model.number="remoteTargetForm.remote_db_port" type="number" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+          <label class="space-y-1 text-xs text-muted-foreground">
+            <span>Web 端口</span>
+            <input v-model.number="remoteTargetForm.remote_web_port" type="number" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          </label>
+        </div>
+
+        <div v-if="remoteDeployStatus" class="mt-4 rounded-lg border border-border bg-background/60 p-4 text-sm">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div class="font-medium">状态：{{ remoteDeployStatus.status }} / {{ remoteDeployStatus.current_step }}</div>
+              <a
+                v-if="remoteDeployStatus.remote_entry_url"
+                :href="remoteDeployStatus.remote_entry_url"
+                target="_blank"
+                class="mt-1 block text-xs text-primary hover:underline break-all"
+              >
+                {{ remoteDeployStatus.remote_entry_url }}
+              </a>
+            </div>
+            <span
+              class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+              :class="remoteBlockingCount > 0 ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' : remoteWarningCount > 0 ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200' : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'"
+            >
+              {{ remoteBlockingCount }} 阻断 / {{ remoteWarningCount }} 警告
+            </span>
+          </div>
+          <div v-if="remoteDeployStatus.checks.length" class="mt-3 grid gap-2 md:grid-cols-2">
+            <div
+              v-for="check in remoteDeployStatus.checks"
+              :key="check.key"
+              class="rounded-md border p-3 text-xs"
+              :class="preflightCheckClass(check)"
+            >
+              <div class="font-medium">{{ check.label }} · {{ preflightStatusLabel(check.status) }}</div>
+              <div class="mt-1">{{ check.message }}</div>
+              <div v-if="check.detail" class="mt-1 text-muted-foreground break-all">{{ check.detail }}</div>
+            </div>
           </div>
         </div>
       </div>

@@ -16,6 +16,58 @@ export type ManagedSiteParseStatus =
 export type ManagedSiteRiskLevel = 'normal' | 'warning' | 'critical'
 export type ManagedSiteParseHealthStatus = ManagedSiteRiskLevel | 'unknown'
 export type ManagedSiteParsePlanMode = 'Full' | 'Bootstrap' | 'RebuildSystem' | 'Selective' | 'FastReparse'
+export type ManagedSiteDbMode = 'file' | 'ws'
+
+
+export interface ManagedRemoteTarget {
+  id: string
+  name: string
+  host: string
+  ssh_port: number
+  ssh_user: string
+  password_env: string
+  remote_root: string
+  remote_db_path: string
+  remote_web_port: number
+  remote_db_port: number
+  public_base_url?: string | null
+  surreal_bin: string
+  remote_web_bin: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ManagedRemoteTargetRequest {
+  id?: string | null
+  name?: string | null
+  host?: string | null
+  ssh_port?: number | null
+  ssh_user?: string | null
+  password_env?: string | null
+  remote_root?: string | null
+  remote_db_path?: string | null
+  remote_web_port?: number | null
+  remote_db_port?: number | null
+  public_base_url?: string | null
+  surreal_bin?: string | null
+  remote_web_bin?: string | null
+}
+
+export interface ManagedRemoteDeployRequest {
+  target_id?: string | null
+  target?: ManagedRemoteTargetRequest | null
+}
+
+export interface ManagedRemoteDeployStatus {
+  site_id: string
+  target_id: string
+  status: string
+  current_step: string
+  remote_entry_url?: string | null
+  checked_at: string
+  last_error?: string | null
+  checks: ManagedSitePreflightCheck[]
+}
 
 export interface ManagedSiteParseHealth {
   status: ManagedSiteParseHealthStatus
@@ -46,6 +98,8 @@ export interface ManagedProjectSite {
   mesh_tol_ratio: number
   export_json: boolean
   export_parquet: boolean
+  pipeline_db_mode: ManagedSiteDbMode
+  runtime_db_mode: ManagedSiteDbMode
   config_path: string
   runtime_dir: string
   db_data_path: string
@@ -261,6 +315,8 @@ export interface CreateManagedSiteRequest {
   mesh_tol_ratio?: number
   export_json?: boolean
   export_parquet?: boolean
+  pipeline_db_mode?: ManagedSiteDbMode
+  runtime_db_mode?: ManagedSiteDbMode
   db_port?: number
   web_port?: number
   auto_deploy?: boolean
@@ -285,6 +341,8 @@ export interface UpdateManagedSiteRequest {
   mesh_tol_ratio?: number
   export_json?: boolean
   export_parquet?: boolean
+  pipeline_db_mode?: ManagedSiteDbMode
+  runtime_db_mode?: ManagedSiteDbMode
   db_port?: number
   web_port?: number
   bind_host?: string

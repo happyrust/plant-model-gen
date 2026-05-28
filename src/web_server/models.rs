@@ -112,6 +112,8 @@ pub enum TaskType {
     StartManagedSite,
     /// 完整部署受管站点
     DeployManagedSite,
+    /// 远端部署受管站点
+    RemoteDeployManagedSite,
     /// 自定义任务
     Custom(String),
 }
@@ -838,6 +840,21 @@ pub struct ManagedSiteParsePlan {
     pub included_db_files: Vec<String>,
 }
 
+/// 受管站点数据库连接模式。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedSiteDbMode {
+    /// 嵌入式文件模式，用于解析/模型生成，避免依赖已启动的 ws 服务。
+    #[default]
+    File,
+    /// WebSocket 模式，用于站点运行时，便于 Web 服务访问独立 SurrealDB 进程。
+    Ws,
+}
+
+fn default_runtime_db_mode() -> ManagedSiteDbMode {
+    ManagedSiteDbMode::Ws
+}
+
 /// 管理后台项目站点
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedProjectSite {
@@ -865,6 +882,10 @@ pub struct ManagedProjectSite {
     pub export_json: bool,
     #[serde(default = "default_true")]
     pub export_parquet: bool,
+    #[serde(default)]
+    pub pipeline_db_mode: ManagedSiteDbMode,
+    #[serde(default = "default_runtime_db_mode")]
+    pub runtime_db_mode: ManagedSiteDbMode,
     pub config_path: String,
     pub runtime_dir: String,
     pub db_data_path: String,
@@ -956,6 +977,10 @@ pub struct CreateManagedSiteRequest {
     #[serde(default)]
     pub export_parquet: Option<bool>,
     #[serde(default)]
+    pub pipeline_db_mode: Option<ManagedSiteDbMode>,
+    #[serde(default)]
+    pub runtime_db_mode: Option<ManagedSiteDbMode>,
+    #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]
     pub web_port: Option<u16>,
@@ -1002,6 +1027,10 @@ pub struct UpdateManagedSiteRequest {
     pub export_json: Option<bool>,
     #[serde(default)]
     pub export_parquet: Option<bool>,
+    #[serde(default)]
+    pub pipeline_db_mode: Option<ManagedSiteDbMode>,
+    #[serde(default)]
+    pub runtime_db_mode: Option<ManagedSiteDbMode>,
     #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]
@@ -1156,6 +1185,101 @@ pub struct ManagedSiteLogsResponse {
     #[serde(default)]
     pub viewer_log: Vec<String>,
     pub streams: Vec<ManagedSiteLogStreamSummary>,
+}
+
+/// 受管站点远端 Linux 部署目标。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManagedRemoteTarget {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub ssh_port: u16,
+    pub ssh_user: String,
+    pub password_env: String,
+    pub remote_root: String,
+    pub remote_db_path: String,
+    pub remote_web_port: u16,
+    pub remote_db_port: u16,
+    pub public_base_url: Option<String>,
+    pub surreal_bin: String,
+    pub remote_web_bin: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Default for ManagedRemoteTarget {
+    fn default() -> Self {
+        Self {
+            id: "default".to_string(),
+            name: "默认 Linux 目标".to_string(),
+            host: "123.57.182.243".to_string(),
+            ssh_port: 22,
+            ssh_user: "root".to_string(),
+            password_env: "REMOTE_PASS".to_string(),
+            remote_root: "/opt/plant3d/sites".to_string(),
+            remote_db_path: String::new(),
+            remote_web_port: 3100,
+            remote_db_port: 8020,
+            public_base_url: None,
+            surreal_bin: "/usr/local/bin/surreal".to_string(),
+            remote_web_bin: "/root/web_server".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+}
+
+/// 创建或更新远端目标请求。密码只通过 password_env 引用，不落库。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedRemoteTargetRequest {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub ssh_user: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+    #[serde(default)]
+    pub remote_root: Option<String>,
+    #[serde(default)]
+    pub remote_db_path: Option<String>,
+    #[serde(default)]
+    pub remote_web_port: Option<u16>,
+    #[serde(default)]
+    pub remote_db_port: Option<u16>,
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub surreal_bin: Option<String>,
+    #[serde(default)]
+    pub remote_web_bin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedRemoteDeployRequest {
+    #[serde(default)]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub target: Option<ManagedRemoteTargetRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedRemoteDeployStatus {
+    pub site_id: String,
+    pub target_id: String,
+    pub status: String,
+    pub current_step: String,
+    pub remote_entry_url: Option<String>,
+    pub checked_at: String,
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub checks: Vec<ManagedSitePreflightCheck>,
 }
 
 /// 管理后台部署预检单项状态

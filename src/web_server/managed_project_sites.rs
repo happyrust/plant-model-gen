@@ -31,20 +31,23 @@ use tokio::task;
 
 use super::models::{
     AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite,
-    ManagedSiteActivitySummary, ManagedSiteDeployValidationCheck,
-    ManagedSiteDeployValidationReport, ManagedSiteLogStreamSummary, ManagedSiteLogsResponse,
-    ManagedSiteParseHealth, ManagedSiteParseHealthStatus, ManagedSiteParsePlan,
-    ManagedSiteParsePlanMode, ManagedSiteParseStatus, ManagedSitePreflightCheck,
-    ManagedSitePreflightReport, ManagedSitePreflightStatus, ManagedSiteProcessResource,
-    ManagedSiteReconcileResponse, ManagedSiteResourceMetrics, ManagedSiteRiskLevel,
-    ManagedSiteRuntimeStatus, ManagedSiteStatus, PreviewManagedSiteParsePlanRequest,
-    UpdateManagedSiteRequest,
+    ManagedRemoteDeployRequest, ManagedRemoteDeployStatus, ManagedRemoteTarget,
+    ManagedRemoteTargetRequest, ManagedSiteActivitySummary, ManagedSiteDbMode,
+    ManagedSiteDeployValidationCheck, ManagedSiteDeployValidationReport,
+    ManagedSiteLogStreamSummary, ManagedSiteLogsResponse, ManagedSiteParseHealth,
+    ManagedSiteParseHealthStatus, ManagedSiteParsePlan, ManagedSiteParsePlanMode,
+    ManagedSiteParseStatus, ManagedSitePreflightCheck, ManagedSitePreflightReport,
+    ManagedSitePreflightStatus, ManagedSiteProcessResource, ManagedSiteReconcileResponse,
+    ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
+    PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const DEFAULT_SQLITE_PATH: &str = "deployment_sites.sqlite";
 const TABLE_NAME: &str = "managed_project_sites";
+const REMOTE_TARGETS_TABLE: &str = "managed_remote_targets";
+const REMOTE_DEPLOY_STATUS_TABLE: &str = "managed_remote_deploy_status";
 const ADMIN_RUNTIME_ROOT: &str = "runtime/admin_sites";
 const LOG_LINES_LIMIT: usize = 120;
 
@@ -82,7 +85,7 @@ const SCAN_MAX_FILES: usize = 200_000;
 const PATH_SIZE_CACHE_TTL_MS: u64 = 60_000;
 
 // Schema 版本号：每次迁移 +1。
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 8;
 
 // ─── Global state (opt-in, interior mutability) ─────────────────────────────
 
@@ -341,6 +344,10 @@ fn config_path(site_id: &str) -> PathBuf {
 
 fn parse_config_path(site_id: &str) -> PathBuf {
     site_runtime_dir(site_id).join("DbOption-parse.toml")
+}
+
+fn generation_config_path(site_id: &str) -> PathBuf {
+    site_runtime_dir(site_id).join("DbOption-generate.toml")
 }
 
 fn db_data_path(site_id: &str) -> PathBuf {
@@ -1238,6 +1245,68 @@ fn set_toml_array(table: &mut toml::value::Table, key: &str, values: Vec<String>
     );
 }
 
+fn managed_db_mode_to_str(mode: ManagedSiteDbMode) -> &'static str {
+    match mode {
+        ManagedSiteDbMode::File => "file",
+        ManagedSiteDbMode::Ws => "ws",
+    }
+}
+
+fn db_mode_from_string(value: Option<String>, default: ManagedSiteDbMode) -> ManagedSiteDbMode {
+    match value
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ws" | "websocket") => ManagedSiteDbMode::Ws,
+        Some("file" | "rocksdb" | "local") => ManagedSiteDbMode::File,
+        _ => default,
+    }
+}
+
+fn apply_site_db_mode_config(
+    table: &mut toml::value::Table,
+    site: &ManagedProjectSite,
+    db_user: &str,
+    db_password: &str,
+    mode: ManagedSiteDbMode,
+) {
+    let web_server = ensure_table(table, "web_server");
+    set_toml_bool(
+        web_server,
+        "auto_start_surreal",
+        mode == ManagedSiteDbMode::Ws,
+    );
+    set_toml_string(web_server, "surreal_bin", managed_surreal_bin_string());
+    set_toml_string(web_server, "surreal_data_path", site.db_data_path.clone());
+    set_toml_string(
+        web_server,
+        "surreal_bind",
+        format!("127.0.0.1:{}", site.db_port),
+    );
+    set_toml_string(web_server, "surreal_user", db_user.to_string());
+    set_toml_string(web_server, "surreal_password", db_password.to_string());
+
+    let surrealdb = ensure_table(table, "surrealdb");
+    set_toml_string(surrealdb, "mode", managed_db_mode_to_str(mode));
+    set_toml_string(surrealdb, "path", site.db_data_path.replace('\\', "/"));
+    match mode {
+        ManagedSiteDbMode::Ws => {
+            set_toml_string(surrealdb, "ip", "127.0.0.1");
+            set_toml_integer(surrealdb, "port", site.db_port as i64);
+            set_toml_string(surrealdb, "user", db_user.to_string());
+            set_toml_string(surrealdb, "password", db_password.to_string());
+        }
+        ManagedSiteDbMode::File => {
+            surrealdb.remove("ip");
+            surrealdb.remove("port");
+            surrealdb.remove("user");
+            surrealdb.remove("password");
+        }
+    }
+}
+
 fn set_toml_integer_array(table: &mut toml::value::Table, key: &str, values: Vec<u32>) {
     table.insert(
         key.to_string(),
@@ -1353,23 +1422,14 @@ fn build_site_config(
     set_toml_string(web_server, "public_base_url", effective);
     set_toml_string(web_server, "backend_url", local);
     set_toml_bool(web_server, "auto_start_surreal", false);
-    set_toml_string(web_server, "surreal_bin", "surreal");
+    set_toml_string(web_server, "surreal_bin", managed_surreal_bin_string());
     set_toml_string(web_server, "surreal_data_path", site.db_data_path.clone());
     set_toml_string(
         web_server,
         "surreal_bind",
         format!("127.0.0.1:{}", site.db_port),
     );
-    web_server.remove("surreal_user");
-    web_server.remove("surreal_password");
-
-    let surrealdb = ensure_table(table, "surrealdb");
-    set_toml_string(surrealdb, "mode", "ws");
-    set_toml_string(surrealdb, "ip", "127.0.0.1");
-    set_toml_integer(surrealdb, "port", site.db_port as i64);
-    set_toml_string(surrealdb, "user", db_user.to_string());
-    set_toml_string(surrealdb, "password", db_password.to_string());
-    set_toml_string(surrealdb, "path", site.db_data_path.replace('\\', "/"));
+    apply_site_db_mode_config(table, site, db_user, db_password, site.runtime_db_mode);
 
     let surrealkv = ensure_table(table, "surrealkv");
     set_toml_bool(surrealkv, "enabled", false);
@@ -1393,6 +1453,8 @@ fn build_parse_config(
         .as_table_mut()
         .ok_or_else(|| anyhow!("DbOption 解析配置不是 table 结构"))?;
     table.remove("web_server");
+    apply_site_db_mode_config(table, site, db_user, db_password, site.pipeline_db_mode);
+    table.remove("web_server");
     set_toml_bool(table, "total_sync", true);
     set_toml_bool(table, "incr_sync", false);
     set_toml_bool(table, "sync_history", false);
@@ -1406,6 +1468,21 @@ fn build_parse_config(
     } else {
         set_toml_array(table, "included_db_files", included_db_files);
     }
+    Ok(toml::to_string_pretty(&value)?)
+}
+
+fn build_generation_config(
+    site: &ManagedProjectSite,
+    db_user: &str,
+    db_password: &str,
+) -> Result<String> {
+    let content = build_site_config(site, db_user, db_password)?;
+    let mut value = toml::from_str::<toml::Value>(&content)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("DbOption 生成配置不是 table 结构"))?;
+    apply_site_db_mode_config(table, site, db_user, db_password, site.pipeline_db_mode);
+    table.remove("web_server");
     Ok(toml::to_string_pretty(&value)?)
 }
 
@@ -1444,6 +1521,8 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
     write_file_atomic(Path::new(&site.config_path), &content)?;
     let parse_content = build_parse_config(site, db_user, db_password)?;
     write_file_atomic(&parse_config_path(&site.site_id), &parse_content)?;
+    let generation_content = build_generation_config(site, db_user, db_password)?;
+    write_file_atomic(&generation_config_path(&site.site_id), &generation_content)?;
     let metadata = serde_json::to_string_pretty(&json!({
         "site_id": site.site_id,
         "project_name": site.project_name,
@@ -1459,6 +1538,8 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
         "mesh_tol_ratio": site.mesh_tol_ratio,
         "export_json": site.export_json,
         "export_parquet": site.export_parquet,
+        "pipeline_db_mode": managed_db_mode_to_str(site.pipeline_db_mode),
+        "runtime_db_mode": managed_db_mode_to_str(site.runtime_db_mode),
         "db_port": site.db_port,
         "web_port": site.web_port,
         "entry_url": site.entry_url,
@@ -1487,6 +1568,47 @@ fn derive_entry_urls(
         });
     let entry = public.clone().unwrap_or_else(|| local.clone());
     (Some(local), public, Some(entry))
+}
+
+fn is_unspecified_or_loopback_host(host: &str) -> bool {
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "" | "0.0.0.0" | "::" | "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+fn url_host(host: &str) -> String {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.contains(':') {
+        format!("[{trimmed}]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn site_probe_host(site: &ManagedProjectSite) -> String {
+    if is_unspecified_or_loopback_host(&site.bind_host) {
+        "127.0.0.1".to_string()
+    } else {
+        site.bind_host.trim().to_string()
+    }
+}
+
+fn site_probe_base_url(site: &ManagedProjectSite) -> String {
+    let host = site_probe_host(site);
+    format!("http://{}:{}", url_host(&host), site.web_port)
+}
+
+fn site_access_base_url(site: &ManagedProjectSite) -> String {
+    site.public_entry_url
+        .clone()
+        .or_else(|| site.entry_url.clone())
+        .unwrap_or_else(|| site_probe_base_url(site))
 }
 
 // ─── Row mapping ────────────────────────────────────────────────────────────
@@ -1532,6 +1654,14 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         mesh_tol_ratio: row_f64_or(row, "mesh_tol_ratio", 3.0),
         export_json: row_bool_or(row, "export_json", false),
         export_parquet: row_bool_or(row, "export_parquet", true),
+        pipeline_db_mode: db_mode_from_string(
+            row.get("pipeline_db_mode").unwrap_or(None),
+            ManagedSiteDbMode::File,
+        ),
+        runtime_db_mode: db_mode_from_string(
+            row.get("runtime_db_mode").unwrap_or(None),
+            ManagedSiteDbMode::Ws,
+        ),
         config_path: row.get("config_path")?,
         runtime_dir: row.get("runtime_dir")?,
         db_data_path: row.get("db_data_path")?,
@@ -1597,6 +1727,8 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             mesh_tol_ratio REAL NOT NULL DEFAULT 3.0,
             export_json INTEGER NOT NULL DEFAULT 0,
             export_parquet INTEGER NOT NULL DEFAULT 1,
+            pipeline_db_mode TEXT NOT NULL DEFAULT 'file',
+            runtime_db_mode TEXT NOT NULL DEFAULT 'ws',
             config_path TEXT NOT NULL,
             runtime_dir TEXT NOT NULL,
             db_data_path TEXT NOT NULL,
@@ -1627,6 +1759,45 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         "#,
         table = TABLE_NAME
     ))?;
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {remote_targets} (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            host TEXT NOT NULL,
+            ssh_port INTEGER NOT NULL,
+            ssh_user TEXT NOT NULL,
+            password_env TEXT NOT NULL,
+            remote_root TEXT NOT NULL,
+            remote_db_path TEXT NOT NULL,
+            remote_web_port INTEGER NOT NULL,
+            remote_db_port INTEGER NOT NULL,
+            public_base_url TEXT,
+            surreal_bin TEXT NOT NULL,
+            remote_web_bin TEXT NOT NULL DEFAULT '/root/web_server',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS {remote_status} (
+            site_id TEXT PRIMARY KEY,
+            target_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_step TEXT NOT NULL,
+            remote_entry_url TEXT,
+            checked_at TEXT NOT NULL,
+            last_error TEXT,
+            checks_json TEXT NOT NULL DEFAULT '[]'
+        );
+        "#,
+        remote_targets = REMOTE_TARGETS_TABLE,
+        remote_status = REMOTE_DEPLOY_STATUS_TABLE
+    ))?;
+    ensure_table_column_exists(
+        conn,
+        REMOTE_TARGETS_TABLE,
+        "remote_web_bin",
+        "TEXT NOT NULL DEFAULT '/root/web_server'",
+    )?;
 
     let mut current_version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -1686,6 +1857,17 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         current_version = 6;
         conn.pragma_update(None, "user_version", current_version as i64)?;
     }
+    if current_version < 7 {
+        for column in ["pipeline_db_mode", "runtime_db_mode"] {
+            ensure_column_exists(conn, column)?;
+        }
+        current_version = 7;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
+    if current_version < 8 {
+        current_version = 8;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
     debug_assert!(current_version <= SCHEMA_VERSION);
     Ok(())
 }
@@ -1712,6 +1894,8 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
             "mesh_tol_ratio" => "REAL NOT NULL DEFAULT 3.0",
             "export_json" => "INTEGER NOT NULL DEFAULT 0",
             "export_parquet" => "INTEGER NOT NULL DEFAULT 1",
+            "pipeline_db_mode" => "TEXT NOT NULL DEFAULT 'file'",
+            "runtime_db_mode" => "TEXT NOT NULL DEFAULT 'ws'",
             _ => "TEXT",
         };
         conn.execute(
@@ -1719,6 +1903,26 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
                 "ALTER TABLE {table} ADD COLUMN {column} {column_type}",
                 table = TABLE_NAME
             ),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_table_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|c| c == column);
+    if !has_column {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
             [],
         )?;
     }
@@ -1752,14 +1956,14 @@ fn persist_site_with_conn(
                 site_id, project_name, project_code, project_path, config_path, runtime_dir,
                 manual_db_nums, parse_db_types, force_rebuild_system_db,
                 gen_model, gen_mesh, gen_spatial_tree, apply_boolean_operation, mesh_tol_ratio,
-                export_json, export_parquet,
+                export_json, export_parquet, pipeline_db_mode, runtime_db_mode,
                 db_data_path, db_port, web_port, viewer_port, bind_host, public_base_url,
                 associated_project,
                 db_pid, web_pid, viewer_pid, viewer_url, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
             table = TABLE_NAME
         ),
         params![
@@ -1779,6 +1983,8 @@ fn persist_site_with_conn(
             site.mesh_tol_ratio,
             if site.export_json { 1i64 } else { 0i64 },
             if site.export_parquet { 1i64 } else { 0i64 },
+            managed_db_mode_to_str(site.pipeline_db_mode),
+            managed_db_mode_to_str(site.runtime_db_mode),
             &site.db_data_path,
             site.db_port as i64,
             site.web_port as i64,
@@ -1829,6 +2035,285 @@ fn load_site_and_credentials(site_id: &str) -> Result<(ManagedProjectSite, Strin
         let site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
         let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
         Ok((site, db_user, db_password))
+    })
+}
+
+fn row_to_remote_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedRemoteTarget> {
+    Ok(ManagedRemoteTarget {
+        id: row.get("id")?,
+        name: row.get("name")?,
+        host: row.get("host")?,
+        ssh_port: row.get::<_, i64>("ssh_port")? as u16,
+        ssh_user: row.get("ssh_user")?,
+        password_env: row.get("password_env")?,
+        remote_root: row.get("remote_root")?,
+        remote_db_path: row.get("remote_db_path")?,
+        remote_web_port: row.get::<_, i64>("remote_web_port")? as u16,
+        remote_db_port: row.get::<_, i64>("remote_db_port")? as u16,
+        public_base_url: row.get("public_base_url")?,
+        surreal_bin: row.get("surreal_bin")?,
+        remote_web_bin: row.get("remote_web_bin")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn default_remote_target_for_site(site_id: &str) -> ManagedRemoteTarget {
+    let now = now_rfc3339();
+    ManagedRemoteTarget {
+        remote_db_path: format!("/root/surreal_data/{site_id}.db"),
+        created_at: now.clone(),
+        updated_at: now,
+        ..ManagedRemoteTarget::default()
+    }
+}
+
+fn normalize_remote_target(mut target: ManagedRemoteTarget, site_id: &str) -> ManagedRemoteTarget {
+    if target.id.trim().is_empty() {
+        target.id = "default".to_string();
+    }
+    if target.name.trim().is_empty() {
+        target.name = "默认 Linux 目标".to_string();
+    }
+    if target.host.trim().is_empty() {
+        target.host = "123.57.182.243".to_string();
+    }
+    if target.ssh_port == 0 {
+        target.ssh_port = 22;
+    }
+    if target.ssh_user.trim().is_empty() {
+        target.ssh_user = "root".to_string();
+    }
+    if target.password_env.trim().is_empty() {
+        target.password_env = "REMOTE_PASS".to_string();
+    }
+    if target.remote_root.trim().is_empty() {
+        target.remote_root = "/opt/plant3d/sites".to_string();
+    }
+    if target.remote_db_path.trim().is_empty() {
+        target.remote_db_path = format!("/root/surreal_data/{site_id}.db");
+    }
+    if target.remote_web_port == 0 {
+        target.remote_web_port = 3100;
+    }
+    if target.remote_db_port == 0 {
+        target.remote_db_port = 8020;
+    }
+    if target.surreal_bin.trim().is_empty() {
+        target.surreal_bin = "/usr/local/bin/surreal".to_string();
+    }
+    if target.remote_web_bin.trim().is_empty() {
+        target.remote_web_bin = "/root/web_server".to_string();
+    }
+    target
+}
+
+fn apply_remote_target_request(
+    mut target: ManagedRemoteTarget,
+    req: ManagedRemoteTargetRequest,
+    site_id: &str,
+) -> ManagedRemoteTarget {
+    if let Some(value) = req.id.filter(|value| !value.trim().is_empty()) {
+        target.id = value;
+    }
+    if let Some(value) = req.name.filter(|value| !value.trim().is_empty()) {
+        target.name = value;
+    }
+    if let Some(value) = req.host.filter(|value| !value.trim().is_empty()) {
+        target.host = value;
+    }
+    if let Some(value) = req.ssh_port.filter(|value| *value != 0) {
+        target.ssh_port = value;
+    }
+    if let Some(value) = req.ssh_user.filter(|value| !value.trim().is_empty()) {
+        target.ssh_user = value;
+    }
+    if let Some(value) = req.password_env.filter(|value| !value.trim().is_empty()) {
+        target.password_env = value;
+    }
+    if let Some(value) = req.remote_root.filter(|value| !value.trim().is_empty()) {
+        target.remote_root = value;
+    }
+    if let Some(value) = req.remote_db_path.filter(|value| !value.trim().is_empty()) {
+        target.remote_db_path = value;
+    }
+    if let Some(value) = req.remote_web_port.filter(|value| *value != 0) {
+        target.remote_web_port = value;
+    }
+    if let Some(value) = req.remote_db_port.filter(|value| *value != 0) {
+        target.remote_db_port = value;
+    }
+    if req.public_base_url.is_some() {
+        target.public_base_url = req.public_base_url.filter(|value| !value.trim().is_empty());
+    }
+    if let Some(value) = req.surreal_bin.filter(|value| !value.trim().is_empty()) {
+        target.surreal_bin = value;
+    }
+    if let Some(value) = req.remote_web_bin.filter(|value| !value.trim().is_empty()) {
+        target.remote_web_bin = value;
+    }
+    normalize_remote_target(target, site_id)
+}
+
+fn load_remote_target_with_conn(
+    conn: &Connection,
+    target_id: &str,
+) -> Result<Option<ManagedRemoteTarget>> {
+    let sql = format!("SELECT * FROM {REMOTE_TARGETS_TABLE} WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, [target_id], row_to_remote_target)
+        .optional()?)
+}
+
+fn persist_remote_target_with_conn(conn: &Connection, target: &ManagedRemoteTarget) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {REMOTE_TARGETS_TABLE} (
+                id, name, host, ssh_port, ssh_user, password_env, remote_root, remote_db_path,
+                remote_web_port, remote_db_port, public_base_url, surreal_bin, remote_web_bin,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+        ),
+        params![
+            &target.id,
+            &target.name,
+            &target.host,
+            target.ssh_port as i64,
+            &target.ssh_user,
+            &target.password_env,
+            &target.remote_root,
+            &target.remote_db_path,
+            target.remote_web_port as i64,
+            target.remote_db_port as i64,
+            &target.public_base_url,
+            &target.surreal_bin,
+            &target.remote_web_bin,
+            &target.created_at,
+            &target.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn resolve_remote_target(
+    site_id: &str,
+    req: Option<ManagedRemoteDeployRequest>,
+) -> Result<ManagedRemoteTarget> {
+    with_conn(|conn| {
+        let request = req.unwrap_or_default();
+        let target_id = request
+            .target_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("default");
+        let base = load_remote_target_with_conn(conn, target_id)?
+            .unwrap_or_else(|| default_remote_target_for_site(site_id));
+        let mut target = if let Some(target_req) = request.target {
+            apply_remote_target_request(base, target_req, site_id)
+        } else {
+            normalize_remote_target(base, site_id)
+        };
+        let now = now_rfc3339();
+        if target.created_at.trim().is_empty() {
+            target.created_at = now.clone();
+        }
+        target.updated_at = now;
+        persist_remote_target_with_conn(conn, &target)?;
+        Ok(target)
+    })
+}
+
+pub fn list_remote_targets() -> Result<Vec<ManagedRemoteTarget>> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT * FROM {REMOTE_TARGETS_TABLE} ORDER BY updated_at DESC"
+        ))?;
+        let targets = stmt
+            .query_map([], row_to_remote_target)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(targets)
+    })
+}
+
+pub fn upsert_remote_target(req: ManagedRemoteTargetRequest) -> Result<ManagedRemoteTarget> {
+    with_conn(|conn| {
+        let target_id = req
+            .id
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let base = load_remote_target_with_conn(conn, &target_id)?
+            .unwrap_or_else(|| default_remote_target_for_site("default"));
+        let mut target = apply_remote_target_request(base, req, "default");
+        target.id = target_id;
+        let now = now_rfc3339();
+        if target.created_at.trim().is_empty() {
+            target.created_at = now.clone();
+        }
+        target.updated_at = now;
+        persist_remote_target_with_conn(conn, &target)?;
+        Ok(target)
+    })
+}
+
+pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStatus> {
+    with_conn(|conn| {
+        let sql = format!(
+            "SELECT site_id, target_id, status, current_step, remote_entry_url, checked_at, last_error, checks_json
+             FROM {REMOTE_DEPLOY_STATUS_TABLE} WHERE site_id = ?1"
+        );
+        let status = conn
+            .query_row(&sql, [site_id], |row| {
+                let checks_json: String = row.get(7)?;
+                let checks = serde_json::from_str(&checks_json).unwrap_or_default();
+                Ok(ManagedRemoteDeployStatus {
+                    site_id: row.get(0)?,
+                    target_id: row.get(1)?,
+                    status: row.get(2)?,
+                    current_step: row.get(3)?,
+                    remote_entry_url: row.get(4)?,
+                    checked_at: row.get(5)?,
+                    last_error: row.get(6)?,
+                    checks,
+                })
+            })
+            .optional()?;
+        Ok(status.unwrap_or_else(|| ManagedRemoteDeployStatus {
+            site_id: site_id.to_string(),
+            target_id: "default".to_string(),
+            status: "idle".to_string(),
+            current_step: "尚未远端部署".to_string(),
+            remote_entry_url: None,
+            checked_at: now_rfc3339(),
+            last_error: None,
+            checks: Vec::new(),
+        }))
+    })
+}
+
+fn save_remote_deploy_status(status: &ManagedRemoteDeployStatus) -> Result<()> {
+    let checks_json = serde_json::to_string(&status.checks)?;
+    with_conn(|conn| {
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {REMOTE_DEPLOY_STATUS_TABLE} (
+                    site_id, target_id, status, current_step, remote_entry_url, checked_at, last_error, checks_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+            ),
+            params![
+                &status.site_id,
+                &status.target_id,
+                &status.status,
+                &status.current_step,
+                &status.remote_entry_url,
+                &status.checked_at,
+                &status.last_error,
+                &checks_json,
+            ],
+        )?;
+        Ok(())
     })
 }
 
@@ -2075,6 +2560,8 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         export_parquet: req
             .export_parquet
             .unwrap_or(generation_defaults.export_parquet),
+        pipeline_db_mode: req.pipeline_db_mode.unwrap_or(ManagedSiteDbMode::File),
+        runtime_db_mode: req.runtime_db_mode.unwrap_or(ManagedSiteDbMode::Ws),
         config_path: config_path(&site_id).to_string_lossy().to_string(),
         runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
         db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
@@ -2187,6 +2674,8 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             mesh_tol_ratio: generation_defaults.mesh_tol_ratio,
             export_json: generation_defaults.export_json,
             export_parquet: generation_defaults.export_parquet,
+            pipeline_db_mode: ManagedSiteDbMode::File,
+            runtime_db_mode: ManagedSiteDbMode::Ws,
             config_path: config_path(&site_id).to_string_lossy().to_string(),
             runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
             db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
@@ -2306,6 +2795,12 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     if let Some(value) = req.export_parquet {
         site.export_parquet = value;
+    }
+    if let Some(value) = req.pipeline_db_mode {
+        site.pipeline_db_mode = value;
+    }
+    if let Some(value) = req.runtime_db_mode {
+        site.runtime_db_mode = value;
     }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
         let value = value.trim().to_string();
@@ -2509,8 +3004,13 @@ fn port_in_use(host: &str, port: u16) -> bool {
     }
 }
 
-fn local_http_json(port: u16, path: &str, timeout: Duration) -> Result<serde_json::Value> {
-    let addr = format!("127.0.0.1:{port}");
+fn local_http_json(
+    host: &str,
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let addr = format!("{}:{port}", url_host(host));
     let socket = addr
         .to_socket_addrs()?
         .next()
@@ -2524,7 +3024,8 @@ fn local_http_json(port: u16, path: &str, timeout: Duration) -> Result<serde_jso
         .set_write_timeout(Some(timeout))
         .with_context(|| format!("设置写入超时失败: {addr}"))?;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {}:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        url_host(host)
     );
     stream
         .write_all(request.as_bytes())
@@ -2601,7 +3102,8 @@ fn probe_site_connectivity(site: &ManagedProjectSite, web_running: bool) -> Site
     }
 
     let timeout = Duration::from_secs(2);
-    let status = local_http_json(site.web_port, "/api/status", timeout);
+    let probe_host = site_probe_host(site);
+    let status = local_http_json(&probe_host, site.web_port, "/api/status", timeout);
     let (web_status_ok, database_connected, surrealdb_connected) = match status {
         Ok(value) => {
             let database_connected = value
@@ -2621,7 +3123,7 @@ fn probe_site_connectivity(site: &ManagedProjectSite, web_running: bool) -> Site
         Err(_) => (Some(false), Some(false), Some(false)),
     };
 
-    let identity = local_http_json(site.web_port, "/api/site/identity", timeout);
+    let identity = local_http_json(&probe_host, site.web_port, "/api/site/identity", timeout);
     let site_identity_ok = match identity {
         Ok(value) => {
             let site_id_ok = value
@@ -3794,6 +4296,27 @@ fn aios_database_exe_name() -> &'static str {
     }
 }
 
+fn surreal_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "surreal.exe"
+    } else {
+        "surreal"
+    }
+}
+
+fn bundled_surreal_binary() -> Option<PathBuf> {
+    let current = current_exe_path().ok()?;
+    let parent = current.parent()?;
+    let candidate = parent.join("surreal").join(surreal_exe_name());
+    candidate.exists().then_some(candidate)
+}
+
+fn managed_surreal_bin_string() -> String {
+    bundled_surreal_binary()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| "surreal".to_string())
+}
+
 fn aios_database_binary() -> Result<Option<PathBuf>> {
     if let Some(override_path) = admin_aios_database_binary_override() {
         if override_path.exists() {
@@ -4480,7 +5003,7 @@ async fn wait_for_business_status_ok(site: &ManagedProjectSite) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    let url = format!("http://127.0.0.1:{}/api/status", site.web_port);
+    let url = format!("{}/api/status", site_probe_base_url(site));
     for _ in 0..WAIT_HTTP_ATTEMPTS {
         let ok = match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => {
@@ -4588,7 +5111,8 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
         .build()
         .context("创建部署验收 HTTP client 失败")?;
     let mut report = DeployValidationReport::new(&site.site_id);
-    let local_base = format!("http://127.0.0.1:{}", site.web_port);
+    let local_base = site_probe_base_url(site);
+    let access_base = site_access_base_url(site);
 
     let require_database_health = site.gen_model || site.gen_mesh || site.export_parquet;
     push_status_json_checks(
@@ -4609,7 +5133,7 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
     if let Some(viewer_url) = site
         .viewer_url
         .clone()
-        .or_else(|| Some(format!("{local_base}/viewer/")))
+        .or_else(|| Some(format!("{access_base}/viewer/")))
     {
         push_required_http_check(
             &mut report,
@@ -5028,7 +5552,8 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
     .await
     .context("写入站点配置失败 (join error)")??;
 
-    let config_no_ext = config_string_without_toml(&site.config_path);
+    let gen_config_path = generation_config_path(&site.site_id);
+    let config_no_ext = config_path_without_toml(&gen_config_path);
     let (stdout, stderr) = open_log_file(&generate_log_path(&site.site_id))?;
     let repo = repo_root()?;
     let mut command = aios_database_command(&repo, &config_no_ext)?;
@@ -5091,7 +5616,7 @@ async fn spawn_db_process(site: &ManagedProjectSite) -> Result<u32> {
     .await
     .context("加载 DB 凭据失败 (join error)")??;
     let (stdout, stderr) = open_log_file(&db_log_path(&site.site_id))?;
-    let mut command = Command::new("surreal");
+    let mut command = Command::new(managed_surreal_bin_string());
     command
         .arg("start")
         .arg("--log")
@@ -5241,10 +5766,11 @@ async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
 fn build_viewer_url(site: &ManagedProjectSite, port: u16) -> String {
     let base = format!("http://127.0.0.1:{port}");
     let backend = site
-        .local_entry_url
+        .public_entry_url
         .clone()
         .or_else(|| site.entry_url.clone())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", site.web_port));
+        .or_else(|| site.local_entry_url.clone())
+        .unwrap_or_else(|| site_probe_base_url(site));
     let project = site
         .associated_project
         .as_deref()
@@ -5313,14 +5839,8 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
         .current_dir(&viewer_dir)
         .env("BROWSER", "none")
         .env("VITE_BACKEND_PORT", site.web_port.to_string())
-        .env(
-            "VITE_BACKEND_URL",
-            format!("http://127.0.0.1:{}", site.web_port),
-        )
-        .env(
-            "VITE_API_BASE_URL",
-            format!("http://127.0.0.1:{}", site.web_port),
-        )
+        .env("VITE_BACKEND_URL", site_access_base_url(site))
+        .env("VITE_API_BASE_URL", site_access_base_url(site))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     isolate_process_group(&mut command);
@@ -5356,7 +5876,21 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
 async fn ensure_site_db_started(
     site: &ManagedProjectSite,
     status: ManagedSiteStatus,
+    mode: ManagedSiteDbMode,
 ) -> Result<Option<u32>> {
+    if mode == ManagedSiteDbMode::File {
+        update_runtime(
+            &site.site_id,
+            RuntimeUpdate {
+                status: Some(status),
+                db_pid: Some(None),
+                last_error: Some(None),
+                ..Default::default()
+            },
+        )?;
+        return Ok(None);
+    }
+
     if port_in_use("127.0.0.1", site.db_port) {
         if probe_managed_port(site.db_port, site.db_pid).managed_running {
             return Ok(None);
@@ -5397,7 +5931,8 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
 
-    let started_db_pid = ensure_site_db_started(&site, site.status.clone()).await?;
+    let started_db_pid =
+        ensure_site_db_started(&site, site.status.clone(), site.pipeline_db_mode).await?;
     let parse_result = spawn_parse_process(site_id.clone()).await;
 
     if let Some(db_pid) = started_db_pid {
@@ -5423,7 +5958,8 @@ async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<(
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
 
-    let started_db_pid = ensure_site_db_started(&site, ManagedSiteStatus::Starting).await?;
+    let started_db_pid =
+        ensure_site_db_started(&site, ManagedSiteStatus::Starting, site.pipeline_db_mode).await?;
 
     let result = async {
         let site = task::spawn_blocking({
@@ -5551,19 +6087,14 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
-    let db_pid = ensure_site_db_started(&site, ManagedSiteStatus::Starting).await?;
-
-    let site = task::spawn_blocking({
-        let site_id = site_id.clone();
-        move || get_site(&site_id)
-    })
-    .await
-    .context("读取站点状态失败 (join error)")??
-    .ok_or_else(|| anyhow!("站点不存在"))?;
     if site.parse_status != ManagedSiteParseStatus::Parsed {
-        if let Err(err) = spawn_parse_process(site_id.clone()).await {
+        let parse_db_pid =
+            ensure_site_db_started(&site, ManagedSiteStatus::Starting, site.pipeline_db_mode)
+                .await?;
+        let parse_result = spawn_parse_process(site_id.clone()).await;
+        cleanup_started_db(&site_id, parse_db_pid).await;
+        if let Err(err) = parse_result {
             let stopped_by_user = site_was_stopped_by_user(&site_id);
-            cleanup_started_db(&site_id, db_pid).await;
             if stopped_by_user {
                 return Err(err);
             }
@@ -5588,6 +6119,16 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
+    let db_pid =
+        ensure_site_db_started(&site, ManagedSiteStatus::Starting, site.runtime_db_mode).await?;
+
+    let site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
     let web_pid = match spawn_web_process(&site).await {
         Ok(pid) => pid,
         Err(err) => {
@@ -5601,11 +6142,11 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
             status: Some(ManagedSiteStatus::Starting),
             web_pid: Some(Some(web_pid)),
             last_error: Some(None),
-            entry_url: Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+            entry_url: Some(Some(site_access_base_url(&site))),
             ..Default::default()
         },
     )?;
-    let status_url = format!("http://127.0.0.1:{}/api/status", site.web_port);
+    let status_url = format!("{}/api/status", site_probe_base_url(&site));
     if !wait_for_http_ok(&status_url, WAIT_HTTP_ATTEMPTS, WAIT_STEP_MS).await {
         let _ = kill_pid(web_pid).await;
         cleanup_started_db(&site_id, db_pid).await;
@@ -5657,7 +6198,7 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
             viewer_pid: Some(viewer_pid),
             viewer_url: Some(viewer_url),
             last_error: Some(None),
-            entry_url: Some(Some(format!("http://127.0.0.1:{}", site.web_port))),
+            entry_url: Some(Some(site_access_base_url(&site))),
             ..Default::default()
         },
     )?;
@@ -5908,6 +6449,654 @@ pub async fn deploy_site(site_id: String) -> Result<()> {
         }
     });
     Ok(())
+}
+
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success() || status.code().is_some())
+        .unwrap_or(false)
+}
+
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn remote_site_dir(target: &ManagedRemoteTarget, site_id: &str) -> String {
+    format!("{}/{}", target.remote_root.trim_end_matches('/'), site_id)
+}
+
+fn remote_entry_url(target: &ManagedRemoteTarget) -> String {
+    target
+        .public_base_url
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("http://{}:{}", target.host, target.remote_web_port))
+}
+
+fn ssh_target(target: &ManagedRemoteTarget) -> String {
+    format!("{}@{}", target.ssh_user, target.host)
+}
+
+fn command_env_password(target: &ManagedRemoteTarget) -> Result<String> {
+    std::env::var(&target.password_env)
+        .with_context(|| format!("远端部署密码环境变量未设置: {}", target.password_env))
+}
+
+async fn run_ssh(target: &ManagedRemoteTarget, remote_cmd: &str) -> Result<String> {
+    let password = command_env_password(target)?;
+    let mut cmd = Command::new("sshpass");
+    cmd.env("SSHPASS", password)
+        .arg("-e")
+        .arg("ssh")
+        .arg("-o")
+        .arg("PreferredAuthentications=password")
+        .arg("-o")
+        .arg("PubkeyAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-p")
+        .arg(target.ssh_port.to_string())
+        .arg(ssh_target(target))
+        .arg(remote_cmd);
+    let output = cmd.output().await.context("执行 SSH 失败")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        bail!(
+            "SSH 命令失败: status={:?}; stderr={}; stdout={}",
+            output.status.code(),
+            stderr,
+            stdout
+        );
+    }
+}
+
+async fn run_rsync_db(site: &ManagedProjectSite, target: &ManagedRemoteTarget) -> Result<()> {
+    let password = command_env_password(target)?;
+    let source = Path::new(&site.db_data_path);
+    let source_arg = if source.is_dir() {
+        format!("{}/", source.to_string_lossy().replace('\\', "/"))
+    } else {
+        source.to_string_lossy().replace('\\', "/")
+    };
+    let remote_dest = format!("{}:{}/", ssh_target(target), target.remote_db_path);
+    let ssh_cmd = format!(
+        "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {}",
+        target.ssh_port
+    );
+    let mut cmd = Command::new("sshpass");
+    cmd.env("SSHPASS", password)
+        .arg("-e")
+        .arg("rsync")
+        .arg("-az")
+        .arg("--delete")
+        .arg("--partial")
+        .arg("--info=progress2")
+        .arg("-e")
+        .arg(ssh_cmd)
+        .arg(source_arg)
+        .arg(remote_dest);
+    let output = cmd.output().await.context("执行 rsync 上传数据库失败")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "rsync 上传数据库失败: status={:?}; stderr={}; stdout={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
+
+async fn run_rsync_file(
+    local_path: &Path,
+    target: &ManagedRemoteTarget,
+    remote_path: &str,
+) -> Result<()> {
+    let password = command_env_password(target)?;
+    let ssh_cmd = format!(
+        "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {}",
+        target.ssh_port
+    );
+    let mut cmd = Command::new("sshpass");
+    cmd.env("SSHPASS", password)
+        .arg("-e")
+        .arg("rsync")
+        .arg("-az")
+        .arg("--partial")
+        .arg("-e")
+        .arg(ssh_cmd)
+        .arg(local_path.to_string_lossy().to_string())
+        .arg(format!("{}:{}", ssh_target(target), remote_path));
+    let output = cmd.output().await.context("执行 rsync 上传文件失败")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "rsync 上传文件失败: status={:?}; stderr={}; stdout={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+}
+
+fn build_remote_site_config(
+    site: &ManagedProjectSite,
+    target: &ManagedRemoteTarget,
+    db_user: &str,
+    db_password: &str,
+) -> Result<String> {
+    let raw = fs::read_to_string(&site.config_path)
+        .with_context(|| format!("读取站点 DbOption 失败: {}", site.config_path))?;
+    let mut value = toml::from_str::<toml::Value>(&raw)?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("站点 DbOption 不是 table 结构"))?;
+    set_toml_string(table, "surreal_ip", "127.0.0.1");
+    set_toml_integer(table, "surreal_port", target.remote_db_port as i64);
+    set_toml_string(table, "surreal_user", db_user.to_string());
+    set_toml_string(table, "surreal_password", db_password.to_string());
+    set_toml_string(table, "surreal_script_dir", "resource/surreal");
+
+    let web_server = ensure_table(table, "web_server");
+    set_toml_integer(web_server, "port", target.remote_web_port as i64);
+    set_toml_string(web_server, "bind_host", "0.0.0.0");
+    set_toml_string(web_server, "public_base_url", remote_entry_url(target));
+    set_toml_string(web_server, "frontend_url", remote_entry_url(target));
+    set_toml_string(
+        web_server,
+        "backend_url",
+        format!("http://127.0.0.1:{}", target.remote_web_port),
+    );
+    set_toml_bool(web_server, "auto_start_surreal", false);
+    set_toml_string(web_server, "surreal_bin", target.surreal_bin.clone());
+    set_toml_string(
+        web_server,
+        "surreal_data_path",
+        target.remote_db_path.clone(),
+    );
+    set_toml_string(
+        web_server,
+        "surreal_bind",
+        format!("0.0.0.0:{}", target.remote_db_port),
+    );
+    set_toml_string(web_server, "surreal_user", db_user.to_string());
+    set_toml_string(web_server, "surreal_password", db_password.to_string());
+
+    let surrealdb = ensure_table(table, "surrealdb");
+    set_toml_string(surrealdb, "mode", "ws");
+    set_toml_string(surrealdb, "ip", "127.0.0.1");
+    set_toml_integer(surrealdb, "port", target.remote_db_port as i64);
+    set_toml_string(surrealdb, "user", db_user.to_string());
+    set_toml_string(surrealdb, "password", db_password.to_string());
+    set_toml_string(surrealdb, "path", target.remote_db_path.clone());
+    Ok(toml::to_string_pretty(&value)?)
+}
+
+fn remote_service_unit_names(site_id: &str) -> (String, String) {
+    (
+        format!("plant3d-surreal-{site_id}.service"),
+        format!("plant3d-web-{site_id}.service"),
+    )
+}
+
+async fn install_remote_services(
+    site: &ManagedProjectSite,
+    target: &ManagedRemoteTarget,
+    db_user: &str,
+    db_password: &str,
+) -> Result<()> {
+    let site_dir = remote_site_dir(target, &site.site_id);
+    let remote_config = format!("{site_dir}/DbOption.toml");
+    let (surreal_unit, web_unit) = remote_service_unit_names(&site.site_id);
+    let web_bin = target.remote_web_bin.trim();
+    let surreal_unit_content = format!(
+        r#"[Unit]
+Description=Plant3D SurrealDB {site_id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={surreal_bin} start --log info --user {db_user} --pass {db_password} --bind 0.0.0.0:{db_port} rocksdb://{db_path}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        site_id = site.site_id,
+        surreal_bin = target.surreal_bin,
+        db_user = db_user,
+        db_password = db_password,
+        db_port = target.remote_db_port,
+        db_path = target.remote_db_path
+    );
+    let web_unit_content = format!(
+        r#"[Unit]
+Description=Plant3D Web Site {site_id}
+After=network-online.target {surreal_unit}
+Wants=network-online.target {surreal_unit}
+
+[Service]
+Type=simple
+WorkingDirectory={site_dir}
+ExecStart={web_bin} --config {config_no_ext}
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        site_id = site.site_id,
+        surreal_unit = surreal_unit,
+        site_dir = site_dir,
+        web_bin = web_bin,
+        config_no_ext = remote_config.trim_end_matches(".toml")
+    );
+    let cmd = format!(
+        "set -e; mkdir -p {site_dir} {db_parent}; cat > /etc/systemd/system/{surreal_unit} <<'EOF_SUR'\n{surreal_unit_content}EOF_SUR\ncat > /etc/systemd/system/{web_unit} <<'EOF_WEB'\n{web_unit_content}EOF_WEB\nsystemctl daemon-reload",
+        site_dir = sh_quote(&site_dir),
+        db_parent = sh_quote(
+            Path::new(&target.remote_db_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("/root/surreal_data")
+        ),
+        surreal_unit = surreal_unit,
+        web_unit = web_unit,
+        surreal_unit_content = surreal_unit_content,
+        web_unit_content = web_unit_content,
+    );
+    run_ssh(target, &cmd).await?;
+    Ok(())
+}
+
+async fn restart_remote_services(site_id: &str, target: &ManagedRemoteTarget) -> Result<()> {
+    let (surreal_unit, web_unit) = remote_service_unit_names(site_id);
+    let cmd = format!(
+        "set -e; systemctl stop {web_unit} 2>/dev/null || true; systemctl stop {surreal_unit} 2>/dev/null || true; systemctl enable --now {surreal_unit}; sleep 2; systemctl enable --now {web_unit}; sleep 2; systemctl is-active {surreal_unit}; systemctl is-active {web_unit}",
+        web_unit = web_unit,
+        surreal_unit = surreal_unit
+    );
+    run_ssh(target, &cmd).await?;
+    Ok(())
+}
+
+async fn validate_remote_http(site_id: &str, target: &ManagedRemoteTarget) -> Result<()> {
+    let base_url = remote_entry_url(target);
+    let base_url = base_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("创建远端验收 HTTP client 失败")?;
+    let status_url = format!("{base_url}/api/status");
+    let status_value = client
+        .get(&status_url)
+        .send()
+        .await
+        .with_context(|| format!("请求远端 /api/status 失败: {status_url}"))?
+        .error_for_status()
+        .with_context(|| format!("远端 /api/status HTTP 状态异常: {status_url}"))?
+        .json::<serde_json::Value>()
+        .await
+        .context("读取远端 /api/status JSON 失败")?;
+    let status_database_connected = status_value
+        .get("database_connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status_surrealdb_connected = status_value
+        .get("surrealdb_connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let db_check_url = format!("{base_url}/api/database/connection/check");
+    let db_check = client
+        .get(&db_check_url)
+        .send()
+        .await
+        .with_context(|| format!("请求远端数据库连接检查失败: {db_check_url}"))?
+        .error_for_status()
+        .context("远端数据库连接检查 HTTP 状态异常")?
+        .json::<serde_json::Value>()
+        .await
+        .context("读取远端数据库连接检查 JSON 失败")?;
+    let db_check_connected = db_check
+        .get("connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !(status_database_connected && status_surrealdb_connected) && !db_check_connected {
+        let surreal_status_url = format!("{base_url}/api/surreal/status");
+        let surreal_status = client
+            .get(&surreal_status_url)
+            .send()
+            .await
+            .ok()
+            .and_then(|resp| resp.error_for_status().ok());
+        let surreal_status_json = match surreal_status {
+            Some(resp) => resp.json::<serde_json::Value>().await.ok(),
+            None => None,
+        };
+        let surreal_listening = surreal_status_json
+            .as_ref()
+            .and_then(|v| v.get("listening"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        bail!(
+            "远端状态未通过: status.database_connected={status_database_connected}, status.surrealdb_connected={status_surrealdb_connected}, database_check.connected={db_check_connected}, surreal.listening={surreal_listening}"
+        );
+    }
+    let identity_url = format!("{base_url}/api/site/identity");
+    let identity = client
+        .get(&identity_url)
+        .send()
+        .await
+        .with_context(|| format!("请求远端站点身份失败: {identity_url}"))?
+        .error_for_status()
+        .context("远端站点身份 HTTP 状态异常")?
+        .json::<serde_json::Value>()
+        .await
+        .context("读取远端站点身份 JSON 失败")?;
+    let remote_site_id = identity
+        .get("site_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !remote_site_id.is_empty() && remote_site_id != site_id {
+        bail!("远端站点身份不一致: expected={site_id}, actual={remote_site_id}");
+    }
+    Ok(())
+}
+
+pub async fn remote_preflight_site(
+    site_id: &str,
+    req: Option<ManagedRemoteDeployRequest>,
+) -> Result<ManagedRemoteDeployStatus> {
+    let site = get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+    let target = resolve_remote_target(site_id, req)?;
+    let mut checks = Vec::new();
+
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        checks.push(preflight_blocking(
+            "local_parse_state",
+            "本地解析状态",
+            "解析任务正在运行，不能复制 RocksDB 目录",
+            None,
+            Some("等待解析结束或先停止站点".to_string()),
+            Vec::new(),
+        ));
+    } else if matches!(
+        site.status,
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+    ) {
+        checks.push(preflight_blocking(
+            "local_site_state",
+            "本地站点状态",
+            format!("当前状态为 {:?}，不能安全复制数据库目录", site.status),
+            None,
+            Some("先停止本机受管站点后再远端部署".to_string()),
+            Vec::new(),
+        ));
+    } else {
+        checks.push(preflight_pass(
+            "local_site_state",
+            "本地站点状态",
+            "本地站点处于可复制状态",
+            None,
+        ));
+    }
+
+    let db_path = Path::new(&site.db_data_path);
+    if !db_path.exists() {
+        checks.push(preflight_blocking(
+            "local_db_path",
+            "本地数据库目录",
+            "本地 RocksDB 目录不存在",
+            Some(site.db_data_path.clone()),
+            Some("先完成解析/生成，确保 runtime/admin_sites 下存在 surreal.db".to_string()),
+            Vec::new(),
+        ));
+    } else if path_size_bytes(db_path) == 0 {
+        checks.push(preflight_blocking(
+            "local_db_size",
+            "本地数据库大小",
+            "本地 RocksDB 目录为空",
+            Some(site.db_data_path.clone()),
+            Some("重新解析或检查数据库生成结果".to_string()),
+            Vec::new(),
+        ));
+    } else {
+        checks.push(preflight_pass(
+            "local_db_path",
+            "本地数据库目录",
+            format!("本地数据库目录存在，大小 {}", path_size_bytes(db_path)),
+            Some(site.db_data_path.clone()),
+        ));
+    }
+
+    for cmd in ["sshpass", "rsync", "ssh"] {
+        if command_exists(cmd) {
+            checks.push(preflight_pass(
+                &format!("cmd_{cmd}"),
+                &format!("本机命令 {cmd}"),
+                "命令可用",
+                None,
+            ));
+        } else {
+            checks.push(preflight_blocking(
+                &format!("cmd_{cmd}"),
+                &format!("本机命令 {cmd}"),
+                format!("远端部署需要本机可执行 {cmd}"),
+                None,
+                Some("安装 sshpass/rsync/ssh 后重试".to_string()),
+                Vec::new(),
+            ));
+        }
+    }
+
+    if std::env::var(&target.password_env)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        checks.push(preflight_pass(
+            "password_env",
+            "SSH 密码环境变量",
+            format!("已读取 {}", target.password_env),
+            None,
+        ));
+    } else {
+        checks.push(preflight_blocking(
+            "password_env",
+            "SSH 密码环境变量",
+            format!("未设置 {}", target.password_env),
+            None,
+            Some("通过环境变量提供 SSH 密码，禁止写入仓库".to_string()),
+            Vec::new(),
+        ));
+    }
+
+    if checks
+        .iter()
+        .all(|check| check.status != ManagedSitePreflightStatus::Blocking)
+    {
+        let (surreal_unit, web_unit) = remote_service_unit_names(site_id);
+        match run_ssh(
+            &target,
+            &format!(
+                "set -e; surreal={surreal}; web_bin={web_bin}; if [ -x \"$surreal\" ]; then echo \"surreal=$surreal\"; else command -v \"$surreal\"; fi; [ -x \"$web_bin\" ] || (echo WEB_BIN_MISSING:$web_bin; exit 43); echo \"web_bin=$web_bin\"; mkdir -p {root} {db_parent}; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{db_port}[[:space:]]' && ! systemctl is-active --quiet {surreal_unit}; then echo DB_PORT_IN_USE; exit 44; fi; if ss -ltn 2>/dev/null | grep -Eq '(^|[[:space:]])[^[:space:]]*:{web_port}[[:space:]]' && ! systemctl is-active --quiet {web_unit}; then echo WEB_PORT_IN_USE; exit 45; fi; df -Pk {root} | tail -1",
+                surreal = sh_quote(&target.surreal_bin),
+                web_bin = sh_quote(&target.remote_web_bin),
+                root = sh_quote(&target.remote_root),
+                db_parent = sh_quote(
+                    Path::new(&target.remote_db_path)
+                        .parent()
+                        .and_then(|p| p.to_str())
+                        .unwrap_or("/root/surreal_data")
+                ),
+                db_port = target.remote_db_port,
+                web_port = target.remote_web_port,
+                surreal_unit = surreal_unit,
+                web_unit = web_unit,
+            ),
+        )
+        .await
+        {
+            Ok(out) => checks.push(preflight_pass(
+                "remote_machine",
+                "远端机器",
+                "SSH、目录、SurrealDB/Web 二进制、端口预检通过",
+                Some(out),
+            )),
+            Err(err) => checks.push(preflight_blocking(
+                "remote_machine",
+                "远端机器",
+                err.to_string(),
+                Some(format!("{}@{}", target.ssh_user, target.host)),
+                Some("检查远端端口、磁盘、surreal 路径和 SSH 权限".to_string()),
+                Vec::new(),
+            )),
+        }
+    }
+
+    let blocking_count = checks
+        .iter()
+        .filter(|check| check.status == ManagedSitePreflightStatus::Blocking)
+        .count();
+    let warning_count = checks
+        .iter()
+        .filter(|check| check.status == ManagedSitePreflightStatus::Warning)
+        .count();
+    let status = ManagedRemoteDeployStatus {
+        site_id: site_id.to_string(),
+        target_id: target.id.clone(),
+        status: if blocking_count == 0 {
+            "ready".to_string()
+        } else {
+            "blocked".to_string()
+        },
+        current_step: format!("{blocking_count} 个阻断 / {warning_count} 个警告"),
+        remote_entry_url: Some(remote_entry_url(&target)),
+        checked_at: now_rfc3339(),
+        last_error: None,
+        checks,
+    };
+    save_remote_deploy_status(&status)?;
+    Ok(status)
+}
+
+pub async fn remote_deploy_site(
+    site_id: String,
+    req: Option<ManagedRemoteDeployRequest>,
+) -> Result<ManagedRemoteDeployStatus> {
+    let request = match req {
+        Some(req) => Some(req),
+        None => {
+            let saved = get_remote_deploy_status(&site_id)?;
+            (saved.target_id != "default").then_some(ManagedRemoteDeployRequest {
+                target_id: Some(saved.target_id),
+                target: None,
+            })
+        }
+    };
+    let target = resolve_remote_target(&site_id, request)?;
+    let mut status = remote_preflight_site(
+        &site_id,
+        Some(ManagedRemoteDeployRequest {
+            target_id: Some(target.id.clone()),
+            target: None,
+        }),
+    )
+    .await?;
+    if status.status == "blocked" {
+        bail!("远端部署预检未通过: {}", status.current_step);
+    }
+    let (site, db_user, db_password) = load_site_and_credentials(&site_id)?;
+    status.status = "running".to_string();
+    status.current_step = "preflight".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+
+    if generation_enabled(&site) && site.parse_status != ManagedSiteParseStatus::Parsed {
+        status.current_step = "local_generation".to_string();
+        status.checked_at = now_rfc3339();
+        save_remote_deploy_status(&status)?;
+        run_generation_pipeline(site_id.clone(), true).await?;
+    }
+
+    let site = load_raw_site(&site_id)?;
+    let site_dir = remote_site_dir(&target, &site_id);
+    status.current_step = "remote_stop".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    let (surreal_unit, web_unit) = remote_service_unit_names(&site_id);
+    run_ssh(
+        &target,
+        &format!(
+            "set -e; systemctl stop {web_unit} 2>/dev/null || true; systemctl stop {surreal_unit} 2>/dev/null || true; mkdir -p {site_dir} {db_parent}",
+            web_unit = web_unit,
+            surreal_unit = surreal_unit,
+            site_dir = sh_quote(&site_dir),
+            db_parent = sh_quote(
+                Path::new(&target.remote_db_path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("/root/surreal_data")
+            )
+        ),
+    )
+    .await?;
+
+    status.current_step = "upload".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    run_rsync_db(&site, &target).await?;
+
+    status.current_step = "remote_config".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    let remote_config = build_remote_site_config(&site, &target, &db_user, &db_password)?;
+    let local_remote_dir = site_runtime_dir(&site_id).join("remote");
+    fs::create_dir_all(&local_remote_dir)?;
+    let local_remote_config = local_remote_dir.join("DbOption.remote.toml");
+    write_file_atomic(&local_remote_config, &remote_config)?;
+    run_rsync_file(
+        &local_remote_config,
+        &target,
+        &format!("{site_dir}/DbOption.toml"),
+    )
+    .await?;
+    install_remote_services(&site, &target, &db_user, &db_password).await?;
+
+    status.current_step = "remote_start".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    restart_remote_services(&site_id, &target).await?;
+
+    status.current_step = "validation".to_string();
+    status.checked_at = now_rfc3339();
+    save_remote_deploy_status(&status)?;
+    validate_remote_http(&site_id, &target).await?;
+
+    status.status = "completed".to_string();
+    status.current_step = "远端部署完成".to_string();
+    status.remote_entry_url = Some(remote_entry_url(&target));
+    status.checked_at = now_rfc3339();
+    status.last_error = None;
+    save_remote_deploy_status(&status)?;
+    Ok(status)
 }
 
 /// 重启站点（C6 / Sprint C · 修 G10）

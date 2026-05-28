@@ -17,7 +17,7 @@ import type {
   AdminSiteDeletedPayload,
 } from '@/composables/useAdminSitesStream'
 
-export type SiteAction = 'parse' | 'generate' | 'deploy' | 'start' | 'stop' | 'restart' | 'delete'
+export type SiteAction = 'parse' | 'generate' | 'deploy' | 'remote_deploy' | 'start' | 'stop' | 'restart' | 'delete'
 export interface SiteActionError {
   siteId: string
   action: SiteAction

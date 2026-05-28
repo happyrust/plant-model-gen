@@ -173,11 +173,12 @@ export const siteActionLabelMap = {
   parse: '解析',
   generate: '生成',
   deploy: '部署',
+  remote_deploy: '远端部署',
   start: '启动',
   stop: '停止',
   restart: '重启',
   delete: '删除',
-} as const satisfies Record<'parse' | 'generate' | 'deploy' | 'start' | 'stop' | 'restart' | 'delete', string>
+} as const satisfies Record<'parse' | 'generate' | 'deploy' | 'remote_deploy' | 'start' | 'stop' | 'restart' | 'delete', string>
 
 export interface SiteStatsExtended {
   total: number

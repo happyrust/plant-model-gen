@@ -16,9 +16,10 @@ use crate::web_server::{
     admin_response::{self, ApiResponse},
     admin_task_handlers, managed_project_sites as managed_sites,
     models::{
-        AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedSiteLogsResponse,
-        ManagedSiteReconcileRequest, ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest,
-        TaskPriority, TaskType, UpdateManagedSiteRequest,
+        AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedRemoteDeployRequest,
+        ManagedRemoteTargetRequest, ManagedSiteLogsResponse, ManagedSiteReconcileRequest,
+        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, TaskPriority, TaskType,
+        UpdateManagedSiteRequest,
     },
 };
 
@@ -27,6 +28,10 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/resources/summary", get(get_resource_summary))
         .route("/api/admin/app-config", get(get_app_config))
         .route("/api/admin/ports/check", get(check_port))
+        .route(
+            "/api/admin/remote-targets",
+            get(list_remote_targets).post(upsert_remote_target),
+        )
         .route("/api/admin/sites", get(list_sites).post(create_site))
         .route(
             "/api/admin/sites/preview-parse-plan",
@@ -37,6 +42,18 @@ pub fn create_admin_routes() -> Router {
             get(get_site).put(update_site).delete(delete_site),
         )
         .route("/api/admin/sites/{id}/preflight", post(preflight_site))
+        .route(
+            "/api/admin/sites/{id}/remote-preflight",
+            post(remote_preflight_site),
+        )
+        .route(
+            "/api/admin/sites/{id}/remote-deploy",
+            get(get_remote_deploy_status).post(remote_deploy_site),
+        )
+        .route(
+            "/api/admin/sites/{id}/remote-deploy/status",
+            get(get_remote_deploy_status),
+        )
         .route("/api/admin/sites/{id}/parse", post(parse_site))
         .route("/api/admin/sites/{id}/generate", post(generate_site))
         .route("/api/admin/sites/{id}/deploy", post(deploy_site))
@@ -224,6 +241,58 @@ pub async fn preview_parse_plan(
 pub async fn preflight_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::preflight_site(&site_id).await {
         Ok(report) => admin_response::ok("部署预检完成", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn list_remote_targets() -> impl IntoResponse {
+    match managed_sites::list_remote_targets() {
+        Ok(targets) => admin_response::ok("获取远端部署目标成功", targets),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn upsert_remote_target(
+    Json(payload): Json<ManagedRemoteTargetRequest>,
+) -> impl IntoResponse {
+    match managed_sites::upsert_remote_target(payload) {
+        Ok(target) => admin_response::ok("保存远端部署目标成功", target),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn remote_preflight_site(
+    Path(site_id): Path<String>,
+    payload: Option<Json<ManagedRemoteDeployRequest>>,
+) -> impl IntoResponse {
+    let request = payload.map(|Json(value)| value);
+    match managed_sites::remote_preflight_site(&site_id, request).await {
+        Ok(report) => admin_response::ok("远端部署预检完成", report),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn remote_deploy_site(
+    Path(site_id): Path<String>,
+    payload: Option<Json<ManagedRemoteDeployRequest>>,
+) -> impl IntoResponse {
+    if let Some(Json(request)) = payload {
+        if let Err(err) = managed_sites::remote_preflight_site(&site_id, Some(request)).await {
+            return admin_response::managed_error(err.to_string());
+        }
+    }
+    match submit_managed_site_task(&site_id, TaskType::RemoteDeployManagedSite, "远端部署") {
+        Ok(task_id) => admin_response::accepted(
+            "已提交远端部署任务",
+            json!({ "site_id": site_id, "action": "remote_deploy", "task_id": task_id }),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+pub async fn get_remote_deploy_status(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::get_remote_deploy_status(&site_id) {
+        Ok(status) => admin_response::ok("获取远端部署状态成功", status),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }

@@ -28,7 +28,7 @@ const TABLE_NAME: &str = "admin_tasks";
 const ADMIN_TASK_SUBMITTED_STEP: &str = "已提交，等待站点状态更新";
 const ADMIN_TASK_TOTAL_STEPS: u32 = 7;
 const ADMIN_TASK_POLL_INTERVAL_MS: u64 = 2_000;
-const ADMIN_TASK_POLL_TIMEOUT_SECS: u64 = 30 * 60;
+const ADMIN_TASK_POLL_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 
 #[derive(Clone)]
 struct StoredAdminTask {
@@ -101,7 +101,7 @@ pub fn create_and_dispatch_site_task(
 ) -> Result<TaskInfo, String> {
     if !is_supported_admin_task_type(&task_type) {
         return Err(
-            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite"
+            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite、RemoteDeployManagedSite"
                 .to_string(),
         );
     }
@@ -172,7 +172,7 @@ async fn create_task(Json(payload): Json<CreateTaskRequest>) -> impl IntoRespons
 
     if !is_supported_admin_task_type(&task_type) {
         return admin_response::bad_request(
-            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite",
+            "当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite、RemoteDeployManagedSite",
         );
     }
 
@@ -431,6 +431,7 @@ fn parse_task_type(s: &str) -> TaskType {
         "ModelExport" => TaskType::ModelExport,
         "StartManagedSite" => TaskType::StartManagedSite,
         "DeployManagedSite" => TaskType::DeployManagedSite,
+        "RemoteDeployManagedSite" => TaskType::RemoteDeployManagedSite,
         other => TaskType::Custom(other.to_string()),
     }
 }
@@ -516,8 +517,28 @@ async fn dispatch_admin_task(task_id: String) {
                 Err(e) => Err(e.to_string()),
             }
         }
+        (TaskType::RemoteDeployManagedSite, Some(sid)) => {
+            mark_task_running(&mut stored.task, "远端部署：preflight", 10.0);
+            let _ = save_task(&stored.task, stored.site_id.as_deref());
+            match crate::web_server::managed_project_sites::remote_deploy_site(sid.to_string(), None)
+                .await
+            {
+                Ok(status) => {
+                    mark_task_completed(
+                        &mut stored.task,
+                        &format!(
+                            "远端部署完成：{}",
+                            status.remote_entry_url.unwrap_or_else(|| "未返回访问地址".to_string())
+                        ),
+                    );
+                    let _ = save_task(&stored.task, stored.site_id.as_deref());
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
         (_, Some(_)) => {
-            Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite".into())
+            Err("当前 admin 仅支持 ParsePdmsData、DataGeneration、FullGeneration、StartManagedSite、DeployManagedSite、RemoteDeployManagedSite".into())
         }
         (_, None) => Err("创建 admin 任务必须指定 site_id".into()),
     };
@@ -605,6 +626,7 @@ fn is_supported_admin_task_type(task_type: &TaskType) -> bool {
             | TaskType::FullGeneration
             | TaskType::StartManagedSite
             | TaskType::DeployManagedSite
+            | TaskType::RemoteDeployManagedSite
     )
 }
 

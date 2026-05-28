@@ -8,6 +8,10 @@ import type {
   ManagedSitePreflightReport,
   ManagedSiteDeployValidationReport,
   ManagedSiteActionResponse,
+  ManagedRemoteDeployRequest,
+  ManagedRemoteDeployStatus,
+  ManagedRemoteTarget,
+  ManagedRemoteTargetRequest,
   ManagedSiteReconcileRequest,
   ManagedSiteReconcileResponse,
   CreateManagedSiteRequest,
@@ -64,6 +68,21 @@ export const sitesApi = {
 
   preflight: (id: string) =>
     apiPost<ManagedSitePreflightReport>(`/api/admin/sites/${id}/preflight`),
+
+  listRemoteTargets: () =>
+    apiGet<ManagedRemoteTarget[]>('/api/admin/remote-targets'),
+
+  upsertRemoteTarget: (payload: ManagedRemoteTargetRequest) =>
+    apiPost<ManagedRemoteTarget>('/api/admin/remote-targets', payload as unknown as Record<string, unknown>),
+
+  remotePreflight: (id: string, payload: ManagedRemoteDeployRequest = {}) =>
+    apiPost<ManagedRemoteDeployStatus>(`/api/admin/sites/${id}/remote-preflight`, payload as unknown as Record<string, unknown>),
+
+  remoteDeploy: (id: string, payload: ManagedRemoteDeployRequest = {}) =>
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/remote-deploy`, payload as unknown as Record<string, unknown>),
+
+  remoteDeployStatus: (id: string) =>
+    apiGet<ManagedRemoteDeployStatus>(`/api/admin/sites/${id}/remote-deploy/status`),
 
   update: (id: string, payload: UpdateManagedSiteRequest) =>
     apiPut<ManagedProjectSite>(`/api/admin/sites/${id}`, payload as unknown as Record<string, unknown>),

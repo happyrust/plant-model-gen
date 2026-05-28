@@ -193,8 +193,16 @@ async fn run_project_db_probe(label: &str, sql: &'static str) -> (bool, Option<S
 }
 
 async fn probe_project_database_connectivity() -> ((bool, Option<String>), (bool, Option<String>)) {
-    let surrealdb = run_project_db_probe("SurrealDB 连接探测", "RETURN 1;").await;
-    let database = run_project_db_probe("项目数据库上下文探测", "INFO FOR DB;").await;
+    let mut surrealdb = run_project_db_probe("SurrealDB 连接探测", "RETURN 1;").await;
+    let mut database = run_project_db_probe("项目数据库上下文探测", "INFO FOR DB;").await;
+    if !surrealdb.0 || !database.0 {
+        let config = get_db_config_from_options();
+        let fresh_check = check_surrealdb_connection(&config).await;
+        if fresh_check.0 {
+            surrealdb = (true, None);
+            database = (true, None);
+        }
+    }
     (database, surrealdb)
 }
 

@@ -855,13 +855,90 @@ fn default_runtime_db_mode() -> ManagedSiteDbMode {
     ManagedSiteDbMode::Ws
 }
 
+/// 工程角色：设计工程 / 元件库工程
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectRole {
+    Design,
+    Library,
+}
+
+impl Default for ProjectRole {
+    fn default() -> Self {
+        Self::Design
+    }
+}
+
+/// 站点内的单个工程条目（多工程合并站点的最小单元）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SiteProject {
+    /// canonical 绝对路径（逐条过白名单）
+    pub path: String,
+    /// 工程目录名（included_projects / Viewer 用）
+    pub name: String,
+    /// 角色：Design | Library
+    #[serde(default)]
+    pub role: ProjectRole,
+    /// 全站恰好一个 true
+    #[serde(default)]
+    pub is_primary: bool,
+    /// 排序
+    #[serde(default)]
+    pub sort_order: u32,
+}
+
+/// 工程扫描候选项（Phase 3 扫描 API 返回的单个候选工程）
+#[derive(Debug, Clone, Serialize)]
+pub struct ScannedProject {
+    /// canonical 绝对路径
+    pub path: String,
+    /// 工程目录名
+    pub name: String,
+    /// 按 db 文件头类型推断的角色（含 DESI=design，仅 CATA=library，其余回退 design）
+    pub role: ProjectRole,
+    /// 建议的主工程标记（首个 design 候选为 true）
+    pub is_primary: bool,
+    /// 建议排序
+    pub sort_order: u32,
+    /// 该工程下发现的 dbnum（去重升序）
+    pub dbnums: Vec<u32>,
+    /// 该工程下出现的 db 类型集合（如 DESI/CATA，升序）
+    pub db_types: Vec<String>,
+}
+
+/// 跨候选工程的 dbnum 冲突（同一 dbnum 落在多个工程）
+#[derive(Debug, Clone, Serialize)]
+pub struct ScannedDbnumConflict {
+    pub dbnum: u32,
+    pub projects: Vec<String>,
+}
+
+/// 工程扫描结果（Phase 3）
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProjectsResult {
+    /// 扫描根（canonical）
+    pub root: String,
+    /// 候选工程
+    pub projects: Vec<ScannedProject>,
+    /// dbnum 冲突标注（仅提示，不阻塞返回；保存时由 precheck_dbnum_conflicts 兜底）
+    pub conflicts: Vec<ScannedDbnumConflict>,
+    /// 是否存在冲突
+    pub has_conflict: bool,
+}
+
 /// 管理后台项目站点
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ManagedProjectSite {
     pub site_id: String,
+    /// 站点身份+显示名（多工程模型的站点级名称）
+    #[serde(default)]
+    pub site_name: String,
     pub project_name: String,
     pub project_code: u32,
     pub project_path: String,
+    /// 站点内工程条目列表（多工程合并的事实源；持久化为 projects_json 列）
+    #[serde(default)]
+    pub projects: Vec<SiteProject>,
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
     #[serde(default)]
@@ -953,6 +1030,10 @@ pub struct ManagedSiteResourceMetrics {
 /// 创建管理后台项目站点请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateManagedSiteRequest {
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<SiteProject>,
     pub project_name: String,
     pub project_path: String,
     pub project_code: u32,
@@ -1001,6 +1082,10 @@ pub struct CreateManagedSiteRequest {
 /// 更新管理后台项目站点请求
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpdateManagedSiteRequest {
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(default)]
+    pub projects: Option<Vec<SiteProject>>,
     #[serde(default)]
     pub project_name: Option<String>,
     #[serde(default)]
@@ -1052,6 +1137,10 @@ pub struct UpdateManagedSiteRequest {
 pub struct PreviewManagedSiteParsePlanRequest {
     #[serde(default)]
     pub site_id: Option<String>,
+    #[serde(default)]
+    pub site_name: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<SiteProject>,
     pub project_name: String,
     pub project_path: String,
     #[serde(default)]

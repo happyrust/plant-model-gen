@@ -39,7 +39,8 @@ use super::models::{
     ManagedSiteParseStatus, ManagedSitePreflightCheck, ManagedSitePreflightReport,
     ManagedSitePreflightStatus, ManagedSiteProcessResource, ManagedSiteReconcileResponse,
     ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
-    PreviewManagedSiteParsePlanRequest, UpdateManagedSiteRequest,
+    PreviewManagedSiteParsePlanRequest, ProjectRole, ScanProjectsResult, ScannedDbnumConflict,
+    ScannedProject, SiteProject, UpdateManagedSiteRequest,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -539,6 +540,15 @@ fn parse_db_types_from_json(raw: Option<String>) -> Vec<String> {
     }
 }
 
+fn projects_to_json(values: &[SiteProject]) -> Result<String> {
+    Ok(serde_json::to_string(values)?)
+}
+
+fn projects_from_json(raw: Option<String>) -> Vec<SiteProject> {
+    raw.and_then(|value| serde_json::from_str::<Vec<SiteProject>>(&value).ok())
+        .unwrap_or_default()
+}
+
 fn normalize_force_rebuild_system_db(
     force_rebuild_system_db: bool,
     parse_db_types: &[String],
@@ -681,7 +691,48 @@ fn split_project_root_multi(
     (raw_path.to_string(), project_names.clone(), project_names)
 }
 
+/// 站点主工程（多工程模型）：优先 is_primary，其次首个 Design，再次第一个。
+fn site_primary_project(site: &ManagedProjectSite) -> Option<&SiteProject> {
+    site.projects
+        .iter()
+        .find(|p| p.is_primary)
+        .or_else(|| {
+            site.projects
+                .iter()
+                .find(|p| matches!(p.role, ProjectRole::Design))
+        })
+        .or_else(|| site.projects.first())
+}
+
+/// 返回站点内 (included_projects 名字, project_dirs 绝对路径)，按 sort_order 对齐并按名去重。
+/// 绝对 project_dirs 配合 `DbOption::get_project_path` 的 `join` 语义可统一同根/跨根（见 dev-plan §10）。
+fn site_included_projects_and_dirs(site: &ManagedProjectSite) -> (Vec<String>, Vec<String>) {
+    let mut ordered: Vec<&SiteProject> = site.projects.iter().collect();
+    ordered.sort_by_key(|p| p.sort_order);
+    let mut names = Vec::new();
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for p in ordered {
+        let name = p.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        names.push(name.to_string());
+        dirs.push(p.path.clone());
+    }
+    (names, dirs)
+}
+
 fn site_source_project_name(site: &ManagedProjectSite) -> String {
+    if let Some(primary) = site_primary_project(site) {
+        let name = primary.name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
     site.associated_project
         .as_deref()
         .map(str::trim)
@@ -702,6 +753,14 @@ fn site_source_project_name(site: &ManagedProjectSite) -> String {
 }
 
 fn site_parse_project_names(site: &ManagedProjectSite) -> Vec<String> {
+    // 多工程模型：直接取显式 projects 列表（事实源）。
+    let (names, _) = site_included_projects_and_dirs(site);
+    if !names.is_empty() {
+        return names;
+    }
+
+    // 回退（无显式 projects 的旧站点）：按 associated/path/project_name 派生。
+    // 已删除 AvevaPlantSample→AvevaCatalogue 硬编码：元件库改由显式 role=library 工程驱动。
     let mut names = normalize_project_names(
         [
             site.associated_project.clone().unwrap_or_default(),
@@ -720,30 +779,6 @@ fn site_parse_project_names(site: &ManagedProjectSite) -> Vec<String> {
     }
     if names.is_empty() {
         names.push(site.project_name.clone());
-    }
-
-    let has_plant = names
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case("AvevaPlantSample"));
-    let has_catalogue = names
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case("AvevaCatalogue"));
-    if has_plant && !has_catalogue {
-        let raw = PathBuf::from(&site.project_path);
-        let catalogue_exists = if raw
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("AvevaPlantSample"))
-        {
-            raw.parent()
-                .map(|parent| parent.join("AvevaCatalogue").exists())
-                .unwrap_or(false)
-        } else {
-            raw.join("AvevaCatalogue").exists()
-        };
-        if catalogue_exists {
-            names.push("AvevaCatalogue".to_string());
-        }
     }
     names
 }
@@ -893,6 +928,310 @@ fn find_db_file_name_for_dbnum(root: &Path, target_dbnum: u32) -> Result<Option<
     Ok(file_names.into_iter().next())
 }
 
+/// 校验并规范化站点工程列表（T2.1）：逐条过白名单 + canonicalize，断言约束。
+/// 返回规范化后的 projects（path 替换为 canonical 绝对路径，name 缺省取目录名）。
+fn validate_and_canonicalize_projects(projects: &[SiteProject]) -> Result<Vec<SiteProject>> {
+    if projects.is_empty() {
+        bail!("至少需要一个工程");
+    }
+    let mut out = Vec::with_capacity(projects.len());
+    let mut design_count = 0usize;
+    let mut primary_count = 0usize;
+    let mut seen_names = HashSet::new();
+    for p in projects {
+        let canonical = canonical_project_path(p.path.trim())?;
+        let name = if p.name.trim().is_empty() {
+            canonical
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            p.name.trim().to_string()
+        };
+        if name.is_empty() {
+            bail!("工程名不能为空: {}", canonical.display());
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            bail!("工程名重复: {name}（同站点内工程名必须唯一）");
+        }
+        if matches!(p.role, ProjectRole::Design) {
+            design_count += 1;
+        }
+        if p.is_primary {
+            primary_count += 1;
+        }
+        out.push(SiteProject {
+            path: canonical.to_string_lossy().to_string(),
+            name,
+            role: p.role,
+            is_primary: p.is_primary,
+            sort_order: p.sort_order,
+        });
+    }
+    if design_count == 0 {
+        bail!("至少需要一个 design 工程");
+    }
+    if primary_count != 1 {
+        bail!("必须恰好指定一个主工程(primary)，当前为 {primary_count} 个");
+    }
+    Ok(out)
+}
+
+/// 扫描单个工程根目录，收集 (dbnum, 文件名)（读 db 文件头）。
+fn collect_project_dbnums(
+    root: &Path,
+    depth: usize,
+    visited: &mut usize,
+    out: &mut Vec<(u32, String)>,
+) -> Result<()> {
+    if depth > SCAN_MAX_DEPTH {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        *visited += 1;
+        if *visited > SCAN_MAX_FILES {
+            bail!("项目路径扫描文件数超过 {SCAN_MAX_FILES} 上限，请缩小工程路径或收紧白名单");
+        }
+        if !is_safe_scan_entry(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_project_dbnums(&path, depth + 1, visited, out)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.contains('.') {
+            continue;
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 60];
+        if file.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        let db_info = parse_file_basic_info(&buf);
+        if db_info.dbnum > 0 {
+            out.push((db_info.dbnum, file_name.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// dbnum 冲突预检（T2.2 / Q2）：跨工程读 db 文件头建 dbnum -> [工程名]，
+/// 任一 dbnum 落在多个工程则 bail（多工程合并到同一命名空间不允许 dbnum 重复）。
+fn precheck_dbnum_conflicts(projects: &[SiteProject]) -> Result<()> {
+    let mut owners: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for p in projects {
+        let root = PathBuf::from(&p.path);
+        if !root.exists() {
+            continue;
+        }
+        let mut visited = 0usize;
+        let mut pairs = Vec::new();
+        collect_project_dbnums(&root, 0, &mut visited, &mut pairs)?;
+        let mut seen_dbnums = HashSet::new();
+        for (dbnum, _file) in pairs {
+            if !seen_dbnums.insert(dbnum) {
+                continue;
+            }
+            let entry = owners.entry(dbnum).or_default();
+            if !entry.iter().any(|n| n.eq_ignore_ascii_case(&p.name)) {
+                entry.push(p.name.clone());
+            }
+        }
+    }
+    let conflicts: Vec<String> = owners
+        .iter()
+        .filter(|(_, projs)| projs.len() > 1)
+        .map(|(dbnum, projs)| format!("dbnum {} 同时出现在工程: {}", dbnum, projs.join(", ")))
+        .collect();
+    if !conflicts.is_empty() {
+        bail!(
+            "检测到 dbnum 冲突，需消解后再保存（多工程合并到同一命名空间不允许 dbnum 重复）:\n{}",
+            conflicts.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// 扫描单个工程根目录，收集 (dbnum, db_type)（读 db 文件头）。Phase 3 扫描用，
+/// 与 `collect_project_dbnums` 同源，但额外保留 db 类型用于推断工程角色。
+fn collect_project_db_entries(
+    root: &Path,
+    depth: usize,
+    visited: &mut usize,
+    out: &mut Vec<(u32, String)>,
+) -> Result<()> {
+    if depth > SCAN_MAX_DEPTH {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        *visited += 1;
+        if *visited > SCAN_MAX_FILES {
+            bail!("项目路径扫描文件数超过 {SCAN_MAX_FILES} 上限，请缩小工程路径或收紧白名单");
+        }
+        if !is_safe_scan_entry(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_project_db_entries(&path, depth + 1, visited, out)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.contains('.') {
+            continue;
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 60];
+        if file.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        let db_info = parse_file_basic_info(&buf);
+        if db_info.dbnum > 0 {
+            out.push((db_info.dbnum, db_info.db_type.trim().to_ascii_uppercase()));
+        }
+    }
+    Ok(())
+}
+
+/// 按 db 类型集合推断工程角色：含 DESI → design；仅 CATA(无 DESI) → library；其余回退 design。
+fn infer_scanned_role(db_types: &HashSet<String>) -> ProjectRole {
+    if db_types.contains("DESI") {
+        ProjectRole::Design
+    } else if db_types.contains("CATA") {
+        ProjectRole::Library
+    } else {
+        ProjectRole::Design
+    }
+}
+
+/// Phase 3：扫描根目录下的候选工程。
+///
+/// 约定：
+/// - `raw_root` 必须落在 admin 白名单内（复用 `canonical_project_path`）。
+/// - 候选工程 = root 的直接子目录中、递归含至少一个 db 文件（dbnum>0）者；
+///   若没有任何子目录命中、但 root 自身直接含 db 文件，则把 root 作为单个候选。
+/// - 角色按 db 文件头类型推断；按名稳定排序后，首个 design 候选标 `is_primary`。
+/// - 跨候选 dbnum 冲突只做标注（不 bail），交由前端消解后再由 create/update 的
+///   `precheck_dbnum_conflicts` 兜底。
+pub fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
+    let root = canonical_project_path(raw_root.trim())?;
+
+    let mut candidate_dirs: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(&root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        if !is_safe_scan_entry(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            candidate_dirs.push(path);
+        }
+    }
+    candidate_dirs.sort();
+    // 没有子目录命中时，把 root 自身作为单个候选（单工程目录直接扫）。
+    if candidate_dirs.is_empty() {
+        candidate_dirs.push(root.clone());
+    }
+
+    let mut projects: Vec<ScannedProject> = Vec::new();
+    let mut owners: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+
+    for dir in &candidate_dirs {
+        let mut visited = 0usize;
+        let mut entries: Vec<(u32, String)> = Vec::new();
+        collect_project_db_entries(dir, 0, &mut visited, &mut entries)?;
+        if entries.is_empty() {
+            continue;
+        }
+        let name = dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| dir.to_string_lossy().to_string());
+
+        let mut dbnum_set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut type_set: HashSet<String> = HashSet::new();
+        for (dbnum, db_type) in entries {
+            dbnum_set.insert(dbnum);
+            if !db_type.is_empty() {
+                type_set.insert(db_type);
+            }
+        }
+        for dbnum in &dbnum_set {
+            let owner = owners.entry(*dbnum).or_default();
+            if !owner.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                owner.push(name.clone());
+            }
+        }
+        let role = infer_scanned_role(&type_set);
+        let mut db_types: Vec<String> = type_set.into_iter().collect();
+        db_types.sort();
+        projects.push(ScannedProject {
+            path: dir.to_string_lossy().to_string(),
+            name,
+            role,
+            is_primary: false,
+            sort_order: 0,
+            dbnums: dbnum_set.into_iter().collect(),
+            db_types,
+        });
+    }
+
+    // 稳定排序 + 主工程建议：首个 design 标 primary（无 design 则首个候选）。
+    projects.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    let primary_idx = projects
+        .iter()
+        .position(|p| matches!(p.role, ProjectRole::Design))
+        .or(if projects.is_empty() { None } else { Some(0) });
+    for (idx, project) in projects.iter_mut().enumerate() {
+        project.sort_order = idx as u32;
+        project.is_primary = Some(idx) == primary_idx;
+    }
+
+    let conflicts: Vec<ScannedDbnumConflict> = owners
+        .into_iter()
+        .filter(|(_, projs)| projs.len() > 1)
+        .map(|(dbnum, projects)| ScannedDbnumConflict { dbnum, projects })
+        .collect();
+    let has_conflict = !conflicts.is_empty();
+
+    Ok(ScanProjectsResult {
+        root: root.to_string_lossy().to_string(),
+        projects,
+        conflicts,
+        has_conflict,
+    })
+}
+
 fn collect_db_file_names_for_types(
     root: &Path,
     target_types: &[&str],
@@ -929,19 +1268,46 @@ fn generation_enabled(site: &ManagedProjectSite) -> bool {
     site.gen_model || site.gen_mesh || site.gen_spatial_tree
 }
 
+/// 站点所有工程的实际根目录（多工程模型用 projects[].path 绝对路径；空则回退旧派生）。
+fn site_existing_project_roots(site: &ManagedProjectSite) -> Result<Vec<PathBuf>> {
+    if !site.projects.is_empty() {
+        let mut ordered: Vec<&SiteProject> = site.projects.iter().collect();
+        ordered.sort_by_key(|p| p.sort_order);
+        let roots: Vec<PathBuf> = ordered
+            .into_iter()
+            .map(|p| PathBuf::from(&p.path))
+            .filter(|path| path.exists())
+            .collect();
+        if !roots.is_empty() {
+            return Ok(roots);
+        }
+    }
+    existing_project_roots(&site_parse_project_names(site), &site.project_path)
+}
+
+/// primary 工程根目录（多工程模型用 primary.path；空则回退旧派生）。
+fn site_primary_existing_roots(site: &ManagedProjectSite) -> Result<Vec<PathBuf>> {
+    if let Some(primary) = site_primary_project(site) {
+        let path = PathBuf::from(&primary.path);
+        if path.exists() {
+            return Ok(vec![path]);
+        }
+    }
+    existing_project_roots(
+        &[site_source_project_name(site), site.project_name.clone()],
+        &site.project_path,
+    )
+}
+
 fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
     let parse_db_types = configured_parse_db_types(site);
     if site.manual_db_nums.is_empty() && parse_db_types.is_empty() {
         return Ok(Vec::new());
     }
 
-    let parse_project_names = site_parse_project_names(site);
-    let project_roots = existing_project_roots(&parse_project_names, &site.project_path)?;
-    let primary_project_roots = existing_project_roots(
-        &[site_source_project_name(site), site.project_name.clone()],
-        &site.project_path,
-    )
-    .unwrap_or_else(|_| project_roots.clone());
+    let project_roots = site_existing_project_roots(site)?;
+    let primary_project_roots =
+        site_primary_existing_roots(site).unwrap_or_else(|_| project_roots.clone());
 
     let mut file_names = Vec::new();
     let selected_non_system_types = parse_db_types
@@ -1368,8 +1734,21 @@ fn build_site_config(
         ..DatabaseConfig::from_db_option(&aios_core::get_db_option())
     };
     let db_option = runtime_cfg.to_runtime_db_option();
-    let (project_root, included_projects, project_dirs) =
-        split_project_root_multi(&parse_project_names, &site.project_path);
+    let (project_root, included_projects, project_dirs) = if !site.projects.is_empty() {
+        // 多工程模型：included_projects=工程名、project_dirs=canonical 绝对路径（统一同根/跨根，见 dev-plan §10）。
+        let (names, dirs) = site_included_projects_and_dirs(site);
+        let primary_root = site_primary_project(site)
+            .map(|p| {
+                PathBuf::from(&p.path)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.path.clone())
+            })
+            .unwrap_or_else(|| site.project_path.clone());
+        (primary_root, names, dirs)
+    } else {
+        split_project_root_multi(&parse_project_names, &site.project_path)
+    };
 
     set_toml_string(table, "project_name", source_project_name);
     set_toml_string(table, "project_path", project_root);
@@ -1414,7 +1793,15 @@ fn build_site_config(
     set_toml_integer(web_server, "port", site.web_port as i64);
     set_toml_string(web_server, "bind_host", site.bind_host.clone());
     set_toml_string(web_server, "site_id", site.site_id.clone());
-    set_toml_string(web_server, "site_name", site.project_name.clone());
+    set_toml_string(
+        web_server,
+        "site_name",
+        if site.site_name.trim().is_empty() {
+            site.project_name.clone()
+        } else {
+            site.site_name.clone()
+        },
+    );
     set_toml_string(web_server, "region", "admin");
     let (local_url, _public_opt, effective_url) =
         derive_entry_urls(site.web_port, &site.bind_host, &site.public_base_url);
@@ -1647,9 +2034,14 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
         derive_entry_urls(web_port, &bind_host, &public_base_url);
     Ok(ManagedProjectSite {
         site_id: row.get("site_id")?,
+        site_name: row
+            .get::<_, Option<String>>("site_name")
+            .unwrap_or(None)
+            .unwrap_or_default(),
         project_name: row.get("project_name")?,
         project_code: row.get::<_, i64>("project_code")? as u32,
         project_path: row.get("project_path")?,
+        projects: projects_from_json(row.get("projects_json").unwrap_or(None)),
         manual_db_nums: manual_db_nums_from_json(row.get("manual_db_nums")?),
         parse_db_types: parse_db_types_from_json(row.get("parse_db_types").unwrap_or(None)),
         force_rebuild_system_db: row
@@ -1727,6 +2119,8 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             project_name TEXT NOT NULL,
             project_code INTEGER NOT NULL,
             project_path TEXT NOT NULL,
+            site_name TEXT,
+            projects_json TEXT NOT NULL DEFAULT '[]',
             manual_db_nums TEXT NOT NULL DEFAULT '[]',
             parse_db_types TEXT NOT NULL DEFAULT '["SYST","DESI","CATA","DICT","GLB","GLOB"]',
             force_rebuild_system_db INTEGER NOT NULL DEFAULT 0,
@@ -1763,7 +2157,6 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_project_sites_project_name ON {table}(project_name);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_project_sites_db_port ON {table}(db_port);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_project_sites_web_port ON {table}(web_port);
         "#,
@@ -1927,6 +2320,22 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         current_version = 8;
         conn.pragma_update(None, "user_version", current_version as i64)?;
     }
+
+    // 多工程合并站点升级（幂等列 + 索引切换，非版本门控；全新升级首跑前可直接删库重建）
+    ensure_column_exists(conn, "site_name")?;
+    ensure_column_exists(conn, "projects_json")?;
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_managed_project_sites_project_name",
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_project_sites_site_name ON {table}(site_name)",
+            table = TABLE_NAME
+        ),
+        [],
+    )?;
+
     debug_assert!(current_version <= SCHEMA_VERSION);
     Ok(())
 }
@@ -1955,6 +2364,7 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
             "export_parquet" => "INTEGER NOT NULL DEFAULT 1",
             "pipeline_db_mode" => "TEXT NOT NULL DEFAULT 'file'",
             "runtime_db_mode" => "TEXT NOT NULL DEFAULT 'ws'",
+            "projects_json" => "TEXT NOT NULL DEFAULT '[]'",
             _ => "TEXT",
         };
         conn.execute(
@@ -2021,8 +2431,8 @@ fn persist_site_with_conn(
                 db_pid, web_pid, viewer_pid, viewer_url, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
-                created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)",
+                created_at, updated_at, site_name, projects_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
             table = TABLE_NAME
         ),
         params![
@@ -2067,6 +2477,8 @@ fn persist_site_with_conn(
             site.last_parse_duration_ms.map(|value| value as i64),
             &site.created_at,
             &site.updated_at,
+            &site.site_name,
+            projects_to_json(&site.projects).unwrap_or_else(|_| "[]".to_string()),
         ],
     )?;
     Ok(())
@@ -2752,11 +3164,34 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     }
     let canonical_path = canonical_project_path(req.project_path.trim())?;
 
+    let site_name = req
+        .site_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| req.project_name.trim().to_string());
+    if site_name.is_empty() {
+        bail!("站点名称不能为空");
+    }
+    let projects = if req.projects.is_empty() {
+        vec![SiteProject {
+            path: canonical_path.to_string_lossy().to_string(),
+            name: req.project_name.trim().to_string(),
+            role: ProjectRole::Design,
+            is_primary: true,
+            sort_order: 0,
+        }]
+    } else {
+        validate_and_canonicalize_projects(&req.projects)?
+    };
+    precheck_dbnum_conflicts(&projects)?;
+
     let _guard = lock_op()?;
 
     let (db_port, web_port) =
         with_conn(|conn| resolve_create_ports_with_conn(conn, req.db_port, req.web_port))?;
-    let site_id = infer_site_id(&req.project_name, web_port);
+    let site_id = infer_site_id(&site_name, web_port);
     let created_at = now_rfc3339();
     let bind_host = normalize_host(req.bind_host);
     assert_bind_host_safe(&bind_host)?;
@@ -2778,9 +3213,11 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let generation_defaults = default_generation_config();
     let site = ManagedProjectSite {
         site_id: site_id.clone(),
+        site_name: site_name.clone(),
         project_name: req.project_name.trim().to_string(),
         project_code: req.project_code,
         project_path: canonical_path.to_string_lossy().to_string(),
+        projects: projects.clone(),
         manual_db_nums: normalize_manual_db_nums(req.manual_db_nums),
         force_rebuild_system_db: normalize_force_rebuild_system_db(
             req.force_rebuild_system_db,
@@ -2904,9 +3341,17 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
 
         ManagedProjectSite {
             site_id: site_id.clone(),
+            site_name: req
+                .site_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| project_name.to_string()),
             project_name: project_name.to_string(),
             project_code: 0,
             project_path: canonical_path.to_string_lossy().to_string(),
+            projects: Vec::new(),
             manual_db_nums: Vec::new(),
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
@@ -2952,6 +3397,27 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
 
     site.project_name = project_name.to_string();
     site.project_path = canonical_path.to_string_lossy().to_string();
+    if let Some(name) = req
+        .site_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        site.site_name = name.to_string();
+    } else if site.site_name.trim().is_empty() {
+        site.site_name = project_name.to_string();
+    }
+    if !req.projects.is_empty() {
+        site.projects = req.projects.clone();
+    } else if site.projects.is_empty() {
+        site.projects = vec![SiteProject {
+            path: canonical_path.to_string_lossy().to_string(),
+            name: project_name.to_string(),
+            role: ProjectRole::Design,
+            is_primary: true,
+            sort_order: 0,
+        }];
+    }
     site.manual_db_nums = normalize_manual_db_nums(req.manual_db_nums);
     site.parse_db_types = parse_db_types;
     site.force_rebuild_system_db = force_rebuild_system_db;
@@ -2976,6 +3442,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
 
 pub fn preview_parse_plan(req: PreviewManagedSiteParsePlanRequest) -> Result<ManagedSiteParsePlan> {
     let site = build_preview_site(req)?;
+    precheck_dbnum_conflicts(&site.projects)?;
     let included_db_files = resolve_included_db_files(&site)?;
     Ok(build_parse_plan_with_files(&site, included_db_files))
 }
@@ -3002,6 +3469,15 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     if let Some(value) = req.project_name.filter(|value| !value.trim().is_empty()) {
         site.project_name = value.trim().to_string();
     }
+    if let Some(value) = req.site_name.filter(|value| !value.trim().is_empty()) {
+        site.site_name = value.trim().to_string();
+    }
+    if let Some(projects) = req.projects {
+        if !projects.is_empty() {
+            site.projects = validate_and_canonicalize_projects(&projects)?;
+        }
+    }
+    precheck_dbnum_conflicts(&site.projects)?;
     if let Some(value) = req.project_path.filter(|value| !value.trim().is_empty()) {
         let canonical = canonical_project_path(value.trim())?;
         site.project_path = canonical.to_string_lossy().to_string();

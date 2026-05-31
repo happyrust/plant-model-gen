@@ -28,6 +28,7 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/resources/summary", get(get_resource_summary))
         .route("/api/admin/app-config", get(get_app_config))
         .route("/api/admin/ports/check", get(check_port))
+        .route("/api/admin/projects/scan", get(scan_projects))
         .route(
             "/api/admin/remote-targets",
             get(list_remote_targets).post(upsert_remote_target),
@@ -182,6 +183,30 @@ pub async fn check_port(Query(params): Query<PortCheckQuery>) -> impl IntoRespon
             "pids": pids,
         }),
     )
+}
+
+/// Phase 3：工程扫描。给一个根路径，自动发现候选工程（读 db 文件头），
+/// 推断 Design/Library 角色、建议主工程，并预标跨工程 dbnum 冲突。
+///
+/// 复用 `managed_project_sites::scan_projects_under_root`（白名单 canonicalize +
+/// 扫描 + 角色推断 + 冲突标注）。**仅在 admin 鉴权后** 暴露。
+#[derive(Debug, Deserialize)]
+pub struct ProjectScanQuery {
+    pub root: String,
+}
+
+pub async fn scan_projects(Query(params): Query<ProjectScanQuery>) -> impl IntoResponse {
+    let root = params.root.trim().to_string();
+    if root.is_empty() {
+        return admin_response::managed_error("root 参数不能为空".to_string());
+    }
+    match managed_sites::scan_projects_under_root(&root) {
+        Ok(result) => admin_response::ok(
+            "工程扫描完成",
+            serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
 }
 
 pub async fn create_site(Json(payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {

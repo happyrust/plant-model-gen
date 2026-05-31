@@ -13,6 +13,35 @@ export type ManagedSiteParseStatus =
   | 'Parsed'
   | 'Failed'
 
+export type ProjectRole = 'design' | 'library'
+
+/** 站点内的单个工程条目（多工程合并站点的最小单元） */
+export interface SiteProject {
+  path: string
+  name: string
+  role: ProjectRole
+  is_primary: boolean
+  sort_order: number
+}
+
+/** Phase 3 扫描 API 返回的候选工程 */
+export interface ScannedProject extends SiteProject {
+  dbnums: number[]
+  db_types: string[]
+}
+
+export interface ScannedDbnumConflict {
+  dbnum: number
+  projects: string[]
+}
+
+export interface ScanProjectsResult {
+  root: string
+  projects: ScannedProject[]
+  conflicts: ScannedDbnumConflict[]
+  has_conflict: boolean
+}
+
 export type ManagedSiteRiskLevel = 'normal' | 'warning' | 'critical'
 export type ManagedSiteParseHealthStatus = ManagedSiteRiskLevel | 'unknown'
 export type ManagedSiteParsePlanMode = 'Full' | 'Bootstrap' | 'RebuildSystem' | 'Selective' | 'FastReparse'
@@ -121,6 +150,8 @@ export interface ManagedSiteParsePlan {
 
 export interface ManagedProjectSite {
   site_id: string
+  site_name?: string
+  projects?: SiteProject[]
   project_name: string
   project_code: number
   project_path: string
@@ -338,6 +369,8 @@ export interface ManagedSiteReconcileResponse {
 }
 
 export interface CreateManagedSiteRequest {
+  site_name?: string
+  projects?: SiteProject[]
   project_name: string
   project_path: string
   project_code: number
@@ -364,6 +397,8 @@ export interface CreateManagedSiteRequest {
 }
 
 export interface UpdateManagedSiteRequest {
+  site_name?: string
+  projects?: SiteProject[]
   project_name?: string
   project_path?: string
   project_code?: number
@@ -390,6 +425,8 @@ export interface UpdateManagedSiteRequest {
 
 export interface PreviewManagedSiteParsePlanRequest {
   site_id?: string
+  site_name?: string
+  projects?: SiteProject[]
   project_name: string
   project_path: string
   manual_db_nums?: number[]

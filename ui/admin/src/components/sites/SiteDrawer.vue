@@ -8,6 +8,9 @@ import type {
   ManagedSiteParsePlan,
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
+  ProjectRole,
+  ScannedDbnumConflict,
+  SiteProject,
 } from '@/types/site'
 import {
   DEFAULT_PARSE_DB_TYPES,
@@ -169,6 +172,118 @@ const form = ref<CreateManagedSiteRequest>({
 const manualDbNumsStr = ref('')
 const autoAllocatePorts = ref(true)
 
+// ─── Phase 4 · 多工程合并站点（可选） ────────────────────────────────────────
+//
+// 站点可包含多个工程条目（projects[]），恰好一个 primary，区分 design / library。
+// 留空（projects 为空）时退回旧单工程语义，后端按 project_path 处理。
+const siteName = ref('')
+const projects = ref<SiteProject[]>([])
+const scanRoot = ref('')
+const scanLoading = ref(false)
+const scanError = ref('')
+const scanConflicts = ref<ScannedDbnumConflict[]>([])
+
+function resetMultiProjectState(site: ManagedProjectSite | null, cloning: boolean) {
+  siteName.value = site && !cloning ? (site.site_name ?? '') : ''
+  projects.value = site?.projects?.length
+    ? site.projects.map((p) => ({ ...p }))
+    : []
+  scanRoot.value = ''
+  scanError.value = ''
+  scanConflicts.value = []
+  ensureSinglePrimary()
+}
+
+function ensureSinglePrimary() {
+  if (!projects.value.length) return
+  const primaries = projects.value.filter((p) => p.is_primary)
+  if (primaries.length === 1) return
+  projects.value.forEach((p) => (p.is_primary = false))
+  const designIdx = projects.value.findIndex((p) => p.role === 'design')
+  projects.value[designIdx >= 0 ? designIdx : 0].is_primary = true
+}
+
+function addProjectRow() {
+  projects.value.push({
+    path: '',
+    name: '',
+    role: 'design',
+    is_primary: projects.value.length === 0,
+    sort_order: projects.value.length,
+  })
+}
+
+function removeProjectRow(idx: number) {
+  const wasPrimary = projects.value[idx]?.is_primary
+  projects.value.splice(idx, 1)
+  if (wasPrimary) ensureSinglePrimary()
+}
+
+function setPrimary(idx: number) {
+  projects.value.forEach((p, i) => (p.is_primary = i === idx))
+}
+
+function setProjectRole(idx: number, role: ProjectRole) {
+  const target = projects.value[idx]
+  if (target) target.role = role
+}
+
+async function runScan() {
+  const root = scanRoot.value.trim()
+  if (!root) {
+    scanError.value = '请输入要扫描的根路径'
+    return
+  }
+  scanLoading.value = true
+  scanError.value = ''
+  try {
+    const result = await sitesApi.scanProjects(root)
+    scanConflicts.value = result.conflicts ?? []
+    const existingPaths = new Set(projects.value.map((p) => p.path))
+    for (const candidate of result.projects) {
+      if (existingPaths.has(candidate.path)) continue
+      projects.value.push({
+        path: candidate.path,
+        name: candidate.name,
+        role: candidate.role,
+        is_primary: false,
+        sort_order: projects.value.length,
+      })
+    }
+    ensureSinglePrimary()
+    if (!result.projects.length) {
+      scanError.value = '该根路径下未发现包含 db 文件的候选工程'
+    }
+  } catch (e) {
+    scanError.value = e instanceof Error ? e.message : '工程扫描失败'
+  } finally {
+    scanLoading.value = false
+  }
+}
+
+const multiProjectError = computed<string | null>(() => {
+  if (!projects.value.length) return null
+  if (projects.value.some((p) => !p.path.trim())) return '存在未填写路径的工程条目'
+  const designCount = projects.value.filter((p) => p.role === 'design').length
+  if (designCount === 0) return '至少需要一个 design（设计）工程'
+  const primaryCount = projects.value.filter((p) => p.is_primary).length
+  if (primaryCount !== 1) return `必须恰好指定一个主工程，当前为 ${primaryCount} 个`
+  const names = projects.value.map((p) => (p.name.trim() || p.path).toLowerCase())
+  if (new Set(names).size !== names.length) return '工程名/路径重复，需唯一'
+  return null
+})
+
+function buildProjectsPayload(): SiteProject[] | undefined {
+  if (!projects.value.length) return undefined
+  return projects.value.map((p, idx) => ({
+    path: p.path.trim(),
+    name: p.name.trim(),
+    role: p.role,
+    is_primary: p.is_primary,
+    sort_order: idx,
+  }))
+}
+
 const isEditing = computed(() => !!props.siteId && !props.clone)
 const isCloning = computed(() => !!props.siteId && !!props.clone)
 const title = computed(() => {
@@ -239,6 +354,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         db_password: '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
+      resetMultiProjectState(s, cloning)
       // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
       if (cloning) {
         existingSite.value = null
@@ -277,6 +393,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
     }
     manualDbNumsStr.value = ''
     autoAllocatePorts.value = true
+    resetMultiProjectState(null, false)
   }
   schedulePreview()
 })
@@ -403,6 +520,7 @@ onBeforeUnmount(() => {
 
 const canSubmit = computed(() => {
   if (!form.value.project_name || !form.value.project_path) return false
+  if (multiProjectError.value) return false
   if (!isEditing.value && (!form.value.db_user?.trim() || !form.value.db_password?.trim())) return false
   if (!isEditing.value && autoAllocatePorts.value) return true
   return !!form.value.db_port && !!form.value.web_port
@@ -421,9 +539,13 @@ async function handleSubmit(autoDeploy = false) {
   }
   try {
     // 克隆模式走 create 路径（不是 update），保持新建语义
+    const siteNameTrimmed = siteName.value.trim()
+    const projectsPayload = buildProjectsPayload()
     if (isEditing.value && props.siteId) {
       const payload: UpdateManagedSiteRequest = {
         ...form.value,
+        site_name: siteNameTrimmed || undefined,
+        projects: projectsPayload,
         db_user: form.value.db_user?.trim() ? form.value.db_user.trim() : undefined,
         db_password: form.value.db_password?.trim() ? form.value.db_password.trim() : undefined,
       }
@@ -431,6 +553,8 @@ async function handleSubmit(autoDeploy = false) {
     } else {
       const payload: CreateManagedSiteRequest = {
         ...form.value,
+        site_name: siteNameTrimmed || undefined,
+        projects: projectsPayload,
         auto_deploy: autoDeploy,
         db_user: form.value.db_user?.trim() || '',
         db_password: form.value.db_password?.trim() || '',
@@ -501,6 +625,114 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <p class="text-xs text-muted-foreground">
                   用于解析源目录和打开 Viewer 的真实 E3D 工程名。AvevaPlantSample 会自动带上同级 AvevaCatalogue 元件库。
                 </p>
+              </div>
+            </fieldset>
+
+            <fieldset class="space-y-3">
+              <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">工程组成（多工程，可选）</legend>
+              <div class="rounded-lg border border-border/60 bg-background p-4 space-y-3">
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">站点名称 <span class="text-muted-foreground">(可选)</span></label>
+                  <input v-model="siteName" type="text" :placeholder="form.project_name || '多工程合并站点的显示名'" :class="inputClass" />
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">扫描根目录</label>
+                  <p class="text-xs text-muted-foreground">填一个含多个工程子目录的根路径，自动发现候选工程并推断角色。工程列表留空则按上方单工程路径处理。</p>
+                  <div class="flex gap-2">
+                    <input
+                      v-model="scanRoot"
+                      type="text"
+                      placeholder="/path/to/projects-root"
+                      :class="inputClass"
+                      @keydown.enter.prevent="runScan"
+                    />
+                    <button
+                      type="button"
+                      :disabled="scanLoading"
+                      class="inline-flex h-9 shrink-0 items-center rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors disabled:opacity-50"
+                      @click="runScan"
+                    >
+                      {{ scanLoading ? '扫描中...' : '扫描' }}
+                    </button>
+                    <button
+                      type="button"
+                      class="inline-flex h-9 shrink-0 items-center rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
+                      @click="addProjectRow"
+                    >
+                      手动添加
+                    </button>
+                  </div>
+                  <p v-if="scanError" class="text-xs text-destructive">{{ scanError }}</p>
+                </div>
+
+                <div
+                  v-if="scanConflicts.length"
+                  class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+                >
+                  <div class="font-medium">检测到 dbnum 冲突（需消解后再保存）</div>
+                  <ul class="mt-1 list-disc pl-4">
+                    <li v-for="conflict in scanConflicts" :key="conflict.dbnum">
+                      dbnum {{ conflict.dbnum }}：{{ conflict.projects.join(' / ') }}
+                    </li>
+                  </ul>
+                </div>
+
+                <div v-if="projects.length" class="space-y-2">
+                  <div
+                    v-for="(proj, idx) in projects"
+                    :key="idx"
+                    class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-2"
+                  >
+                    <div class="flex items-center gap-2">
+                      <input
+                        v-model="proj.name"
+                        type="text"
+                        placeholder="工程名"
+                        class="h-8 w-28 shrink-0 rounded-md border border-input bg-transparent px-2 text-sm"
+                      />
+                      <input
+                        v-model="proj.path"
+                        type="text"
+                        placeholder="工程绝对路径"
+                        :class="inputClass"
+                      />
+                      <button
+                        type="button"
+                        class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-destructive hover:bg-destructive/10 transition-colors"
+                        @click="removeProjectRow(idx)"
+                      >
+                        <X class="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-4 text-xs">
+                      <div class="flex items-center gap-2">
+                        <span class="text-muted-foreground">角色</span>
+                        <select
+                          :value="proj.role"
+                          class="h-8 rounded-md border border-input bg-transparent px-2 text-sm"
+                          @change="setProjectRole(idx, ($event.target as HTMLSelectElement).value as ProjectRole)"
+                        >
+                          <option value="design">design（设计）</option>
+                          <option value="library">library（元件库）</option>
+                        </select>
+                      </div>
+                      <label class="flex items-center gap-1.5 cursor-pointer">
+                        <input type="radio" :checked="proj.is_primary" @change="setPrimary(idx)" />
+                        <span>主工程</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
+                <p v-else class="text-xs text-muted-foreground">
+                  未配置多工程，将按上方「项目路径」作为单工程站点处理。
+                </p>
+
+                <div
+                  v-if="multiProjectError"
+                  class="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                >
+                  {{ multiProjectError }}
+                </div>
               </div>
             </fieldset>
 

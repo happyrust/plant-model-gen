@@ -17,6 +17,7 @@ import type {
   CreateManagedSiteRequest,
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
+  ScanProjectsResult,
 } from '@/types/site'
 
 export type ManagedSiteLogKind = 'parse' | 'generate' | 'db' | 'web' | 'viewer'
@@ -52,6 +53,15 @@ export const sitesApi = {
     if (host) params.set('host', host)
     return apiGet<PortCheckResult>(`/api/admin/ports/check?${params.toString()}`)
   },
+
+  /**
+   * Phase 3 · 工程扫描
+   *
+   * 给一个根路径，后端读 db 文件头自动发现候选工程、推断 Design/Library 角色，
+   * 并预标跨工程 dbnum 冲突（只标注不报错）。供新建/编辑抽屉的「工程组成」一键导入。
+   */
+  scanProjects: (root: string) =>
+    apiGet<ScanProjectsResult>(`/api/admin/projects/scan?root=${encodeURIComponent(root)}`),
 
   list: () => apiGet<ManagedProjectSite[]>('/api/admin/sites'),
 

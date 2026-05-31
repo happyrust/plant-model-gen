@@ -13,6 +13,11 @@ const matchedPreset = computed(() => matchParsePreset(
   props.site.force_rebuild_system_db ?? false,
 ))
 
+const hasMultiProjects = computed(() => (props.site.projects?.length ?? 0) > 0)
+const orderedProjects = computed(() =>
+  [...(props.site.projects ?? [])].sort((a, b) => a.sort_order - b.sort_order),
+)
+
 function formatTime(value?: string | null) {
   if (!value) return '-'
   const d = new Date(value)
@@ -38,6 +43,34 @@ function yesNo(value: boolean | undefined) {
         <span class="text-muted-foreground">项目路径</span><span class="break-all">{{ site.project_path }}</span>
         <span class="text-muted-foreground">关联工程</span>
         <span>{{ site.associated_project || site.project_name }} <span v-if="!site.associated_project" class="text-xs text-muted-foreground">(默认)</span></span>
+      </div>
+    </div>
+
+    <div v-if="hasMultiProjects" class="rounded-lg border border-border bg-card p-5">
+      <h4 class="text-sm font-medium text-muted-foreground mb-3">工程组成（多工程）</h4>
+      <div v-if="site.site_name" class="mb-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
+        <span class="text-muted-foreground">站点名称</span><span>{{ site.site_name }}</span>
+      </div>
+      <div class="space-y-2">
+        <div
+          v-for="proj in orderedProjects"
+          :key="proj.path"
+          class="rounded-md border border-border/60 bg-muted/20 p-3 text-sm"
+        >
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-medium">{{ proj.name || proj.path }}</span>
+            <span class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs">
+              {{ proj.role === 'library' ? '元件库' : '设计' }}
+            </span>
+            <span
+              v-if="proj.is_primary"
+              class="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary"
+            >
+              主工程
+            </span>
+          </div>
+          <div class="mt-1 break-all font-mono text-xs text-muted-foreground">{{ proj.path }}</div>
+        </div>
       </div>
     </div>
 

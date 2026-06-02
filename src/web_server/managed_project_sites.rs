@@ -8145,9 +8145,19 @@ pub async fn start_site(site_id: String) -> Result<()> {
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
+    if site.status == ManagedSiteStatus::Running {
+        update_runtime(
+            &site_id,
+            RuntimeUpdate {
+                last_error: Some(None),
+                ..Default::default()
+            },
+        )?;
+        return Ok(());
+    }
     if matches!(
         site.status,
-        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+        ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
     ) {
         let message = if site.status == ManagedSiteStatus::Stopping {
             "站点停止中，请稍后再启动".to_string()

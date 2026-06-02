@@ -827,7 +827,15 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
             }
         }
         TaskType::StartManagedSite => {
-            if runtime.status == ManagedSiteStatus::Failed
+            if runtime.status == ManagedSiteStatus::Running
+                && runtime.web_running
+                && runtime.web_status_ok == Some(true)
+                && runtime.database_connected == Some(true)
+                && runtime.surrealdb_connected == Some(true)
+                && runtime.site_identity_ok == Some(true)
+            {
+                mark_task_completed(task, "启动完成：Web/DB/Surreal/站点身份验收通过");
+            } else if runtime.status == ManagedSiteStatus::Failed
                 || runtime
                     .last_error
                     .as_deref()
@@ -838,14 +846,6 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                     .clone()
                     .unwrap_or_else(|| "站点启动失败".to_string());
                 mark_task_failed(task, &runtime_step, &message);
-            } else if runtime.status == ManagedSiteStatus::Running
-                && runtime.web_running
-                && runtime.web_status_ok == Some(true)
-                && runtime.database_connected == Some(true)
-                && runtime.surrealdb_connected == Some(true)
-                && runtime.site_identity_ok == Some(true)
-            {
-                mark_task_completed(task, "启动完成：Web/DB/Surreal/站点身份验收通过");
             } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
                 mark_task_running(task, "Web 已启动，等待业务连通性验收", 90.0);
             } else if runtime.current_stage == "generating" {
@@ -863,18 +863,7 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
             }
         }
         TaskType::DeployManagedSite => {
-            if runtime.status == ManagedSiteStatus::Failed
-                || runtime
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty())
-            {
-                let message = runtime
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "站点部署失败".to_string());
-                mark_task_failed(task, &runtime_step, &message);
-            } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
+            if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
                 match managed_project_sites::deploy_validation_report(&runtime.site_id) {
                     Ok(report) if report.exists && report.blocking_count == 0 => {
                         mark_task_completed(task, "部署完成：部署后验收无阻断项");
@@ -901,6 +890,17 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                         mark_task_running(task, "Web 已启动，等待部署后验收报告", 95.0);
                     }
                 }
+            } else if runtime.status == ManagedSiteStatus::Failed
+                || runtime
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            {
+                let message = runtime
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "站点部署失败".to_string());
+                mark_task_failed(task, &runtime_step, &message);
             } else if runtime.current_stage == "generating" {
                 mark_task_running(task, &runtime_step, 45.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {

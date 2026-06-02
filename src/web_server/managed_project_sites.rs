@@ -10392,7 +10392,7 @@ fn reconcile_runtime_update(
 
     if matches!(
         site.status,
-        ManagedSiteStatus::Running | ManagedSiteStatus::Starting
+        ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
     ) {
         if web_running && db_running {
             // 正常运行，无需改写 status。
@@ -10412,11 +10412,15 @@ fn reconcile_runtime_update(
                 }
                 actions.push("已请求清理孤立 DB/Viewer 进程".to_string());
             }
-        } else if !db_running && !web_running && !parse_running {
+        } else if !db_running && !web_running && !viewer_running && !parse_running {
             if site.status == ManagedSiteStatus::Starting {
                 update.status = Some(ManagedSiteStatus::Failed);
                 last_error = Some("启动中断：未发现有效 DB/Web/Parse 进程或监听端口".to_string());
                 actions.push("修正无进程 Starting 为 Failed".to_string());
+            } else if site.status == ManagedSiteStatus::Stopping {
+                update.status = Some(ManagedSiteStatus::Stopped);
+                last_error = None;
+                actions.push("修正无进程 Stopping 为 Stopped".to_string());
             } else {
                 update.status = Some(ManagedSiteStatus::Stopped);
                 last_error = None;

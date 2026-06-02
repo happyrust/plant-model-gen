@@ -2,6 +2,22 @@
 
 ## 2026-06-02
 
+### Fixed — 站点部署生成后自动启动与运行态对账修复
+
+> 以 AvevaPlantSample `aps250160_0001` 为验证样例，站点部署默认不再自动扩展解析依赖；模型生成完成后自动导出 Parquet 并启动 `plant3d-web` 加载目标 dbnum 的全部模型。
+
+- `managed_project_sites.rs`：部署流水线串联生成与启动，生成完成后自动拉起站点 Web 和 `plant3d-web`，并将 Viewer URL 固定到 `data_source=parquet`、`show_dbnum=250160` 等目标模型参数。
+- `options.rs`：`export_parquet_after_gen` 默认继承 `export_parquet`，避免开启 Parquet 导出后生成流程仍静默跳过导出。
+- `export_dbnum_instances_parquet.rs`：兼容 SurrealDB 返回的数组形 `cata_hash` / `ptset` 数据，移除不稳定的 `record::id(out)` fallback，保证 `instances.parquet`、`geo_instances.parquet`、`spec_info.parquet`、`ptsets.parquet` 和 manifest 能完整产出。
+- `admin_task_handlers.rs` / `managed_project_sites.rs`：重复启动已运行站点改为幂等成功；任务轮询优先依据真实健康检查和部署验收结果，避免陈旧 `last_error` 把健康站点误判为失败。
+- `managed_project_sites.rs`：运行态对账会把无 DB/Web/Viewer/Parse 进程的陈旧 `Stopping` 状态收敛为 `Stopped`，防止 stop 请求中断后阻塞后续 start。
+- 验证：
+  - `cargo fmt` 通过。
+  - `ReadLints` 无错误。
+  - `cargo check --bin web_server` 通过。
+  - `cargo build --bin web_server` 通过。
+  - `quicktest-250160-8080` 实测：`Running`、`parse_status=Parsed`、`last_error=null`，`3100/8080/3101/8021` 端口开放；重复 `start` 任务完成且不产生错误。
+
 ### Changed — 模型 KV 启动脚本切换到 RocksDB
 
 > 配合移除 `surrealkv` 依赖，所有本仓启动 SurrealDB 模型 KV 的脚本不再使用 `surrealkv://` 后端 URL。

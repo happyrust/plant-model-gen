@@ -2,6 +2,13 @@
 
 ## 2026-06-02
 
+### Changed — 模型 KV 启动脚本切换到 RocksDB
+
+> 配合移除 `surrealkv` 依赖，所有本仓启动 SurrealDB 模型 KV 的脚本不再使用 `surrealkv://` 后端 URL。
+
+- `run_surrealdb_kv_8020.sh`、`run_surreal_pair.sh` 和 `run_surreal_8020_skv.ps1` 改用 `rocksdb://` 存储 URL。
+- `run_surrealkv_versioned.ps1` 保留版本管理测试意图，但底层引擎切换为 RocksDB。
+
 ### Added — 站点创建表单示例模板填充
 
 > 新建站点抽屉新增「加载示例样例」入口，可一键填入 AvevaPlantSample 的模板配置，降低手动录入测试站点的成本。

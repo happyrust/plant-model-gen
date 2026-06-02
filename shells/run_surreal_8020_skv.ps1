@@ -7,4 +7,4 @@ if ($processes) {
     }
 }
 
-surreal start --user root --pass root --bind 0.0.0.0:$port surrealkv://ams-$port.kv
+surreal start --user root --pass root --bind 0.0.0.0:$port rocksdb://ams-$port.kv

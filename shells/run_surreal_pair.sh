@@ -126,13 +126,13 @@ echo $! > "$V_PID"
 echo "  - log: $V_LOG"
 echo "  - pid: $V_PID"
 
-echo "Starting SurrealDB (KV) on ${KV_IP}:${KV_PORT} ..."
+echo "Starting SurrealDB (RocksDB KV) on ${KV_IP}:${KV_PORT} ..."
 nohup "$SURREAL_BIN" start \
   --log info \
   --user "$V_USER" \
   --pass "$V_PASS" \
   --bind "${KV_IP}:${KV_PORT}" \
-  "surrealkv://$KV_FILE_PATH" \
+  "rocksdb://$KV_FILE_PATH" \
   >"$KV_LOG" 2>&1 &
 echo $! > "$KV_PID"
 echo "  - log: $KV_LOG"

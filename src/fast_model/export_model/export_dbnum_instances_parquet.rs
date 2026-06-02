@@ -5,6 +5,7 @@
 //!
 //! 输出表（按 dbnum 分目录，文件名固定）：
 //! - `instances.parquet`     — 一行一个实例 refno
+//! - `ptsets.parquet`        — 一行一个 cata_hash 局部坐标系关键点
 //! - `geo_instances.parquet` — 一行一个几何引用 (refno × geo_index)
 //! - `tubings.parquet`       — 一行一个 TUBI 段
 //! - `transforms.parquet`    — 一行一个唯一 trans_hash
@@ -21,7 +22,8 @@ use aios_core::options::DbOption;
 use aios_core::pdms_types::RefnoEnum;
 use anyhow::{Context, Result};
 use arrow_array::{
-    ArrayRef, BooleanArray, Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{SecondsFormat, Utc};
@@ -48,6 +50,7 @@ struct InstanceRow {
     owner_refno_str: Option<String>,
     owner_refno_u64: Option<u64>,
     owner_noun: String,
+    cata_hash: Option<String>,
     trans_hash: String,
     aabb_hash: String,
     spec_value: i64,
@@ -108,6 +111,29 @@ struct AabbRow {
     max_x: f64,
     max_y: f64,
     max_z: f64,
+}
+
+/// ptsets.parquet 的一行：按 cata_hash 复用局部坐标系关键点定义。
+#[derive(Clone)]
+struct PtsetRow {
+    cata_hash: String,
+    point_number: i32,
+    pt_x: f64,
+    pt_y: f64,
+    pt_z: f64,
+    has_dir: bool,
+    dir_x: f64,
+    dir_y: f64,
+    dir_z: f64,
+    dir_flag: f64,
+    has_ref_dir: bool,
+    ref_dir_x: f64,
+    ref_dir_y: f64,
+    ref_dir_z: f64,
+    pbore: f64,
+    pwidth: f64,
+    pheight: f64,
+    pconnect: String,
 }
 
 // =============================================================================
@@ -386,6 +412,7 @@ fn instances_schema() -> Schema {
         Field::new("owner_refno_str", DataType::Utf8, true),
         Field::new("owner_refno_u64", DataType::UInt64, true),
         Field::new("owner_noun", DataType::Utf8, false),
+        Field::new("cata_hash", DataType::Utf8, true),
         Field::new("trans_hash", DataType::Utf8, false),
         Field::new("aabb_hash", DataType::Utf8, false),
         Field::new("spec_value", DataType::UInt64, false),
@@ -453,6 +480,29 @@ fn aabb_schema() -> Schema {
     ])
 }
 
+fn ptsets_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("cata_hash", DataType::Utf8, false),
+        Field::new("point_number", DataType::Int32, false),
+        Field::new("pt_x", DataType::Float64, false),
+        Field::new("pt_y", DataType::Float64, false),
+        Field::new("pt_z", DataType::Float64, false),
+        Field::new("has_dir", DataType::Boolean, false),
+        Field::new("dir_x", DataType::Float64, false),
+        Field::new("dir_y", DataType::Float64, false),
+        Field::new("dir_z", DataType::Float64, false),
+        Field::new("dir_flag", DataType::Float64, false),
+        Field::new("has_ref_dir", DataType::Boolean, false),
+        Field::new("ref_dir_x", DataType::Float64, false),
+        Field::new("ref_dir_y", DataType::Float64, false),
+        Field::new("ref_dir_z", DataType::Float64, false),
+        Field::new("pbore", DataType::Float64, false),
+        Field::new("pwidth", DataType::Float64, false),
+        Field::new("pheight", DataType::Float64, false),
+        Field::new("pconnect", DataType::Utf8, false),
+    ])
+}
+
 // =============================================================================
 // RecordBatch 构建
 // =============================================================================
@@ -490,6 +540,11 @@ fn build_instances_batch(rows: &[InstanceRow]) -> Result<RecordBatch> {
             )) as ArrayRef,
             Arc::new(StringArray::from(
                 rows.iter()
+                    .map(|r| r.cata_hash.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
                     .map(|r| r.trans_hash.as_str())
                     .collect::<Vec<_>>(),
             )) as ArrayRef,
@@ -506,6 +561,72 @@ fn build_instances_batch(rows: &[InstanceRow]) -> Result<RecordBatch> {
             )) as ArrayRef,
             Arc::new(UInt32Array::from(
                 rows.iter().map(|r| r.dbnum).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )?;
+    Ok(batch)
+}
+
+fn build_ptsets_batch(rows: &[PtsetRow]) -> Result<RecordBatch> {
+    let schema = Arc::new(ptsets_schema());
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|r| r.cata_hash.as_str())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int32Array::from(
+                rows.iter().map(|r| r.point_number).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pt_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pt_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pt_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.has_dir).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_flag).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.has_ref_dir).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.ref_dir_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.ref_dir_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.ref_dir_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pbore).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pwidth).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.pheight).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.pconnect.as_str()).collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )?;
@@ -689,6 +810,8 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
 // SurrealDB 查询结构体
 // =============================================================================
 
+use aios_core::parsed_data::CateAxisParam;
+use aios_core::vec3_pool::{CateAxisParamCompact, decompress_ptset};
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
@@ -716,6 +839,72 @@ struct TransQueryRow {
 struct AabbQueryRow {
     hash: String,
     d: Option<aios_core::types::PlantAabb>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct InstInfoPtsetQueryRow {
+    refno: RefnoEnum,
+    cata_hash: Option<serde_json::Value>,
+    ptset: Option<serde_json::Value>,
+}
+
+struct PtsetExportData {
+    refno_cata_hash: HashMap<RefnoEnum, String>,
+    rows_by_cata_hash: HashMap<String, Vec<PtsetRow>>,
+    missing_cata_hash_refnos: usize,
+    empty_ptset_hashes: usize,
+}
+
+fn normalize_cata_hash(value: Option<serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim().to_string();
+            (!trimmed.is_empty() && trimmed != "NONE" && trimmed != "null").then_some(trimmed)
+        }
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .find_map(|value| normalize_cata_hash(Some(value))),
+        _ => None,
+    }
+}
+
+fn parse_ptset_value(value: serde_json::Value) -> Vec<CateAxisParam> {
+    let value = match value {
+        serde_json::Value::Array(mut values) if values.len() == 1 && values[0].is_array() => {
+            values.remove(0)
+        }
+        value => value,
+    };
+
+    match serde_json::from_value::<Vec<CateAxisParamCompact>>(value.clone()) {
+        Ok(compact) => decompress_ptset(&compact),
+        Err(_) => serde_json::from_value::<Vec<CateAxisParam>>(value).unwrap_or_default(),
+    }
+}
+
+fn axis_to_ptset_row(cata_hash: &str, axis: &CateAxisParam) -> PtsetRow {
+    let dir = axis.dir.as_ref().map(|v| v.0);
+    let ref_dir = axis.ref_dir.as_ref().map(|v| v.0);
+    PtsetRow {
+        cata_hash: cata_hash.to_string(),
+        point_number: axis.number,
+        pt_x: axis.pt.0.x as f64,
+        pt_y: axis.pt.0.y as f64,
+        pt_z: axis.pt.0.z as f64,
+        has_dir: dir.is_some(),
+        dir_x: dir.map(|v| v.x as f64).unwrap_or(0.0),
+        dir_y: dir.map(|v| v.y as f64).unwrap_or(0.0),
+        dir_z: dir.map(|v| v.z as f64).unwrap_or(0.0),
+        dir_flag: axis.dir_flag as f64,
+        has_ref_dir: ref_dir.is_some(),
+        ref_dir_x: ref_dir.map(|v| v.x as f64).unwrap_or(0.0),
+        ref_dir_y: ref_dir.map(|v| v.y as f64).unwrap_or(0.0),
+        ref_dir_z: ref_dir.map(|v| v.z as f64).unwrap_or(0.0),
+        pbore: axis.pbore as f64,
+        pwidth: axis.pwidth as f64,
+        pheight: axis.pheight as f64,
+        pconnect: axis.pconnect.clone(),
+    }
 }
 
 // =============================================================================
@@ -812,6 +1001,88 @@ async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<Ins
         );
     }
 
+    if rows.is_empty() {
+        if verbose {
+            println!(
+                "⚠️ inst_relate.dbnum 未命中 dbnum={}，回退到 refno->dbnum 缓存过滤...",
+                dbnum
+            );
+        }
+        rows = query_inst_relate_by_refno_dbnum_fallback(dbnum, verbose).await?;
+    }
+
+    Ok(rows)
+}
+
+/// 兼容旧/轻量写入路径：部分 inst_relate 关系未写入 dbnum 字段。
+/// 此时通过 db_meta_info/refno 缓存推导所属 dbnum，避免生成后 Parquet 被导成 0 行。
+async fn query_inst_relate_by_refno_dbnum_fallback(
+    dbnum: u32,
+    verbose: bool,
+) -> Result<Vec<InstRelateRow>> {
+    if verbose {
+        println!("🔍 扫描 inst_relate（兼容路径: refno -> dbnum）...");
+    }
+
+    const PAGE_SIZE: usize = 10_000;
+    let query_start = std::time::Instant::now();
+    let mut rows = Vec::new();
+    let mut offset = 0usize;
+    let mut page = 0usize;
+
+    loop {
+        let sql = format!(
+            r#"
+            SELECT
+                owner_refno,
+                owner_type,
+                in as refno,
+                in.noun as noun,
+                spec_value as spec_value
+            FROM inst_relate
+            WHERE in != NONE
+            ORDER BY in
+            LIMIT {PAGE_SIZE} START {offset}
+            "#
+        );
+
+        let mut resp = aios_core::project_primary_db().query(&sql).await?;
+        let page_rows: Vec<InstRelateRow> = resp.take(0)?;
+        if page_rows.is_empty() {
+            break;
+        }
+
+        page += 1;
+        offset += page_rows.len();
+        let page_len = page_rows.len();
+        rows.extend(page_rows.into_iter().filter(|row| {
+            TreeIndexManager::resolve_dbnum_for_refno(row.refno)
+                .map(|resolved| resolved == dbnum)
+                .unwrap_or(false)
+        }));
+
+        if verbose {
+            println!(
+                "   - fallback page {}: scanned={}, matched_total={}",
+                page,
+                page_len,
+                rows.len()
+            );
+        }
+
+        if page_len < PAGE_SIZE {
+            break;
+        }
+    }
+
+    if verbose {
+        println!(
+            "✅ fallback inst_relate 命中记录: {} ({:?})",
+            rows.len(),
+            query_start.elapsed()
+        );
+    }
+
     Ok(rows)
 }
 
@@ -861,6 +1132,102 @@ async fn query_inst_relate_by_refnos(
     }
 
     Ok(rows)
+}
+
+/// 批量查询实例的 cata_hash 与 ptset，构建 instances/ptsets 共用的导出索引。
+async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<PtsetExportData> {
+    let mut refno_cata_hash: HashMap<RefnoEnum, String> = HashMap::new();
+    let mut rows_by_cata_hash: HashMap<String, Vec<PtsetRow>> = HashMap::new();
+    let mut missing_cata_hash_refnos = 0usize;
+    let mut empty_ptset_hashes = 0usize;
+
+    if refnos.is_empty() {
+        return Ok(PtsetExportData {
+            refno_cata_hash,
+            rows_by_cata_hash,
+            missing_cata_hash_refnos,
+            empty_ptset_hashes,
+        });
+    }
+
+    const BATCH_SIZE: usize = 500;
+    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+        if verbose {
+            println!(
+                "   - 查询 inst_info ptset 分批 {}/{} (批大小 {})",
+                idx + 1,
+                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                chunk.len()
+            );
+        }
+
+        let pe_list = chunk
+            .iter()
+            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT
+                in as refno,
+                out[0].cata_hash as cata_hash,
+                out[0].ptset as ptset
+            FROM [{pe_list}]->inst_relate
+            WHERE out != NONE
+            "#
+        );
+
+        let rows: Vec<InstInfoPtsetQueryRow> = aios_core::project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .with_context(|| format!("query_ptset_export_data SQL: {sql}"))?;
+
+        for row in rows {
+            let cata_hash = normalize_cata_hash(row.cata_hash);
+            let Some(cata_hash) = cata_hash else {
+                missing_cata_hash_refnos += 1;
+                continue;
+            };
+
+            refno_cata_hash.insert(row.refno, cata_hash.clone());
+            if rows_by_cata_hash.contains_key(&cata_hash) {
+                continue;
+            }
+
+            let ptset_rows = row
+                .ptset
+                .map(parse_ptset_value)
+                .unwrap_or_default()
+                .iter()
+                .map(|axis| axis_to_ptset_row(&cata_hash, axis))
+                .collect::<Vec<_>>();
+
+            if ptset_rows.is_empty() {
+                empty_ptset_hashes += 1;
+            }
+            rows_by_cata_hash.insert(cata_hash, ptset_rows);
+        }
+    }
+
+    if verbose {
+        let ptset_point_count: usize = rows_by_cata_hash.values().map(Vec::len).sum();
+        println!(
+            "✅ ptset 导出索引: refno_cata_hash={}, cata_hash={}, ptset_points={}, missing_cata_hash_refnos={}, empty_ptset_hashes={}",
+            refno_cata_hash.len(),
+            rows_by_cata_hash.len(),
+            ptset_point_count,
+            missing_cata_hash_refnos,
+            empty_ptset_hashes
+        );
+    }
+
+    Ok(PtsetExportData {
+        refno_cata_hash,
+        rows_by_cata_hash,
+        missing_cata_hash_refnos,
+        empty_ptset_hashes,
+    })
 }
 
 /// 本地实现导出专用实例查询。
@@ -1223,6 +1590,7 @@ async fn query_aabb_rows(
 /// Parquet 导出统计信息
 pub struct ParquetExportStats {
     pub instance_count: usize,
+    pub ptset_count: usize,
     pub geo_instance_count: usize,
     pub tubing_count: usize,
     pub transform_count: usize,
@@ -1416,6 +1784,17 @@ pub async fn export_dbnum_instances_parquet(
     }
 
     // =========================================================================
+    // 3.5 查询 inst_info cata_hash / ptset（供 instances 与 ptsets.parquet 复用）
+    // =========================================================================
+    if verbose {
+        println!(
+            "🔍 查询 {} 个 refno 的 cata_hash / ptset...",
+            in_refnos.len()
+        );
+    }
+    let ptset_export_data = query_ptset_export_data(&in_refnos, verbose).await?;
+
+    // =========================================================================
     // 4. 查询 tubi_relate
     // =========================================================================
     let mut tubi_owner_refnos: Vec<RefnoEnum> = grouped_children
@@ -1502,6 +1881,7 @@ pub async fn export_dbnum_instances_parquet(
                 owner_refno_str: Some(owner_refno.to_string()),
                 owner_refno_u64: Some(refno_to_u64(owner_refno)),
                 owner_noun: owner_type.to_string(),
+                cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
                 trans_hash: trans_hash.clone(),
                 aabb_hash: child_aabb_hash,
                 spec_value: child.spec_value,
@@ -1598,6 +1978,7 @@ pub async fn export_dbnum_instances_parquet(
             owner_refno_str: child.owner_refno.map(|r| r.to_string()),
             owner_refno_u64: child.owner_refno.map(|r| refno_to_u64(&r)),
             owner_noun: child.owner_type.clone(),
+            cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
             trans_hash: trans_hash.clone(),
             aabb_hash: child_aabb_hash,
             spec_value: child.spec_value,
@@ -1668,6 +2049,30 @@ pub async fn export_dbnum_instances_parquet(
         }
     }
 
+    let used_cata_hashes = instance_rows
+        .iter()
+        .filter_map(|row| row.cata_hash.as_ref())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut ptset_rows = used_cata_hashes
+        .iter()
+        .filter_map(|cata_hash| ptset_export_data.rows_by_cata_hash.get(cata_hash))
+        .flat_map(|rows| rows.iter().cloned())
+        .collect::<Vec<_>>();
+    ptset_rows.sort_by(|a, b| {
+        a.cata_hash
+            .cmp(&b.cata_hash)
+            .then(a.point_number.cmp(&b.point_number))
+    });
+
+    if verbose {
+        println!(
+            "✅ ptsets.parquet 准备写入: {} 个 cata_hash, {} 个点",
+            used_cata_hashes.len(),
+            ptset_rows.len()
+        );
+    }
+
     // =========================================================================
     // 6. 查询 trans/aabb 实际数据
     // =========================================================================
@@ -1712,6 +2117,21 @@ pub async fn export_dbnum_instances_parquet(
             println!(
                 "   ✅ instances.parquet: {} 行, {} 字节",
                 instance_rows.len(),
+                size
+            );
+        }
+    }
+
+    // ptsets.parquet
+    {
+        let batch = build_ptsets_batch(&ptset_rows)?;
+        let path = output_dir.join("ptsets.parquet");
+        let size = write_parquet(&path, &batch)?;
+        total_bytes += size;
+        if verbose {
+            println!(
+                "   ✅ ptsets.parquet: {} 行, {} 字节",
+                ptset_rows.len(),
                 size
             );
         }
@@ -1792,6 +2212,11 @@ pub async fn export_dbnum_instances_parquet(
                 "file": "instances.parquet",
                 "rows": instance_rows.len(),
             },
+            "ptsets": {
+                "file": "ptsets.parquet",
+                "rows": ptset_rows.len(),
+                "key": ["cata_hash", "point_number"],
+            },
             "geo_instances": {
                 "file": "geo_instances.parquet",
                 "rows": geo_instance_rows.len(),
@@ -1815,6 +2240,17 @@ pub async fn export_dbnum_instances_parquet(
             "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
             "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
             "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
+        },
+        "ptset_unit": {
+            "source": LengthUnit::Millimeter.name(),
+            "target": target.name(),
+            "conversion_factor": unit_converter.conversion_factor(),
+            "coordinate_space": "local",
+        },
+        "ptset_export": {
+            "cata_hashes": used_cata_hashes.len(),
+            "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
+            "empty_ptset_hashes": ptset_export_data.empty_ptset_hashes,
         },
         "total_bytes": total_bytes,
     });
@@ -1843,6 +2279,11 @@ pub async fn export_dbnum_instances_parquet(
                     "file": format!("{}/instances.parquet", subdir),
                     "rows": instance_rows.len(),
                 },
+                "ptsets": {
+                    "file": format!("{}/ptsets.parquet", subdir),
+                    "rows": ptset_rows.len(),
+                    "key": ["cata_hash", "point_number"],
+                },
                 "geo_instances": {
                     "file": format!("{}/geo_instances.parquet", subdir),
                     "rows": geo_instance_rows.len(),
@@ -1867,6 +2308,17 @@ pub async fn export_dbnum_instances_parquet(
                 "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
                 "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
             },
+            "ptset_unit": {
+                "source": LengthUnit::Millimeter.name(),
+                "target": target.name(),
+                "conversion_factor": unit_converter.conversion_factor(),
+                "coordinate_space": "local",
+            },
+            "ptset_export": {
+                "cata_hashes": used_cata_hashes.len(),
+                "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
+                "empty_ptset_hashes": ptset_export_data.empty_ptset_hashes,
+            },
             "total_bytes": total_bytes,
         });
         let web_manifest_path = parent.join(format!("manifest_{}.json", dbnum));
@@ -1883,6 +2335,7 @@ pub async fn export_dbnum_instances_parquet(
 
     Ok(ParquetExportStats {
         instance_count: instance_rows.len(),
+        ptset_count: ptset_rows.len(),
         geo_instance_count: geo_instance_rows.len(),
         tubing_count: tubing_rows.len(),
         transform_count: transform_rows.len(),

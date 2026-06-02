@@ -21,6 +21,7 @@ import {
   normalizeParseDbTypes,
 } from './parse-db-types'
 import { parsePlanClass } from './site-status'
+import { MANAGED_SITE_FORM_PRESETS, type ManagedSiteFormPreset } from './site-presets'
 import { X } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -290,6 +291,51 @@ const title = computed(() => {
   if (isCloning.value) return '克隆站点'
   return isEditing.value ? '编辑站点' : '新建站点'
 })
+
+function applySitePreset(preset: ManagedSiteFormPreset) {
+  if (isEditing.value || isCloning.value) return
+
+  const presetForm = preset.form
+  const manualDbNums = [...(presetForm.manual_db_nums ?? [])]
+  form.value = {
+    project_name: presetForm.project_name,
+    project_path: presetForm.project_path,
+    project_code: presetForm.project_code,
+    manual_db_nums: manualDbNums,
+    parse_db_types: normalizeParseDbTypes(presetForm.parse_db_types ?? []),
+    force_rebuild_system_db: presetForm.force_rebuild_system_db ?? false,
+    gen_model: presetForm.gen_model ?? true,
+    gen_mesh: presetForm.gen_mesh ?? false,
+    gen_spatial_tree: presetForm.gen_spatial_tree ?? true,
+    apply_boolean_operation: presetForm.apply_boolean_operation ?? true,
+    mesh_tol_ratio: presetForm.mesh_tol_ratio ?? 3.0,
+    export_json: presetForm.export_json ?? false,
+    export_parquet: presetForm.export_parquet ?? true,
+    pipeline_db_mode: presetForm.pipeline_db_mode ?? 'file',
+    runtime_db_mode: presetForm.runtime_db_mode ?? 'ws',
+    db_port: presetForm.db_port ?? DEFAULT_DB_PORT,
+    web_port: presetForm.web_port ?? DEFAULT_WEB_PORT,
+    bind_host: presetForm.bind_host ?? '127.0.0.1',
+    public_base_url: presetForm.public_base_url ?? '',
+    associated_project: presetForm.associated_project ?? '',
+    db_user: presetForm.db_user ?? '',
+    db_password: presetForm.db_password ?? '',
+    auto_deploy: presetForm.auto_deploy,
+  }
+  manualDbNumsStr.value = manualDbNums.join(', ')
+  siteName.value = presetForm.site_name ?? ''
+  projects.value = (presetForm.projects ?? []).map((project) => ({ ...project }))
+  scanRoot.value = ''
+  scanError.value = ''
+  scanConflicts.value = []
+  autoAllocatePorts.value = presetForm.db_port === undefined && presetForm.web_port === undefined
+  portStatuses.value = {
+    db_port: { state: 'idle' },
+    web_port: { state: 'idle' },
+  }
+  ensureSinglePrimary()
+  schedulePreview()
+}
 
 const WEAK_CREDENTIAL_SET = new Set([
   'root/root',
@@ -605,6 +651,33 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
 
           <!-- Form -->
           <form class="flex-1 overflow-auto px-6 py-4 space-y-6" @submit.prevent="handleSubmit(false)">
+            <section
+              v-if="!isEditing && !isCloning"
+              class="rounded-lg border border-primary/20 bg-primary/5 p-4 space-y-3"
+            >
+              <div class="space-y-1">
+                <div class="text-sm font-medium">加载示例样例</div>
+                <p class="text-xs text-muted-foreground">
+                  选择一个模板先填入常用配置，之后仍可按本机路径、端口和凭据继续调整。
+                </p>
+              </div>
+              <button
+                v-for="preset in MANAGED_SITE_FORM_PRESETS"
+                :key="preset.key"
+                type="button"
+                class="w-full rounded-lg border border-border/60 bg-background px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                @click="applySitePreset(preset)"
+              >
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-sm font-medium">{{ preset.label }}</span>
+                  <span class="shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                    {{ preset.badge }}
+                  </span>
+                </div>
+                <p class="mt-1 text-xs text-muted-foreground">{{ preset.detail }}</p>
+              </button>
+            </section>
+
             <fieldset class="space-y-3">
               <legend class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">项目信息</legend>
               <div class="space-y-2">

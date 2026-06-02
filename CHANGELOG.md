@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-02
+
+### Added — 站点创建表单示例模板填充
+
+> 新建站点抽屉新增「加载示例样例」入口，可一键填入 AvevaPlantSample 的模板配置，降低手动录入测试站点的成本。
+
+- `SiteDrawer.vue`：新建模式下展示示例模板卡片；点击后填充项目、多工程组成、解析范围、模型生成、端口和数据库凭据，并刷新解析预览。
+- `site-presets.ts`：集中维护 AvevaPlantSample + AvevaCatalogue 的站点表单预设，便于后续增加更多模板案例。
+- 验证：
+  - `npm run build` 通过（执行 `vue-tsc -b && vite build`）。
+
 ## 2026-05-18
 
 ### Fixed — 三维校审批注状态血缘与流程历史事务化

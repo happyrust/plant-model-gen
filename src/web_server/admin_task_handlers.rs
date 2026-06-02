@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -133,7 +133,10 @@ pub fn create_admin_task_routes() -> Router {
 
     Router::new()
         .route("/api/admin/tasks", get(list_tasks).post(create_task))
-        .route("/api/admin/tasks/{id}", get(get_task))
+        .route(
+            "/api/admin/tasks/{id}",
+            get(get_task).delete(delete_admin_task),
+        )
         .route("/api/admin/tasks/{id}/cancel", post(cancel_task))
         .route("/api/admin/tasks/{id}/retry", post(retry_task))
         .layer(middleware::from_fn(admin_auth_middleware))
@@ -262,6 +265,42 @@ async fn retry_task(Path(task_id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// 删除任务记录。仅允许删除已完结（Completed/Failed/Cancelled）的任务，
+/// 运行中/等待中的任务删除会留下后台 dispatch 孤儿，故先拒绝。
+async fn delete_admin_task(Path(task_id): Path<String>) -> impl IntoResponse {
+    match load_task_record_by_id(&task_id) {
+        Ok(Some(stored)) => {
+            if matches!(
+                stored.task.status,
+                TaskStatus::Pending | TaskStatus::Running
+            ) {
+                return admin_response::conflict(
+                    "运行中或等待中的任务不可删除，请等待其完成（或失败/取消）后再删除",
+                );
+            }
+            match delete_task_row(&task_id) {
+                Ok(0) => admin_response::not_found(format!("任务不存在: {task_id}")),
+                Ok(_) => admin_response::ok(
+                    "删除任务成功",
+                    serde_json::json!({ "id": task_id, "deleted": true }),
+                ),
+                Err(e) => admin_response::server_error(format!("删除任务失败: {e}")),
+            }
+        }
+        Ok(None) => admin_response::not_found(format!("任务不存在: {task_id}")),
+        Err(e) => admin_response::server_error(format!("读取任务失败: {e}")),
+    }
+}
+
+fn delete_task_row(task_id: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let conn = open_deployment_sites_sqlite()?;
+    let affected = conn.execute(
+        &format!("DELETE FROM {TABLE_NAME} WHERE id = ?1"),
+        rusqlite::params![task_id],
+    )?;
+    Ok(affected)
+}
+
 fn apply_config_overrides(config: &mut DatabaseConfig, overrides: &serde_json::Value) {
     if let Some(obj) = overrides.as_object() {
         if let Some(v) = obj.get("gen_model").and_then(|v| v.as_bool()) {
@@ -312,7 +351,7 @@ fn redact_secret_fields(value: &mut Value) {
             for (key, nested) in object.iter_mut() {
                 if matches!(
                     key.as_str(),
-                    "db_password" | "password" | "surreal_password"
+                    "db_password" | "password" | "surreal_password" | "ssh_password"
                 ) {
                     *nested = Value::String("********".to_string());
                 } else {
@@ -476,7 +515,7 @@ async fn dispatch_admin_task(task_id: String) {
         (TaskType::DataGeneration, Some(sid)) => {
             mark_task_running(
                 &mut stored.task,
-                "已提交模型生成任务，等待站点状态更新",
+                "已提交模型生成并启动 plant3d-web 任务，等待站点状态更新",
                 10.0,
             );
             let _ = save_task(&stored.task, stored.site_id.as_deref());
@@ -490,7 +529,7 @@ async fn dispatch_admin_task(task_id: String) {
         (TaskType::FullGeneration, Some(sid)) => {
             mark_task_running(
                 &mut stored.task,
-                "已提交完整生成任务，等待站点状态更新",
+                "已提交完整生成并启动 plant3d-web 任务，等待站点状态更新",
                 10.0,
             );
             let _ = save_task(&stored.task, stored.site_id.as_deref());
@@ -551,7 +590,10 @@ async fn dispatch_admin_task(task_id: String) {
         Ok(()) => {
             if matches!(
                 task_type_for_poll,
-                TaskType::StartManagedSite | TaskType::DeployManagedSite
+                TaskType::DataGeneration
+                    | TaskType::FullGeneration
+                    | TaskType::StartManagedSite
+                    | TaskType::DeployManagedSite
             ) {
                 if let Some(site_id) = site_id_for_poll {
                     poll_site_task_until_terminal(task_id, site_id).await;
@@ -765,13 +807,13 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                     .clone()
                     .unwrap_or_else(|| "站点启动失败".to_string());
                 mark_task_failed(task, &runtime_step, &message);
-            } else if runtime.status == ManagedSiteStatus::Running {
+            } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
                 mark_task_completed(task, &runtime_step);
             } else if runtime.parse_status == ManagedSiteParseStatus::Parsed
                 && runtime.status == ManagedSiteStatus::Parsed
                 && !runtime.parse_running
             {
-                mark_task_completed(task, &runtime_step);
+                mark_task_running(task, "模型生成完成，正在启动 plant3d-web Viewer", 75.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {
                 mark_task_running(task, &runtime_step, 40.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Parsed

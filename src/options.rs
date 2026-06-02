@@ -650,10 +650,11 @@ impl DbOptionExt {
 
 impl From<DbOption> for DbOptionExt {
     fn from(option: DbOption) -> Self {
+        let export_parquet_after_gen = option.export_parquet;
         Self {
             inner: option,
             export_instances: false,
-            export_parquet_after_gen: false,
+            export_parquet_after_gen,
             trimesh_l0_dir: None,
             mqtt_server: None,
             mqtt_port: None,
@@ -948,7 +949,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     let export_parquet_after_gen = toml_value
         .get("export_parquet_after_gen")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(db_option.export_parquet);
 
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {

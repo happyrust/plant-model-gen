@@ -18,8 +18,8 @@ use crate::web_server::{
     models::{
         AdminResourceSummary, CreateManagedSiteRequest, DatabaseConfig, ManagedRemoteDeployRequest,
         ManagedRemoteTargetRequest, ManagedSiteLogsResponse, ManagedSiteReconcileRequest,
-        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, TaskPriority, TaskType,
-        UpdateManagedSiteRequest,
+        ManagedSiteRuntimeStatus, PreviewManagedSiteParsePlanRequest, QuickDeployTestRequest,
+        TaskPriority, TaskType, UpdateManagedSiteRequest,
     },
 };
 
@@ -34,6 +34,7 @@ pub fn create_admin_routes() -> Router {
             get(list_remote_targets).post(upsert_remote_target),
         )
         .route("/api/admin/sites", get(list_sites).post(create_site))
+        .route("/api/admin/sites/quick-deploy", post(quick_deploy_site))
         .route(
             "/api/admin/sites/preview-parse-plan",
             post(preview_parse_plan),
@@ -64,8 +65,13 @@ pub fn create_admin_routes() -> Router {
             get(get_remote_agent_status),
         )
         .route("/api/admin/sites/{id}/parse", post(parse_site))
+        .route(
+            "/api/admin/sites/{id}/db-index/rebuild",
+            post(rebuild_site_db_index),
+        )
         .route("/api/admin/sites/{id}/generate", post(generate_site))
         .route("/api/admin/sites/{id}/deploy", post(deploy_site))
+        .route("/api/admin/sites/{id}/redeploy", post(redeploy_site))
         .route("/api/admin/sites/{id}/start", post(start_site))
         .route("/api/admin/sites/{id}/stop", post(stop_site))
         .route("/api/admin/sites/{id}/restart", post(restart_site))
@@ -428,10 +434,21 @@ pub async fn parse_site(Path(site_id): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// 手动重建站点 db_index 预扫描索引（全局 ref0→dbnum + 精确依赖边，强制全量重扫）。
+pub async fn rebuild_site_db_index(Path(site_id): Path<String>) -> impl IntoResponse {
+    match managed_sites::rebuild_site_db_index(site_id.clone(), true).await {
+        Ok(summary) => admin_response::ok(
+            "已重建 db_index 预扫描索引",
+            json!({ "site_id": site_id, "action": "db-index-rebuild", "summary": summary }),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
 pub async fn generate_site(Path(site_id): Path<String>) -> impl IntoResponse {
     match managed_sites::generate_site(site_id.clone(), true).await {
         Ok(()) => admin_response::accepted(
-            "已提交模型生成任务",
+            "已提交模型生成并启动 plant3d-web 任务",
             json!({ "site_id": site_id, "action": "generate" }),
         ),
         Err(err) => admin_response::managed_error(err.to_string()),
@@ -444,6 +461,50 @@ pub async fn deploy_site(Path(site_id): Path<String>) -> impl IntoResponse {
             "已提交完整部署任务",
             json!({ "site_id": site_id, "action": "deploy", "task_id": task_id }),
         ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+/// 重新部署：先删除旧数据（停站 + 清空 `<runtime>/data/`，保留配置），再提交
+/// 完整部署任务重新走「解析 → 生成 → 启动」。
+pub async fn redeploy_site(Path(site_id): Path<String>) -> impl IntoResponse {
+    if let Err(err) = managed_sites::redeploy_reset_site(&site_id).await {
+        return admin_response::managed_error(err.to_string());
+    }
+    match submit_managed_site_task(&site_id, TaskType::DeployManagedSite, "重新部署") {
+        Ok(task_id) => admin_response::accepted(
+            "已删除旧数据并提交重新部署任务",
+            json!({ "site_id": site_id, "action": "redeploy", "task_id": task_id }),
+        ),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+/// Admin 鉴权版快速部署：POST /api/admin/sites/quick-deploy
+///
+/// 复用 quick_deploy_test 的建站/解析/生成/可选启动管线，但不依赖免鉴权测试端点开关。
+/// 支持只传绝对 dbfile，后端会自动推断 project_path 并读取文件头得到 dbnum。
+pub async fn quick_deploy_site(Json(payload): Json<QuickDeployTestRequest>) -> impl IntoResponse {
+    match managed_sites::quick_deploy_test(payload).await {
+        Ok(resp) => admin_response::ok("快速部署已提交", resp),
+        Err(err) => admin_response::managed_error(err.to_string()),
+    }
+}
+
+/// 一键部署测试（免鉴权快测）：POST /api/admin/quick-deploy-test
+///
+/// 传 project_path + db_file/dbnum，单次完成 建站→解析(单库)→生成→(可选)启动。
+/// 该端点不挂 admin 鉴权中间件（在主路由注册），仅用于本地/测试快速验证。
+pub async fn quick_deploy_test(Json(payload): Json<QuickDeployTestRequest>) -> impl IntoResponse {
+    // P0 安全收口：该端点不挂 admin 鉴权中间件，默认禁用，避免在生产被未授权调用。
+    // 如需本地 / 测试快测，显式设置 AIOS_ENABLE_QUICK_DEPLOY_TEST=1 后重启 web_server。
+    if !managed_sites::quick_deploy_test_enabled() {
+        return admin_response::forbidden(
+            "quick-deploy-test 已禁用；如需本地 / 测试快测，请设置 AIOS_ENABLE_QUICK_DEPLOY_TEST=1 后重启 web_server",
+        );
+    }
+    match managed_sites::quick_deploy_test(payload).await {
+        Ok(resp) => admin_response::ok("一键部署测试完成", resp),
         Err(err) => admin_response::managed_error(err.to_string()),
     }
 }

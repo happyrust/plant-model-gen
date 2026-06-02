@@ -39,8 +39,9 @@ use super::models::{
     ManagedSiteParseStatus, ManagedSitePreflightCheck, ManagedSitePreflightReport,
     ManagedSitePreflightStatus, ManagedSiteProcessResource, ManagedSiteReconcileResponse,
     ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
-    PreviewManagedSiteParsePlanRequest, ProjectRole, ScanProjectsResult, ScannedDbnumConflict,
-    ScannedProject, SiteProject, UpdateManagedSiteRequest,
+    PreviewManagedSiteParsePlanRequest, ProjectRole, QuickDeployTestRequest,
+    QuickDeployTestResponse, ScanProjectsResult, ScannedDbnumConflict, ScannedProject, SiteProject,
+    UpdateManagedSiteRequest,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -49,6 +50,9 @@ const DEFAULT_SQLITE_PATH: &str = "deployment_sites.sqlite";
 const TABLE_NAME: &str = "managed_project_sites";
 const REMOTE_TARGETS_TABLE: &str = "managed_remote_targets";
 const REMOTE_DEPLOY_STATUS_TABLE: &str = "managed_remote_deploy_status";
+/// 受管子进程登记表：记录每个站点各角色进程的 pid + 启动时刻 token，
+/// 用于 kill 前做「同一进程」双重校验，规避 PID 复用导致的误杀。
+const PROC_REGISTRY_TABLE: &str = "managed_site_processes";
 const ADMIN_RUNTIME_ROOT: &str = "runtime/admin_sites";
 const LOG_LINES_LIMIT: usize = 120;
 
@@ -70,6 +74,12 @@ const PARSE_CRITICAL_DURATION_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI", "CATA", "DICT", "GLB", "GLOB"];
 const SUPPORTED_PARSE_DB_TYPES: &[&str] = &["SYST", "DESI", "CATA", "DICT", "GLB", "GLOB"];
 const REPARSE_REUSE_DB_TYPES: &[&str] = &["SYST"];
+/// 无条件预解析库：无论 auto_parse_related_dbnums 开关与否，都强制纳入解析。
+/// DICT 字典/属性定义、GLOB/GLB 全局库都是建模与解析的通用依赖，故与 SYST 同级无条件预解析。
+const MANDATORY_PREPARSE_DB_TYPES: &[&str] = &["DICT", "GLOB", "GLB"];
+/// auto_parse_related_dbnums 开启时额外纳入的关联依赖库（精确解析针对 CATA 元件库；
+/// DICT 已改为无条件预解析，不再受此开关控制）。
+const RELATED_DEPENDENCY_DB_TYPES: &[&str] = &["CATA"];
 const AUTO_DB_PORT_START: u16 = 8020;
 const AUTO_WEB_PORT_START: u16 = 8080;
 const AUTO_PORT_END: u16 = 8999;
@@ -261,6 +271,35 @@ fn admin_allow_any_project_path() -> bool {
     }
     load_config_builder()
         .and_then(|builder| builder.get_bool("admin_allow_any_project_path").ok())
+        .unwrap_or(false)
+}
+
+/// quick-deploy-test 免鉴权端点开关（默认关闭）。
+///
+/// 该端点不挂 admin 鉴权中间件，能创建站点 / 解析 / 生成 / 起进程 / 占端口；
+/// 为避免在生产被未授权调用，默认禁用，仅在显式 `AIOS_ENABLE_QUICK_DEPLOY_TEST=1`
+/// （或配置 `admin_enable_quick_deploy_test=true`）时放行，落实
+/// `docs/plans/2026-05-31-one-click-deploy-test-plan.md` §6「仅 debug/测试暴露」。
+pub fn quick_deploy_test_enabled() -> bool {
+    if let Ok(value) = std::env::var("AIOS_ENABLE_QUICK_DEPLOY_TEST") {
+        return matches!(value.trim(), "1" | "true" | "yes" | "on");
+    }
+    load_config_builder()
+        .and_then(|builder| builder.get_bool("admin_enable_quick_deploy_test").ok())
+        .unwrap_or(false)
+}
+
+/// 是否允许把明文 SSH 密码持久化到 SQLite（默认不允许）。
+///
+/// 默认仅把密码保留在进程内缓存，并在部署时优先从 `password_env` 读取，避免
+/// 明文落库（遵 AGENTS.md：SSH 密码仅通过环境变量 / CI Secrets 提供）。如确需
+/// 在测试环境落库，显式设置 `AIOS_ALLOW_SSH_PASSWORD_PERSIST=1`。
+fn ssh_password_persist_allowed() -> bool {
+    if let Ok(value) = std::env::var("AIOS_ALLOW_SSH_PASSWORD_PERSIST") {
+        return matches!(value.trim(), "1" | "true" | "yes" | "on");
+    }
+    load_config_builder()
+        .and_then(|builder| builder.get_bool("admin_allow_ssh_password_persist").ok())
         .unwrap_or(false)
 }
 
@@ -1162,7 +1201,8 @@ pub fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
     }
 
     let mut projects: Vec<ScannedProject> = Vec::new();
-    let mut owners: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+    let mut owners: std::collections::BTreeMap<u32, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     for dir in &candidate_dirs {
         let mut visited = 0usize;
@@ -1207,7 +1247,11 @@ pub fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
     }
 
     // 稳定排序 + 主工程建议：首个 design 标 primary（无 design 则首个候选）。
-    projects.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+    projects.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     let primary_idx = projects
         .iter()
         .position(|p| matches!(p.role, ProjectRole::Design))
@@ -1264,6 +1308,17 @@ fn parse_scope_enabled(site: &ManagedProjectSite) -> bool {
     !site.manual_db_nums.is_empty() || !configured_parse_db_types(site).is_empty()
 }
 
+fn manual_db_only_scope(
+    site: &ManagedProjectSite,
+    parse_db_types: &[String],
+    force_rebuild_system_db: bool,
+) -> bool {
+    !site.manual_db_nums.is_empty()
+        && parse_db_types.is_empty()
+        && !site.auto_parse_related_dbnums
+        && !force_rebuild_system_db
+}
+
 fn generation_enabled(site: &ManagedProjectSite) -> bool {
     site.gen_model || site.gen_mesh || site.gen_spatial_tree
 }
@@ -1299,10 +1354,22 @@ fn site_primary_existing_roots(site: &ManagedProjectSite) -> Result<Vec<PathBuf>
     )
 }
 
-fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
+/// 解析计划涉及的 db 文件明细。
+///
+/// - `all`：本次最终全量纳入解析的 db 文件集合（写入 parse 配置的口径）。
+/// - `auto_related`：其中由「自动解析依赖库」根据 ref0→dbnum 依赖闭包额外纳入的子集。
+#[derive(Debug, Clone, Default)]
+struct ResolvedIncludedDbFiles {
+    all: Vec<String>,
+    auto_related: Vec<String>,
+}
+
+fn resolve_included_db_files_detailed(
+    site: &ManagedProjectSite,
+) -> Result<ResolvedIncludedDbFiles> {
     let parse_db_types = configured_parse_db_types(site);
     if site.manual_db_nums.is_empty() && parse_db_types.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ResolvedIncludedDbFiles::default());
     }
 
     let project_roots = site_existing_project_roots(site)?;
@@ -1325,12 +1392,26 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
         .map(|value| value.as_str())
         .collect::<Vec<_>>();
     let selected_reuse_types = !selected_reuse_refs.is_empty();
-    let missing_system_dependency = has_other_targets
-        && !parse_config_includes_any_db_type(
-            &project_roots,
-            &site.site_id,
-            REPARSE_REUSE_DB_TYPES,
-        )?;
+    let is_manual_db_only_scope =
+        manual_db_only_scope(site, &parse_db_types, force_rebuild_system_db);
+
+    // 首次/重建解析默认重新补齐 SYST + 字典/全局库。不能只依赖旧
+    // DbOption-parse.toml 的复用检测，否则刚写入/残留的单库配置会把
+    // bootstrap 误判成“已包含依赖”，导致 quick-deploy 实际只解析目标库。
+    //
+    // 但显式单 DB 测试部署在未开启自动依赖时必须保持“只解析这一个 DB 文件”，
+    // 不再隐式补齐 SYST/DICT/GLOB/GLB。
+    let needs_bootstrap_dependencies = !is_manual_db_only_scope
+        && has_other_targets
+        && (force_rebuild_system_db || should_include_system_db_files(site));
+    let missing_system_dependency = needs_bootstrap_dependencies
+        || !is_manual_db_only_scope
+            && has_other_targets
+            && !parse_config_includes_any_db_type(
+                &project_roots,
+                &site.site_id,
+                REPARSE_REUSE_DB_TYPES,
+            )?;
     let include_reuse_types = selected_reuse_types || missing_system_dependency;
 
     tracing::debug!(
@@ -1351,6 +1432,26 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
         };
         for root in &project_roots {
             collect_db_file_names_for_types(root, &reuse_refs, &mut file_names)?;
+        }
+    }
+
+    // DICT 等默认预解析库：与 SYST 同级补齐；显式单 DB 测试部署关闭自动依赖时跳过。
+    // 同样做复用检测——解析配置里已包含该类型时不重复纳入。
+    let missing_mandatory_dependency = needs_bootstrap_dependencies
+        || !is_manual_db_only_scope
+            && has_other_targets
+            && !parse_config_includes_any_db_type(
+                &project_roots,
+                &site.site_id,
+                MANDATORY_PREPARSE_DB_TYPES,
+            )?;
+    let include_mandatory = parse_db_types
+        .iter()
+        .any(|value| MANDATORY_PREPARSE_DB_TYPES.contains(&value.as_str()))
+        || missing_mandatory_dependency;
+    if include_mandatory {
+        for root in &project_roots {
+            collect_db_file_names_for_types(root, MANDATORY_PREPARSE_DB_TYPES, &mut file_names)?;
         }
     }
 
@@ -1387,9 +1488,78 @@ fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
             matched.ok_or_else(|| anyhow!("项目路径下未找到 dbnum={} 对应的 db 文件", dbnum))?;
         file_names.push(file_name);
     }
+
+    // auto_parse_related_dbnums：开启后纳入设计库依赖的外部库。
+    // 优先用 db_index.sqlite 的精确依赖（Stage 4，基于全局 ref0->dbnum + 依赖边闭包）。
+    //
+    // 注意：web_server 默认启用 sqlite-index。若精确依赖为空，通用自动依赖路径不再静默
+    // 回退到“全部 CATA”，否则会把全项目解析放大成大范围解析。显式单库 quick-deploy
+    // 仍允许回退到当前工程本地 CATA，用于补齐 SPEC/CATE 等命名和属性引用。
+    let mut auto_related: Vec<String> = Vec::new();
+    if site.auto_parse_related_dbnums {
+        let mut used_precise = false;
+        let mut allow_type_fallback = true;
+        #[cfg(feature = "sqlite-index")]
+        {
+            allow_type_fallback = !site.manual_db_nums.is_empty();
+            match related_db_file_names_precise(site, &project_roots) {
+                Ok(precise) if !precise.is_empty() => {
+                    auto_related.extend(precise.iter().cloned());
+                    file_names.extend(precise);
+                    used_precise = true;
+                }
+                Ok(_) => {
+                    if allow_type_fallback {
+                        tracing::warn!(
+                            site = %site.site_id,
+                            "精确依赖为空；显式单库解析回退纳入当前工程 CATA 依赖"
+                        );
+                    } else {
+                        tracing::warn!(
+                            site = %site.site_id,
+                            "精确依赖为空；跳过粗粒度 CATA 回退，仅解析目标库与必要系统/字典库"
+                        );
+                    }
+                }
+                Err(e) => {
+                    if allow_type_fallback {
+                        tracing::warn!(
+                            site = %site.site_id,
+                            "精确依赖推导失败；显式单库解析回退纳入当前工程 CATA 依赖: {e}"
+                        );
+                    } else {
+                        tracing::warn!(
+                            site = %site.site_id,
+                            "精确依赖推导失败；跳过粗粒度 CATA 回退，仅解析目标库与必要系统/字典库: {e}"
+                        );
+                    }
+                }
+            }
+        }
+        if !used_precise && allow_type_fallback {
+            for root in &project_roots {
+                collect_db_file_names_for_types(
+                    root,
+                    RELATED_DEPENDENCY_DB_TYPES,
+                    &mut auto_related,
+                )?;
+            }
+            file_names.extend(auto_related.iter().cloned());
+        }
+    }
+
     file_names.sort();
     file_names.dedup();
-    Ok(file_names)
+    auto_related.sort();
+    auto_related.dedup();
+    Ok(ResolvedIncludedDbFiles {
+        all: file_names,
+        auto_related,
+    })
+}
+
+fn resolve_included_db_files(site: &ManagedProjectSite) -> Result<Vec<String>> {
+    Ok(resolve_included_db_files_detailed(site)?.all)
 }
 
 fn read_parse_config_included_db_files(site_id: &str) -> Vec<String> {
@@ -1484,6 +1654,7 @@ fn build_parse_type_summary(site: &ManagedProjectSite) -> String {
 fn build_parse_plan_with_files(
     site: &ManagedProjectSite,
     included_db_files: Vec<String>,
+    auto_related_db_files: Vec<String>,
 ) -> ManagedSiteParsePlan {
     let parse_type_summary = build_parse_type_summary(site);
     let parse_scope_enabled = parse_scope_enabled(site);
@@ -1508,6 +1679,7 @@ fn build_parse_plan_with_files(
             detail,
             includes_system_db_files: true,
             included_db_files,
+            auto_related_db_files,
         };
     }
 
@@ -1532,6 +1704,7 @@ fn build_parse_plan_with_files(
                 ),
                 includes_system_db_files,
                 included_db_files,
+                auto_related_db_files,
             }
         } else {
             ManagedSiteParsePlan {
@@ -1543,6 +1716,7 @@ fn build_parse_plan_with_files(
                 ),
                 includes_system_db_files,
                 included_db_files,
+                auto_related_db_files,
             }
         }
     } else if selected_reuse_types
@@ -1559,6 +1733,7 @@ fn build_parse_plan_with_files(
             ),
             includes_system_db_files,
             included_db_files,
+            auto_related_db_files,
         }
     } else {
         ManagedSiteParsePlan {
@@ -1570,12 +1745,19 @@ fn build_parse_plan_with_files(
             ),
             includes_system_db_files,
             included_db_files,
+            auto_related_db_files,
         }
     }
 }
 
 fn build_parse_plan(site: &ManagedProjectSite) -> ManagedSiteParsePlan {
-    build_parse_plan_with_files(site, read_parse_config_included_db_files(&site.site_id))
+    // 持久化口径：included_db_files 从已写入的 parse 配置读取，不重算依赖闭包，
+    // auto_related_db_files 留空（依赖明细仅在预览路径实时计算）。
+    build_parse_plan_with_files(
+        site,
+        read_parse_config_included_db_files(&site.site_id),
+        Vec::new(),
+    )
 }
 
 fn annotate_site_parse_plan(site: &mut ManagedProjectSite) {
@@ -1760,7 +1942,7 @@ fn build_site_config(
     set_toml_integer(table, "surreal_port", site.db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
     set_toml_string(table, "surreal_password", db_password.to_string());
-    set_toml_string(table, "surreal_script_dir", "resource/surreal");
+    set_toml_string(table, "surreal_script_dir", resolve_surreal_script_dir());
     table.remove("v_ip");
     table.remove("v_port");
     table.remove("v_user");
@@ -1920,6 +2102,7 @@ fn write_site_files(site: &ManagedProjectSite, db_user: &str, db_password: &str)
         "manual_db_nums": site.manual_db_nums,
         "parse_db_types": site.parse_db_types,
         "force_rebuild_system_db": site.force_rebuild_system_db,
+        "auto_parse_related_dbnums": site.auto_parse_related_dbnums,
         "gen_model": site.gen_model,
         "gen_mesh": site.gen_mesh,
         "gen_spatial_tree": site.gen_spatial_tree,
@@ -2049,6 +2232,7 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
             .unwrap_or(None)
             .unwrap_or(0)
             != 0,
+        auto_parse_related_dbnums: row_bool_or(row, "auto_parse_related_dbnums", false),
         gen_model: row_bool_or(row, "gen_model", true),
         gen_mesh: row_bool_or(row, "gen_mesh", false),
         gen_spatial_tree: row_bool_or(row, "gen_spatial_tree", true),
@@ -2124,6 +2308,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             manual_db_nums TEXT NOT NULL DEFAULT '[]',
             parse_db_types TEXT NOT NULL DEFAULT '["SYST","DESI","CATA","DICT","GLB","GLOB"]',
             force_rebuild_system_db INTEGER NOT NULL DEFAULT 0,
+            auto_parse_related_dbnums INTEGER NOT NULL DEFAULT 0,
             gen_model INTEGER NOT NULL DEFAULT 1,
             gen_mesh INTEGER NOT NULL DEFAULT 0,
             gen_spatial_tree INTEGER NOT NULL DEFAULT 1,
@@ -2251,6 +2436,21 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         ensure_table_column_exists(conn, REMOTE_DEPLOY_STATUS_TABLE, column, column_type)?;
     }
 
+    // 受管子进程登记表（PID + 启动时刻 token），用于 kill 前双重校验防误杀。
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS {proc_table} (
+            site_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            start_token INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, role)
+        );
+        "#,
+        proc_table = PROC_REGISTRY_TABLE
+    ))?;
+
     let mut current_version: u32 = conn
         .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
         .unwrap_or(0) as u32;
@@ -2324,6 +2524,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
     // 多工程合并站点升级（幂等列 + 索引切换，非版本门控；全新升级首跑前可直接删库重建）
     ensure_column_exists(conn, "site_name")?;
     ensure_column_exists(conn, "projects_json")?;
+    ensure_column_exists(conn, "auto_parse_related_dbnums")?;
     conn.execute(
         "DROP INDEX IF EXISTS idx_managed_project_sites_project_name",
         [],
@@ -2355,6 +2556,7 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
                 "TEXT NOT NULL DEFAULT '[\"SYST\",\"DESI\",\"CATA\",\"DICT\",\"GLB\",\"GLOB\"]'"
             }
             "force_rebuild_system_db" => "INTEGER NOT NULL DEFAULT 0",
+            "auto_parse_related_dbnums" => "INTEGER NOT NULL DEFAULT 0",
             "gen_model" => "INTEGER NOT NULL DEFAULT 1",
             "gen_mesh" => "INTEGER NOT NULL DEFAULT 0",
             "gen_spatial_tree" => "INTEGER NOT NULL DEFAULT 1",
@@ -2431,8 +2633,8 @@ fn persist_site_with_conn(
                 db_pid, web_pid, viewer_pid, viewer_url, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
-                created_at, updated_at, site_name, projects_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)",
+                created_at, updated_at, site_name, projects_json, auto_parse_related_dbnums
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)",
             table = TABLE_NAME
         ),
         params![
@@ -2479,6 +2681,7 @@ fn persist_site_with_conn(
             &site.updated_at,
             &site.site_name,
             projects_to_json(&site.projects).unwrap_or_else(|_| "[]".to_string()),
+            if site.auto_parse_related_dbnums { 1i64 } else { 0i64 },
         ],
     )?;
     Ok(())
@@ -2781,6 +2984,14 @@ fn load_remote_target_with_conn(
 
 fn persist_remote_target_with_conn(conn: &Connection, target: &ManagedRemoteTarget) -> Result<()> {
     let allowed_cidrs_json = serde_json::to_string(&target.allowed_cidrs)?;
+    // Q1.3 安全收口：默认不把明文 SSH 密码落库，仅在显式开启
+    // AIOS_ALLOW_SSH_PASSWORD_PERSIST 时持久化。注意：只影响落库的绑定值，
+    // 不修改入参 target，调用方（resolve_remote_target）当次部署仍可用 ssh_password。
+    let ssh_password_to_store: Option<&String> = if ssh_password_persist_allowed() {
+        target.ssh_password.as_ref()
+    } else {
+        None
+    };
     conn.execute(
         &format!(
             "INSERT OR REPLACE INTO {REMOTE_TARGETS_TABLE} (
@@ -2803,7 +3014,7 @@ fn persist_remote_target_with_conn(conn: &Connection, target: &ManagedRemoteTarg
             target.ssh_port as i64,
             &target.ssh_user,
             &target.password_env,
-            &target.ssh_password,
+            ssh_password_to_store,
             &target.remote_root,
             &target.remote_db_path,
             target.remote_web_port as i64,
@@ -3223,6 +3434,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
             req.force_rebuild_system_db,
             &parse_db_types,
         ),
+        auto_parse_related_dbnums: req.auto_parse_related_dbnums,
         parse_db_types,
         gen_model: req.gen_model.unwrap_or(generation_defaults.gen_model),
         gen_mesh: req.gen_mesh.unwrap_or(generation_defaults.gen_mesh),
@@ -3295,6 +3507,400 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     Ok(site)
 }
 
+/// 递归在 root 下按文件名查找一个文件（用于 quick-deploy-test 仅给文件名的情况）。
+fn find_file_by_name(root: &Path, target: &str, depth: usize) -> Result<Option<PathBuf>> {
+    if depth > SCAN_MAX_DEPTH {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        if !is_safe_scan_entry(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_by_name(&path, target, depth + 1)? {
+                return Ok(Some(found));
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some(target) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// 把用户给的 db_file（文件名 / 绝对路径 / 相对 project_root 路径）解析为 (dbnum, 相对路径)。
+/// 通过读取文件头（parse_file_basic_info）取真实 numbdb，不依赖文件名编号。
+fn resolve_dbnum_from_db_file(project_root: &Path, db_file: &str) -> Result<(u32, String)> {
+    let direct = Path::new(db_file);
+    let candidate: PathBuf = if direct.is_absolute() && direct.is_file() {
+        direct.to_path_buf()
+    } else {
+        let joined = project_root.join(db_file);
+        if joined.is_file() {
+            joined
+        } else {
+            find_file_by_name(project_root, db_file, 0)?
+                .ok_or_else(|| anyhow!("项目路径下未找到 db 文件: {}", db_file))?
+        }
+    };
+
+    // 安全收口（P1）：db_file 必须落在已通过白名单校验的 project_root 之内。
+    // 绝对路径直达任意文件、相对路径用 `..` 逃逸，都会在此被 canonicalize + starts_with 拒绝，
+    // 避免这个免鉴权端点借 db_file 读取项目根目录以外的任意文件头。
+    let candidate = fs::canonicalize(&candidate)
+        .with_context(|| format!("db 文件无法访问: {}", candidate.display()))?;
+    if !candidate.starts_with(project_root) {
+        bail!(
+            "db_file 超出项目根目录范围，已拒绝（必须位于 project_path 之内）: {}",
+            candidate.display()
+        );
+    }
+
+    let mut file = fs::File::open(&candidate)
+        .with_context(|| format!("打开 db 文件失败: {}", candidate.display()))?;
+    let mut buf = [0u8; 60];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("读取 db 文件头失败: {}", candidate.display()))?;
+    let info = parse_file_basic_info(&buf);
+    if info.dbnum == 0 {
+        bail!("无法从文件头解析 dbnum: {}", candidate.display());
+    }
+    let rel = candidate
+        .strip_prefix(project_root)
+        .unwrap_or(&candidate)
+        .to_string_lossy()
+        .to_string();
+    Ok((info.dbnum, rel))
+}
+
+/// 未提供项目名时生成**稳定**默认站点名 `quicktest-<dbnum>`（G6 幂等）。
+///
+/// 旧实现按 `quicktest-{N}` 递增，导致同一 dbnum 多次快测每次都新建站点、无限累积。
+/// 改为按 dbnum 取稳定名后，重复调用可命中同名站点并复用/重置（见 `quick_deploy_test`）。
+fn default_quicktest_site_name(dbnum: u32) -> String {
+    format!("quicktest-{}", dbnum)
+}
+
+/// 从绝对 dbfile 推断 E3D 工程根。
+///
+/// 常见布局为 `<project>/<db-folder>/<db-file>`，例如
+/// `AvevaPlantSample/aps000/aps250124_0001`。如果父目录看起来是 db 分片目录
+/// （形如 `aps000`/`cat000`），取其父级作为工程根；否则退回 dbfile 所在目录。
+fn infer_project_root_from_db_file(db_file: &str) -> Result<PathBuf> {
+    let path = Path::new(db_file.trim());
+    if !path.is_absolute() {
+        bail!("未提供 project_path 时，db_file 必须是绝对路径");
+    }
+    if !path.is_file() {
+        bail!("db_file 不存在或不可访问: {}", path.display());
+    }
+    let canonical_file =
+        fs::canonicalize(path).with_context(|| format!("db_file 无法访问: {}", path.display()))?;
+    let db_dir = canonical_file
+        .parent()
+        .ok_or_else(|| anyhow!("无法从 db_file 推断所在目录: {}", canonical_file.display()))?;
+    let db_dir_name = db_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let looks_like_db_folder = db_dir_name.len() >= 6
+        && db_dir_name
+            .chars()
+            .take(3)
+            .all(|ch| ch.is_ascii_alphabetic())
+        && db_dir_name.chars().skip(3).all(|ch| ch.is_ascii_digit());
+    let root = if looks_like_db_folder {
+        db_dir.parent().unwrap_or(db_dir)
+    } else {
+        db_dir
+    };
+    canonical_project_path(&root.to_string_lossy())
+}
+
+/// 一键部署测试（免鉴权快测）：建站 → 解析(单库, 可选含关联) → 生成 →(可选)启动。
+pub async fn quick_deploy_test(req: QuickDeployTestRequest) -> Result<QuickDeployTestResponse> {
+    let started = Instant::now();
+
+    let project_path = req.project_path.trim().to_string();
+    let canonical = if project_path.is_empty() {
+        let db_file = req
+            .db_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!("必须提供 project_path，或提供可用于推断工程根的绝对 db_file")
+            })?;
+        infer_project_root_from_db_file(db_file)?
+    } else {
+        canonical_project_path(&project_path)?
+    };
+
+    // 1) dbnum 解析（dbnum 优先，否则按 db_file 读文件头）
+    let (dbnum, resolved_db_file) = match req.dbnum {
+        Some(n) if n > 0 => (n, req.db_file.clone().unwrap_or_default()),
+        _ => {
+            let db_file = req
+                .db_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("必须提供 db_file（文件名/路径）或 dbnum"))?;
+            resolve_dbnum_from_db_file(&canonical, db_file)?
+        }
+    };
+
+    // 2) 命名：未提供项目名 → E3D 项目名取目录名，站点显示名用默认递增名（评审反馈）
+    let provided_name = req
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let e3d_project_name = provided_name.clone().unwrap_or_else(|| {
+        canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project")
+            .to_string()
+    });
+    let site_name = provided_name.unwrap_or_else(|| default_quicktest_site_name(dbnum));
+    let project_code = req.project_code.filter(|code| *code > 0).unwrap_or(1);
+
+    // 3) 免鉴权快测：用强默认 db 凭据，避开弱凭据硬校验
+    let create_req = CreateManagedSiteRequest {
+        site_name: Some(site_name.clone()),
+        projects: Vec::new(),
+        project_name: e3d_project_name.clone(),
+        project_path: canonical.to_string_lossy().to_string(),
+        project_code,
+        manual_db_nums: vec![dbnum],
+        parse_db_types: Vec::new(),
+        force_rebuild_system_db: false,
+        auto_parse_related_dbnums: req.auto_parse_related_dbnums,
+        gen_model: Some(req.gen_model),
+        gen_mesh: Some(req.gen_mesh),
+        gen_spatial_tree: Some(req.gen_spatial_tree),
+        apply_boolean_operation: None,
+        mesh_tol_ratio: None,
+        export_json: None,
+        export_parquet: None,
+        pipeline_db_mode: req.pipeline_db_mode,
+        runtime_db_mode: None,
+        db_port: None,
+        web_port: req.web_port,
+        auto_deploy: false,
+        bind_host: None,
+        public_base_url: None,
+        associated_project: None,
+        db_user: Some("quicktest".to_string()),
+        db_password: Some("QuickTest@2026".to_string()),
+    };
+
+    // 4) 幂等（G6）：按稳定站点名定位已存在站点。
+    //    - force_recreate=true：删除全部同名旧站点后重建；
+    //    - 否则若已存在：复用并重置（update_site 清空 parse/gen 状态并套用本次配置），
+    //      避免每次新建导致 quicktest 站点无限累积；
+    //    - 不存在：正常新建。
+    let existing_same_name = list_sites()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|s| s.site_name == site_name);
+
+    let site = match existing_same_name {
+        Some(existing) if !req.force_recreate => {
+            let update_req = UpdateManagedSiteRequest {
+                project_name: Some(e3d_project_name.clone()),
+                project_path: Some(canonical.to_string_lossy().to_string()),
+                project_code: Some(project_code),
+                manual_db_nums: Some(vec![dbnum]),
+                auto_parse_related_dbnums: Some(req.auto_parse_related_dbnums),
+                gen_model: Some(req.gen_model),
+                gen_mesh: Some(req.gen_mesh),
+                gen_spatial_tree: Some(req.gen_spatial_tree),
+                pipeline_db_mode: req.pipeline_db_mode,
+                web_port: req.web_port,
+                ..Default::default()
+            };
+            update_site(&existing.site_id, update_req).with_context(|| {
+                format!(
+                    "复用已存在站点失败（站点运行中请先停止，或改用 force_recreate=true）: {}",
+                    existing.site_id
+                )
+            })?
+        }
+        Some(_) => {
+            for s in list_sites().unwrap_or_default() {
+                if s.site_name == site_name {
+                    let should_stop = site_has_active_processes(&s)
+                        || matches!(
+                            s.status,
+                            ManagedSiteStatus::Running
+                                | ManagedSiteStatus::Starting
+                                | ManagedSiteStatus::Stopping
+                        )
+                        || s.parse_status == ManagedSiteParseStatus::Running;
+                    if should_stop {
+                        let stop_result = stop_site(&s.site_id)
+                            .await
+                            .with_context(|| format!("重建前停止同名旧站点失败: {}", s.site_id))?;
+                        if stop_result.conflict {
+                            bail!(
+                                "重建前停止同名旧站点存在端口冲突: {} (web={:?}, db={:?}, viewer={:?})",
+                                s.site_id,
+                                stop_result.web_conflict_pids,
+                                stop_result.db_conflict_pids,
+                                stop_result.viewer_conflict_pids
+                            );
+                        }
+                    }
+                    delete_site(&s.site_id)
+                        .with_context(|| format!("重建前删除同名旧站点失败: {}", s.site_id))?;
+                }
+            }
+            create_site(create_req)?
+        }
+        None => create_site(create_req)?,
+    };
+    let site_id = site.site_id.clone();
+    let want_generate = req.gen_model || req.gen_mesh || req.gen_spatial_tree;
+    let resolved_db_file = if resolved_db_file.is_empty() {
+        None
+    } else {
+        Some(resolved_db_file)
+    };
+
+    // 5) 后台模式：立即返回 site_id；pipeline 改由持久化任务表（admin_tasks）调度，
+    //    替代原先裸 tokio::spawn 的 fire-and-forget —— 进程重启后任务记录仍可查询/对账，
+    //    且与 /api/admin/sites/{id}/deploy 共用同一套调度 + 站点运行态对账。
+    if !req.wait {
+        let task_type = if req.start_site {
+            crate::web_server::models::TaskType::DeployManagedSite
+        } else if want_generate {
+            crate::web_server::models::TaskType::FullGeneration
+        } else {
+            crate::web_server::models::TaskType::ParsePdmsData
+        };
+        let mut task_config = DatabaseConfig::default();
+        task_config.name = format!("快速部署 - {}", site_name);
+
+        let (message, warnings) =
+            match crate::web_server::admin_task_handlers::create_and_dispatch_site_task(
+                site_id.clone(),
+                task_config.name.clone(),
+                task_type,
+                crate::web_server::models::TaskPriority::Normal,
+                task_config,
+            ) {
+                Ok(task) => (
+                    Some(format!("已提交后台部署任务（task_id={}）", task.id)),
+                    vec![format!(
+                        "wait=false：已创建持久化任务 task_id={tid}，可用 GET /api/admin/tasks/{tid} 或 GET /api/admin/sites/{{id}}/runtime 轮询进度",
+                        tid = task.id
+                    )],
+                ),
+                Err(err) => {
+                    // 持久化任务创建失败时回退到后台 spawn，保证行为不退化。
+                    tracing::warn!(
+                        site = %site_id,
+                        "创建持久化部署任务失败，回退 fire-and-forget: {err}"
+                    );
+                    let site_id_bg = site_id.clone();
+                    let start_site = req.start_site;
+                    tokio::spawn(async move {
+                        let result = if start_site {
+                            run_deploy_pipeline(site_id_bg.clone()).await
+                        } else if want_generate {
+                            run_generation_pipeline(site_id_bg.clone(), true).await
+                        } else {
+                            run_parse_pipeline(site_id_bg.clone()).await
+                        };
+                        if let Err(err) = result {
+                            let _ = update_runtime(
+                                &site_id_bg,
+                                RuntimeUpdate {
+                                    status: Some(ManagedSiteStatus::Failed),
+                                    last_error: Some(Some(err.to_string())),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    });
+                    (
+                        Some("已在后台启动一键部署测试（持久化任务创建失败，已降级为非持久化后台执行）".to_string()),
+                        vec![format!(
+                            "wait=false：持久化任务创建失败（{err}），已回退后台执行，请用 GET /api/admin/sites/{{id}}/runtime 轮询进度"
+                        )],
+                    )
+                }
+            };
+
+        return Ok(QuickDeployTestResponse {
+            success: true,
+            site_id,
+            dbnum: Some(dbnum),
+            resolved_db_file,
+            parse_status: parse_status_to_str(&ManagedSiteParseStatus::Pending).to_string(),
+            generated: false,
+            entry_url: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            parse_log_tail: Vec::new(),
+            generate_log_tail: Vec::new(),
+            warnings,
+            message,
+        });
+    }
+
+    // 6) 同步模式：等 pipeline 结束再返回 summary
+    let pipeline_result = if req.start_site {
+        run_deploy_pipeline(site_id.clone()).await
+    } else if want_generate {
+        run_generation_pipeline(site_id.clone(), true).await
+    } else {
+        run_parse_pipeline(site_id.clone()).await
+    };
+
+    let final_site = get_site(&site_id)?.unwrap_or(site);
+    let parse_log_tail = tail_log(&site_id, "parse", 40)
+        .map(|tail| tail.lines)
+        .unwrap_or_default();
+    let generate_log_tail = if want_generate {
+        tail_log(&site_id, "generate", 40)
+            .map(|tail| tail.lines)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let parsed = final_site.parse_status == ManagedSiteParseStatus::Parsed;
+    let mut warnings = Vec::new();
+    if let Err(err) = &pipeline_result {
+        warnings.push(format!("pipeline 错误: {err}"));
+    }
+
+    Ok(QuickDeployTestResponse {
+        success: pipeline_result.is_ok() && parsed,
+        site_id,
+        dbnum: Some(dbnum),
+        resolved_db_file,
+        parse_status: parse_status_to_str(&final_site.parse_status).to_string(),
+        generated: want_generate && parsed && pipeline_result.is_ok(),
+        entry_url: if req.start_site {
+            final_site.entry_url.clone()
+        } else {
+            None
+        },
+        duration_ms: started.elapsed().as_millis() as u64,
+        parse_log_tail,
+        generate_log_tail,
+        warnings,
+        message: final_site.last_error.clone(),
+    })
+}
+
 fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<ManagedProjectSite> {
     let project_name = req.project_name.trim();
     if project_name.is_empty() {
@@ -3355,6 +3961,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             manual_db_nums: Vec::new(),
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
+            auto_parse_related_dbnums: false,
             gen_model: generation_defaults.gen_model,
             gen_mesh: generation_defaults.gen_mesh,
             gen_spatial_tree: generation_defaults.gen_spatial_tree,
@@ -3421,6 +4028,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
     site.manual_db_nums = normalize_manual_db_nums(req.manual_db_nums);
     site.parse_db_types = parse_db_types;
     site.force_rebuild_system_db = force_rebuild_system_db;
+    site.auto_parse_related_dbnums = req.auto_parse_related_dbnums;
     site.web_port = req.web_port;
     site.bind_host = normalize_host(req.bind_host);
     site.public_base_url = req
@@ -3443,8 +4051,12 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
 pub fn preview_parse_plan(req: PreviewManagedSiteParsePlanRequest) -> Result<ManagedSiteParsePlan> {
     let site = build_preview_site(req)?;
     precheck_dbnum_conflicts(&site.projects)?;
-    let included_db_files = resolve_included_db_files(&site)?;
-    Ok(build_parse_plan_with_files(&site, included_db_files))
+    let resolved = resolve_included_db_files_detailed(&site)?;
+    Ok(build_parse_plan_with_files(
+        &site,
+        resolved.all,
+        resolved.auto_related,
+    ))
 }
 
 pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<ManagedProjectSite> {
@@ -3493,6 +4105,9 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     if let Some(value) = req.force_rebuild_system_db {
         site.force_rebuild_system_db = value;
+    }
+    if let Some(value) = req.auto_parse_related_dbnums {
+        site.auto_parse_related_dbnums = value;
     }
     if let Some(value) = req.gen_model {
         site.gen_model = value;
@@ -5003,6 +5618,52 @@ fn repo_root() -> Result<PathBuf> {
     std::env::current_dir().context("获取当前工作目录失败")
 }
 
+/// 解析站点解析/生成 worker 使用的 surql 脚本目录，返回一个【确实存在】的路径。
+///
+/// 历史上这里写死为 "resource/surreal"，但 worker 以 repo_root 为 CWD 运行，真实脚本
+/// 位于 ../rs-core/resource/surreal，导致站点专属 SurrealDB 加载 schema 失败
+/// （att_meta / 通用函数缺失）从而解析失败。这里按候选项探测，命中即用其路径：
+/// AIOS_SURREAL_SCRIPT_DIR 环境变量 → 主配置 surreal_script_dir → repo_root/resource/surreal
+/// → repo_root/../rs-core/resource/surreal；都不存在时回退旧默认值。
+fn resolve_surreal_script_dir() -> String {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/");
+
+    if let Ok(v) = std::env::var("AIOS_SURREAL_SCRIPT_DIR") {
+        let v = v.trim();
+        if !v.is_empty() && Path::new(v).exists() {
+            return norm(Path::new(v));
+        }
+    }
+
+    let repo = repo_root().ok();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(builder) = load_config_builder() {
+        if let Ok(s) = builder.get_string("surreal_script_dir") {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                let p = PathBuf::from(&s);
+                if p.is_absolute() {
+                    candidates.push(p);
+                } else if let Some(repo) = repo.as_ref() {
+                    candidates.push(repo.join(&s));
+                }
+            }
+        }
+    }
+    if let Some(repo) = repo.as_ref() {
+        candidates.push(repo.join("resource/surreal"));
+        if let Some(parent) = repo.parent() {
+            candidates.push(parent.join("rs-core/resource/surreal"));
+        }
+    }
+    for c in candidates {
+        if c.exists() {
+            return norm(&c);
+        }
+    }
+    "resource/surreal".to_string()
+}
+
 fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("获取当前 web_server 可执行文件失败")
 }
@@ -5122,6 +5783,15 @@ fn open_log_file(path: &Path) -> Result<(std::fs::File, std::fs::File)> {
     let stdout = OpenOptions::new().create(true).append(true).open(path)?;
     let stderr = OpenOptions::new().create(true).append(true).open(path)?;
     Ok((stdout, stderr))
+}
+
+fn append_log_line(path: &Path, line: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// 把 `tokio::process::Command` 放进一个新的进程组；停止时可以按组杀。
@@ -6131,6 +6801,155 @@ async fn kill_pid(pid: u32) -> Result<()> {
     Ok(())
 }
 
+// ─── Process registry（PID + 启动时刻 token，防误杀） ─────────────────────────
+//
+// 仅靠 pid 杀进程在 pid 被 OS 复用后会误杀无关进程。这里在子进程拉起时登记
+// (site_id, role) -> (pid, start_token)，其中 start_token 取自该 pid 的进程启动时刻
+// （`sysinfo::Process::start_time()`，Unix 秒）。kill 前重新读取目标 pid 的启动时刻，
+// 与登记值一致才执行 kill，否则判定为「pid 已被复用」并跳过，避免误杀。
+
+/// 进程角色（与 ManagedProjectSite 的各 *_pid 一一对应）。
+const PROC_ROLE_DB: &str = "db";
+const PROC_ROLE_WEB: &str = "web";
+const PROC_ROLE_VIEWER: &str = "viewer";
+const PROC_ROLE_PARSE: &str = "parse";
+
+/// 读取指定 pid 的进程启动时刻（Unix 秒）作为「同一进程」判定 token。
+/// 返回 None 表示进程不存在或无法采样（调用方据此判定该 pid 已消亡）。
+fn process_start_token(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let target = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(target).map(|proc| proc.start_time())
+}
+
+/// 登记一个受管子进程（覆盖式 upsert）。失败仅告警，不影响主流程。
+fn register_process(site_id: &str, role: &str, pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let token = process_start_token(pid).map(|value| value as i64);
+    let result = with_conn(|conn| {
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {table} (site_id, role, pid, start_token, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                table = PROC_REGISTRY_TABLE
+            ),
+            params![site_id, role, pid as i64, token, now_rfc3339()],
+        )?;
+        Ok(())
+    });
+    if let Err(err) = result {
+        tracing::warn!(site = %site_id, role, pid, "登记受管进程失败: {err}");
+    }
+}
+
+/// 移除某站点某角色的进程登记。
+fn unregister_process(site_id: &str, role: &str) {
+    let _ = with_conn(|conn| {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE site_id = ?1 AND role = ?2",
+                table = PROC_REGISTRY_TABLE
+            ),
+            params![site_id, role],
+        )?;
+        Ok(())
+    });
+}
+
+/// 清空某站点的全部进程登记（停站 / 删除站点时调用）。
+fn unregister_site_processes(site_id: &str) {
+    let _ = with_conn(|conn| {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE site_id = ?1",
+                table = PROC_REGISTRY_TABLE
+            ),
+            params![site_id],
+        )?;
+        Ok(())
+    });
+}
+
+/// 读取登记的 start_token；外层 None=无登记行，内层 None=登记时未取到 token。
+fn registered_start_token(site_id: &str, role: &str) -> Option<Option<u64>> {
+    with_conn(|conn| {
+        let token = conn
+            .query_row(
+                &format!(
+                    "SELECT start_token FROM {table} WHERE site_id = ?1 AND role = ?2",
+                    table = PROC_REGISTRY_TABLE
+                ),
+                params![site_id, role],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(token.map(|inner| inner.map(|value| value as u64)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// 守卫式 kill：用 (pid, 启动时刻) 双重校验确认仍是登记的同一进程后才杀，
+/// 杀完移除登记。返回 true=已执行 kill；false=因身份不符/进程已亡而跳过。
+async fn kill_pid_guarded(site_id: &str, role: &str, pid: u32) -> Result<bool> {
+    if pid == 0 {
+        unregister_process(site_id, role);
+        return Ok(false);
+    }
+    match registered_start_token(site_id, role) {
+        Some(Some(expected)) => match process_start_token(pid) {
+            Some(actual) if actual == expected => {
+                kill_pid(pid).await?;
+            }
+            Some(actual) => {
+                tracing::warn!(
+                    site = %site_id, role, pid, expected, actual,
+                    "进程启动时刻不匹配，疑似 PID 已被系统复用，跳过 kill 防误杀"
+                );
+                unregister_process(site_id, role);
+                return Ok(false);
+            }
+            None => {
+                // 目标进程已不存在，无需 kill。
+                unregister_process(site_id, role);
+                return Ok(false);
+            }
+        },
+        // 有登记行但当初没采到 token：尽力按 pid 存活性兜底，避免误杀已消亡 pid。
+        Some(None) => {
+            if !pid_running(Some(pid)) {
+                unregister_process(site_id, role);
+                return Ok(false);
+            }
+            tracing::warn!(
+                site = %site_id, role, pid,
+                "登记缺少启动时刻 token，按 pid 存活性兜底执行 kill（无法做复用校验）"
+            );
+            kill_pid(pid).await?;
+        }
+        // 完全没有登记（历史站点 / 登记前的旧数据）：保持旧逻辑直接 kill。
+        None => {
+            tracing::warn!(
+                site = %site_id, role, pid,
+                "无进程登记，按旧逻辑直接 kill（无法做复用校验）"
+            );
+            kill_pid(pid).await?;
+        }
+    }
+    unregister_process(site_id, role);
+    Ok(true)
+}
+
 // ─── Parse / start pipelines ────────────────────────────────────────────────
 
 fn site_was_stopped_by_user(site_id: &str) -> bool {
@@ -6142,7 +6961,7 @@ fn site_was_stopped_by_user(site_id: &str) -> bool {
 
 async fn cleanup_started_db(site_id: &str, db_pid: Option<u32>) {
     if let Some(pid) = db_pid {
-        let _ = kill_pid(pid).await;
+        let _ = kill_pid_guarded(site_id, PROC_ROLE_DB, pid).await;
         let _ = update_runtime(
             site_id,
             RuntimeUpdate {
@@ -6186,6 +7005,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     let parse_started_instant = Instant::now();
     let mut child = command.spawn().context("启动解析进程失败")?;
     let pid = child.id();
+    register_process(&site.site_id, PROC_ROLE_PARSE, pid.unwrap_or_default());
     update_runtime(
         &site.site_id,
         RuntimeUpdate {
@@ -6284,6 +7104,7 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
 
     let mut child = command.spawn().context("启动模型生成进程失败")?;
     let pid = child.id();
+    register_process(&site.site_id, PROC_ROLE_PARSE, pid.unwrap_or_default());
     update_runtime(
         &site.site_id,
         RuntimeUpdate {
@@ -6352,6 +7173,7 @@ async fn spawn_db_process(site: &ManagedProjectSite) -> Result<u32> {
     isolate_process_group(&mut command);
     let child = command.spawn().context("启动 SurrealDB 失败")?;
     let pid = child.id().unwrap_or_default();
+    register_process(&site.site_id, PROC_ROLE_DB, pid);
     Ok(pid)
 }
 
@@ -6374,7 +7196,9 @@ async fn spawn_web_process(site: &ManagedProjectSite) -> Result<u32> {
         .stderr(Stdio::from(stderr));
     isolate_process_group(&mut command);
     let child = command.spawn().context("启动项目 web_server 失败")?;
-    Ok(child.id().unwrap_or_default())
+    let pid = child.id().unwrap_or_default();
+    register_process(&site.site_id, PROC_ROLE_WEB, pid);
+    Ok(pid)
 }
 
 #[derive(Debug, Clone)]
@@ -6512,6 +7336,43 @@ fn build_viewer_url(site: &ManagedProjectSite, port: u16) -> String {
     url
 }
 
+/// Viewer 是否使用 Vite dev server（开发服务器 / HMR / 未构建）。
+///
+/// 默认 false：构建 plant3d-web 生产产物（`npm run build`）并以 `vite preview`
+/// 提供静态服务，避免把开发服务器当部署态。设 `AIOS_VIEWER_MODE=dev` 时回退到
+/// dev server（仅本地开发场景）。
+fn viewer_use_dev_server() -> bool {
+    std::env::var("AIOS_VIEWER_MODE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "dev" | "development"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 是否强制重建 plant3d-web 生产产物（即使 `dist/index.html` 已存在）。
+fn viewer_force_build() -> bool {
+    std::env::var("AIOS_VIEWER_FORCE_BUILD")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// 构造调用 npm 的 Command（Windows 走 `cmd /C npm`，其余平台直接 `npm`）。
+fn npm_command() -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg("npm");
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("npm")
+    }
+}
+
 async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<ViewerLaunch>> {
     if !managed_viewer_enabled() {
         tracing::info!(site = %site.site_id, "受管 plant3d-web Viewer 启动已禁用");
@@ -6536,19 +7397,51 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
         }));
     }
 
-    let (stdout, stderr) = open_log_file(&viewer_log_path(&site.site_id))?;
-    #[cfg(windows)]
-    let mut command = {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg("npm");
-        cmd
-    };
-    #[cfg(not(windows))]
-    let mut command = Command::new("npm");
+    // 生产模式（默认）：先构建 plant3d-web 生产产物，再以 `vite preview` 提供静态服务，
+    // 不再用 `vite dev`（开发服务器 / HMR）充当部署态。设 AIOS_VIEWER_MODE=dev 可回退。
+    let use_dev_server = viewer_use_dev_server();
+    if !use_dev_server {
+        let dist_index = viewer_dir.join("dist").join("index.html");
+        if !dist_index.exists() || viewer_force_build() {
+            append_log_line(
+                &viewer_log_path(&site.site_id),
+                "🏗️ 构建 plant3d-web 生产产物 (npm run build)...",
+            );
+            let (build_out, build_err) = open_log_file(&viewer_log_path(&site.site_id))?;
+            let mut build_command = npm_command();
+            build_command
+                .arg("run")
+                .arg("build")
+                .current_dir(&viewer_dir)
+                .env("VITE_BACKEND_PORT", site.web_port.to_string())
+                .env("VITE_BACKEND_URL", site_access_base_url(site))
+                .env("VITE_API_BASE_URL", site_access_base_url(site))
+                .stdout(Stdio::from(build_out))
+                .stderr(Stdio::from(build_err));
+            isolate_process_group(&mut build_command);
+            let build_status = build_command
+                .status()
+                .await
+                .context("启动 plant3d-web 构建失败 (npm run build)")?;
+            if !build_status.success() {
+                bail!(
+                    "plant3d-web 构建失败 (npm run build 退出码 {:?})，请检查 viewer 日志",
+                    build_status.code()
+                );
+            }
+            append_log_line(
+                &viewer_log_path(&site.site_id),
+                "✅ plant3d-web 构建完成，启动 vite preview 静态服务",
+            );
+        }
+    }
 
+    let run_script = if use_dev_server { "dev" } else { "preview" };
+    let (stdout, stderr) = open_log_file(&viewer_log_path(&site.site_id))?;
+    let mut command = npm_command();
     command
         .arg("run")
-        .arg("dev")
+        .arg(run_script)
         .arg("--")
         .arg("--host")
         .arg("127.0.0.1")
@@ -6566,12 +7459,14 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
 
     let child = command.spawn().with_context(|| {
         format!(
-            "启动 plant3d-web Viewer 失败 (dir={}, port={})",
+            "启动 plant3d-web Viewer 失败 (dir={}, port={}, script={})",
             viewer_dir.display(),
-            port
+            port,
+            run_script
         )
     })?;
     let pid = child.id().unwrap_or_default();
+    register_process(&site.site_id, PROC_ROLE_VIEWER, pid);
     if !wait_for_http_ok(
         &format!("http://127.0.0.1:{port}/"),
         WAIT_HTTP_ATTEMPTS,
@@ -6580,7 +7475,7 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
     .await
     {
         if pid != 0 {
-            let _ = kill_pid(pid).await;
+            let _ = kill_pid_guarded(&site.site_id, PROC_ROLE_VIEWER, pid).await;
         }
         bail!("plant3d-web Viewer 未在端口 {} 启动成功", port);
     }
@@ -6641,7 +7536,147 @@ async fn ensure_site_db_started(
     Ok(Some(db_pid))
 }
 
-async fn run_parse_pipeline(site_id: String) -> Result<()> {
+/// 站点级 db_index.sqlite 路径（runtime/admin_sites/<site_id>/db_index.sqlite）。
+#[cfg(feature = "sqlite-index")]
+fn site_db_index_path(site_id: &str) -> PathBuf {
+    site_runtime_dir(site_id).join(crate::data_interface::db_index::DB_INDEX_FILE_NAME)
+}
+
+/// 站点预扫描的 (project_name, root_path) 列表（多工程用 projects[]，否则回退派生根）。
+#[cfg(feature = "sqlite-index")]
+fn site_prescan_roots(site: &ManagedProjectSite) -> Vec<(String, PathBuf)> {
+    if !site.projects.is_empty() {
+        let mut ordered: Vec<&SiteProject> = site.projects.iter().collect();
+        ordered.sort_by_key(|p| p.sort_order);
+        let roots: Vec<(String, PathBuf)> = ordered
+            .into_iter()
+            .map(|p| (p.name.clone(), PathBuf::from(&p.path)))
+            .filter(|(_, path)| path.exists())
+            .collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+    site_existing_project_roots(site)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|root| {
+            let name = root
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| site.project_name.clone());
+            (name, root)
+        })
+        .collect()
+}
+
+/// db_index 预扫描结果摘要（用于 admin/CLI 反馈）。
+#[cfg(feature = "sqlite-index")]
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct DbIndexRebuildSummary {
+    pub scanned: usize,
+    pub skipped: usize,
+    pub db_files: usize,
+    pub ref0_total: usize,
+    pub dependency_edges: usize,
+    pub errors: usize,
+}
+
+/// 预扫描核心（两阶段），返回摘要；失败不致命（记入 errors）。
+/// - Phase 1（index-only）：遍历全部 db 文件，构建全局 `ref0 -> dbnum` 归属表。
+/// - Phase 2（Stage 4）：为设计库抽取外向引用 → 经全局表反查 → 记录精确依赖边。
+#[cfg(feature = "sqlite-index")]
+async fn db_index_prescan_core(site: &ManagedProjectSite, force: bool) -> DbIndexRebuildSummary {
+    use crate::data_interface::db_index::{
+        DbIndexStore, ScanReport, collect_design_outbound, prescan_roots,
+    };
+    let mut summary = DbIndexRebuildSummary::default();
+    let roots = site_prescan_roots(site);
+    if roots.is_empty() {
+        summary.errors += 1;
+        return summary;
+    }
+    let index_path = site_db_index_path(&site.site_id);
+
+    // Phase 1：index-only 归属扫描（阻塞线程，连接不跨 await）。
+    let roots_p1 = roots.clone();
+    let index_p1 = index_path.clone();
+    match task::spawn_blocking(move || -> Result<ScanReport> {
+        let store = DbIndexStore::open(&index_p1)?;
+        Ok(prescan_roots(&store, &roots_p1, force))
+    })
+    .await
+    {
+        Ok(Ok(report)) => {
+            summary.scanned = report.scanned;
+            summary.skipped = report.skipped;
+            summary.db_files = report.db_files;
+            summary.ref0_total = report.ref0_total;
+            summary.errors += report.errors.len();
+        }
+        Ok(Err(_)) | Err(_) => summary.errors += 1,
+    }
+
+    // Phase 2：设计库外向引用 → 精确依赖边（async 解析与阻塞写库分离，保持 Send）。
+    //
+    // 显式 manual_db_nums（quick deploy / 单库解析）不在请求链路里同步抽取依赖边：
+    // 单个 DESI 的属性解析也可能很慢，而且收窄后的配置已经不再回退全 CATA。这里保持
+    // index-only 预扫快速结束，让后台解析尽快进入可观测的 parse 子进程。
+    let outbound = if site.manual_db_nums.is_empty() {
+        collect_design_outbound(&roots).await
+    } else {
+        Vec::new()
+    };
+    if !outbound.is_empty() {
+        let index_p2 = index_path.clone();
+        match task::spawn_blocking(move || -> Result<usize> {
+            let store = DbIndexStore::open(&index_p2)?;
+            let mut edges = 0usize;
+            for (src, ref0s) in &outbound {
+                let mut dsts = store.resolve_dbnums(ref0s);
+                dsts.retain(|d| d != src);
+                store.record_dependencies(*src, &dsts)?;
+                edges += dsts.len();
+            }
+            Ok(edges)
+        })
+        .await
+        {
+            Ok(Ok(edges)) => summary.dependency_edges = edges,
+            Ok(Err(_)) | Err(_) => summary.errors += 1,
+        }
+    }
+    summary
+}
+
+/// 解析前自动预扫（包装核心 + 日志，失败不致命）。
+#[cfg(feature = "sqlite-index")]
+async fn run_db_index_prescan(site: &ManagedProjectSite, force: bool) -> DbIndexRebuildSummary {
+    let summary = db_index_prescan_core(site, force).await;
+    tracing::info!(
+        site = %site.site_id,
+        scanned = summary.scanned,
+        skipped = summary.skipped,
+        db_files = summary.db_files,
+        ref0_total = summary.ref0_total,
+        edges = summary.dependency_edges,
+        errors = summary.errors,
+        "db_index 预扫描完成"
+    );
+    summary
+}
+
+#[cfg(feature = "sqlite-index")]
+fn should_run_db_index_prescan(site: &ManagedProjectSite) -> bool {
+    // quick deploy / 单库解析已有显式 manual_db_nums，且 `resolve_included_db_files`
+    // 在精确依赖为空时不会再回退全 CATA。同步 db_index 预扫会阻塞解析启动，
+    // 所以只在没有显式目标库的通用自动依赖路径里执行。
+    site.auto_parse_related_dbnums && site.manual_db_nums.is_empty()
+}
+
+/// 手动重建站点 db_index（admin『重建索引』/ CLI 强制全量重扫）。
+#[cfg(feature = "sqlite-index")]
+pub async fn rebuild_site_db_index(site_id: String, force: bool) -> Result<DbIndexRebuildSummary> {
     let site = task::spawn_blocking({
         let site_id = site_id.clone();
         move || get_site(&site_id)
@@ -6649,13 +7684,125 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
+    Ok(db_index_prescan_core(&site, force).await)
+}
+
+/// 基于 db_index.sqlite 的精确依赖：seeds=设计库 dbnum → 传递闭包 → 依赖库文件名。
+/// 索引/依赖边尚未就绪时返回空，由调用方回退到按类型粗粒度纳入。
+#[cfg(feature = "sqlite-index")]
+fn related_db_file_names_precise(
+    site: &ManagedProjectSite,
+    project_roots: &[PathBuf],
+) -> Result<Vec<String>> {
+    use crate::data_interface::db_index::DbIndexStore;
+    let index_path = site_db_index_path(&site.site_id);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let store = DbIndexStore::open(&index_path)?;
+    // seeds：优先用户指定的 manual_db_nums，否则索引中的 DESI 设计库。
+    let mut seeds: Vec<u32> = site.manual_db_nums.clone();
+    if seeds.is_empty() {
+        seeds = store.dbnums_by_type("DESI");
+    }
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dep_dbnums = store.resolve_related_closure(&seeds);
+    let mut names = Vec::new();
+    for dbnum in dep_dbnums {
+        if let Some(rec) = store.file_by_dbnum(dbnum) {
+            if !rec.file_name.is_empty() {
+                names.push(rec.file_name);
+                continue;
+            }
+        }
+        for root in project_roots {
+            if let Some(file_name) = find_db_file_name_for_dbnum(root, dbnum)? {
+                names.push(file_name);
+                break;
+            }
+        }
+    }
+    Ok(names)
+}
+
+async fn run_parse_pipeline(site_id: String) -> Result<()> {
+    let mut site = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+
+    let parse_started_at = now_rfc3339();
+    update_runtime(
+        &site.site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Draft),
+            parse_status: Some(ManagedSiteParseStatus::Running),
+            parse_pid: Some(None),
+            last_error: Some(None),
+            last_parse_started_at: Some(Some(parse_started_at)),
+            last_parse_finished_at: Some(None),
+            last_parse_duration_ms: Some(None),
+            ..Default::default()
+        },
+    )?;
+
+    // 解析前自动预扫，刷新站点级 db_index.sqlite（全局 ref0->dbnum + 依赖边）。
+    //
+    // 首次 quick-deploy 创建站点时还没有 db_index.sqlite，`write_site_files` 会回退到
+    // 粗粒度 CATA 纳入。预扫完成后必须重写一次配置，才能让本次解析立即使用精确依赖闭包，
+    // 避免“一键部署 smoke”被放大成全 CATA 解析。
+    #[cfg(feature = "sqlite-index")]
+    {
+        if should_run_db_index_prescan(&site) {
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                "🧭 db_index 预扫描中：解析进程启动前正在刷新依赖索引...",
+            );
+            let summary = run_db_index_prescan(&site, false).await;
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                &format!(
+                    "✅ db_index 预扫描完成：scanned={} skipped={} db_files={} ref0_total={} edges={} errors={}",
+                    summary.scanned,
+                    summary.skipped,
+                    summary.db_files,
+                    summary.ref0_total,
+                    summary.dependency_edges,
+                    summary.errors
+                ),
+            );
+            let (fresh_site, db_user, db_password) = task::spawn_blocking({
+                let site_id = site_id.clone();
+                move || load_site_and_credentials(&site_id)
+            })
+            .await
+            .context("读取站点凭据失败 (join error)")??;
+            task::spawn_blocking({
+                let site = fresh_site.clone();
+                move || write_site_files(&site, &db_user, &db_password)
+            })
+            .await
+            .context("刷新站点解析配置失败 (join error)")??;
+            site = fresh_site;
+        } else {
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                "⏭️ 跳过 db_index 预扫描：未启用自动关联依赖；系统库补齐由解析计划直接处理。",
+            );
+        }
+    }
 
     let started_db_pid =
         ensure_site_db_started(&site, site.status.clone(), site.pipeline_db_mode).await?;
     let parse_result = spawn_parse_process(site_id.clone()).await;
 
     if let Some(db_pid) = started_db_pid {
-        let _ = kill_pid(db_pid).await;
+        let _ = kill_pid_guarded(&site_id, PROC_ROLE_DB, db_pid).await;
         let _ = update_runtime(
             &site_id,
             RuntimeUpdate {
@@ -6669,13 +7816,74 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
 }
 
 async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<()> {
-    let site = task::spawn_blocking({
+    let mut site = task::spawn_blocking({
         let site_id = site_id.clone();
         move || get_site(&site_id)
     })
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
+
+    if parse_first && site.parse_status != ManagedSiteParseStatus::Parsed {
+        let parse_started_at = now_rfc3339();
+        update_runtime(
+            &site.site_id,
+            RuntimeUpdate {
+                status: Some(ManagedSiteStatus::Draft),
+                parse_status: Some(ManagedSiteParseStatus::Running),
+                parse_pid: Some(None),
+                last_error: Some(None),
+                last_parse_started_at: Some(Some(parse_started_at)),
+                last_parse_finished_at: Some(None),
+                last_parse_duration_ms: Some(None),
+                ..Default::default()
+            },
+        )?;
+    }
+
+    // 完整部署/生成会在 `parse_first=true` 时直接调用 `spawn_parse_process`，
+    // 不经过 `run_parse_pipeline`。这里同样要在首次解析前刷新 db_index 并重写解析配置，
+    // 否则 quick-deploy + gen_model 会继续使用建站时的粗粒度 CATA 列表。
+    #[cfg(feature = "sqlite-index")]
+    if parse_first && site.parse_status != ManagedSiteParseStatus::Parsed {
+        if should_run_db_index_prescan(&site) {
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                "🧭 db_index 预扫描中：模型生成前正在刷新依赖索引...",
+            );
+            let summary = run_db_index_prescan(&site, false).await;
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                &format!(
+                    "✅ db_index 预扫描完成：scanned={} skipped={} db_files={} ref0_total={} edges={} errors={}",
+                    summary.scanned,
+                    summary.skipped,
+                    summary.db_files,
+                    summary.ref0_total,
+                    summary.dependency_edges,
+                    summary.errors
+                ),
+            );
+            let (fresh_site, db_user, db_password) = task::spawn_blocking({
+                let site_id = site_id.clone();
+                move || load_site_and_credentials(&site_id)
+            })
+            .await
+            .context("读取站点凭据失败 (join error)")??;
+            task::spawn_blocking({
+                let site = fresh_site.clone();
+                move || write_site_files(&site, &db_user, &db_password)
+            })
+            .await
+            .context("刷新站点解析配置失败 (join error)")??;
+            site = fresh_site;
+        } else {
+            append_log_line(
+                &parse_log_path(&site.site_id),
+                "⏭️ 跳过 db_index 预扫描：未启用自动关联依赖；系统库补齐由解析计划直接处理。",
+            );
+        }
+    }
 
     let started_db_pid =
         ensure_site_db_started(&site, ManagedSiteStatus::Starting, site.pipeline_db_mode).await?;
@@ -6702,7 +7910,7 @@ async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<(
     .await;
 
     if let Some(db_pid) = started_db_pid {
-        let _ = kill_pid(db_pid).await;
+        let _ = kill_pid_guarded(&site_id, PROC_ROLE_DB, db_pid).await;
         let _ = update_runtime(
             &site_id,
             RuntimeUpdate {
@@ -6713,6 +7921,11 @@ async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<(
     }
 
     result
+}
+
+async fn run_generation_then_start_pipeline(site_id: String, parse_first: bool) -> Result<()> {
+    run_generation_pipeline(site_id.clone(), parse_first).await?;
+    run_start_pipeline(site_id).await
 }
 
 async fn run_deploy_pipeline(site_id: String) -> Result<()> {
@@ -7086,7 +8299,7 @@ pub async fn generate_site(site_id: String, parse_first: bool) -> Result<()> {
         },
     )?;
     tokio::spawn(async move {
-        if let Err(err) = run_generation_pipeline(site_id.clone(), parse_first).await {
+        if let Err(err) = run_generation_then_start_pipeline(site_id.clone(), parse_first).await {
             if site_was_stopped_by_user(&site_id) {
                 return;
             }
@@ -7101,6 +8314,63 @@ pub async fn generate_site(site_id: String, parse_first: bool) -> Result<()> {
             );
         }
     });
+    Ok(())
+}
+
+/// 重新部署前的清理：若运行中先停站（释放 DB 锁/子进程）→ 删除旧数据目录
+/// （`<runtime>/data/`，即 SurrealDB 数据，保留 DbOption 配置与站点注册行）→
+/// 重置状态为 Draft/Pending。之后由调用方提交 `DeployManagedSite` 任务重新走
+/// 「解析 → 生成 → 启动」全流程。
+pub async fn redeploy_reset_site(site_id: &str) -> Result<()> {
+    let site = task::spawn_blocking({
+        let site_id = site_id.to_string();
+        move || get_site(&site_id)
+    })
+    .await
+    .context("读取站点状态失败 (join error)")??
+    .ok_or_else(|| anyhow!("站点不存在"))?;
+
+    // 1) 运行中/解析中则先停站，给子进程释放文件句柄留出时间。
+    let needs_stop = site_has_active_processes(&site)
+        || matches!(
+            site.status,
+            ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+        )
+        || site.parse_status == ManagedSiteParseStatus::Running;
+    if needs_stop {
+        let _ = stop_site(site_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+
+    // 2) 删除旧数据目录（保留 DbOption.toml / 注册行 / 日志）。
+    let data_dir = site_runtime_dir(site_id).join("data");
+    task::spawn_blocking(move || -> Result<()> {
+        if data_dir.exists() {
+            fs::remove_dir_all(&data_dir)
+                .with_context(|| format!("删除旧数据目录失败: {}", data_dir.display()))?;
+        }
+        Ok(())
+    })
+    .await
+    .context("删除旧数据失败 (join error)")??;
+
+    // 3) 重置状态为草稿/待解析，清理 pid、错误与解析时间戳。
+    update_runtime(
+        site_id,
+        RuntimeUpdate {
+            status: Some(ManagedSiteStatus::Draft),
+            parse_status: Some(ManagedSiteParseStatus::Pending),
+            db_pid: Some(None),
+            web_pid: Some(None),
+            viewer_pid: Some(None),
+            parse_pid: Some(None),
+            last_error: Some(None),
+            last_parse_started_at: Some(None),
+            last_parse_finished_at: Some(None),
+            last_parse_duration_ms: Some(None),
+            ..Default::default()
+        },
+    )?;
     Ok(())
 }
 
@@ -7873,7 +9143,7 @@ fn build_remote_site_config(
     set_toml_integer(table, "surreal_port", target.remote_db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
     set_toml_string(table, "surreal_password", db_password.to_string());
-    set_toml_string(table, "surreal_script_dir", "resource/surreal");
+    set_toml_string(table, "surreal_script_dir", resolve_surreal_script_dir());
 
     let web_server = ensure_table(table, "web_server");
     set_toml_integer(web_server, "port", target.remote_web_port as i64);
@@ -8896,18 +10166,21 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     )?;
 
     // 顺序：生产者先停（parse、web），消费者（db）最后停，避免 parse 写库时 db 突然消失。
+    // 用守卫式 kill：仅在 (pid, 启动时刻) 与登记一致时才杀，防 PID 复用误杀。
     if let Some(pid) = site.parse_pid {
-        kill_pid(pid).await?;
+        kill_pid_guarded(site_id, PROC_ROLE_PARSE, pid).await?;
     }
     if let Some(pid) = site.viewer_pid {
-        kill_pid(pid).await?;
+        kill_pid_guarded(site_id, PROC_ROLE_VIEWER, pid).await?;
     }
     if let Some(pid) = site.web_pid {
-        kill_pid(pid).await?;
+        kill_pid_guarded(site_id, PROC_ROLE_WEB, pid).await?;
     }
     if let Some(pid) = site.db_pid {
-        kill_pid(pid).await?;
+        kill_pid_guarded(site_id, PROC_ROLE_DB, pid).await?;
     }
+    // 兜底清理本站点的全部进程登记（覆盖 pid 为 None 未走 kill 的角色与历史残留行）。
+    unregister_site_processes(site_id);
 
     let web_conflict_pids = process_ids_on_port(site.web_port).await.unwrap_or_default();
     let db_conflict_pids = process_ids_on_port(site.db_port).await.unwrap_or_default();
@@ -9043,6 +10316,7 @@ pub fn delete_site(site_id: &str) -> Result<bool> {
         )?;
         Ok(rows)
     })?;
+    unregister_site_processes(site_id);
     let runtime = site_runtime_dir(site_id);
     if runtime.exists() {
         if let Err(err) = fs::remove_dir_all(&runtime) {
@@ -9635,6 +10909,15 @@ fn current_stage(
             "parsing".to_string(),
             "解析中".to_string(),
             parse_detail.or(Some("解析任务正在运行".to_string())),
+        );
+    }
+    if site.parse_status == ManagedSiteParseStatus::Running {
+        return (
+            "parse-preparing".to_string(),
+            "解析准备中".to_string(),
+            parse_detail.or(Some(
+                "解析进程启动前正在准备依赖索引或数据库环境".to_string(),
+            )),
         );
     }
     if matches!(site.status, ManagedSiteStatus::Starting) {

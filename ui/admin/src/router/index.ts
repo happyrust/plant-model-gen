@@ -1,5 +1,6 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { OFFLINE_DEPLOY_ENABLED } from '@/lib/features'
 
 function normalizeRedirectTarget(value: unknown) {
   if (typeof value !== 'string' || !value.startsWith('/')) {
@@ -22,7 +23,7 @@ const router = createRouter({
       component: () => import('@/components/layout/MainLayout.vue'),
       meta: { requiresAuth: true },
       children: [
-        { path: '', redirect: '/offline-deploy' },
+        { path: '', redirect: '/sites' },
         {
           path: 'sites',
           name: 'sites',
@@ -36,7 +37,9 @@ const router = createRouter({
         {
           path: 'offline-deploy',
           name: 'offline-deploy',
-          component: () => import('@/views/OfflineDeployView.vue'),
+          ...(OFFLINE_DEPLOY_ENABLED
+            ? { component: () => import('@/views/OfflineDeployView.vue') }
+            : { redirect: '/sites' }),
         },
         {
           path: 'sites/:id',

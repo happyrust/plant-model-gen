@@ -30,6 +30,7 @@ import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from '@/components/sites/parse-db-types'
 import { parsePlanClass, siteActionLabelMap } from '@/components/sites/site-status'
+import { OFFLINE_DEPLOY_ENABLED } from '@/lib/features'
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
@@ -50,6 +51,7 @@ import type { TaskInfo, TaskStatus } from '@/types/task'
 const route = useRoute()
 const router = useRouter()
 const sitesStore = useSitesStore()
+const offlineDeployEnabled = OFFLINE_DEPLOY_ENABLED
 
 const site = ref<ManagedProjectSite | null>(null)
 const runtime = ref<ManagedSiteRuntimeStatus | null>(null)
@@ -509,7 +511,7 @@ async function fetchDeployTask() {
 
 
 async function fetchRemoteDeployStatus() {
-  if (!siteId.value) return
+  if (!offlineDeployEnabled || !siteId.value) return
   try {
     remoteDeployStatus.value = await sitesApi.remoteDeployStatus(siteId.value)
     remoteDeployError.value = ''
@@ -519,7 +521,7 @@ async function fetchRemoteDeployStatus() {
 }
 
 async function handleRemotePreflight() {
-  if (!siteId.value) return
+  if (!offlineDeployEnabled || !siteId.value) return
   remotePreflightLoading.value = true
   try {
     remoteDeployStatus.value = await sitesApi.remotePreflight(siteId.value, { target: remoteTargetForm.value })
@@ -532,7 +534,7 @@ async function handleRemotePreflight() {
 }
 
 async function handleRemotePrepare() {
-  if (!siteId.value) return
+  if (!offlineDeployEnabled || !siteId.value) return
   remotePrepareLoading.value = true
   try {
     remoteDeployStatus.value = await sitesApi.remotePrepare(siteId.value, { target: remoteTargetForm.value })
@@ -545,7 +547,7 @@ async function handleRemotePrepare() {
 }
 
 async function handleRemoteDeploy() {
-  if (!siteId.value) return
+  if (!offlineDeployEnabled || !siteId.value) return
   remoteDeployLoading.value = true
   try {
     remoteDeployStatus.value = await sitesApi.remotePreflight(siteId.value, { target: remoteTargetForm.value })
@@ -889,7 +891,9 @@ async function handleDeploy() {
     await fetchAll()
     await fetchPreflight()
     await fetchDeployValidation()
-    await fetchRemoteDeployStatus()
+    if (offlineDeployEnabled) {
+      await fetchRemoteDeployStatus()
+    }
   } catch {
     // 错误已写入 store，页面横幅会显示
   }
@@ -934,7 +938,7 @@ useAdminSitesStream({
 
 const { start: startPolling } = usePolling(fetchAll, 10000)
 const { start: startDeployTaskPolling } = usePolling(async () => {
-  if (activeTab.value === 'deploy') {
+  if (offlineDeployEnabled && activeTab.value === 'deploy') {
     await fetchRemoteDeployStatus()
   }
   if (!deployTaskId.value) return
@@ -942,7 +946,9 @@ const { start: startDeployTaskPolling } = usePolling(async () => {
   if (deployTask.value?.status === 'Completed' || deployTask.value?.status === 'Failed' || deployTask.value?.status === 'Cancelled') {
     await fetchAll()
     await fetchDeployValidation()
-    await fetchRemoteDeployStatus()
+    if (offlineDeployEnabled) {
+      await fetchRemoteDeployStatus()
+    }
   }
 }, 3000)
 
@@ -951,7 +957,9 @@ onMounted(async () => {
   if (activeTab.value === 'deploy') {
     await fetchPreflight()
     await fetchDeployValidation()
-    await fetchRemoteDeployStatus()
+    if (offlineDeployEnabled) {
+      await fetchRemoteDeployStatus()
+    }
   }
   startPolling()
   startDeployTaskPolling()
@@ -1448,7 +1456,7 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="rounded-lg border border-border bg-card p-5">
+      <div v-if="offlineDeployEnabled" class="rounded-lg border border-border bg-card p-5">
         <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 class="text-base font-medium">离线远端部署向导</h3>

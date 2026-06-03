@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-03
+
+### Changed — Admin 离线部署入口默认隐藏
+
+> 离线/远端部署仍处于敏感能力阶段，默认不再在 admin 中展示，需显式开启前端开关后才可访问。
+
+- `ui/admin/src/lib/features.ts`：新增 `VITE_ENABLE_OFFLINE_DEPLOY` feature flag，默认关闭，仅接受 `1/true/yes/on` 作为开启值。
+- `AppHeader.vue` / `router/index.ts`：顶部导航默认隐藏「离线部署」，admin 根路由默认进入「站点管理」；直接访问 `/offline-deploy` 时在开关关闭下重定向到 `/sites`。
+- `SiteDetailView.vue`：站点详情的「离线远端部署向导」默认不渲染，且关闭开关时不再请求远端部署状态接口。
+- 验证：
+  - `ReadLints` 无错误。
+  - `git diff --check` 通过。
+  - `npm install --no-package-lock` 在本机执行时卡住，已中止；未完成 `npm run build`。
+
 ## 2026-06-02
 
 ### Fixed — 站点部署生成后自动启动与运行态对账修复

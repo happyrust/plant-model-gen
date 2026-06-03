@@ -3,18 +3,19 @@ import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { Server, ListTodo, LogOut, DatabaseBackup, Network, PackageOpen } from 'lucide-vue-next'
+import { OFFLINE_DEPLOY_ENABLED } from '@/lib/features'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
-const navItems = [
+const navItems = computed(() => [
   { path: '/sites', label: '站点管理', icon: Server },
-  { path: '/offline-deploy', label: '离线部署', icon: PackageOpen },
+  ...(OFFLINE_DEPLOY_ENABLED ? [{ path: '/offline-deploy', label: '离线部署', icon: PackageOpen }] : []),
   { path: '/registry', label: '中心注册表', icon: DatabaseBackup },
   { path: '/collaboration', label: '异地协同', icon: Network },
   { path: '/tasks', label: '任务管理', icon: ListTodo },
-]
+])
 
 const currentPath = computed(() => '/' + (route.path.split('/')[1] ?? ''))
 

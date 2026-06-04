@@ -34,6 +34,7 @@ function Wait-HttpOk([string]$Url, [int]$TimeoutSec) {
 $Root = Resolve-InstallRoot
 $WebServer = Join-Path $Root "bin/web_server.exe"
 $LogDir = Join-Path $Root "logs"
+$AdminSitesUrl = "http://127.0.0.1:$Port/admin/#/sites"
 $ViewerUrl = "http://127.0.0.1:$Port/viewer/"
 
 if (-not (Test-Path -LiteralPath $WebServer -PathType Leaf)) {
@@ -43,6 +44,10 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $env:WEB_SERVER_PORT = "$Port"
 $env:Path = (Join-Path $Root "bin/surreal") + ";" + $env:Path
+$env:ADMIN_USER = "admin"
+$env:ADMIN_PASS = "admin"
+$env:AIOS_ALLOW_WEAK_DB_CREDS = "1"
+$env:AIOS_ALLOW_PUBLIC_BIND = "1"
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $stdout = Join-Path $LogDir "web_server-$stamp.out.log"
@@ -50,6 +55,7 @@ $stderr = Join-Path $LogDir "web_server-$stamp.err.log"
 $args = @("--config", $Config)
 
 Write-Host "Starting Plant3D AIOS from $Root" -ForegroundColor Cyan
+Write-Host "Admin Sites: $AdminSitesUrl" -ForegroundColor Cyan
 Write-Host "Viewer: $ViewerUrl" -ForegroundColor Cyan
 
 $process = Start-Process `
@@ -66,7 +72,7 @@ if (-not (Wait-HttpOk "http://127.0.0.1:$Port/api/version" 90)) {
     Write-Warning "  $stdout"
     Write-Warning "  $stderr"
 } elseif (-not $NoBrowser) {
-    Start-Process $ViewerUrl
+    Start-Process $AdminSitesUrl
 }
 
 Write-Host "PID: $($process.Id)"

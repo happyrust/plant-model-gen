@@ -1,0 +1,166 @@
+name: Release Dist Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: "Build profile packaged by scripts/package/build-windows-bundle.ps1"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+          - both
+      frontend_ref:
+        description: "plant3d-web ref to package"
+        required: true
+        default: "main"
+        type: string
+      surreal_version:
+        description: "Bundled SurrealDB version"
+        required: true
+        default: "3.1.0-alpha"
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  package-windows-dist:
+    name: Package Windows dist
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout plant-model-gen
+        uses: actions/checkout@v4
+        with:
+          path: plant-model-gen
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Checkout plant3d-web
+        uses: actions/checkout@v4
+        with:
+          repository: happyrust/plant3d-web
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.frontend_ref || 'main' }}
+          path: plant3d-web
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Configure private Git dependencies
+        shell: pwsh
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if ($env:GH_PAT) {
+            git config --global url."https://$env:GH_PAT@github.com/".insteadOf "https://github.com/"
+          }
+          git config --global fetch.depth 0
+
+      - name: Prepare local patch dependencies
+        working-directory: plant-model-gen
+        shell: bash
+        run: ./shells/prepare_ci_patch_deps.sh
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plant-model-gen
+          shared-key: release-dist-package-windows
+          cache-on-failure: true
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          $nasmDir = "C:\Program Files\NASM"
+          if (Test-Path -LiteralPath (Join-Path $nasmDir "nasm.exe")) {
+            Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
+          }
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: plant3d-web/package-lock.json
+
+      - name: Install plant3d-web dependencies
+        working-directory: plant3d-web
+        shell: pwsh
+        run: npm ci
+
+      - name: Resolve package metadata
+        id: package_meta
+        shell: pwsh
+        run: |
+          $refName = "${{ github.ref_name }}"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $refName = "manual-${{ github.run_number }}-${{ github.sha }}"
+          }
+          $safeRef = $refName -replace '[^A-Za-z0-9._-]', '-'
+          $bundleName = "Plant3D-AIOS-win-x64-$safeRef"
+          "bundle_name=$bundleName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "build_profile=${{ github.event_name == 'workflow_dispatch' && inputs.build_profile || 'release' }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "surreal_version=${{ github.event_name == 'workflow_dispatch' && inputs.surreal_version || '3.1.0-alpha' }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build dist package
+        working-directory: plant-model-gen
+        shell: pwsh
+        run: |
+          ./scripts/package/build-windows-bundle.ps1 `
+            -FrontendRoot "${{ github.workspace }}\plant3d-web" `
+            -OutputRoot "dist\package" `
+            -BundleName "${{ steps.package_meta.outputs.bundle_name }}" `
+            -BuildProfile "${{ steps.package_meta.outputs.build_profile }}" `
+            -SurrealVersion "${{ steps.package_meta.outputs.surreal_version }}" `
+            -DebugCodegenBackend llvm
+
+      - name: Verify package archive
+        id: archive
+        working-directory: plant-model-gen
+        shell: pwsh
+        run: |
+          $archives = Get-ChildItem -LiteralPath "dist\package" -Filter "*.zip" -File
+          if (-not $archives) {
+            throw "No package zip was produced under dist\package"
+          }
+          $archives | Format-Table Name, Length, LastWriteTime
+          "zip_count=$($archives.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_meta.outputs.bundle_name }}
+          path: plant-model-gen/dist/package/*.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach package to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: plant-model-gen/dist/package/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

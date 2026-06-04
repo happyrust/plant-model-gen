@@ -2,9 +2,13 @@ param(
     [string]$FrontendRoot = "",
     [string]$OutputRoot = "",
     [string]$BundleName = "Plant3D-AIOS-win-x64",
-    [string]$SurrealVersion = "2.3.10",
+    [ValidateSet("release", "debug", "both")]
+    [string]$BuildProfile = "both",
+    [string]$SurrealVersion = "3.1.0-alpha",
     [string]$SurrealExePath = "",
     [string]$SurrealSha256 = "",
+    [ValidateSet("cranelift", "llvm")]
+    [string]$DebugCodegenBackend = "cranelift",
     [switch]$SkipBackendBuild,
     [switch]$SkipFrontendBuild,
     [switch]$SkipZip,
@@ -25,12 +29,16 @@ if (-not $OutputRoot) {
 
 $PackageRoot = Join-Path $OutputRoot $BundleName
 $TargetTriple = "x86_64-pc-windows-msvc"
-$BackendExe = Join-Path $RepoRoot "target/$TargetTriple/release/web_server.exe"
-$AiosDatabaseExe = Join-Path $RepoRoot "target/$TargetTriple/release/aios-database.exe"
 $FrontendDist = Join-Path $FrontendRoot "dist"
+$AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
-$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export"
+$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,kv-rocksdb"
+if ($BuildProfile -eq "both") {
+    $RequestedProfiles = @("release", "debug")
+} else {
+    $RequestedProfiles = @($BuildProfile)
+}
 
 function Step([string]$Message) {
     Write-Host ""
@@ -40,6 +48,66 @@ function Step([string]$Message) {
 function Require-File([string]$Path, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "$Label not found: $Path"
+    }
+}
+
+function Get-ProfileTargetDir([string]$Profile) {
+    return Join-Path (Join-Path $RepoRoot "target/$TargetTriple") $Profile
+}
+
+function Get-ProfileExe([string]$Profile, [string]$ExeName) {
+    return Join-Path (Get-ProfileTargetDir $Profile) $ExeName
+}
+
+function Get-CargoProfileArgs([string]$Profile) {
+    if ($Profile -eq "release") {
+        return @("--release")
+    }
+    return @()
+}
+
+function Get-ProfileCodegenBackend([string]$Profile) {
+    if ($Profile -eq "debug") {
+        return $DebugCodegenBackend
+    }
+    return "llvm"
+}
+
+function Test-DebugCraneliftEnabled([string]$Profile) {
+    return $Profile -eq "debug" -and $DebugCodegenBackend -eq "cranelift"
+}
+
+function Assert-CraneliftAvailable {
+    $rustup = Get-Command rustup -ErrorAction SilentlyContinue
+    if (-not $rustup) {
+        throw "rustup is required for debug Cranelift builds. Install rustup or rerun with -DebugCodegenBackend llvm."
+    }
+
+    $installed = & rustup +nightly component list --installed 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "nightly toolchain is required for debug Cranelift builds. Run: rustup toolchain install nightly"
+    }
+
+    $hasCranelift = $installed | Where-Object {
+        $_ -match '^rustc-codegen-cranelift(-preview)?-'
+    } | Select-Object -First 1
+    if (-not $hasCranelift) {
+        throw "rustc_codegen_cranelift is required for debug builds. Run: rustup +nightly component add rustc-codegen-cranelift"
+    }
+}
+
+function Invoke-BackendCargoBuild([string]$Profile) {
+    $profileArgs = Get-CargoProfileArgs $Profile
+    if (Test-DebugCraneliftEnabled $Profile) {
+        Assert-CraneliftAvailable
+        Write-Host "Using rustc_codegen_cranelift for debug backend build (profile.dev in .cargo/config.toml)" -ForegroundColor Yellow
+        & cargo +nightly build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+    } else {
+        & cargo build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed for $Profile profile"
     }
 }
 
@@ -147,13 +215,35 @@ function Download-SurrealExe([string]$Version, [string]$DestinationExe) {
     throw "Unable to download SurrealDB v$Version for Windows x64"
 }
 
+function Get-SurrealVersionText([string]$ExePath) {
+    try {
+        return ((& $ExePath version 2>$null) -join " ")
+    } catch {
+        return "unknown"
+    }
+}
+
+function Test-SurrealVersion([string]$ExePath, [string]$ExpectedVersion) {
+    if (-not $ExpectedVersion) { return $true }
+    $text = Get-SurrealVersionText $ExePath
+    return $text -like "$ExpectedVersion*"
+}
+
 function Resolve-SurrealExe() {
     if ($SurrealExePath) {
         Require-File $SurrealExePath "SurrealDB executable"
+        if (-not (Test-SurrealVersion $SurrealExePath $SurrealVersion)) {
+            $actual = Get-SurrealVersionText $SurrealExePath
+            throw "SurrealDB executable version mismatch: expected $SurrealVersion, actual $actual"
+        }
         return [System.IO.Path]::GetFullPath($SurrealExePath)
     }
     if (Test-Path -LiteralPath $SurrealCacheExe -PathType Leaf) {
-        return $SurrealCacheExe
+        if (Test-SurrealVersion $SurrealCacheExe $SurrealVersion) {
+            return $SurrealCacheExe
+        }
+        $actual = Get-SurrealVersionText $SurrealCacheExe
+        Write-Warning "Cached SurrealDB version mismatch: expected $SurrealVersion, actual $actual. Downloading replacement."
     }
     return Download-SurrealExe $SurrealVersion $SurrealCacheExe
 }
@@ -162,6 +252,10 @@ function Update-PackageDbOption([string]$Path) {
     $updates = @{
         "__root__.meshes_path" = '"./assets/meshes"'
         "__root__.surreal_script_dir" = '"resource/surreal"'
+        "__root__.surreal_ip" = '"127.0.0.1"'
+        "__root__.surreal_port" = "8020"
+        "__root__.surreal_user" = '"root"'
+        "__root__.surreal_password" = '"root"'
         "web_server.port" = "3100"
         "web_server.auto_start_surreal" = "true"
         "web_server.surreal_bin" = '"bin/surreal/surreal.exe"'
@@ -170,30 +264,75 @@ function Update-PackageDbOption([string]$Path) {
         "web_server.surreal_user" = '"root"'
         "web_server.surreal_password" = '"root"'
         "surrealdb.mode" = '"ws"'
+        "surrealdb.ip" = '"127.0.0.1"'
+        "surrealdb.port" = "8020"
+        "surrealdb.user" = '"root"'
+        "surrealdb.password" = '"root"'
         "surrealdb.path" = '"runtime/surrealdb"'
         "surrealkv.mode" = '"file"'
         "surrealkv.path" = '"runtime/surrealkv"'
     }
+    $sectionOrder = @("__root__", "web_server", "surrealdb", "surrealkv")
+    $keysBySection = @{
+        "__root__" = @("meshes_path", "surreal_script_dir", "surreal_ip", "surreal_port", "surreal_user", "surreal_password")
+        "web_server" = @("port", "auto_start_surreal", "surreal_bin", "surreal_data_path", "surreal_bind", "surreal_user", "surreal_password")
+        "surrealdb" = @("mode", "ip", "port", "user", "password", "path")
+        "surrealkv" = @("mode", "path")
+    }
     $section = "__root__"
     $seen = @{}
     $lines = Get-Content -LiteralPath $Path
-    $out = foreach ($line in $lines) {
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
         if ($line -match '^\s*\[([^\]]+)\]\s*$') {
+            Add-MissingPackageDbOptionKeys $out $updates $keysBySection $seen $section
             $section = $Matches[1]
-            $line
+            $out.Add($line)
             continue
         }
         if ($line -match '^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$') {
             $fullKey = "$section.$($Matches[2])"
             if ($updates.ContainsKey($fullKey)) {
                 $seen[$fullKey] = $true
-                "$($Matches[1])$($Matches[2])$($Matches[3])$($updates[$fullKey])"
+                $out.Add("$($Matches[1])$($Matches[2])$($Matches[3])$($updates[$fullKey])")
                 continue
             }
         }
-        $line
+        $out.Add($line)
+    }
+    Add-MissingPackageDbOptionKeys $out $updates $keysBySection $seen $section
+    foreach ($targetSection in $sectionOrder) {
+        Add-MissingPackageDbOptionKeys $out $updates $keysBySection $seen $targetSection $true
     }
     Set-Content -LiteralPath $Path -Value $out -Encoding UTF8
+}
+
+function Add-MissingPackageDbOptionKeys(
+    [System.Collections.Generic.List[string]]$Out,
+    [hashtable]$Updates,
+    [hashtable]$KeysBySection,
+    [hashtable]$Seen,
+    [string]$Section,
+    [bool]$CreateSection = $false
+) {
+    if (-not $KeysBySection.ContainsKey($Section)) { return }
+    $missing = @()
+    foreach ($key in $KeysBySection[$Section]) {
+        $fullKey = "$Section.$key"
+        if ($Updates.ContainsKey($fullKey) -and -not $Seen.ContainsKey($fullKey)) {
+            $missing += $key
+        }
+    }
+    if ($missing.Count -eq 0) { return }
+    if ($CreateSection -and $Section -ne "__root__") {
+        $Out.Add("")
+        $Out.Add("[$Section]")
+    }
+    foreach ($key in $missing) {
+        $fullKey = "$Section.$key"
+        $Out.Add("$key = $($Updates[$fullKey])")
+        $Seen[$fullKey] = $true
+    }
 }
 
 Step "Validate input repositories"
@@ -203,19 +342,29 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "Cargo.toml"))) {
 if (-not (Test-Path -LiteralPath (Join-Path $FrontendRoot "package.json"))) {
     throw "Frontend repo not found: $FrontendRoot"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $AdminStaticDist "index.html") -PathType Leaf)) {
+    throw "Admin static dist not found: $AdminStaticDist"
+}
 if (-not $SkipBackendBuild) {
-    Step "Build backend web_server and aios-database"
-    Assert-NasmAvailable
+    Step "Build backend web_server, offline_deployer and aios-database ($($RequestedProfiles -join ', '))"
+    $env:CARGO_INCREMENTAL = "1"
+    if ($RequestedProfiles -contains "release") {
+        Assert-NasmAvailable
+    }
     Push-Location $RepoRoot
     try {
-        & cargo build --release --bin web_server --bin aios-database --target $TargetTriple --no-default-features --features $Features
-        if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+        foreach ($profile in $RequestedProfiles) {
+            Invoke-BackendCargoBuild $profile
+        }
     } finally {
         Pop-Location
     }
 }
-Require-File $BackendExe "Backend executable"
-Require-File $AiosDatabaseExe "aios-database executable"
+foreach ($profile in $RequestedProfiles) {
+    Require-File (Get-ProfileExe $profile "web_server.exe") "$profile backend executable"
+    Require-File (Get-ProfileExe $profile "offline_deployer.exe") "$profile offline deployer executable"
+    Require-File (Get-ProfileExe $profile "aios-database.exe") "$profile aios-database executable"
+}
 
 if (-not $SkipFrontendBuild) {
     Step "Build plant3d-web for /viewer/"
@@ -241,66 +390,77 @@ Step "Resolve bundled SurrealDB"
 $ResolvedSurreal = Resolve-SurrealExe
 Require-File $ResolvedSurreal "SurrealDB executable"
 Assert-Sha256 $ResolvedSurreal $SurrealSha256
-$surrealVersionText = ""
-try {
-    $surrealVersionText = (& $ResolvedSurreal version 2>$null) -join " "
-} catch {
-    $surrealVersionText = "unknown"
-}
+$surrealVersionText = Get-SurrealVersionText $ResolvedSurreal
 $surrealSha = Get-FileSha256 $ResolvedSurreal
-$aiosDatabaseSha = Get-FileSha256 $AiosDatabaseExe
 
 Step "Create package layout"
 if (Test-Path -LiteralPath $PackageRoot) {
     Remove-Item -LiteralPath $PackageRoot -Recurse -Force
 }
-foreach ($dir in @("bin", "bin/surreal", "viewer", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $PackageRoot $dir) | Out-Null
-}
-
-Copy-Item -LiteralPath $BackendExe -Destination (Join-Path $PackageRoot "bin/web_server.exe") -Force
-Copy-Item -LiteralPath $AiosDatabaseExe -Destination (Join-Path $PackageRoot "bin/aios-database.exe") -Force
-Copy-Item -LiteralPath $ResolvedSurreal -Destination (Join-Path $PackageRoot "bin/surreal/surreal.exe") -Force
-Copy-Tree $FrontendDist (Join-Path $PackageRoot "viewer")
+New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
 if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
     throw "Surreal resource directory not found: $SurrealResourceDir"
 }
-Copy-Tree $SurrealResourceDir (Join-Path $PackageRoot "resource/surreal")
-Copy-Item -Path (Join-Path $RepoRoot "db_options/*") -Destination (Join-Path $PackageRoot "db_options") -Recurse -Force
-Update-PackageDbOption (Join-Path $PackageRoot "db_options/DbOption.toml")
+foreach ($profile in $RequestedProfiles) {
+    $profilePackageRoot = Join-Path $PackageRoot $profile
+    foreach ($dir in @("bin", "bin/surreal", "viewer", "src/web_server/static/admin", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $profilePackageRoot $dir) | Out-Null
+    }
 
-Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.ps1") -Destination (Join-Path $PackageRoot "start-plant3d.ps1") -Force
-Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.ps1") -Destination (Join-Path $PackageRoot "install-service.ps1") -Force
+    $backendExe = Get-ProfileExe $profile "web_server.exe"
+    $offlineDeployerExe = Get-ProfileExe $profile "offline_deployer.exe"
+    $aiosDatabaseExe = Get-ProfileExe $profile "aios-database.exe"
+    $aiosDatabaseSha = Get-FileSha256 $aiosDatabaseExe
 
-$buildInfo = [ordered]@{
-    name = "Plant3D AIOS Windows x64"
-    bundle = $BundleName
-    builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    target = $TargetTriple
-    backendCommit = Get-GitCommit $RepoRoot
-    frontendCommit = Get-GitCommit $FrontendRoot
-    surrealVersion = $SurrealVersion
-    surrealVersionText = $surrealVersionText
-    surrealSha256 = $surrealSha
-    surrealBundled = $true
-    aiosDatabaseBundled = $true
-    aiosDatabaseSha256 = $aiosDatabaseSha
-    databaseDataIncluded = $false
-    webPort = 3100
-    viewerUrl = "http://127.0.0.1:3100/viewer/"
-}
-$buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $PackageRoot "BUILD_INFO.json") -Encoding UTF8
+    Copy-Item -LiteralPath $backendExe -Destination (Join-Path $profilePackageRoot "bin/web_server.exe") -Force
+    Copy-Item -LiteralPath $offlineDeployerExe -Destination (Join-Path $profilePackageRoot "offline_deployer.exe") -Force
+    Copy-Item -LiteralPath $aiosDatabaseExe -Destination (Join-Path $profilePackageRoot "bin/aios-database.exe") -Force
+    Copy-Item -LiteralPath $ResolvedSurreal -Destination (Join-Path $profilePackageRoot "bin/surreal/surreal.exe") -Force
+    Copy-Tree $FrontendDist (Join-Path $profilePackageRoot "viewer")
+    Copy-Tree $AdminStaticDist (Join-Path $profilePackageRoot "src/web_server/static/admin")
+    Copy-Tree $SurrealResourceDir (Join-Path $profilePackageRoot "resource/surreal")
+    Copy-Item -Path (Join-Path $RepoRoot "db_options/*") -Destination (Join-Path $profilePackageRoot "db_options") -Recurse -Force
+    Update-PackageDbOption (Join-Path $profilePackageRoot "db_options/DbOption.toml")
 
-@"
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.bat") -Destination (Join-Path $profilePackageRoot "start-plant3d.bat") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.bat") -Destination (Join-Path $profilePackageRoot "install-service.bat") -Force
+
+    $buildInfo = [ordered]@{
+        name = "Plant3D AIOS Windows x64"
+        bundle = $BundleName
+        profile = $profile
+        builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        target = $TargetTriple
+        rustCodegenBackend = Get-ProfileCodegenBackend $profile
+        cargoIncremental = $true
+        backendCommit = Get-GitCommit $RepoRoot
+        frontendCommit = Get-GitCommit $FrontendRoot
+        surrealVersion = $SurrealVersion
+        surrealVersionText = $surrealVersionText
+        surrealSha256 = $surrealSha
+        surrealBundled = $true
+        aiosDatabaseBundled = $true
+        aiosDatabaseSha256 = $aiosDatabaseSha
+        databaseDataIncluded = $false
+        webPort = 3100
+        viewerUrl = "http://127.0.0.1:3100/viewer/"
+        offlineDeployWizardUrl = "http://127.0.0.1:3100/admin/#/offline-deploy"
+        offlineDeployExe = "offline_deployer.exe"
+        startupScript = "start-plant3d.bat"
+        serviceScript = "install-service.bat"
+    }
+    $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $profilePackageRoot "BUILD_INFO.json") -Encoding UTF8
+
+    @'
 # Plant3D AIOS Windows x64 安装说明
 
 ## 快速启动
 
 1. 解压整个目录，不要只复制 `bin`。
-2. 双击或在 PowerShell 中运行：
+2. 双击或在命令提示符中运行：
 
-```powershell
-.\start-plant3d.ps1
+```bat
+start-plant3d.bat
 ```
 
 3. 浏览器打开：
@@ -309,23 +469,44 @@ $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Pack
 http://127.0.0.1:3100/viewer/
 ```
 
-## 后台自启动
+## 离线部署向导
 
-以管理员 PowerShell 运行：
+如果只想打开"把本机站点推送到远端服务器"的安装部署向导，双击：
 
-```powershell
-.\install-service.ps1 -RunNow
+```bat
+offline_deployer.exe
 ```
 
-该脚本使用 Windows 计划任务启动 `start-plant3d.ps1 -NoBrowser`，确保工作目录固定为安装根目录。
+它会启动同一个 Rust Web 服务，并自动打开：
+
+```text
+http://127.0.0.1:3100/admin/#/offline-deploy
+```
+
+## 后台自启动
+
+以管理员命令提示符运行：
+
+```bat
+install-service.bat /RunNow
+```
+
+该脚本使用 Windows 计划任务启动 `start-plant3d.bat /NoBrowser`，确保工作目录固定为安装根目录。
+卸载自启动任务：
+
+```bat
+install-service.bat /Uninstall
+```
 
 ## 目录说明
 
 - `bin/web_server.exe`：后端服务。
+- `offline_deployer.exe`：离线部署向导入口，启动本地网页并打开 `/admin/#/offline-deploy`。
 - `bin/aios-database.exe`：站点部署/解析使用的数据库导入执行文件。
 - `bin/surreal/surreal.exe`：随包分发的 SurrealDB。
 - `resource/surreal/`：初始化函数与 `att_meta` 属性元数据脚本。
 - `viewer/`：plant3d-web 静态前端，挂载在 `/viewer/`。
+- `src/web_server/static/admin/`：站点部署管理后台，挂载在 `/admin`。
 - `db_options/DbOption.toml`：默认运行配置。
 - `runtime/surrealdb/`：目标电脑首次启动时创建的新 SurrealDB 数据目录；安装包不包含本机数据库数据。
 - `runtime/surrealkv/`：预留的空运行目录；安装包不复制本机数据库数据。
@@ -346,12 +527,33 @@ port = 3100
 surreal_bind = "127.0.0.1:8020"
 ```
 
-修改后重新运行 `start-plant3d.ps1 -Port <新端口>`。
-"@ | Set-Content -LiteralPath (Join-Path $PackageRoot "README-安装说明.md") -Encoding UTF8
+修改后重新运行 `start-plant3d.bat /Port <新端口>`。
+'@ | Set-Content -LiteralPath (Join-Path $profilePackageRoot "README-安装说明.md") -Encoding UTF8
+}
+
+@'
+# Plant3D AIOS Windows x64 版本说明
+
+本目录按构建 profile 保留可并存的完整安装包：
+
+- `release/`：发布版，适合正式部署和性能验证。
+- `debug/`：调试版，适合快速迭代、日志分析和本机问题复现。
+
+进入对应目录后运行：
+
+```bat
+start-plant3d.bat
+```
+'@ | Set-Content -LiteralPath (Join-Path $PackageRoot "README-版本说明.md") -Encoding UTF8
 
 if (-not $SkipZip) {
     Step "Create zip archive"
-    $zipPath = Join-Path $OutputRoot "$BundleName.zip"
+    if ($BuildProfile -eq "both") {
+        $zipName = "$BundleName.zip"
+    } else {
+        $zipName = "$BundleName-$BuildProfile.zip"
+    }
+    $zipPath = Join-Path $OutputRoot $zipName
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force
     }

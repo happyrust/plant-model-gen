@@ -30,6 +30,7 @@ if (-not $OutputRoot) {
 $PackageRoot = Join-Path $OutputRoot $BundleName
 $TargetTriple = "x86_64-pc-windows-msvc"
 $FrontendDist = Join-Path $FrontendRoot "dist"
+$AdminUiRoot = Join-Path $RepoRoot "ui/admin"
 $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
@@ -342,9 +343,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "Cargo.toml"))) {
 if (-not (Test-Path -LiteralPath (Join-Path $FrontendRoot "package.json"))) {
     throw "Frontend repo not found: $FrontendRoot"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $AdminStaticDist "index.html") -PathType Leaf)) {
-    throw "Admin static dist not found: $AdminStaticDist"
-}
 if (-not $SkipBackendBuild) {
     Step "Build backend web_server, offline_deployer and aios-database ($($RequestedProfiles -join ', '))"
     $env:CARGO_INCREMENTAL = "1"
@@ -384,6 +382,29 @@ if (-not $SkipFrontendBuild) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $FrontendDist "index.html") -PathType Leaf)) {
     throw "Frontend dist missing: $FrontendDist"
+}
+
+if (Test-Path -LiteralPath (Join-Path $AdminUiRoot "package.json") -PathType Leaf) {
+    Step "Build admin UI for /admin/static/"
+    Push-Location $AdminUiRoot
+    try {
+        if (Test-Path -LiteralPath (Join-Path $AdminUiRoot "package-lock.json") -PathType Leaf) {
+            & npm ci
+        } else {
+            & npm install --no-package-lock
+        }
+        if ($LASTEXITCODE -ne 0) { throw "admin dependency install failed" }
+
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw "admin build failed" }
+    } finally {
+        Pop-Location
+    }
+} else {
+    Step "Use committed admin static assets"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $AdminStaticDist "index.html") -PathType Leaf)) {
+    throw "Admin static dist not found: $AdminStaticDist"
 }
 
 Step "Resolve bundled SurrealDB"

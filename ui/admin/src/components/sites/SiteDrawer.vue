@@ -304,6 +304,7 @@ function applySitePreset(preset: ManagedSiteFormPreset) {
     manual_db_nums: manualDbNums,
     parse_db_types: normalizeParseDbTypes(presetForm.parse_db_types ?? []),
     force_rebuild_system_db: presetForm.force_rebuild_system_db ?? false,
+    auto_parse_related_dbnums: presetForm.auto_parse_related_dbnums ?? false,
     gen_model: presetForm.gen_model ?? true,
     gen_mesh: presetForm.gen_mesh ?? false,
     gen_spatial_tree: presetForm.gen_spatial_tree ?? true,

@@ -101,9 +101,9 @@ function Invoke-BackendCargoBuild([string]$Profile) {
     if (Test-DebugCraneliftEnabled $Profile) {
         Assert-CraneliftAvailable
         Write-Host "Using rustc_codegen_cranelift for debug backend build (profile.dev in .cargo/config.toml)" -ForegroundColor Yellow
-        & cargo +nightly build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        & cargo +nightly build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
     } else {
-        & cargo build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        & cargo build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
     }
 
     if ($LASTEXITCODE -ne 0) {

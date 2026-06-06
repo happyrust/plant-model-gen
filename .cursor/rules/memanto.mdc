@@ -1,0 +1,63 @@
+---
+description: MEMANTO — active memory companion. Mandatory rules for storing, recalling, and answering from persistent memory.
+alwaysApply: true
+---
+
+<!-- MEMANTO-MANAGED-SECTION -->
+
+# MEMANTO — Your Active Memory Companion
+
+**MEMANTO is not a passive store. It is an active companion agent that works alongside you.**
+Don't treat MEMANTO like a static blob you query once and forget. It's a teammate you keep
+talking to — every preference, decision, and correction flows through it. MEMANTO remembers,
+recalls, and answers so you hold context across sessions, honor prior decisions, and avoid
+repeating mistakes the user already corrected. Every memory operation in this session goes
+through MEMANTO.
+
+> **CRITICAL**: All `memanto` commands are **shell commands**. Always run them in the terminal.
+> Never simulate or "pretend to call" them. If you cannot run the shell, say so explicitly
+> instead of inventing memory state.
+
+## NON-NEGOTIABLE RULES
+
+1. **Sync and read `MEMORY.md` at session start.** Run `memanto memory sync --project-dir .`
+   then read `MEMORY.md` in the project root. It holds the user's preferences, facts,
+   goals, instructions, decisions, and commitments from every prior session. You MUST
+   honor what is written there.
+2. **Search memory before saying you don't know.** If the user asks about past context,
+   an earlier decision, a preference, or anything you are unsure about, you MUST run
+   `recall` or `answer` first.
+3. **Store proactively. Do not wait to be asked.** The moment a memory-worthy event
+   happens — a preference stated, a decision made, a fact learned, an instruction given,
+   a goal set, a mistake corrected — run `memanto remember` immediately, in the same turn.
+4. **Always pass full metadata to `remember`.** Every call MUST include `--type`,
+   `--confidence`, `--provenance`, and `--source <your_agent_name>`. Never let these
+   default.
+5. **All memory operations go through MEMANTO.** No mental scratch pads, no "I'll
+   remember this next time." If it matters beyond this turn, it goes into MEMANTO.
+
+## Memory Operations — Use the Right One
+
+```bash
+memanto recall "query"      # raw memory chunks — for context-building, multi-step work
+memanto answer "question"   # one synthesized, grounded answer — for direct questions
+memanto recall --recent     # newest first, no query needed
+memanto recall --changed-since "last 7 days"
+memanto remember "content" --type <type> --confidence <0.0-1.0> --provenance <provenance> --source <agent_name>
+memanto memory sync --project-dir .
+```
+
+Do NOT always default to `recall`. `recall` returns raw chunks (best for context-building);
+`answer` returns one grounded synthesis (best for "what did we decide / prefer / commit
+to?"). Equal priority — pick by intent.
+
+**Memory types**: `fact`, `preference`, `instruction`, `decision`, `event`, `goal`,
+`commitment`, `observation`, `learning`, `relationship`, `context`, `artifact`, `error`.
+
+**Provenance**: `explicit_statement`, `inferred`, `observed`, `corrected`, `validated`,
+`imported`.
+
+**Confidence**: `1.0` for explicit user statements; `0.9-0.95` strong consensus;
+`0.8-0.85` for patterns seen 3+ times; below `0.6` — do not store.
+
+<!-- /MEMANTO-MANAGED-SECTION -->

@@ -15,6 +15,12 @@ import { apiGet } from '@/api/client'
 
 export interface AdminAppConfig {
   viewer_base_url?: string | null
+  viewer_base_url_source?: 'env' | 'local_ip' | string | null
+}
+
+export interface ViewerBaseUrlResolution {
+  url: string
+  source: 'env' | 'local_ip' | 'vite' | 'runtime'
 }
 
 const configRef = ref<AdminAppConfig>({})
@@ -40,6 +46,7 @@ export function loadAppConfig(): Promise<void> {
       const resp = await apiGet<AdminAppConfig>('/api/admin/app-config')
       configRef.value = {
         viewer_base_url: normalizeBase(resp?.viewer_base_url),
+        viewer_base_url_source: resp?.viewer_base_url_source ?? null,
       }
     } catch (err) {
       // Not fatal: fall back to Vite env / null in the resolver below.
@@ -57,10 +64,28 @@ export function loadAppConfig(): Promise<void> {
  *   runtime 后端配置 → Vite build-time env → null
  */
 export function resolveViewerBaseUrl(): string | null {
+  return resolveViewerBaseUrlInfo()?.url ?? null
+}
+
+/**
+ * 带来源解析 Viewer 基础 URL：
+ *   runtime 后端配置 → Vite build-time env → null
+ *
+ * `source=local_ip` 表示后端只是探测了机器 IP，不代表 Nginx 已经接管 80 端口；
+ * 调用方若有站点 `viewer_port`，应拼成 `http://<local-ip>:<viewer_port>`。
+ */
+export function resolveViewerBaseUrlInfo(): ViewerBaseUrlResolution | null {
   const runtime = normalizeBase(configRef.value.viewer_base_url)
-  if (runtime) return runtime
+  if (runtime) {
+    const source = configRef.value.viewer_base_url_source
+    return {
+      url: runtime,
+      source: source === 'env' || source === 'local_ip' ? source : 'runtime',
+    }
+  }
   const viteEnv = import.meta.env.VITE_VIEWER_BASE as string | undefined
-  return normalizeBase(viteEnv)
+  const viteBase = normalizeBase(viteEnv)
+  return viteBase ? { url: viteBase, source: 'vite' } : null
 }
 
 /** 测试 / 调试：直接读取当前缓存的配置对象。 */

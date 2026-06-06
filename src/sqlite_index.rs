@@ -41,7 +41,8 @@ impl SqliteAabbIndex {
             CREATE TABLE IF NOT EXISTS items (
                 id INTEGER PRIMARY KEY,
                 noun TEXT,
-                spec_value INTEGER NOT NULL DEFAULT 0
+                spec_value INTEGER NOT NULL DEFAULT 0,
+                dbnum INTEGER
             );
             -- 3D AABB RTree: id, [min_x, max_x], [min_y, max_y], [min_z, max_z]
             CREATE VIRTUAL TABLE IF NOT EXISTS aabb_index USING rtree(
@@ -55,6 +56,7 @@ impl SqliteAabbIndex {
             "ALTER TABLE items ADD COLUMN spec_value INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN dbnum INTEGER", []);
         Ok(())
     }
 
@@ -205,6 +207,59 @@ impl SqliteAabbIndex {
         tx.commit()?;
         Ok(count)
     }
+
+    pub fn replace_dbnum_aabbs_with_items_and_spec_values<I>(
+        &self,
+        dbnum: u32,
+        iter: I,
+    ) -> Result<usize>
+    where
+        I: IntoIterator<Item = (i64, String, i64, f64, f64, f64, f64, f64, f64)>,
+    {
+        let mut conn = Connection::open(&self.path)?;
+        Self::configure(&conn)?;
+        self.init_schema()?;
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM aabb_index WHERE id IN (SELECT id FROM items WHERE dbnum = ?1)",
+            params![dbnum],
+        )?;
+        tx.execute("DELETE FROM items WHERE dbnum = ?1", params![dbnum])?;
+
+        // Clean up legacy Parquet imports that encoded the export dbnum into the
+        // RTree id instead of preserving the real refno_u64.
+        let start = ((dbnum as u64) << 32) as i64;
+        let end = ((((dbnum as u64) + 1) << 32) - 1) as i64;
+        tx.execute(
+            "DELETE FROM aabb_index WHERE id BETWEEN ?1 AND ?2",
+            params![start, end],
+        )?;
+        tx.execute(
+            "DELETE FROM items WHERE id BETWEEN ?1 AND ?2",
+            params![start, end],
+        )?;
+
+        let mut count = 0;
+        {
+            let mut aabb_stmt = tx.prepare(
+                "INSERT OR REPLACE INTO aabb_index \
+                 (id, min_x, max_x, min_y, max_y, min_z, max_z) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut item_stmt = tx.prepare(
+                "INSERT OR REPLACE INTO items (id, noun, spec_value, dbnum) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (id, noun, spec_value, minx, maxx, miny, maxy, minz, maxz) in iter {
+                aabb_stmt.execute(params![id, minx, maxx, miny, maxy, minz, maxz])?;
+                item_stmt.execute(params![id, noun, spec_value, dbnum])?;
+                count += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
 }
 
 // ============================================================================
@@ -228,6 +283,44 @@ impl Default for ImportConfig {
         }
     }
 }
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+#[derive(Debug, Clone, Copy)]
+struct ParquetAabbBounds {
+    minx: f64,
+    maxx: f64,
+    miny: f64,
+    maxy: f64,
+    minz: f64,
+    maxz: f64,
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+impl ParquetAabbBounds {
+    fn merge(&mut self, other: Self) {
+        self.minx = self.minx.min(other.minx);
+        self.maxx = self.maxx.max(other.maxx);
+        self.miny = self.miny.min(other.miny);
+        self.maxy = self.maxy.max(other.maxy);
+        self.minz = self.minz.min(other.minz);
+        self.maxz = self.maxz.max(other.maxz);
+    }
+
+    fn as_sqlite_parts(self) -> (f64, f64, f64, f64, f64, f64) {
+        (
+            self.minx, self.maxx, self.miny, self.maxy, self.minz, self.maxz,
+        )
+    }
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+struct OwnerAabbAggregate {
+    noun: String,
+    bounds: ParquetAabbBounds,
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+type SqliteAabbRow = (i64, String, i64, f64, f64, f64, f64, f64, f64);
 
 /// 将 refno 字符串（如 "17496_170764"）转换为 i64
 /// 格式：(dbnum << 32) + refno
@@ -255,6 +348,584 @@ pub fn i64_to_refno_str(id: i64) -> String {
     let dbnum = (id >> 32) as u32;
     let refno = (id & 0xFFFFFFFF) as u32;
     format!("{}_{}", dbnum, refno)
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_string_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<&'a arrow_array::StringArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<arrow_array::StringArray>())
+        .ok_or_else(|| anyhow::anyhow!("{} 缺少 Utf8 列 `{}`", path.display(), name))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_f64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<&'a arrow_array::Float64Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<arrow_array::Float64Array>())
+        .ok_or_else(|| anyhow::anyhow!("{} 缺少 Float64 列 `{}`", path.display(), name))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_u64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<&'a arrow_array::UInt64Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<arrow_array::UInt64Array>())
+        .ok_or_else(|| anyhow::anyhow!("{} 缺少 UInt64 列 `{}`", path.display(), name))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_optional_u64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<Option<&'a arrow_array::UInt64Array>> {
+    match batch.column_by_name(name) {
+        Some(column) => column
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("{} 列 `{}` 不是 UInt64", path.display(), name)),
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_u32_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    name: &str,
+    path: &Path,
+) -> anyhow::Result<&'a arrow_array::UInt32Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|column| column.as_any().downcast_ref::<arrow_array::UInt32Array>())
+        .ok_or_else(|| anyhow::anyhow!("{} 缺少 UInt32 列 `{}`", path.display(), name))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_required_string<'a>(
+    column: &'a arrow_array::StringArray,
+    row: usize,
+    column_name: &str,
+    path: &Path,
+) -> anyhow::Result<&'a str> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        anyhow::bail!("{} 第 {} 行 `{}` 为空", path.display(), row, column_name);
+    }
+    Ok(column.value(row))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_optional_string<'a>(
+    column: &'a arrow_array::StringArray,
+    row: usize,
+) -> Option<&'a str> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        None
+    } else {
+        Some(column.value(row))
+    }
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_required_f64(
+    column: &arrow_array::Float64Array,
+    row: usize,
+    column_name: &str,
+    path: &Path,
+) -> anyhow::Result<f64> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        anyhow::bail!("{} 第 {} 行 `{}` 为空", path.display(), row, column_name);
+    }
+    Ok(column.value(row))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_required_u64(
+    column: &arrow_array::UInt64Array,
+    row: usize,
+    column_name: &str,
+    path: &Path,
+) -> anyhow::Result<u64> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        anyhow::bail!("{} 第 {} 行 `{}` 为空", path.display(), row, column_name);
+    }
+    Ok(column.value(row))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_optional_u64(column: &arrow_array::UInt64Array, row: usize) -> Option<u64> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        None
+    } else {
+        Some(column.value(row))
+    }
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+fn parquet_required_u32(
+    column: &arrow_array::UInt32Array,
+    row: usize,
+    column_name: &str,
+    path: &Path,
+) -> anyhow::Result<u32> {
+    use arrow_array::Array;
+
+    if column.is_null(row) {
+        anyhow::bail!("{} 第 {} 行 `{}` 为空", path.display(), row, column_name);
+    }
+    Ok(column.value(row))
+}
+
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+impl SqliteAabbIndex {
+    pub fn refresh_dbnum_from_parquet_dir<P: AsRef<Path>>(
+        &self,
+        dbnum: u32,
+        parquet_dir: P,
+    ) -> anyhow::Result<ImportStats> {
+        use anyhow::Context;
+        use std::collections::HashMap;
+
+        let parquet_dir = parquet_dir.as_ref();
+        let aabb_path = parquet_dir.join("aabb.parquet");
+        let instances_path = parquet_dir.join("instances.parquet");
+        let tubings_path = parquet_dir.join("tubings.parquet");
+
+        if !aabb_path.exists() {
+            anyhow::bail!("aabb.parquet 不存在: {}", aabb_path.display());
+        }
+        if !instances_path.exists() {
+            anyhow::bail!("instances.parquet 不存在: {}", instances_path.display());
+        }
+        if !tubings_path.exists() {
+            anyhow::bail!("tubings.parquet 不存在: {}", tubings_path.display());
+        }
+
+        let aabb_by_hash = Self::read_parquet_aabb_table(&aabb_path)?;
+        let mut rows: HashMap<i64, SqliteAabbRow> = HashMap::new();
+        let mut owner_aggs: HashMap<i64, OwnerAabbAggregate> = HashMap::new();
+        let mut owner_specs: HashMap<i64, i64> = HashMap::new();
+        let mut nouns_by_refno: HashMap<String, String> = HashMap::new();
+        let mut stats = ImportStats::default();
+
+        Self::read_parquet_instances(
+            dbnum,
+            &instances_path,
+            &aabb_by_hash,
+            &mut rows,
+            &mut owner_aggs,
+            &mut owner_specs,
+            &mut nouns_by_refno,
+            &mut stats,
+        )?;
+        Self::read_parquet_tubings(
+            dbnum,
+            &tubings_path,
+            &aabb_by_hash,
+            &nouns_by_refno,
+            &mut rows,
+            &mut owner_aggs,
+            &mut stats,
+        )?;
+
+        for (owner_id, agg) in owner_aggs {
+            let spec_value = owner_specs.get(&owner_id).copied().unwrap_or(0);
+            let should_insert = matches!(agg.noun.as_str(), "BRAN" | "HANG")
+                || (agg.noun == "EQUI" && !rows.contains_key(&owner_id));
+            if should_insert {
+                let (minx, maxx, miny, maxy, minz, maxz) = agg.bounds.as_sqlite_parts();
+                if agg.noun == "EQUI" {
+                    stats.equi_count += 1;
+                }
+                rows.insert(
+                    owner_id,
+                    (
+                        owner_id, agg.noun, spec_value, minx, maxx, miny, maxy, minz, maxz,
+                    ),
+                );
+            }
+        }
+
+        let mut items: Vec<_> = rows.into_values().collect();
+        items.sort_by_key(|row| row.0);
+        let inserted = self
+            .replace_dbnum_aabbs_with_items_and_spec_values(dbnum, items)
+            .with_context(|| {
+                format!(
+                    "从 Parquet 刷新 SQLite spatial index 失败: dbnum={}, dir={}",
+                    dbnum,
+                    parquet_dir.display()
+                )
+            })?;
+        stats.unique_count = inserted;
+        stats.total_inserted = inserted;
+        Ok(stats)
+    }
+
+    fn read_parquet_aabb_table(
+        path: &Path,
+    ) -> anyhow::Result<std::collections::HashMap<String, ParquetAabbBounds>> {
+        use anyhow::Context;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::collections::HashMap;
+        use std::fs::File;
+
+        let file = File::open(path)
+            .with_context(|| format!("打开 aabb.parquet 失败: {}", path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("读取 aabb.parquet metadata 失败: {}", path.display()))?
+            .build()
+            .with_context(|| format!("创建 aabb.parquet reader 失败: {}", path.display()))?;
+
+        let mut map = HashMap::new();
+        for batch in reader {
+            let batch = batch
+                .with_context(|| format!("读取 aabb.parquet batch 失败: {}", path.display()))?;
+            let hash_col = parquet_string_column(&batch, "aabb_hash", path)?;
+            let min_x_col = parquet_f64_column(&batch, "min_x", path)?;
+            let min_y_col = parquet_f64_column(&batch, "min_y", path)?;
+            let min_z_col = parquet_f64_column(&batch, "min_z", path)?;
+            let max_x_col = parquet_f64_column(&batch, "max_x", path)?;
+            let max_y_col = parquet_f64_column(&batch, "max_y", path)?;
+            let max_z_col = parquet_f64_column(&batch, "max_z", path)?;
+
+            for row in 0..batch.num_rows() {
+                let hash = parquet_required_string(hash_col, row, "aabb_hash", path)?;
+                let bounds = ParquetAabbBounds {
+                    minx: parquet_required_f64(min_x_col, row, "min_x", path)?,
+                    maxx: parquet_required_f64(max_x_col, row, "max_x", path)?,
+                    miny: parquet_required_f64(min_y_col, row, "min_y", path)?,
+                    maxy: parquet_required_f64(max_y_col, row, "max_y", path)?,
+                    minz: parquet_required_f64(min_z_col, row, "min_z", path)?,
+                    maxz: parquet_required_f64(max_z_col, row, "max_z", path)?,
+                };
+                Self::validate_bounds(hash, bounds, path)?;
+                map.insert(hash.to_string(), bounds);
+            }
+        }
+
+        Ok(map)
+    }
+
+    fn read_parquet_instances(
+        dbnum: u32,
+        path: &Path,
+        aabb_by_hash: &std::collections::HashMap<String, ParquetAabbBounds>,
+        rows: &mut std::collections::HashMap<i64, SqliteAabbRow>,
+        owner_aggs: &mut std::collections::HashMap<i64, OwnerAabbAggregate>,
+        owner_specs: &mut std::collections::HashMap<i64, i64>,
+        nouns_by_refno: &mut std::collections::HashMap<String, String>,
+        stats: &mut ImportStats,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(path)
+            .with_context(|| format!("打开 instances.parquet 失败: {}", path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("读取 instances.parquet metadata 失败: {}", path.display()))?
+            .build()
+            .with_context(|| format!("创建 instances.parquet reader 失败: {}", path.display()))?;
+
+        for batch in reader {
+            let batch = batch.with_context(|| {
+                format!("读取 instances.parquet batch 失败: {}", path.display())
+            })?;
+            let refno_col = parquet_string_column(&batch, "refno_str", path)?;
+            let noun_col = parquet_string_column(&batch, "noun", path)?;
+            let owner_refno_col = parquet_string_column(&batch, "owner_refno_str", path)?;
+            let owner_noun_col = parquet_string_column(&batch, "owner_noun", path)?;
+            let aabb_hash_col = parquet_string_column(&batch, "aabb_hash", path)?;
+            let spec_value_col = parquet_u64_column(&batch, "spec_value", path)?;
+            let dbnum_col = parquet_u32_column(&batch, "dbnum", path)?;
+            let refno_u64_col = parquet_optional_u64_column(&batch, "refno_u64", path)?;
+            let owner_refno_u64_col = parquet_optional_u64_column(&batch, "owner_refno_u64", path)?;
+
+            for row in 0..batch.num_rows() {
+                let row_dbnum = parquet_required_u32(dbnum_col, row, "dbnum", path)?;
+                if row_dbnum != dbnum {
+                    anyhow::bail!(
+                        "{} 第 {} 行 dbnum={}，期望 dbnum={}",
+                        path.display(),
+                        row,
+                        row_dbnum,
+                        dbnum
+                    );
+                }
+
+                let refno = parquet_required_string(refno_col, row, "refno_str", path)?;
+                let noun = parquet_required_string(noun_col, row, "noun", path)?;
+                let refno_u64 = refno_u64_col.and_then(|column| parquet_optional_u64(column, row));
+                let id = Self::required_refno_id(refno, refno_u64, dbnum, path, row)?;
+                let spec_value =
+                    Self::required_spec_value(spec_value_col, row, "spec_value", path)?;
+                let aabb_hash = parquet_required_string(aabb_hash_col, row, "aabb_hash", path)?;
+                if aabb_hash.trim().is_empty() {
+                    stats.skipped_empty_aabb_count += 1;
+                    continue;
+                }
+                let bounds = *aabb_by_hash.get(aabb_hash).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} 第 {} 行 aabb_hash={} 未在 aabb.parquet 中找到",
+                        path.display(),
+                        row,
+                        aabb_hash
+                    )
+                })?;
+
+                let (minx, maxx, miny, maxy, minz, maxz) = bounds.as_sqlite_parts();
+                rows.insert(
+                    id,
+                    (
+                        id,
+                        noun.to_string(),
+                        spec_value,
+                        minx,
+                        maxx,
+                        miny,
+                        maxy,
+                        minz,
+                        maxz,
+                    ),
+                );
+                stats.children_count += 1;
+                owner_specs.insert(id, spec_value);
+                nouns_by_refno.insert(refno.to_string(), noun.to_string());
+
+                if let Some(owner_refno) = parquet_optional_string(owner_refno_col, row)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    let owner_refno_u64 =
+                        owner_refno_u64_col.and_then(|column| parquet_optional_u64(column, row));
+                    let owner_noun =
+                        parquet_required_string(owner_noun_col, row, "owner_noun", path)?;
+                    Self::merge_owner_aggregate(
+                        dbnum,
+                        owner_refno,
+                        owner_refno_u64,
+                        owner_noun,
+                        bounds,
+                        owner_aggs,
+                        path,
+                        row,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_parquet_tubings(
+        dbnum: u32,
+        path: &Path,
+        aabb_by_hash: &std::collections::HashMap<String, ParquetAabbBounds>,
+        nouns_by_refno: &std::collections::HashMap<String, String>,
+        rows: &mut std::collections::HashMap<i64, SqliteAabbRow>,
+        owner_aggs: &mut std::collections::HashMap<i64, OwnerAabbAggregate>,
+        stats: &mut ImportStats,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(path)
+            .with_context(|| format!("打开 tubings.parquet 失败: {}", path.display()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("读取 tubings.parquet metadata 失败: {}", path.display()))?
+            .build()
+            .with_context(|| format!("创建 tubings.parquet reader 失败: {}", path.display()))?;
+
+        for batch in reader {
+            let batch = batch
+                .with_context(|| format!("读取 tubings.parquet batch 失败: {}", path.display()))?;
+            let refno_col = parquet_string_column(&batch, "tubi_refno_str", path)?;
+            let owner_refno_col = parquet_string_column(&batch, "owner_refno_str", path)?;
+            let aabb_hash_col = parquet_string_column(&batch, "aabb_hash", path)?;
+            let spec_value_col = parquet_u64_column(&batch, "spec_value", path)?;
+            let dbnum_col = parquet_u32_column(&batch, "dbnum", path)?;
+            let refno_u64_col = parquet_optional_u64_column(&batch, "tubi_refno_u64", path)?;
+            let owner_refno_u64_col = parquet_optional_u64_column(&batch, "owner_refno_u64", path)?;
+
+            for row in 0..batch.num_rows() {
+                let row_dbnum = parquet_required_u32(dbnum_col, row, "dbnum", path)?;
+                if row_dbnum != dbnum {
+                    anyhow::bail!(
+                        "{} 第 {} 行 dbnum={}，期望 dbnum={}",
+                        path.display(),
+                        row,
+                        row_dbnum,
+                        dbnum
+                    );
+                }
+
+                let refno = parquet_required_string(refno_col, row, "tubi_refno_str", path)?;
+                let refno_u64 = refno_u64_col.and_then(|column| parquet_optional_u64(column, row));
+                let id = Self::required_refno_id(refno, refno_u64, dbnum, path, row)?;
+                let spec_value =
+                    Self::required_spec_value(spec_value_col, row, "spec_value", path)?;
+                let aabb_hash = parquet_required_string(aabb_hash_col, row, "aabb_hash", path)?;
+                if aabb_hash.trim().is_empty() {
+                    stats.skipped_empty_aabb_count += 1;
+                    continue;
+                }
+                let bounds = *aabb_by_hash.get(aabb_hash).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} 第 {} 行 aabb_hash={} 未在 aabb.parquet 中找到",
+                        path.display(),
+                        row,
+                        aabb_hash
+                    )
+                })?;
+
+                let (minx, maxx, miny, maxy, minz, maxz) = bounds.as_sqlite_parts();
+                rows.insert(
+                    id,
+                    (
+                        id,
+                        "TUBI".to_string(),
+                        spec_value,
+                        minx,
+                        maxx,
+                        miny,
+                        maxy,
+                        minz,
+                        maxz,
+                    ),
+                );
+                stats.tubings_count += 1;
+
+                let owner_refno =
+                    parquet_required_string(owner_refno_col, row, "owner_refno_str", path)?;
+                if let Some(owner_noun) = nouns_by_refno.get(owner_refno) {
+                    let owner_refno_u64 =
+                        owner_refno_u64_col.and_then(|column| parquet_optional_u64(column, row));
+                    Self::merge_owner_aggregate(
+                        dbnum,
+                        owner_refno,
+                        owner_refno_u64,
+                        owner_noun,
+                        bounds,
+                        owner_aggs,
+                        path,
+                        row,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_bounds(hash: &str, bounds: ParquetAabbBounds, path: &Path) -> anyhow::Result<()> {
+        if !bounds.minx.is_finite()
+            || !bounds.maxx.is_finite()
+            || !bounds.miny.is_finite()
+            || !bounds.maxy.is_finite()
+            || !bounds.minz.is_finite()
+            || !bounds.maxz.is_finite()
+        {
+            anyhow::bail!("{} aabb_hash={} 包含非有限 bounds", path.display(), hash);
+        }
+        if bounds.minx > bounds.maxx || bounds.miny > bounds.maxy || bounds.minz > bounds.maxz {
+            anyhow::bail!("{} aabb_hash={} bounds min/max 非法", path.display(), hash);
+        }
+        Ok(())
+    }
+
+    fn sqlite_id_from_refno_u64(refno_u64: u64, path: &Path, row: usize) -> anyhow::Result<i64> {
+        i64::try_from(refno_u64).map_err(|_| {
+            anyhow::anyhow!(
+                "{} 第 {} 行 refno_u64={} 超过 SQLite RTree id 范围",
+                path.display(),
+                row,
+                refno_u64
+            )
+        })
+    }
+
+    fn required_refno_id(
+        refno: &str,
+        refno_u64: Option<u64>,
+        _dbnum: u32,
+        path: &Path,
+        row: usize,
+    ) -> anyhow::Result<i64> {
+        if let Some(refno_u64) = refno_u64 {
+            return Self::sqlite_id_from_refno_u64(refno_u64, path, row);
+        }
+
+        let id = refno_str_to_i64(refno).ok_or_else(|| {
+            anyhow::anyhow!("{} 第 {} 行 refno 格式非法: {}", path.display(), row, refno)
+        })?;
+        Ok(id)
+    }
+
+    fn required_spec_value(
+        column: &arrow_array::UInt64Array,
+        row: usize,
+        column_name: &str,
+        path: &Path,
+    ) -> anyhow::Result<i64> {
+        let value = parquet_required_u64(column, row, column_name, path)?;
+        i64::try_from(value).map_err(|_| {
+            anyhow::anyhow!(
+                "{} 第 {} 行 `{}`={} 超过 i64::MAX",
+                path.display(),
+                row,
+                column_name,
+                value
+            )
+        })
+    }
+
+    fn merge_owner_aggregate(
+        dbnum: u32,
+        owner_refno: &str,
+        owner_refno_u64: Option<u64>,
+        owner_noun: &str,
+        bounds: ParquetAabbBounds,
+        owner_aggs: &mut std::collections::HashMap<i64, OwnerAabbAggregate>,
+        path: &Path,
+        row: usize,
+    ) -> anyhow::Result<()> {
+        if !matches!(owner_noun, "BRAN" | "HANG" | "EQUI") {
+            return Ok(());
+        }
+        let owner_id = Self::required_refno_id(owner_refno, owner_refno_u64, dbnum, path, row)?;
+        owner_aggs
+            .entry(owner_id)
+            .and_modify(|agg| agg.bounds.merge(bounds))
+            .or_insert_with(|| OwnerAabbAggregate {
+                noun: owner_noun.to_string(),
+                bounds,
+            });
+        Ok(())
+    }
 }
 
 #[cfg(feature = "sqlite-index")]
@@ -855,6 +1526,7 @@ pub struct ImportStats {
     pub equi_count: usize,
     pub children_count: usize,
     pub tubings_count: usize,
+    pub skipped_empty_aabb_count: usize,
     pub total_inserted: usize,
     /// 去重后的唯一记录数
     pub unique_count: usize,
@@ -883,5 +1555,162 @@ mod tests {
         assert!(ids.contains(&1) && ids.contains(&2) && !ids.contains(&3));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(feature = "parquet-export")]
+    #[test]
+    fn refresh_dbnum_from_parquet_dir_replaces_only_target_dbnum_and_merges_owner() {
+        use arrow_array::{
+            ArrayRef, Float64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use rusqlite::Connection;
+        use std::sync::Arc;
+
+        fn write_batch(path: &Path, batch: RecordBatch) {
+            let file = fs::File::create(path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let parquet_dir = temp.path().join("parquet").join("24383");
+        fs::create_dir_all(&parquet_dir).unwrap();
+
+        let aabb_schema = Arc::new(Schema::new(vec![
+            Field::new("aabb_hash", DataType::Utf8, false),
+            Field::new("min_x", DataType::Float64, false),
+            Field::new("min_y", DataType::Float64, false),
+            Field::new("min_z", DataType::Float64, false),
+            Field::new("max_x", DataType::Float64, false),
+            Field::new("max_y", DataType::Float64, false),
+            Field::new("max_z", DataType::Float64, false),
+        ]));
+        write_batch(
+            &parquet_dir.join("aabb.parquet"),
+            RecordBatch::try_new(
+                aabb_schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["owner_direct", "child", "tubi"])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![100.0, 0.0, 2.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![100.0, 0.0, 2.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![100.0, 0.0, 2.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![101.0, 1.0, 3.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![101.0, 1.0, 3.0])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![101.0, 1.0, 3.0])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        );
+
+        let instances_schema = Arc::new(Schema::new(vec![
+            Field::new("refno_str", DataType::Utf8, false),
+            Field::new("noun", DataType::Utf8, false),
+            Field::new("owner_refno_str", DataType::Utf8, true),
+            Field::new("owner_noun", DataType::Utf8, false),
+            Field::new("aabb_hash", DataType::Utf8, false),
+            Field::new("spec_value", DataType::UInt64, false),
+            Field::new("dbnum", DataType::UInt32, false),
+        ]));
+        write_batch(
+            &parquet_dir.join("instances.parquet"),
+            RecordBatch::try_new(
+                instances_schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["24383_100", "24383_101"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["BRAN", "PIPE"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![None, Some("24383_100")])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["", "BRAN"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["owner_direct", "child"])) as ArrayRef,
+                    Arc::new(UInt64Array::from(vec![42_u64, 7_u64])) as ArrayRef,
+                    Arc::new(UInt32Array::from(vec![24383_u32, 24383_u32])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        );
+
+        let tubings_schema = Arc::new(Schema::new(vec![
+            Field::new("tubi_refno_str", DataType::Utf8, false),
+            Field::new("owner_refno_str", DataType::Utf8, false),
+            Field::new("aabb_hash", DataType::Utf8, false),
+            Field::new("spec_value", DataType::UInt64, false),
+            Field::new("dbnum", DataType::UInt32, false),
+        ]));
+        write_batch(
+            &parquet_dir.join("tubings.parquet"),
+            RecordBatch::try_new(
+                tubings_schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["24383_201"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["24383_100"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["tubi"])) as ArrayRef,
+                    Arc::new(UInt64Array::from(vec![8_u64])) as ArrayRef,
+                    Arc::new(UInt32Array::from(vec![24383_u32])) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+        );
+
+        let sqlite_path = temp.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&sqlite_path).unwrap();
+        idx.init_schema().unwrap();
+
+        let foreign_id = refno_str_to_i64("24384_1").unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![(
+            foreign_id,
+            "FOREIGN".to_string(),
+            1,
+            -1.0,
+            1.0,
+            -1.0,
+            1.0,
+            -1.0,
+            1.0,
+        )])
+        .unwrap();
+
+        let stats = idx
+            .refresh_dbnum_from_parquet_dir(24383, &parquet_dir)
+            .unwrap();
+        assert_eq!(stats.total_inserted, 3);
+
+        let conn = Connection::open(&sqlite_path).unwrap();
+        let owner_id = refno_str_to_i64("24383_100").unwrap();
+        let owner: (String, i64, f64, f64, f64, f64, f64, f64) = conn
+            .query_row(
+                "SELECT items.noun, items.spec_value, min_x, max_x, min_y, max_y, min_z, max_z \
+                 FROM aabb_index JOIN items USING(id) WHERE id = ?1",
+                [owner_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(owner.0, "BRAN");
+        assert_eq!(owner.1, 42);
+        assert_eq!(
+            (owner.2, owner.3, owner.4, owner.5, owner.6, owner.7),
+            (0.0, 3.0, 0.0, 3.0, 0.0, 3.0)
+        );
+
+        let foreign_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM aabb_index WHERE id = ?1",
+                [foreign_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(foreign_count, 1);
     }
 }

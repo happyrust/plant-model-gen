@@ -32,6 +32,10 @@ pub fn unauthorized(message: impl Into<String>) -> ApiResponse {
     response::<Value>(StatusCode::UNAUTHORIZED, false, message, None)
 }
 
+pub fn forbidden(message: impl Into<String>) -> ApiResponse {
+    response::<Value>(StatusCode::FORBIDDEN, false, message, None)
+}
+
 pub fn bad_request(message: impl Into<String>) -> ApiResponse {
     response::<Value>(StatusCode::BAD_REQUEST, false, message, None)
 }

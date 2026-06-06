@@ -119,10 +119,10 @@ impl SpatialIndexScope {
     }
 }
 
-/// 确保 spatial_index.sqlite 已从 inst_relate_aabb 刷新（进程生命周期内至多执行一次）。
+/// Legacy: 从 inst_relate_aabb 刷新 spatial_index.sqlite。
 ///
-/// `force=true` 时忽略缓存、强制重新刷新（全量 build_room_relations 使用）。
-/// `force=false` 时仅首次调用执行（单 panel cal_room_refnos 路径使用）。
+/// 生产主路径已改为 Parquet 导出成功后刷新 SQLite RTree。此函数仅保留给显式
+/// legacy/debug 重建入口，默认房间计算不得调用它作为 fallback。
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn ensure_spatial_index_ready(
     db_nums: Option<&[u32]>,
@@ -163,6 +163,18 @@ async fn ensure_spatial_index_ready(
         }
     }
     result
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+fn ensure_prebuilt_sqlite_spatial_index_ready() -> anyhow::Result<usize> {
+    let idx = SqliteSpatialIndex::with_default_path()?;
+    let stats = idx.get_stats()?;
+    if stats.total_elements == 0 {
+        anyhow::bail!(
+            "SQLite spatial index is empty; refresh is only performed after successful Parquet export"
+        );
+    }
+    Ok(stats.total_elements)
 }
 
 /// Resolve room calc config from env vars (read-only) and DbOption defaults.
@@ -1881,7 +1893,7 @@ impl Default for RoomComputeOptions {
 
             candidate_concurrency: default_candidate_concurrency(),
 
-            refresh_spatial_index: true,
+            refresh_spatial_index: false,
 
             query_from_cache: true,
 
@@ -2227,26 +2239,20 @@ async fn build_room_relations_with_cancel_and_overrides(
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     {
-        let source_aabb_count = preflight_room_compute_aabb_count(db_nums, refno_root).await?;
-        info!(
-            "[room_model] 房间计算前置检查通过: inst_relate_aabb_count={}, db_nums={:?}, refno_root={:?}",
-            source_aabb_count, db_nums, refno_root
-        );
         if let Some(ref cb) = progress_callback {
-            cb(0.02, "正在刷新 SQLite AABB 索引");
+            cb(0.02, "正在检查预建 SQLite AABB 索引");
         }
-        info!(
-            "[room_model] 开始刷新 SQLite AABB 索引: db_nums={:?}, refno_root={:?}, force_rebuild={}",
-            db_nums, refno_root, force_rebuild
-        );
-        let inserted =
-            ensure_spatial_index_ready(db_nums, refno_root.clone(), force_rebuild).await?;
-        if inserted == 0 {
-            anyhow::bail!(
-                "房间计算前置失败：SQLite AABB 索引刷新结果为空，已停止后续 room 关系写入"
+        if force_rebuild {
+            warn!(
+                "[room_model] force_rebuild 不再触发 SurrealDB/cache 刷新 SQLite spatial index；索引仅在 Parquet 导出成功后刷新"
             );
         }
-        println!("[room_model] SQLite AABB 索引刷新完成: inserted={inserted}");
+        let indexed = ensure_prebuilt_sqlite_spatial_index_ready()?;
+        info!(
+            "[room_model] 使用预建 SQLite AABB 索引: indexed={}, db_nums={:?}, refno_root={:?}",
+            indexed, db_nums, refno_root
+        );
+        println!("[room_model] 预建 SQLite AABB 索引可用: indexed={indexed}");
     }
 
     // 1. 构建房间面板映射关系
@@ -2296,15 +2302,16 @@ async fn build_room_relations_with_cancel_and_overrides(
         pregen_room_panels_into_model_cache(db_option, &room_panel_map, db_nums).await?;
 
         if let Some(ref cb) = progress_callback {
-            cb(0.15, "正在刷新模型生成后的 SQLite AABB 索引");
+            cb(0.15, "跳过 SQLite AABB 索引刷新，等待 Parquet 导出链路刷新");
         }
-        let inserted = ensure_spatial_index_ready(db_nums, refno_root.clone(), true).await?;
-        if inserted == 0 {
-            anyhow::bail!(
-                "房间计算前置失败：模型预生成后 SQLite AABB 索引刷新结果为空，已停止后续 room 关系写入"
-            );
-        }
-        println!("[room_model] 模型预生成后 SQLite AABB 索引刷新完成: inserted={inserted}");
+        let indexed = ensure_prebuilt_sqlite_spatial_index_ready()?;
+        info!(
+            "[room_model] 模型预生成后不再从 SurrealDB/cache 刷新 SQLite spatial index；继续使用预建索引 indexed={}",
+            indexed
+        );
+        println!(
+            "[room_model] SQLite spatial index refresh skipped because parquet export is required"
+        );
     }
 
     if let Some(ref token) = cancel_token {
@@ -3345,7 +3352,7 @@ pub async fn diagnose_coarse_aabb_intersection(
     panel_refno: RefnoEnum,
     expect_refnos: &[RefnoEnum],
 ) -> anyhow::Result<CoarseAabbDiagnostic> {
-    ensure_spatial_index_ready(None, None, false).await?;
+    ensure_prebuilt_sqlite_spatial_index_ready()?;
     let floor_2d = Floor2dConfig::from_env();
 
     let mut panel_aabb: Option<Aabb> = query_aabb_from_inst_relate_aabb(&[panel_refno])
@@ -3836,7 +3843,7 @@ pub async fn cal_room_refnos_with_options(
 
     // 步骤 3：粗算 - 通过空间索引查询候选构件
 
-    // 自动确保 SQLite 空间索引已从 inst_relate_aabb 刷新（进程内至多一次）
+    // Legacy option: 默认关闭。生产主路径使用 Parquet 导出后的预建 SQLite RTree。
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     if options.refresh_spatial_index_enabled() {
         ensure_spatial_index_ready(None, None, false).await?;
@@ -5487,6 +5494,8 @@ mod tests {
         assert!(options.concurrency > 0);
 
         assert!(options.candidate_concurrency > 0);
+
+        assert!(!options.refresh_spatial_index_enabled());
     }
 
     #[test]
@@ -6137,9 +6146,9 @@ pub async fn rebuild_room_relations_for_rooms_with_cancel(
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     {
         if let Some(ref cb) = progress_callback {
-            cb(0.02, "正在刷新 SQLite AABB 索引");
+            cb(0.02, "正在检查预建 SQLite AABB 索引");
         }
-        ensure_spatial_index_ready(None, None, true).await?;
+        ensure_prebuilt_sqlite_spatial_index_ready()?;
     }
 
     // 1. 查询房间面板关系
@@ -6274,7 +6283,7 @@ pub async fn update_room_relations_incremental_original(
     init_room_calc_config(&db_option);
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-    ensure_spatial_index_ready(None, None, true).await?;
+    ensure_prebuilt_sqlite_spatial_index_ready()?;
 
     // 获取所有房间面板（用于排除）
 

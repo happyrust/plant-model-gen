@@ -1846,6 +1846,31 @@ async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
         )
         .await?;
 
+        #[cfg(feature = "sqlite-index")]
+        {
+            use crate::spatial_index::SqliteSpatialIndex;
+            use crate::sqlite_index::SqliteAabbIndex;
+
+            let idx_path = SqliteSpatialIndex::default_path();
+            if let Some(parent) = idx_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let idx = SqliteAabbIndex::open(&idx_path)?;
+            let import_stats = idx.refresh_dbnum_from_parquet_dir(dbnum, &output_dir)?;
+            println!(
+                "[mbd-pipe] SQLite spatial index refreshed: dbnum={dbnum}, inserted={}, path={}",
+                import_stats.total_inserted,
+                idx_path.display()
+            );
+        }
+
+        #[cfg(not(feature = "sqlite-index"))]
+        {
+            println!(
+                "[mbd-pipe] SQLite spatial index refresh skipped because sqlite-index feature is disabled"
+            );
+        }
+
         println!(
             "[mbd-pipe] 后台导出完成: dbnum={dbnum} instances={} tubings={} ({} bytes, {:?})",
             stats.instance_count, stats.tubing_count, stats.total_bytes, stats.elapsed

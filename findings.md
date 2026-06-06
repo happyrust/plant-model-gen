@@ -1,3 +1,146 @@
+# Release 包 Nginx 客户入口开发发现
+
+## 2026-06-05 Discovery
+
+- [任务] 用户要求使用 `planning-with-files` 制定“release 部署包能否正确配置 Nginx，以及如何修复”的开发计划；本轮将 release 包 Nginx 客户入口修复计划前置为 active plan。
+- [已确认] 当前源码 `src/web_server/managed_project_sites.rs` 已有 Windows/Linux Nginx 自动配置分支：生成 `plant3d-web-<site_id>.conf`、执行 `nginx -t`、reload/start，并在缺少 Nginx 时 fallback。
+- [已确认] 当前已打出的 release 验证包 `BUILD_INFO.json` 仍是 2026-05-27 构建，`viewerUrl` 为 `http://127.0.0.1:3100/viewer/`，不是客户根路径 URL。
+- [已确认] 当前包内未发现 `nginx*` 文件，启动脚本也没有设置 `AIOS_NGINX_BIN`、`AIOS_NGINX_ROOT`、`AIOS_VIEWER_STATIC_ROOT`、`AIOS_VIEWER_BASE_URL`。
+- [不匹配] 打包脚本当前用 `VITE_BASE_PATH=/viewer/` 构建前端，并把 dist 内容复制到包内 `viewer/`；源码 Nginx 配置当前默认使用 `viewer_dir/dist` 作为 root，更像面向前端源码项目而不是 release 包静态产物。
+- [不匹配] 包内 `viewer/index.html` 引用 `/viewer/assets/...`；如果 Nginx 直接把它作为根站点 `/` 的 index，会导致资产路径与 `root` 映射不一致，除非额外 alias/rewrite。
+- [风险] Windows Nginx 分支当前调用 `render_plant3d_web_nginx_conf(site, viewer_dir, 80)`，硬编码 `listen 80`；如果 `AIOS_VIEWER_BASE_URL` 配置了端口（如 `http://host:8080`），URL 与 Nginx 监听端口会不一致。
+- [风险] 若启动脚本提前设置 `AIOS_VIEWER_BASE_URL=http://<local-ip>` 但 Nginx 没有成功启动，管理端会生成指向 80 的 URL，造成“看起来配置成功，实际不可达”。
+- [grill-me 决策] Windows release 包推荐“开箱即用”：可选捆绑 Nginx，启动脚本自动配置环境变量；Linux 推荐接管系统 Nginx，不捆绑。
+- [grill-me 决策] 推荐打两份前端产物：`viewer/` 继续服务 `/viewer/` fallback，`viewer-root/` 服务 Nginx 客户根入口 `/`。
+- [grill-me 决策] 一个 `host:port` 只绑定一个客户站点；多站点必须使用不同域名、IP 或端口，避免重新引入 `backend=` 参数。
+- [grill-me 决策] Nginx 的 `/admin/` 推荐代理到主控 `web_server` 端口，`/api/`、`/files/`、`/ws/` 代理到当前客户站点 `site.web_port`。
+- [计划] 下一步应优先修改打包布局和运行时静态 root 识别，而不是直接调 Nginx 配置模板；否则 release 包仍缺少可被 Nginx 正确服务的 root-base 前端产物。
+- [修复] `build-windows-bundle.ps1` 现在会构建两份 `plant3d-web` 静态产物：`viewer/` 使用 `VITE_BASE_PATH=/viewer/`，`viewer-root/` 使用 `VITE_BASE_PATH=/`；`BUILD_INFO.json` 和安装 README 已区分 fallback URL 与客户入口模板。
+- [修复] Windows 包支持可选复制 `tools/nginx/windows/nginx.exe` 到 `bin/nginx/nginx.exe`；缺失时仅 warning，不阻断打包。
+- [修复] `managed_project_sites.rs` 的 Nginx 模板现在优先使用 `AIOS_VIEWER_STATIC_ROOT` 或包内 `viewer-root/`，Windows listen 端口跟随 `AIOS_VIEWER_BASE_URL`，并把 `/admin/`、`/api/admin/` 代理到主控 `web_server` 端口。
+- [修复] Windows Nginx 配置/校验/reload/start 失败默认写日志并继续 `vite preview` fallback；只有 `AIOS_REQUIRE_NGINX=1` 时才返回 fatal。
+- [修复] `start-plant3d.ps1/.bat` 和 `install-service.ps1/.bat` 已增加 `EnableNginx`、`ViewerHost`、`ViewerPort`、`RequireNginx` 参数传递。
+- [修复] 当前工作树里 `ManagedProjectSite` / `CreateManagedSiteRequest` 新增生成范围字段后，`managed_project_sites.rs` 的既有构造点已补齐 `generate_db_nums` / `generate_db_files` 默认值，恢复 `web_server` 类型检查。
+- [验证] 已构建 debug 包布局 smoke：`runtime/codex-validation/nginx-package-smoke-20260605-165240/Plant3D-AIOS-win-x64/debug`。包内 `viewer/index.html` 引用 `/viewer/assets/...`，`viewer-root/index.html` 引用 `/assets/...`，`BUILD_INFO.json` 标记 `nginxStaticRoot=viewer-root`、`nginxBundled=false`。
+- [验证] 无 Nginx 场景下运行包内 `start-plant3d.ps1 -Port 3196 -NoBrowser -NoPortFallback`：脚本提示缺少 `nginx.exe` 并降级到 `/viewer/` fallback；`GET /api/version` 和 `GET /viewer/` 均返回 200，临时进程已停止。
+- [修复] 已从 Nginx 官方下载 stable Windows 包 `https://nginx.org/download/nginx-1.30.2.zip`，提取 `nginx.exe` 到 `tools/nginx/windows/nginx.exe`；SHA256 为 `f2ffb8462dc348a333f40557a9e0d9cd554a2d4501eb3a265da2c429ec99a527`。同一二进制已复制到 debug smoke 包的 `bin/nginx/nginx.exe`，便于后续 Nginx 场景验证。
+- [验证] 已构建 release 包布局 smoke：`runtime/codex-validation/nginx-release-with-bundled-20260605-170329/Plant3D-AIOS-win-x64/release`。`BUILD_INFO.json` 标记 `nginxBundled=true`、`nginxExe=bin/nginx/nginx.exe`、`nginxStaticRoot=viewer-root`；包内 Nginx SHA256 与 `tools/nginx/windows/nginx.exe` 一致。
+- [验证] bundled Nginx 启动检测 smoke：运行 `start-plant3d.ps1 -Port 3298 -EnableNginx on -RequireNginx -ViewerHost 127.0.0.1 -ViewerPort 3297`，脚本识别包内 Nginx、设置 `AIOS_VIEWER_STATIC_ROOT=viewer-root`、后端 `/api/version` 返回 200；`/api/admin/app-config` 未登录返回 401，符合管理 API 鉴权预期。
+- [修复] 真实 release 包只有 `viewer-root/` 静态产物，没有 `plant3d-web` 源码项目；原 `spawn_viewer_process` 在找不到 `plant3d-web` 时会提前跳过 Viewer/Nginx 配置。已改为：若存在 `viewer-root/index.html` 且 Nginx 配置成功，则直接用 release 静态根启动/刷新 Nginx，并返回客户 Viewer URL，不再要求 npm/vite 项目目录。
+- [验证] 已构建包含该修复的 debug smoke 包：`runtime/codex-validation/nginx-static-root-fix-20260605-171011/Plant3D-AIOS-win-x64/debug`。通过 admin API 创建最小站点并标记 Parsed 后启动，站点进入 Running，Nginx 生成 `runtime/nginx/conf/conf.d/plant3d-web-nginx-static-smoke-1780650910-3396.conf`；HTTP 验证 `GET /`、`GET /assets/<bundle>.js`、`GET /api/status`、`GET /admin/` 均返回 200，客户 URL 为 `http://127.0.0.1:3397/?output_project=NginxStaticSmoke`，无 `backend=` 参数。`/files/` location 已在生成配置中覆盖，尚缺真实文件样本做 HTTP 命中验证。
+- [验证] 已构建包含静态 root 修复的正式 release 包：`runtime/codex-validation/nginx-release-static-root-fix-20260605-172033/Plant3D-AIOS-win-x64/release`。`BUILD_INFO.json` 标记 `nginxBundled=true`、`nginxStaticRoot=viewer-root`，`bin/aios-database.exe` SHA256 与 `aiosDatabaseSha256` 一致，包内 `bin/nginx/nginx.exe` SHA256 与官方下载缓存一致。运行 `start-plant3d.ps1 -Port 3498 -EnableNginx on -RequireNginx -ViewerHost 127.0.0.1 -ViewerPort 3497` 后脚本识别 Nginx/`viewer-root`，`GET /api/version` 返回 200，临时主服务已停止。
+- [验证] 已补充 `/files/` Nginx 代理 HTTP 命中验证：在站点 `nginx-static-smoke-1780650910-3396` 的 `output_root` 下创建 `nginx-file-smoke.txt`，启动站点后请求 `GET http://127.0.0.1:3397/files/output/nginx-file-smoke.txt` 返回 200，内容命中 `nginx file proxy smoke`。临时主服务、站点和 Nginx 均已停止。
+
+## Archived Previous Findings
+
+# AMS BRAN quick deploy 解析放大开发发现
+
+## 2026-06-03 Discovery
+
+- [任务] MCP 会话要求“结合 grill-me skill，使用 planning-with-files skill 制定开发计划”；本轮将当前任务切换为 AMS BRAN quick deploy 解析放大修复计划，并把 AABB SQLite index 计划归档保留。
+- [目标] 用户要求使用 `D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams7999_0001` 作为 dbfile 自动部署，并验证 `BRAN 24383/73930` 显示。
+- [代码审查] `src/web_server/models.rs::QuickDeployTestRequest.wait` 当前默认 `true`；同步路径会等待 parse/generate/start 完成。AMS 这类大库解析会超过 HTTP 客户端超时，导致请求方误判为部署卡死，但后台进程仍可能继续运行。
+- [代码审查] `src/web_server/admin_handlers.rs::quick_deploy_site()` 直接调用 `managed_project_sites::quick_deploy_test()`；admin 部署入口当前复用测试部署语义。
+- [风险] `quick_deploy_test()` 内部持久化固定数据库凭据 `quicktest / QuickTest@2026`；这适合作 smoke，但不适合作正式 admin 归档站点的默认凭据语义。
+- [根因] `src/web_server/managed_project_sites.rs::should_run_db_index_prescan()` 当前条件是 `site.auto_parse_related_dbnums && site.manual_db_nums.is_empty()`；quick deploy 单库部署会设置 `manual_db_nums=[dbnum]`，因此不会跑 db_index 精确依赖预扫。
+- [根因] `resolve_included_db_files_detailed()` 在 `auto_parse_related_dbnums=true` 时，若启用 sqlite-index 且 `manual_db_nums` 非空，会将 `allow_type_fallback` 设为 true；精确依赖为空/失败后会 fallback 到 `RELATED_DEPENDENCY_DB_TYPES`，这会把 AMS 单 BRAN 解析放大为当前工程 CATA 粗粒度解析。
+- [结论] 旧 AMS 站点 `avevamarinesample-bran-24383-73930-20260603-215256-8081` 更像是“解析范围失控 + 同步请求超时”，不是已经完成意义上的部署失败；在修复依赖范围前继续等待不利于验证 `BRAN 24383/73930`。
+- [grill-me 决策] admin quick deploy 默认应后台化，返回 `site_id/task_id`；同步等待只保留给显式 smoke/debug。
+- [grill-me 决策] 单库 quick deploy 只要开启 `auto_parse_related_dbnums`，也应执行 db_index prescan，用精确依赖闭包补库。
+- [grill-me 决策] 精确依赖为空/失败时，默认不回退全 CATA；粗粒度 fallback 必须成为显式选项，并在响应/日志中标明风险。
+- [grill-me 决策] admin quick deploy 与 quick deploy test 应拆分凭据和语义，避免正式归档站点使用固定测试用户。
+- [修复] `QuickDeployTestResponse` 新增 `task_id`；后台 quick deploy 成功创建持久化 admin task 时会结构化返回任务 ID，不再只藏在 message/warnings 中。
+- [修复] `admin_handlers::quick_deploy_site()` 改为调用 `managed_project_sites::quick_deploy_admin()`，鉴权版 quick deploy 始终后台执行并返回 `202 Accepted`。
+- [修复] `managed_project_sites` 增加 `QuickDeployProfile`：免鉴权 test 继续使用历史 `quicktest / QuickTest@2026`，admin 入口使用 per-dbnum 默认凭据（如 `siteadmin7999` / `AdminQuickDeploy@7999`），避免正式归档站点写入固定测试用户。
+- [修复] `resolve_included_db_files_detailed()` 默认禁用 CATA type fallback；精确依赖为空/失败时仅记录 warn，继续解析目标库与必要系统/字典库。
+- [修复] `should_run_db_index_prescan()` 改为只要 `auto_parse_related_dbnums=true` 就预扫，单库 quick deploy 不再因 `manual_db_nums` 非空跳过 prescan。
+- [验证] `rustfmt --edition 2024 src/web_server/models.rs src/web_server/admin_handlers.rs src/web_server/managed_project_sites.rs` 通过。
+- [验证] `cargo check --bin web_server --features web_server` 通过；仅有上游 `pdms_io` / `parse_pdms_db` 既有 warning。
+- [验证] `ReadLints` 对 `models.rs`、`admin_handlers.rs`、`managed_project_sites.rs` 无新增诊断。
+
+## Archived Previous Findings
+
+# AABB Parquet 导入 SQLite Index 开发发现
+
+## 2026-06-03 Discovery
+
+- [任务] MCP 会话要求“结合 grill-me skill，使用 planning-with-files skill 制定开发计划”；本轮将 AABB Parquet 导入 SQLite index 计划前置写入 `task_plan.md`，并保留 quick deploy / ptset 历史计划作为归档上下文。
+- [grill-me 规则] 对能通过代码确认的问题先探索代码，不直接反问用户；本轮已核对 `src/sqlite_index.rs`、`src/cli_modes.rs`、`src/main.rs`、`src/fast_model/gen_model/orchestrator.rs`、`src/fast_model/room_model.rs`。
+- [现状] `src/sqlite_index.rs::refresh_dbnum_from_parquet_dir(dbnum, parquet_dir)` 已实现核心导入：读取 `aabb.parquet`、`instances.parquet`、`tubings.parquet`，校验 `dbnum`、`refno`、`aabb_hash`，写入 SQLite `items` 与 `aabb_index`。
+- [现状] `read_parquet_aabb_table()` 会按 `aabb_hash` 建表并校验 bounds 有限、min/max 合法；`read_parquet_instances()` 要求 `instances.parquet` 的 `dbnum/refno_str/aabb_hash/spec_value` 合法；`read_parquet_tubings()` 会写 TUBI row 并参与 owner 聚合。
+- [现状] BRAN/HANG/EQUI owner 聚合已在导入侧实现：children/tubings 的 bounds 可合并到 owner；BRAN/HANG 默认写聚合 row，EQUI 在自身没有 row 时写 owner aggregate。
+- [现状] `src/cli_modes.rs::export_dbnum_instances_parquet_mode()` 在 `export_dbnum_instances_parquet()` 成功后，feature=`sqlite-index` 时会打开 `SqliteSpatialIndex::default_path()` 并调用 `refresh_dbnum_from_parquet_dir()`。
+- [现状] `src/fast_model/room_model.rs` 明确说明生产主路径已改为 Parquet 导出成功后刷新 SQLite RTree，legacy `inst_relate_aabb` 刷新仅保留给显式 legacy/debug 重建入口。
+- [现状] `src/fast_model/gen_model/orchestrator.rs` 在 `export_parquet_after_gen` 开启时会跳过生成后 SurrealDB 刷新，并提示 SQLite spatial index 将在 Parquet 导出成功后刷新。
+- [已确认] `src/main.rs` 已有独立 `--import-spatial-index-parquet <PARQUET_DIR> --dbnum <N> [--spatial-index-output <SQLITE_PATH>]` 入口；旧 `--import-spatial-index <JSON_PATH>` 仍保留给 instances.json。
+- [已确认] quick deploy 可作为真实 Parquet 产出验收入口；本轮已用 admin 归档站点 `quicktest-250160-8080` 跑通解析、模型生成和 Parquet 导出。
+- [已确认] 房间计算前置的 SQLite RTree 消费 smoke 已通过：默认 `output/spatial_index.sqlite` 查询 `2013286704/431` 成功，返回 496 个候选并包含自身。
+- [决策建议] 独立 Parquet 导入 CLI 应纳入本轮：索引丢失/损坏时可以从已有 Parquet 包重建，不必重跑模型生成。
+- [决策建议] `tubings.parquet` 缺失默认 fatal：新导出包应始终包含空表或实表，旧包兼容应另设显式 flag。
+- [决策建议] 房间计算默认不应 legacy fallback：缺失预建 SQLite index 应提示先导出/导入索引，避免重新引入 SurrealDB 依赖。
+- [验证策略] 不运行 Rust test；按仓库规则使用 CLI、quick deploy、Parquet/SQLite 检查和房间计算 smoke。
+- [环境] 项目内 `.cursor/skills/planning-with-files` 缺少 `scripts/session-catchup.py`；本轮 catchup 命令失败但不阻塞计划制定。
+- [Phase 2 决策] 独立 Parquet 导入 CLI 已纳入本轮；它是 `spatial_index.sqlite` 丢失/损坏后的低成本重建路径，避免把索引修复绑定到模型重新导出。
+- [Phase 2 决策] 默认导入路径要求新导出包包含 `tubings.parquet`（可为空表），缺失应 fatal；旧包兼容不进入默认路径，后续若需要再加显式兼容 flag。
+- [Phase 2 决策] 多 dbnum 共用 SQLite 文件时按 `items.dbnum` 局部替换旧 rows，不删除其他 dbnum；同时保留旧错误 id range 清理，用于清掉曾经按 export dbnum 伪造的 RTree id。
+- [Phase 2 决策] 房间计算默认消费预建 SQLite index，不自动 legacy fallback；缺失 index 应提示先跑 Parquet 导出/导入，避免重新引入 SurrealDB 依赖。
+- [Phase 3 现状] `main.rs` 已提供独立入口：`--import-spatial-index-parquet <PARQUET_DIR> --dbnum <N> [--spatial-index-output <SQLITE_PATH>]`；旧 `--import-spatial-index <JSON_PATH>` 仍保留，兼容原 instances.json 脚本。
+- [Phase 3 现状] `cli_modes.rs::import_spatial_index_parquet_mode()` 已打开/初始化 SQLite，调用 `refresh_dbnum_from_parquet_dir()`，并输出 EQUI/children/tubings/total/unique 统计与 SQLite 路径；未启用 `sqlite-index + parquet-export` 时返回明确错误。
+- [验证] `cargo check --bin aios-database --no-default-features --features "review,parquet-export" --target-dir target-aabb-sqlite-cli-check` 通过（EXIT=0，只有上游 `pdms_io` 既有 warning）。
+- [Phase 4 验证] `cargo build --bin aios-database` 通过；随后使用 `runtime/quick-deploy-last-payload.json` 复跑 `POST /api/admin/quick-deploy-test`，响应 `success=true`、`data.success=true`、`generated=true`、`parse_status=Parsed`、`warnings=[]`。
+- [Phase 4 验证] quick deploy 归档站点已改用 `8022`，不再复用冲突的 `8020`；`generate.log` 显示 Parquet 写出成功：`instances=808`、`geo_instances=808`、`ptsets=0`、`transforms=547`、`aabb=517`、`manifest.json` 写入。
+- [Phase 4 验证] `ptset_export` 统计为 `cata_hashes=0`、`empty_ptset_hashes=0`、`missing_cata_hash_refnos=861`；缺失 cata_hash 只进入诊断，不再导致 quick deploy fatal。
+- [修复] `src/sqlite_index.rs` 的 Parquet 导入路径保留真实 `refno_u64` 作为 SQLite RTree id；`items` 新增 `dbnum` 列用于按导出 dbnum 局部替换。旧 schema 缺少 `refno_u64` 时才回退字符串解析。
+- [修复] `replace_dbnum_aabbs_with_items_and_spec_values()` 先删除 `items.dbnum = <dbnum>` 对应 rows，再额外清理旧版错误导入产生的 `(dbnum << 32)..((dbnum+1)<<32)` id range，避免历史污染残留。
+- [验证] 独立导入命令 `target/debug/aios-database.exe --import-spatial-index-parquet output/AvevaPlantSample/parquet/250160 --dbnum 250160 --spatial-index-output runtime/aabb-spatial-index-verify.sqlite` 成功，输出 `EQUI=3`、`Children=808`、`Tubings=0`、`total_inserted=811`、`unique=811`。
+- [验证] clean SQLite 查询结果：`aabb_index=811`、`items=811`、`items where dbnum=250160` 为 `811`；错误 id `250160/431` 不存在，真实 id `2013286704/431` 为 `EQUI` 且 `dbnum=250160`。
+- [验证] 默认 `output/spatial_index.sqlite` 经 quick deploy 复跑后：总行 `831`，`dbnum_items=811`，错误 id `250160/431` 不存在，真实 id `2013286704/431` 存在；说明本轮局部替换已清理历史错误 id，并保留其它 dbnum 既有行。
+- [验证] 默认索引 spatial smoke：`target/debug/aios-database.exe spatial query-refno 2013286704/431 --distance-mm 1000 --include-self` 返回 `success=true`、`result_count=496`，结果包含 `2013286704/431`。
+- [数据契约] 历史 Parquet 包可能存在 `instances.parquet.aabb_hash=''` 的行；这些行没有可索引 AABB，导入端应跳过并计数，不能阻塞整个 dbnum 或全量 clean rebuild。
+- [修复] `src/sqlite_index.rs` 已在 `read_parquet_instances()` 与 `read_parquet_tubings()` 中跳过空 `aabb_hash`，并记录 `ImportStats::skipped_empty_aabb_count`；非空 `aabb_hash` 找不到对应 `aabb.parquet` 记录时仍 fatal，避免掩盖真实引用损坏。
+- [验证] `output/AvevaPlantSample/parquet/250164` clean rebuild 通过，`skipped_empty_aabb_count=243`、`EQUI=2`、`Children=460`、`unique=462`；此前 fatal 的空 hash 不再阻塞导入。
+- [验证] 全仓可发现 Parquet 包 clean rebuild 通过：扫描 `output/` 与 `runtime/` 下父目录为数字且具备 `aabb.parquet/instances.parquet/tubings.parquet` 的目录，导入 13 个目录到 `runtime/spatial-index-clean-rebuild-all-aabbskip-20260603-211958.sqlite`，最终 `aabb_index=41270`、`items=41270`、`orphan_aabb=0`、`duplicate_item_ids=0`。
+- [注意] SQLite RTree `id` 当前保留真实 PDMS `refno_u64`，因此 `id >> 32` 是 `ref0` 而不是导出 `dbnum`；dbnum 归属应以 `items.dbnum` 为准。
+- [验证] 已扫描 `output/` 与 `runtime/` 下 13 个可发现 `tubings.parquet`，全部为 0 行；当前没有现成样本覆盖非空 TUBI 写入与 BRAN/HANG owner 聚合。
+- [修复] `src/cli_modes.rs::spatial_query_refno_mode()` 已增加空索引前置检查：`SqliteSpatialIndex::with_default_path()` 打开后若 `get_stats().total_elements == 0`，直接提示先完成 Parquet 导出自动刷新或运行 `--import-spatial-index-parquet` 重建。
+- [验证] 空索引 smoke 使用 `AIOS_SPATIAL_INDEX_SQLITE=runtime/spatial-index-missing-smoke.sqlite`，现在返回 `SQLite spatial index 为空... --import-spatial-index-parquet ...`；默认 `output/spatial_index.sqlite` 正常查询仍 `success=true`、`result_count=496`。
+- [残留] TUBI/BRAN-HANG 聚合需要另找或生成带非空 `tubings.parquet` 的样本；现有输出集无法覆盖。
+
+## Archived Previous Findings
+
+# ptset parquet measurement snapping 开发发现
+
+## 2026-06-03 Discovery
+
+- [任务] MCP 会话要求“使用 planning-with-files 来制定下一步开发计划”；本轮将 ptset 计划前置写入 `task_plan.md`，并保留 DuckLake 历史计划作为归档。
+- [当前阶段] ptset 功能不是从零设计阶段，而是“核心代码已落地，等待真实数据导出和浏览器验收”阶段。
+- [后端契约] `plant-model-gen/src/fast_model/export_model/export_dbnum_instances_parquet.rs` 已包含 `instances.cata_hash`、`ptsets.parquet` 写出、`manifest.tables.ptsets`、`ptset_unit` 和 `ptset_export` 诊断字段。
+- [前端 loader] `plant3d-web/src/composables/useDbnoInstancesParquetLoader.ts` 已支持 `manifest.tables.ptsets`、懒注册 `ptsets.parquet`、按 `refno -> instances.cata_hash -> ptsets` 返回 `PtsetResponse`。
+- [测量行为] `plant3d-web/src/composables/useXeokitMeasurementTools.ts` 已改为严格 ptset 语义：普通表面命中只用于确定 refno 和触发加载，最终测量点必须是 `ptset:<refno>#<point_number>`。
+- [UI 文案] `plant3d-web/src/components/tools/MeasurementPanel.vue` 已说明“测量点必须捕捉 ptset，关闭捕捉不会回退表面测量”。
+- [事实源] `cata_hash` 应被视为 PE/refno 对应实例侧数据，权威来源是 `EleGeosInfo.cata_hash` / instance info / cache，而不是从 `ptsets.parquet` 反推。
+- [风险] 当前后端导出查询从 `pe -> inst_relate -> inst_info(out)` 读取 `out[0].cata_hash`。如果真实库里该字段不稳定或为空，需要改为更直接的 PE/instance-info 来源，或者增加明确兜底；不能让 ptset 表决定 cata_hash。
+- [修正] `query_ptset_export_data()` 已改为优先读取 `out[0].cata_hash`，同时读取 `record::id(out[0])` 作为保守兜底；两者都必须通过 `is_valid_cata_hash()`，避免把 `EleGeosInfo::id_str()` 的 `refno_sesno` 退化 ID 当作 cata hash。
+- [验证] `rustfmt --edition 2024 --check src/fast_model/export_model/export_dbnum_instances_parquet.rs` 通过；`cargo check --features parquet-export --lib` 在加入 NASM PATH 后通过。
+- [阻塞] 真实 scoped Parquet 导出尚未完成。历史失败原因包括 `D:/backup-dbs/ams-8020.db LOCK` 和 `127.0.0.1:8020` 拒绝连接；下一步应先恢复数据库环境，不删除锁、不强杀未知进程。
+- [Phase 2 尝试] `127.0.0.1:8020` 当前监听的是 `runtime/admin_sites/quicktest-250160-8080/data/surreal.db`，不是目标 `D:/backup-dbs/ams-8020.db`；使用 ws 配置导出时认证失败，使用 file-mode 直连目标 RocksDB 时被 `LOCK` 阻塞。
+- [部署约束] AvevaPlantSample 的部署/导出验证默认不能直接用 `CLI + DbOption.toml` 拼配置；应使用 quick deploy test 快速生成可行配置，并在 admin 站点部署配置中归档。
+- [部署约束] quick deploy test 生成配置前必须做前置校验：`project_name` 不重名、DB 端口不冲突、站点端口不冲突等；端口校验通过后才能执行配置。
+- [Phase 2 尝试] 临时手动启动 `18020` 连接 `D:/backup-dbs/ams-8020.db` 后，`7011/AvevaPlantSample` 可连接但缺少 `inst_relate`/`pe` 表，说明该数据路径不是可用 APS 模型库；临时 `18020` SurrealDB 已停止。
+- [验证策略] 不运行 Rust/前端 test 作为默认路径；按仓库规则使用 `cargo check`、CLI 导出、Parquet/DuckDB 检查和浏览器联调。
+- [quick deploy 复跑] 已启动本地 `target/debug/web_server.exe` 并设置 `AIOS_ENABLE_QUICK_DEPLOY_TEST=1`，随后调用 `POST /api/admin/quick-deploy-test`：`project_path=AvevaPlantSample`、`db_file=aps250160_0001`、`pipeline_db_mode=ws`、`wait=true`、`force_recreate=false`、`start_site=false`。
+- [quick deploy 当前失败] 本轮复跑立即返回 `409 Conflict`，未进入解析/生成；根因是复用已有同名站点 `quicktest-250160-8080` 时保留旧 `db_port=8020`，而当前 `web_server` 自启动的主 SurrealDB 已占用 `8020`。
+- [quick deploy 证据] Admin runtime 显示 `db_port_conflict=true`、`db_conflict_pids=[59684]`；进程命令行为 `surreal start --bind 0.0.0.0:8020 --user root --pass root rocksdb://D:/backup-dbs/ams-8020.db`；归档配置 `runtime/admin_sites/quicktest-250160-8080/DbOption.toml` 中 `surreal_bind="127.0.0.1:8020"`。
+- [quick deploy 代码边界] `quick_deploy_test()` 命中同名站点后走 `update_site()`；当前更新请求没有重新分配 `db_port`，`update_site()` 在 `assert_port_available_with_conn()` 阶段检测到旧端口被外部进程占用并返回冲突。
+- [历史部署失败] `quicktest-250160-8080/logs/generate.log` 显示模型生成主体已完成，失败发生在生成后 `export_parquet_after_gen`：`query_ptset_export_data()` 的 SQL 使用 `record::id(out[0]) as inst_info_id`，查询失败导致 `Parquet 导出 dbnum=250160 失败` 和子进程退出码 1。
+- [grill-me 决策点] quick deploy 复用 failed/stopped 同名站点时，若端口来自自动 quicktest 分配，建议允许重新分配不可用端口并重写归档配置；若端口是用户显式指定，则继续严格冲突失败。
+- [Phase 2 修复确认] 当前 `quick_deploy_test()` 复用同名站点时先调用 `resolve_quicktest_reuse_ports_with_conn()`：旧自动 `db_port/web_port` 仍可用则复用，不可用则从自动端口段重新分配；显式 `web_port` 仍走 `reserve_explicit_port()`，冲突时失败，不会悄悄改用户指定端口。
+- [Phase 2 落盘路径] 重分配后的端口通过 `UpdateManagedSiteRequest { db_port, web_port }` 进入 `update_site()`；`update_site()` 在事务中调用 `assert_port_available_with_conn()` 和 `persist_site_with_conn()`，随后 `write_site_files()` 重写 `runtime/admin_sites/<site_id>/DbOption*.toml`，满足归档配置可复现要求。
+- [Phase 3 修复] `query_ptset_export_data()` 已删除 `record::id(out[0]) as inst_info_id` 和 Rust 层 `inst_info_id` fallback；主 SQL 仅读取 `in as refno`、`out[0].cata_hash`、`out[0].ptset`。缺失/非法 `cata_hash` 只计入 `missing_cata_hash_refnos`，不再让 quick deploy 的 Parquet 导出主查询因 record id fallback fatal。
+- [验证] `rustfmt --edition 2024 --check src/fast_model/export_model/export_dbnum_instances_parquet.rs` 通过；`cargo check --features parquet-export --lib` 通过（EXIT=0，只有既有依赖 warning）。
+
+## Archived Previous Findings
+
 # DuckLake ModelWriter 下一步开发发现
 
 ## 2026-05-17 Discovery
@@ -127,3 +270,34 @@
 - [优化] 总刷新耗时从 621,990ms 降到 380,072ms（**39% 减少**），瓶颈已从 Parquet 写入转移到 BFS 计算（59.7%）和 SurrealDB 写入（39.7%）。
 - [修复] Compare 冗余 SurrealDB 加载：当 `surreal` 在 `transform_compare_backends` 中时跳过重复加载，输出从 3 行变为 2 行（baseline + parquet）。
 - [确认] 优化后 Parquet compare 结果不变：loaded=143222, missing=32115, mismatched=58930, max_delta=0.000854, elapsed=1743ms，证明 batch 写入+合并与旧的增量合并在数据正确性上一致。
+
+## 2026-06-05 Viewer 独立站点 URL Findings
+
+- [现状] 原管理端 Viewer URL 会拼 `/viewer/?backend=...&output_project=...&show_dbnum=...`，这是内部调试/跨端口包装形态，不适合客户访问。
+- [用户目标] 客户访问形态应为独立 `plant3d-web` 根站点，例如 `http://123.57.182.243/?output_project=AvevaMarineSample&show_dbnum=7997`。
+- [诊断] `http://127.0.0.1:33351/viewer/` 页面和静态资源可返回 200，但 `AvevaMarineSample/parquet/manifest_7998.json`、`instances.parquet`、`geo_instances.parquet` 返回 404；模型不显示的直接原因是输出数据不存在或未导出。
+- [契约] 独立 `plant3d-web` 不应依赖 URL 中的 `backend` / `backendPort`。后端访问应由同源 Nginx 代理 `/api/`、`/files/`、`/ws/` 提供。
+- [配置] Viewer Base 应是完整 URL（scheme + host + optional port/domain），优先级为 `AIOS_VIEWER_BASE_URL` → 站点 `public_base_url/public_entry_url` → 自动探测本机 IPv4 `http://<local-ip>` → 本机 `viewer_port` fallback。
+- [多站点边界] 一个 Viewer Base URL 应绑定一个 web_server 后端；多站点并行对外服务时使用不同域名、端口或 Nginx vhost 隔离，不靠 `output_project/show_dbnum` 选择后端。
+- [实现] 已新增共享 `web_server::get_local_ip_via_udp()`，并让 `/api/admin/app-config` 与受管 `viewer_url` 都可默认返回 `http://<local-ip>`。
+- [部署] 已新增 `shells/deploy/nginx-plant3d-web.conf.example`，约定 `plant3d-web` 服务在 `/`，同源反代 `/api/`、`/files/`、`/ws/` 到目标 web_server。
+- [新增需求] Viewer 独立站点方案需要覆盖 Nginx 自动配置和自动启动/reload，不能只提供静态示例文件。
+- [自动化边界] Nginx 自动化应在 Linux/远端部署路径执行；Windows 本机开发保留 `vite preview` fallback，不强制安装 Nginx。
+- [安全边界] 自动写 `/etc/nginx/conf.d/*.conf` 和 `systemctl reload nginx` 需要 root/sudo。无权限时应输出配置文件和命令作为降级结果，而不是静默失败。
+- [验收边界] 自动化必须先 `nginx -t`，成功后再 reload/start；部署验收应检查 `/`、`/api/health`、模型 `/files/output/...` 可达性。
+- [OS 差异] Linux 远端默认走系统 Nginx：写 `/etc/nginx/conf.d/plant3d-web-<site_id>.conf`，执行 `nginx -t`，再 `systemctl reload nginx` / `nginx -s reload`。
+- [OS 差异] Windows 默认不要求 Nginx，继续用受管 `vite preview` 作为本机 fallback；只有显式配置 `AIOS_NGINX_BIN` / `AIOS_NGINX_ROOT` 时才启用 Windows Nginx 自动化。
+- [OS 差异] Windows Nginx 自动化需要处理 `nginx.exe -t -p <nginx_root>`、`nginx.exe -s reload`、路径分隔符和是否已有 nginx 进程运行；失败时回退到受管 Viewer。
+- [实现] Windows 本机已实现可选 Nginx 路径：检测 `AIOS_NGINX_BIN` 或常见 `C:\nginx\nginx.exe` / `D:\nginx\nginx.exe`；未检测到时记录日志并继续受管 `vite preview`，不阻断自动部署。
+- [实现] Windows Nginx 检测成功时使用独立 prefix：默认 `runtime/admin_sites/<site_id>/nginx`，生成 `conf/nginx.conf` 与 `conf/conf.d/plant3d-web-<site_id>.conf`，避免依赖用户原始 `nginx.conf` 是否 include `conf.d`。
+- [实现] Windows Nginx 配置校验和启动顺序为：`nginx.exe -p <prefix> -t` → `nginx.exe -p <prefix> -s reload` → reload 失败时启动 `nginx.exe -p <prefix>`。
+- [运行态验证] 临时启动 `web_server` 到 `WEB_SERVER_PORT=3198`，设置临时 `ADMIN_USER=admin` / `ADMIN_PASS=admin-pass` 后登录成功；`GET /api/admin/app-config` 返回 `viewer_base_url="http://192.168.31.60"`，证明未配置 `AIOS_VIEWER_BASE_URL` 时会默认使用本机 IPv4。
+- [兼容修复] 历史站点数据库中已有旧格式 `viewer_url`（包含 `backend=` / `data_source=parquet`）会被前端优先使用。已在 read-side API 返回前归一化旧 URL，不直接改历史 DB 行。
+- [运行态验证] 重建并重启临时 `web_server` 后，`GET /api/admin/sites` 返回的历史站点 `viewer_url` 已归一化，例如 `http://192.168.31.60/?output_project=AvevaPlantSample&show_dbnum=250164`，不再包含 `backend=` / `data_source=parquet`。
+- [端口修复] Windows 本机无 Nginx 时，默认 Viewer URL 必须带受管 Viewer 端口；否则 `http://<local-ip>/` 会落到 80 端口且不可达。已改为无 `AIOS_VIEWER_BASE_URL` / `public_base_url` 时生成 `http://<local-ip>:<viewer_port>`。
+- [绑定修复] 受管 Viewer 原先只绑定 `127.0.0.1`，导致 `http://<local-ip>:<viewer_port>` 被拒绝连接。已新增 `AIOS_VIEWER_BIND_HOST`，默认 `0.0.0.0`，保证本机 IP URL 可访问。
+- [运行态验证] 启动 `avevaplantsamplegoalfast-8084` 后，站点进入 `Running`，`viewer_port=3105`，`viewer_url=http://192.168.31.60:3105/?output_project=AvevaPlantSampleGoalFast&show_dbnum=250164`；直接请求该 URL 返回 HTTP 200，内容包含 plant3d/Vite 标识。
+- [前端硬化] `/api/admin/app-config` 现在返回 `viewer_base_url_source`。当来源是默认 `local_ip` 且站点存在 `viewer_port` 时，管理端会生成 `http://<local-ip>:<viewer_port>/...`；当来源是显式 `AIOS_VIEWER_BASE_URL` 或 `VITE_VIEWER_BASE` 时，仍按配置的 Nginx/public 入口使用。
+- [Linux Nginx 自动化] 非 Windows 受管 Viewer 启动时会尝试 `AIOS_NGINX_CONF_DIR`（默认 `/etc/nginx/conf.d`）写入 `plant3d-web-<site_id>.conf`，执行 `nginx -t`，再尝试 `systemctl reload nginx` / `systemctl enable --now nginx` / `nginx -s reload`。无 Nginx、无权限、校验失败、reload 失败都会写入 viewer 日志；校验失败不会 reload，且会继续受管 `vite preview` fallback。
+- [验证限制] 当前本机只安装 `x86_64-pc-windows-msvc` Rust target，Linux `cfg(not(windows))` 路径未能在本机做 Linux target 编译；已完成 Windows 主目标 `cargo check` 和静态 diff 检查。
+- [验证] 静态验证已完成：修改文件 `ReadLints` 无诊断，`git diff --check` 无空白错误；真实 Nginx + web_server runtime smoke 尚未执行。

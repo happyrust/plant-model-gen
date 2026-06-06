@@ -1,6 +1,11 @@
 param(
     [string]$TaskName = "Plant3D-AIOS",
     [int]$Port = 3100,
+    [ValidateSet("auto", "on", "off")]
+    [string]$EnableNginx = "on",
+    [string]$ViewerHost = "",
+    [int]$ViewerPort = 80,
+    [switch]$RequireNginx,
     [switch]$RunNow,
     [switch]$Uninstall
 )
@@ -42,7 +47,14 @@ if (-not (Test-Path -LiteralPath $StartScript -PathType Leaf)) {
     throw "start script not found: $StartScript"
 }
 
-$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`" -Port $Port -NoBrowser"
+$effectiveRequireNginx = $RequireNginx -or $EnableNginx -eq "on"
+$actionArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$StartScript`" -Port $Port -NoBrowser -EnableNginx `"$EnableNginx`" -ViewerPort $ViewerPort"
+if ($ViewerHost.Trim()) {
+    $actionArgs += " -ViewerHost `"$ViewerHost`""
+}
+if ($effectiveRequireNginx) {
+    $actionArgs += " -RequireNginx"
+}
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $actionArgs -WorkingDirectory $Root
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet `
@@ -64,7 +76,9 @@ Register-ScheduledTask `
 
 Write-Host "Registered scheduled task: $TaskName" -ForegroundColor Green
 Write-Host "Install root: $Root"
-Write-Host "Viewer URL: http://127.0.0.1:$Port/viewer/"
+Write-Host "Fallback Viewer URL: http://127.0.0.1:$Port/viewer/"
+Write-Host "Nginx mode: $EnableNginx"
+Write-Host "Nginx required: $effectiveRequireNginx"
 
 if ($RunNow) {
     Start-ScheduledTask -TaskName $TaskName

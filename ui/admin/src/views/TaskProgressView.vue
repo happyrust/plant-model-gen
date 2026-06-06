@@ -30,6 +30,16 @@ async function handleRetry(id: string) {
   await openDetail(retried.id)
 }
 
+async function handleDelete(task: TaskInfo) {
+  if (!window.confirm(`确定删除任务「${task.name}」？此操作不可撤销。`)) return
+  try {
+    await tasksStore.deleteTask(task.id)
+    if (detailTask.value?.id === task.id) closeDetail()
+  } catch (e) {
+    window.alert(e instanceof Error ? e.message : '删除任务失败')
+  }
+}
+
 async function openDetail(id: string) {
   await tasksStore.fetchTask(id)
   detailTask.value = tasksStore.currentTask
@@ -125,6 +135,8 @@ const statusConfig: Record<TaskStatus, { class: string; label: string }> = {
               <div class="flex items-center justify-end gap-1">
                 <button v-if="task.status === 'Failed'" @click="handleRetry(task.id)"
                   class="text-xs text-primary hover:underline px-2 py-1">重试</button>
+                <button v-if="task.status !== 'Running' && task.status !== 'Pending'" @click="handleDelete(task)"
+                  class="text-xs text-destructive hover:underline px-2 py-1">删除</button>
                 <ChevronRight class="h-4 w-4 text-muted-foreground" />
               </div>
             </td>

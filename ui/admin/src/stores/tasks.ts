@@ -44,8 +44,14 @@ export const useTasksStore = defineStore('tasks', () => {
     return task
   }
 
+  async function deleteTask(id: string) {
+    await tasksApi.remove(id)
+    if (currentTask.value?.id === id) currentTask.value = null
+    await fetchTasks()
+  }
+
   return {
     tasks, currentTask, loading, error,
-    fetchTasks, fetchTask, createTask, cancelTask, retryTask,
+    fetchTasks, fetchTask, createTask, cancelTask, retryTask, deleteTask,
   }
 })

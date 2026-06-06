@@ -19,6 +19,7 @@ import {
 import RegistrySiteDrawer from '@/components/registry/RegistrySiteDrawer.vue'
 import RegistryTaskDialog from '@/components/registry/RegistryTaskDialog.vue'
 import { findLinkedLocalSite, getRegistryStatusLabel } from '@/lib/registry'
+import { formatDisplayPath } from '@/lib/utils'
 import { usePolling } from '@/composables/usePolling'
 import { useRegistryStore } from '@/stores/registry'
 import { useSitesStore } from '@/stores/sites'
@@ -401,7 +402,7 @@ onMounted(async () => {
             </td>
             <td class="px-4 py-3">
               <div>{{ site.project_name || '-' }}</div>
-              <div class="text-xs text-muted-foreground">{{ site.project_path || '-' }}</div>
+              <div class="text-xs text-muted-foreground">{{ formatDisplayPath(site.project_path) || '-' }}</div>
             </td>
             <td class="px-4 py-3">
               <span

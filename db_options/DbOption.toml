@@ -99,6 +99,8 @@ location_dbs = [251181]
 file_server_host = "http://localhost:8082/assets/archives"
 remote_file_server_hosts = []
 surreal_script_dir = "../rs-core/resource/surreal"
+# quick-deploy-test 免鉴权端点默认关闭；本地演示需临时打开时再改为 true。
+admin_enable_quick_deploy_test = false
 
 # ====== 调试选项 ======
 need_sync_refno_basic = false

@@ -1520,10 +1520,6 @@ async fn process_index_tree_generation(
         "[gen_model] gen_all_geos_data 总耗时: {} ms",
         time.elapsed().as_millis()
     );
-    let touched_dbnums_vec: Vec<u32> = touched_dbnums
-        .lock()
-        .map(|s| s.iter().copied().collect())
-        .unwrap_or_default();
     perf.mark("instances_export");
 
     // ✅ 模型生成完毕后导出 instances.json（按 dbno）
@@ -1531,9 +1527,13 @@ async fn process_index_tree_generation(
         let (dbno_source, mut dbnos): (&str, Vec<u32>) =
             if let Some(nums) = db_option.inner.manual_db_nums.clone() {
                 ("manual_db_nums", nums)
-            } else if !touched_dbnums_vec.is_empty() {
-                // 优先导出本次生成实际触达的 dbnum，避免扫描全 MDB 触发无关库的 tree 缺失报错。
-                ("touched_dbnums", touched_dbnums_vec.clone())
+            } else if db_meta().ensure_loaded().is_ok() {
+                // touched_dbnums 会包含 DESI 解析过程中访问到的 CATA/DICT 引用；导出面向
+                // viewer 的实例数据时，只应该导出当前 module（通常 DESI）自己的数据库。
+                (
+                    "db_meta_module",
+                    db_meta().get_dbnums_by_type(&db_option.inner.module),
+                )
             } else {
                 (
                     "query_mdb_db_nums",
@@ -1585,48 +1585,14 @@ async fn process_index_tree_generation(
     #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
     {
         if db_option.inner.enable_sqlite_rtree && db_option.inner.gen_spatial_tree {
-            let mut sqlite_dbnums: Vec<u32> =
-                if let Some(nums) = db_option.inner.manual_db_nums.clone() {
-                    nums
-                } else {
-                    touched_dbnums_vec.clone()
-                };
-            if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
-                let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
-                sqlite_dbnums.retain(|dbnum| !exclude.contains(dbnum));
-            }
-            sqlite_dbnums.sort_unstable();
-            sqlite_dbnums.dedup();
-
-            if sqlite_dbnums.is_empty() {
-                println!("[sqlite-index] 跳过刷新：本轮未触达 dbnum");
+            if db_option.export_parquet_after_gen {
+                println!(
+                    "[sqlite-index] 跳过生成后 SurrealDB 刷新：SQLite spatial index 将在 Parquet 导出成功后刷新"
+                );
             } else {
                 println!(
-                    "[sqlite-index] 模型生成后刷新空间索引并聚合中间节点 AABB: dbnums={:?}",
-                    sqlite_dbnums
+                    "[sqlite-index] SQLite spatial index refresh skipped because parquet export is disabled"
                 );
-                match crate::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb(
-                    Some(&sqlite_dbnums),
-                    None,
-                )
-                .await
-                {
-                    Ok(count) if count > 0 => {
-                        println!("[sqlite-index] 空间索引刷新完成: inserted={count}")
-                    }
-                    Ok(_) => {
-                        return Err(anyhow::anyhow!(
-                            "gen_spatial_tree 已启用，但空间索引刷新结果为空: dbnums={sqlite_dbnums:?}"
-                        )
-                        .into());
-                    }
-                    Err(err) => {
-                        return Err(anyhow::anyhow!(
-                            "gen_spatial_tree 已启用，但空间索引刷新失败: {err:#}"
-                        )
-                        .into());
-                    }
-                }
             }
         } else if db_option.inner.enable_sqlite_rtree {
             println!("[sqlite-index] 跳过刷新：gen_spatial_tree 未启用");

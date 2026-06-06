@@ -171,13 +171,14 @@ indicatif = "0.18.1"
 rust_xlsxwriter = { version = "0.91.0", optional = true }
 
 libc = "0.2"
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
 
 # ═══════════════════════════════════════════════════════════════
 # Features 重组 (2026-05)
 # ─────────────────────────────────────────────────────────────
 # 设计原则：按"业务能力"切片，而不是按 library 切片。
-#   review          三维校审最小必要集（default）
-#   review-rocksdb  review + kv-rocksdb（需要 RocksDB 持久化时用）
+#   review          三维校审最小必要集（不含 RocksDB）
+#   review-rocksdb  review + kv-rocksdb（default 的基础能力，启用 RocksDB 持久化）
 #   web_server      基础 Web HTTP 服务（axum + 周边，不带业务扩展）
 #   gen_model       模型几何生成开关（aios_core 转发）
 #   parquet-export  Parquet 列式导出（拉 polars/arrow/ethnum，重）
@@ -185,10 +186,11 @@ libc = "0.2"
 #   excel-export    Excel 数据导出（data_to_excel，已弃用但保留 hook）
 #   kv-rocksdb      RocksDB 嵌入后端（C++ 编译重）
 #   full            完整产物，等价旧 default+web_server+parquet-export 行为
-# 历史 default 行为请用 `--features full` 复现。
+# 默认启用 kv-rocksdb 与 parquet-export，确保嵌入式 RocksDB(file) 模式和 Parquet 导出开箱可用。
+# 轻量校审构建请用 `--no-default-features --features review`。
 # ═══════════════════════════════════════════════════════════════
 [features]
-default = ["review"]
+default = ["review-rocksdb", "parquet-export"]
 
 # 三维校审最小必要集
 # 不含：polars / arrow / parquet / ethnum / RocksDB（C++ 编译重）

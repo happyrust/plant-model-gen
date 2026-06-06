@@ -297,6 +297,10 @@ pub struct DbOptionExt {
     #[serde(default = "default_false")]
     pub export_parquet_after_gen: bool,
 
+    /// 输出根目录，默认 output。项目产物写入 <output_root>/<project_name>。
+    #[serde(default)]
+    pub output_root: Option<String>,
+
     /// 预烘 TriMesh(L0) 输出目录（默认 meshes/trimesh_L0）
     #[serde(default)]
     pub trimesh_l0_dir: Option<String>,
@@ -528,16 +532,26 @@ impl DbOptionExt {
                 || self.is_noun_category_enabled(noun))
     }
 
+    /// 获取输出根目录，默认 output。
+    pub fn get_output_root(&self) -> std::path::PathBuf {
+        self.output_root
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("output"))
+    }
+
     /// 获取带 project_name 前缀的 output 基础目录
     ///
-    /// - 如果 project_name 非空，返回 `output/{project_name}`
+    /// - 如果 project_name 非空，返回 `<output_root>/{project_name}`
     /// - 如果 project_name 为空，panic 报错
     pub fn get_project_output_dir(&self) -> std::path::PathBuf {
         let project_name = &self.inner.project_name;
         if project_name.is_empty() {
             panic!("project_name 不能为空，请在配置文件中设置 project_name");
         }
-        std::path::PathBuf::from("output").join(project_name)
+        self.get_output_root().join(project_name)
     }
 
     /// 获取 model 缓存目录，默认为 output/{project_name}/instance_cache
@@ -655,6 +669,7 @@ impl From<DbOption> for DbOptionExt {
             inner: option,
             export_instances: false,
             export_parquet_after_gen,
+            output_root: None,
             trimesh_l0_dir: None,
             mqtt_server: None,
             mqtt_port: None,
@@ -951,11 +966,18 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(db_option.export_parquet);
 
+    let output_root = toml_value
+        .get("output_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
         export_instances,
         export_parquet_after_gen,
+        output_root,
         trimesh_l0_dir,
         mqtt_server: None,
         mqtt_port: None,
@@ -1042,13 +1064,18 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     if db_option_ext.enable_db_backfill {
         println!("   - enable_db_backfill: true");
     }
+    if let Some(output_root) = db_option_ext.output_root.as_deref() {
+        println!("   - output_root: {}", output_root);
+    }
 
     Ok(db_option_ext)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RegenDeleteMode, parse_regen_delete_mode, validate_data_source_mode};
+    use super::{DbOptionExt, RegenDeleteMode, parse_regen_delete_mode, validate_data_source_mode};
+    use aios_core::options::DbOption;
+    use std::path::PathBuf;
 
     #[test]
     fn data_source_mode_requires_fixed_surreal_input() {
@@ -1061,6 +1088,31 @@ mod tests {
         assert_eq!(
             parse_regen_delete_mode(Some("refno_assoc_index")),
             RegenDeleteMode::Legacy
+        );
+    }
+
+    #[test]
+    fn project_output_dir_defaults_to_output_project_name() {
+        let mut option = DbOption::default();
+        option.project_name = "demo".to_string();
+        let db_option_ext = DbOptionExt::from(option);
+
+        assert_eq!(
+            db_option_ext.get_project_output_dir(),
+            PathBuf::from("output").join("demo")
+        );
+    }
+
+    #[test]
+    fn project_output_dir_uses_configured_output_root() {
+        let mut option = DbOption::default();
+        option.project_name = "demo".to_string();
+        let mut db_option_ext = DbOptionExt::from(option);
+        db_option_ext.output_root = Some("runtime/admin_sites/site-8080/output".to_string());
+
+        assert_eq!(
+            db_option_ext.get_project_output_dir(),
+            PathBuf::from("runtime/admin_sites/site-8080/output").join("demo")
         );
     }
 }

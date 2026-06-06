@@ -10,6 +10,7 @@ import type {
   ManagedSiteStatus,
   ManagedSiteParseStatus,
   ManagedSiteActionResponse,
+  AppendManagedSiteDbFileResponse,
 } from '@/types/site'
 import type {
   AdminSiteSnapshotPayload,
@@ -17,7 +18,7 @@ import type {
   AdminSiteDeletedPayload,
 } from '@/composables/useAdminSitesStream'
 
-export type SiteAction = 'parse' | 'generate' | 'deploy' | 'remote_deploy' | 'start' | 'stop' | 'restart' | 'delete'
+export type SiteAction = 'parse' | 'append_dbfile' | 'generate' | 'deploy' | 'redeploy' | 'remote_deploy' | 'start' | 'stop' | 'restart' | 'delete'
 export interface SiteActionError {
   siteId: string
   action: SiteAction
@@ -184,6 +185,17 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
+  async function appendDbFile(id: string, dbFile: string): Promise<AppendManagedSiteDbFileResponse | undefined> {
+    return withAction(id, 'append_dbfile', async () => {
+      const response = await sitesApi.appendDbFile(id, { db_file: dbFile, stop_running: true })
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交追加 DB file 任务失败')
+      }
+      await fetchSites()
+      return response.data
+    })
+  }
+
   async function generateSite(id: string) {
     await withAction(id, 'generate', async () => {
       await sitesApi.generate(id)
@@ -196,6 +208,17 @@ export const useSitesStore = defineStore('sites', () => {
       const response = await sitesApi.deploy(id)
       if (!response.success || !response.data) {
         throw new Error(response.message || '提交完整部署任务失败')
+      }
+      await fetchSites()
+      return response.data
+    })
+  }
+
+  async function redeploySite(id: string): Promise<ManagedSiteActionResponse | undefined> {
+    return withAction(id, 'redeploy', async () => {
+      const response = await sitesApi.redeploy(id)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交重新部署任务失败')
       }
       await fetchSites()
       return response.data
@@ -278,7 +301,7 @@ export const useSitesStore = defineStore('sites', () => {
     pendingActions, actionErrors, latestActionError,
     getSiteAction, isSiteActionPending, getSiteActionError, clearSiteActionError,
     fetchSites, createSite, updateSite, deleteSite,
-    parseSite, generateSite, deploySite, startSite, stopSite, restartSite,
+    parseSite, appendDbFile, generateSite, deploySite, redeploySite, startSite, stopSite, restartSite,
     bulkAction,
     patchSiteSnapshot, handleSiteCreated, handleSiteDeleted, refreshOnReconnect,
   }

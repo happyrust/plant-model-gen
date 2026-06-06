@@ -75,7 +75,13 @@ async fn extract_target_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
     } else {
         let mut from_meta = Vec::new();
         if db_meta().ensure_loaded().is_ok() {
-            from_meta = db_meta().get_all_dbnums();
+            from_meta = db_meta().get_dbnums_by_type(&db_option.inner.module);
+            if from_meta.is_empty() && db_option.inner.module.eq_ignore_ascii_case("DESI") {
+                println!(
+                    "[precheck] ⚠️ db_meta_info.json 中未发现 DESI 数据库，回退检查所有 dbnum"
+                );
+                from_meta = db_meta().get_all_dbnums();
+            }
         }
         from_meta
     };

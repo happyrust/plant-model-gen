@@ -9,6 +9,10 @@ pub mod db_manager;
 
 pub mod db_meta_manager;
 
+/// 全库 ref0/dbnum 预扫描索引（index-only，写 SQLite）。依赖 rusqlite（sqlite-index feature）。
+#[cfg(feature = "sqlite-index")]
+pub mod db_index;
+
 pub mod increment_manager;
 
 pub mod increment_record;

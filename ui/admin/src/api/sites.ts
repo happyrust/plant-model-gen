@@ -14,7 +14,11 @@ import type {
   ManagedRemoteTargetRequest,
   ManagedSiteReconcileRequest,
   ManagedSiteReconcileResponse,
+  AppendManagedSiteDbFileRequest,
+  AppendManagedSiteDbFileResponse,
   CreateManagedSiteRequest,
+  QuickDeploySiteRequest,
+  QuickDeploySiteResponse,
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
   ScanProjectsResult,
@@ -39,6 +43,13 @@ export interface PortCheckResult {
   pids: number[]
 }
 
+export interface PortKillResult {
+  port: number
+  killed_pids: number[]
+  remaining_pids: number[]
+  released: boolean
+}
+
 export const sitesApi = {
   resourceSummary: () => apiGet<AdminResourceSummary>('/api/admin/resources/summary'),
 
@@ -53,6 +64,9 @@ export const sitesApi = {
     if (host) params.set('host', host)
     return apiGet<PortCheckResult>(`/api/admin/ports/check?${params.toString()}`)
   },
+
+  killPort: (port: number) =>
+    apiPost<PortKillResult>('/api/admin/ports/kill', { port }),
 
   /**
    * Phase 3 · 工程扫描
@@ -69,6 +83,12 @@ export const sitesApi = {
 
   create: (payload: CreateManagedSiteRequest) =>
     apiPost<ManagedProjectSite>('/api/admin/sites', payload as unknown as Record<string, unknown>),
+
+  quickDeploy: (payload: QuickDeploySiteRequest) =>
+    apiPost<QuickDeploySiteResponse>(
+      '/api/admin/sites/quick-deploy',
+      payload as unknown as Record<string, unknown>,
+    ),
 
   previewParsePlan: (payload: PreviewManagedSiteParsePlanRequest) =>
     apiPost<ManagedSiteParsePlan>(
@@ -108,11 +128,20 @@ export const sitesApi = {
   parse: (id: string) =>
     apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/parse`),
 
+  appendDbFile: (id: string, payload: AppendManagedSiteDbFileRequest) =>
+    apiPostRaw<AppendManagedSiteDbFileResponse>(
+      `/api/admin/sites/${id}/append-dbfile`,
+      payload as unknown as Record<string, unknown>,
+    ),
+
   generate: (id: string) =>
     apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/generate`),
 
   deploy: (id: string) =>
     apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/deploy`),
+
+  redeploy: (id: string) =>
+    apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/redeploy`),
 
   start: (id: string) =>
     apiPostRaw<ManagedSiteActionResponse>(`/api/admin/sites/${id}/start`),

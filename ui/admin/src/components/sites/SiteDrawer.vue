@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useSitesStore } from '@/stores/sites'
 import { sitesApi } from '@/api/sites'
+import { checkPortConflicts, resolvePortConflicts } from '@/lib/port-conflicts'
+import { formatDisplayPath } from '@/lib/utils'
 import type {
   CreateManagedSiteRequest,
   ManagedProjectSite,
@@ -20,6 +22,7 @@ import {
   matchParsePreset,
   normalizeParseDbTypes,
 } from './parse-db-types'
+import { groupParsePlanFilesByDbType } from './parse-plan-files'
 import { parsePlanClass } from './site-status'
 import { MANAGED_SITE_FORM_PRESETS, type ManagedSiteFormPreset } from './site-presets'
 import { X } from 'lucide-vue-next'
@@ -52,6 +55,7 @@ const existingSite = ref<ManagedProjectSite | null>(null)
 const previewLoading = ref(false)
 const previewError = ref('')
 const previewPlan = ref<ManagedSiteParsePlan | null>(null)
+const previewPlanFileGroups = computed(() => groupParsePlanFilesByDbType(previewPlan.value))
 let previewTimer: ReturnType<typeof setTimeout> | null = null
 let previewRequestSeq = 0
 const DEFAULT_DB_PORT = 8020
@@ -60,9 +64,7 @@ const DEFAULT_WEB_PORT = 8080
 // D4 / Sprint D · 修 G12：端口冲突前端预检
 //
 // Drawer 提交前 onBlur 调 /api/admin/ports/check，给用户立即反馈端口是否
-// 已被本机其他进程占用。提示是软警告（不阻断提交，因为：
-//   1. 编辑既有站点时端口可能本来就归这个站点的子进程，自我冲突属正常
-//   2. 后端创建/启动会再次校验，是真正的 source of truth）。
+// 已被本机其他进程占用。保存时会再次强制检查：冲突未处理则不创建/更新。
 type PortFieldKey = 'db_port' | 'web_port'
 type PortStatus =
   | { state: 'idle' }
@@ -150,8 +152,12 @@ const form = ref<CreateManagedSiteRequest>({
   project_path: '',
   project_code: 0,
   manual_db_nums: [],
+  manual_db_files: [],
+  generate_db_nums: [],
+  generate_db_files: [],
   parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
   force_rebuild_system_db: false,
+  auto_parse_related_dbnums: false,
   gen_model: true,
   gen_mesh: false,
   gen_spatial_tree: true,
@@ -159,7 +165,7 @@ const form = ref<CreateManagedSiteRequest>({
   mesh_tol_ratio: 3.0,
   export_json: false,
   export_parquet: true,
-  pipeline_db_mode: 'file',
+  pipeline_db_mode: 'ws',
   runtime_db_mode: 'ws',
   db_port: DEFAULT_DB_PORT,
   web_port: DEFAULT_WEB_PORT,
@@ -171,6 +177,9 @@ const form = ref<CreateManagedSiteRequest>({
 })
 
 const manualDbNumsStr = ref('')
+const manualDbFilesStr = ref('')
+const generateDbNumsStr = ref('')
+const generateDbFilesStr = ref('')
 const autoAllocatePorts = ref(true)
 
 // ─── Phase 4 · 多工程合并站点（可选） ────────────────────────────────────────
@@ -187,7 +196,7 @@ const scanConflicts = ref<ScannedDbnumConflict[]>([])
 function resetMultiProjectState(site: ManagedProjectSite | null, cloning: boolean) {
   siteName.value = site && !cloning ? (site.site_name ?? '') : ''
   projects.value = site?.projects?.length
-    ? site.projects.map((p) => ({ ...p }))
+    ? site.projects.map((p) => ({ ...p, path: formatDisplayPath(p.path) }))
     : []
   scanRoot.value = ''
   scanError.value = ''
@@ -302,6 +311,9 @@ function applySitePreset(preset: ManagedSiteFormPreset) {
     project_path: presetForm.project_path,
     project_code: presetForm.project_code,
     manual_db_nums: manualDbNums,
+    manual_db_files: [],
+    generate_db_nums: [...(presetForm.generate_db_nums ?? [])],
+    generate_db_files: [],
     parse_db_types: normalizeParseDbTypes(presetForm.parse_db_types ?? []),
     force_rebuild_system_db: presetForm.force_rebuild_system_db ?? false,
     gen_model: presetForm.gen_model ?? true,
@@ -311,7 +323,7 @@ function applySitePreset(preset: ManagedSiteFormPreset) {
     mesh_tol_ratio: presetForm.mesh_tol_ratio ?? 3.0,
     export_json: presetForm.export_json ?? false,
     export_parquet: presetForm.export_parquet ?? true,
-    pipeline_db_mode: presetForm.pipeline_db_mode ?? 'file',
+    pipeline_db_mode: presetForm.pipeline_db_mode ?? 'ws',
     runtime_db_mode: presetForm.runtime_db_mode ?? 'ws',
     db_port: presetForm.db_port ?? DEFAULT_DB_PORT,
     web_port: presetForm.web_port ?? DEFAULT_WEB_PORT,
@@ -323,6 +335,9 @@ function applySitePreset(preset: ManagedSiteFormPreset) {
     auto_deploy: presetForm.auto_deploy,
   }
   manualDbNumsStr.value = manualDbNums.join(', ')
+  manualDbFilesStr.value = ''
+  generateDbNumsStr.value = (presetForm.generate_db_nums ?? []).join(', ')
+  generateDbFilesStr.value = ''
   siteName.value = presetForm.site_name ?? ''
   projects.value = (presetForm.projects ?? []).map((project) => ({ ...project }))
   scanRoot.value = ''
@@ -362,6 +377,13 @@ function parseManualDbNumsInput(value: string) {
     .filter((n) => !isNaN(n) && n > 0)
 }
 
+function parseManualDbFilesInput(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
 watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
   if (!open) return
   error.value = ''
@@ -377,11 +399,15 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       const cloning = props.clone === true
       form.value = {
         project_name: cloning ? `${s.project_name} (副本)` : s.project_name,
-        project_path: s.project_path,
+        project_path: formatDisplayPath(s.project_path),
         project_code: s.project_code,
         manual_db_nums: s.manual_db_nums,
+        manual_db_files: [],
+        generate_db_nums: s.generate_db_nums ?? [],
+        generate_db_files: [],
         parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
+        auto_parse_related_dbnums: s.auto_parse_related_dbnums ?? false,
         gen_model: s.gen_model ?? true,
         gen_mesh: s.gen_mesh ?? false,
         gen_spatial_tree: s.gen_spatial_tree ?? true,
@@ -389,7 +415,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         mesh_tol_ratio: s.mesh_tol_ratio ?? 3.0,
         export_json: s.export_json ?? false,
         export_parquet: s.export_parquet ?? true,
-        pipeline_db_mode: s.pipeline_db_mode ?? 'file',
+        pipeline_db_mode: s.pipeline_db_mode ?? 'ws',
         runtime_db_mode: s.runtime_db_mode ?? 'ws',
         db_port: s.db_port,
         web_port: s.web_port,
@@ -400,6 +426,9 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         db_password: '',
       }
       manualDbNumsStr.value = s.manual_db_nums.join(', ')
+      manualDbFilesStr.value = ''
+      generateDbNumsStr.value = (s.generate_db_nums ?? []).join(', ')
+      generateDbFilesStr.value = ''
       resetMultiProjectState(s, cloning)
       // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
       if (cloning) {
@@ -418,8 +447,12 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       project_path: '',
       project_code: 0,
       manual_db_nums: [],
+      manual_db_files: [],
+      generate_db_nums: [],
+      generate_db_files: [],
       parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
       force_rebuild_system_db: false,
+      auto_parse_related_dbnums: false,
       gen_model: true,
       gen_mesh: false,
       gen_spatial_tree: true,
@@ -427,7 +460,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       mesh_tol_ratio: 3.0,
       export_json: false,
       export_parquet: true,
-      pipeline_db_mode: 'file',
+      pipeline_db_mode: 'ws',
       runtime_db_mode: 'ws',
       db_port: DEFAULT_DB_PORT,
       web_port: DEFAULT_WEB_PORT,
@@ -438,6 +471,9 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       db_password: '',
     }
     manualDbNumsStr.value = ''
+    manualDbFilesStr.value = ''
+    generateDbNumsStr.value = ''
+    generateDbFilesStr.value = ''
     autoAllocatePorts.value = true
     resetMultiProjectState(null, false)
   }
@@ -446,6 +482,9 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
 
 function parseDbNums() {
   form.value.manual_db_nums = parseManualDbNumsInput(manualDbNumsStr.value)
+  form.value.manual_db_files = parseManualDbFilesInput(manualDbFilesStr.value)
+  form.value.generate_db_nums = parseManualDbNumsInput(generateDbNumsStr.value)
+  form.value.generate_db_files = parseManualDbFilesInput(generateDbFilesStr.value)
 }
 
 function toggleParseDbType(type: string) {
@@ -491,8 +530,10 @@ const previewPayload = computed<PreviewManagedSiteParsePlanRequest | null>(() =>
     project_name: projectName,
     project_path: projectPath,
     manual_db_nums: parseManualDbNumsInput(manualDbNumsStr.value),
+    manual_db_files: parseManualDbFilesInput(manualDbFilesStr.value),
     parse_db_types: parseDbTypes,
     force_rebuild_system_db: parseDbTypes.includes('SYST') ? !!form.value.force_rebuild_system_db : false,
+    auto_parse_related_dbnums: !!form.value.auto_parse_related_dbnums,
     web_port: previewWebPort,
     bind_host: form.value.bind_host?.trim() || undefined,
     public_base_url: form.value.public_base_url?.trim() || undefined,
@@ -572,6 +613,28 @@ const canSubmit = computed(() => {
   return !!form.value.db_port && !!form.value.web_port
 })
 
+async function ensureSubmitPortsAvailable() {
+  if (!isEditing.value && autoAllocatePorts.value) return true
+
+  const portsToCheck: Array<{ label: string; port?: number | null }> = []
+  const bindHost = form.value.bind_host?.trim() || undefined
+  const existingMayOwnPorts = existingSite.value?.status === 'Running' || existingSite.value?.status === 'Starting'
+  if (!existingMayOwnPorts || existingSite.value?.db_port !== form.value.db_port) {
+    portsToCheck.push({ label: 'DB', port: form.value.db_port })
+  }
+  if (!existingMayOwnPorts || existingSite.value?.web_port !== form.value.web_port) {
+    portsToCheck.push({ label: 'Web', port: form.value.web_port })
+  }
+
+  const conflicts = await checkPortConflicts(portsToCheck, bindHost)
+  const result = await resolvePortConflicts(conflicts, '保存站点部署配置前需要先处理端口冲突。')
+  if (!result.ok) {
+    error.value = result.message || '端口冲突未处理，已取消保存。'
+    return false
+  }
+  return true
+}
+
 async function handleSubmit(autoDeploy = false) {
   saving.value = true
   error.value = ''
@@ -584,6 +647,7 @@ async function handleSubmit(autoDeploy = false) {
     form.value.mesh_tol_ratio = 3.0
   }
   try {
+    if (!await ensureSubmitPortsAvailable()) return
     // 克隆模式走 create 路径（不是 update），保持新建语义
     const siteNameTrimmed = siteName.value.trim()
     const projectsPayload = buildProjectsPayload()
@@ -866,23 +930,15 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                   </p>
                 </div>
               </div>
-              <div class="grid grid-cols-2 gap-4">
-                <div class="space-y-2">
-                  <label class="text-sm font-medium">解析/生成 DB 模式</label>
-                  <select v-model="form.pipeline_db_mode" :class="inputClass">
-                    <option value="file">file（默认，离线文件）</option>
-                    <option value="ws">ws（连接服务）</option>
-                  </select>
-                  <p class="text-xs text-muted-foreground">解析和模型生成默认使用 file，避免依赖已启动站点。</p>
-                </div>
-                <div class="space-y-2">
-                  <label class="text-sm font-medium">站点运行 DB 模式</label>
-                  <select v-model="form.runtime_db_mode" :class="inputClass">
-                    <option value="ws">ws（默认，启动站点服务）</option>
-                    <option value="file">file（单进程文件）</option>
-                  </select>
-                  <p class="text-xs text-muted-foreground">正式启动站点默认使用 ws，由站点进程连接 SurrealDB 服务。</p>
-                </div>
+              <div class="space-y-2">
+                <label class="text-sm font-medium">解析/生成 DB 模式</label>
+                <select v-model="form.pipeline_db_mode" :class="inputClass">
+                  <option value="ws">ws（默认，连接服务）</option>
+                  <option value="file">file（离线文件）</option>
+                </select>
+                <p class="text-xs text-muted-foreground">
+                  只控制解析和模型生成管线。plant3d-web 启动固定使用 ws 模式，不再提供运行模式选项。
+                </p>
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">绑定地址</label>
@@ -962,19 +1018,56 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                     <div class="text-xs text-muted-foreground">预计解析文件</div>
                     <div v-if="previewPlan.included_db_files.length" class="mt-2">
                       <div class="mb-2 text-xs text-muted-foreground">共 {{ previewPlan.included_db_files.length }} 个文件</div>
-                      <div class="flex max-h-32 flex-wrap gap-2 overflow-auto">
-                        <span
-                          v-for="file in previewPlan.included_db_files"
-                          :key="file"
-                          class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+                      <div class="max-h-40 space-y-3 overflow-auto">
+                        <div
+                          v-for="group in previewPlanFileGroups"
+                          :key="group.dbType"
+                          class="rounded-md border border-border/60 bg-background/70 p-2"
                         >
-                          {{ file }}
-                        </span>
+                          <div class="mb-2 flex items-center gap-2">
+                            <span class="text-xs font-medium">{{ group.label }}</span>
+                            <span class="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                              {{ group.files.length }} 个
+                            </span>
+                          </div>
+                          <div class="flex flex-wrap gap-2">
+                            <span
+                              v-for="file in group.files"
+                              :key="file"
+                              class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+                            >
+                              {{ file }}
+                            </span>
+                          </div>
+                        </div>
                       </div>
                     </div>
                     <p v-else class="mt-2 text-xs text-muted-foreground">
                       当前没有限制具体文件，解析时会按项目配置做全量解析。
                     </p>
+                  </div>
+                  <div
+                    v-if="previewPlan.auto_related_db_files?.length"
+                    class="rounded-md border border-primary/40 bg-primary/5 p-3"
+                  >
+                    <div class="flex items-center gap-2">
+                      <span class="text-xs font-medium text-primary">将自动解析的依赖库</span>
+                      <span class="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                        {{ previewPlan.auto_related_db_files.length }} 个
+                      </span>
+                    </div>
+                    <p class="mt-1 text-xs text-muted-foreground">
+                      已开启「自动解析依赖库」，以下文件由 ref0→dbnum 依赖闭包自动纳入，已计入上方解析文件。
+                    </p>
+                    <div class="mt-2 flex max-h-32 flex-wrap gap-2 overflow-auto">
+                      <span
+                        v-for="file in previewPlan.auto_related_db_files"
+                        :key="`auto-${file}`"
+                        class="inline-flex items-center rounded-full border border-primary/40 bg-background px-2 py-0.5 text-xs"
+                      >
+                        {{ file }}
+                      </span>
+                    </div>
                   </div>
                 </template>
               </div>
@@ -986,7 +1079,19 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <div class="space-y-2">
                   <label class="text-sm font-medium">手动 DB Nums <span class="text-muted-foreground">(可选，逗号分隔)</span></label>
                   <input v-model="manualDbNumsStr" type="text" placeholder="7997, 7998, 7999" :class="inputClass" />
-                  <p class="text-xs text-muted-foreground">留空表示解析并生成全部设计库；填写后才限制到指定 dbnum。</p>
+                  <p class="text-xs text-muted-foreground">留空表示解析全部设计库；填写后才把解析范围限制到指定 dbnum。</p>
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">需要解析的 DB Files <span class="text-muted-foreground">(可选，一行一个)</span></label>
+                  <textarea
+                    v-model="manualDbFilesStr"
+                    rows="3"
+                    placeholder="aps250160_0001&#10;D:/AVEVA/Projects/E3D2.1/AvevaPlantSample/aps000/aps250160_0001"
+                    class="min-h-20 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                  <p class="text-xs text-muted-foreground">
+                    手动填入本次需要解析的 db files，可填写文件名、相对项目路径或绝对路径；预览/保存时后端会读取文件头反推出 dbnum，并与上方手动 DB Nums 合并。
+                  </p>
                 </div>
                 <div class="grid gap-2">
                   <label
@@ -1047,6 +1152,21 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                     </span>
                   </span>
                 </label>
+                <label
+                  class="flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2 cursor-pointer hover:border-border"
+                >
+                  <input
+                    v-model="form.auto_parse_related_dbnums"
+                    type="checkbox"
+                    class="mt-0.5 h-4 w-4 rounded border-input"
+                  />
+                  <span class="min-w-0">
+                    <span class="block text-sm font-medium">自动解析依赖库</span>
+                    <span class="block text-xs text-muted-foreground">
+                      开启后，解析所选设计库时会自动纳入其引用的关联库（基于全局 ref0→dbnum 依赖闭包递归展开，如元件库 CATA / 字典库 DICT 等）一并解析；关闭时仅解析所选库。
+                    </span>
+                  </span>
+                </label>
                 <p class="text-xs text-muted-foreground">
                   默认完整部署：SYST + DESI + CATA + DICT + GLB + GLOB，用于同时补齐属性定义和元件库数据。
                 </p>
@@ -1062,7 +1182,26 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                 <div>
                   <div class="text-sm font-medium">生成开关</div>
                   <p class="mt-1 text-xs text-muted-foreground">
-                    保存后会写入该部署项目的 DbOption.toml，解析完成后启动站点/完整生成时使用这些配置。
+                    保存后会写入该部署项目的 DbOption-generate.toml，解析完成后完整生成时使用这些配置。
+                  </p>
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">需要生成的 DB Nums <span class="text-muted-foreground">(可选，逗号分隔)</span></label>
+                  <input v-model="generateDbNumsStr" type="text" placeholder="7997, 7998, 7999" :class="inputClass" />
+                  <p class="text-xs text-muted-foreground">
+                    留空时沿用上方解析范围；填写后模型生成只使用这里指定的 dbnum。
+                  </p>
+                </div>
+                <div class="space-y-2">
+                  <label class="text-sm font-medium">需要生成的 DB Files <span class="text-muted-foreground">(可选，一行一个)</span></label>
+                  <textarea
+                    v-model="generateDbFilesStr"
+                    rows="3"
+                    placeholder="aps250160_0001&#10;D:/AVEVA/Projects/E3D2.1/AvevaPlantSample/aps000/aps250160_0001"
+                    class="min-h-20 w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  />
+                  <p class="text-xs text-muted-foreground">
+                    可填写文件名、相对项目路径或绝对路径；保存时后端读取文件头反推出 dbnum，并与上方生成 DB Nums 合并。
                   </p>
                 </div>
                 <div class="grid gap-2">

@@ -486,6 +486,7 @@ pub async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()>
     use aios_core::options::DbConnMode;
 
     let sdb_cfg = db_option_ext.inner.effective_surrealdb();
+    print_surreal_startup_diagnostics(db_option_ext);
 
     if sdb_cfg.mode == DbConnMode::Ws {
         let ip = if sdb_cfg.ip == "localhost" {
@@ -539,6 +540,162 @@ pub async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()>
         .await
         .context("初始化 SurrealDB 失败（需要读取 PDMS 输入数据）")?;
     println!("✅ 数据库连接成功");
+    Ok(())
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn current_process_repro_command() -> String {
+    std::env::args()
+        .map(|arg| powershell_quote(&arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn surreal_start_test_command(
+    surreal_bin: &str,
+    bind: &str,
+    user: &str,
+    pass: &str,
+    data_path: &str,
+) -> String {
+    format!(
+        "{} start --user {} --pass {} --bind {} {}",
+        powershell_quote(surreal_bin),
+        powershell_quote(user),
+        powershell_quote(pass),
+        powershell_quote(bind),
+        powershell_quote(&format!("rocksdb://{}", data_path)),
+    )
+}
+
+fn print_surreal_startup_diagnostics(db_option_ext: &DbOptionExt) {
+    use aios_core::options::DbConnMode;
+
+    let option = &db_option_ext.inner;
+    let sdb_cfg = option.effective_surrealdb();
+    let ws_cfg = &option.web_server;
+    let surrealdb_path = sdb_cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| option.surrealdb_data_path());
+    let startup_data_path = ws_cfg.effective_data_path(sdb_cfg.path.as_deref());
+    let startup_cmd = surreal_start_test_command(
+        &ws_cfg.surreal_bin,
+        &ws_cfg.surreal_bind,
+        &ws_cfg.surreal_user,
+        &ws_cfg.surreal_password,
+        startup_data_path,
+    );
+
+    println!("🔎 SurrealDB 启动诊断:");
+    println!("   - 当前进程复现命令: {}", current_process_repro_command());
+    println!("   - 连接模式: {:?}", sdb_cfg.mode);
+    println!("   - [surrealdb].path: {}", surrealdb_path);
+    println!("   - [surrealdb].ws: {}:{}", sdb_cfg.ip, sdb_cfg.port);
+    println!("   - [web_server].surreal_data_path: {}", startup_data_path);
+    println!("   - [web_server].surreal_bind: {}", ws_cfg.surreal_bind);
+    if sdb_cfg.mode == DbConnMode::File {
+        println!("   - 嵌入式 open 目标: rocksdb://{}", surrealdb_path);
+    } else {
+        println!("   - WS 连接目标: {}:{}", sdb_cfg.ip, sdb_cfg.port);
+    }
+    println!("   - 手动启动测试命令: {}", startup_cmd);
+}
+
+pub async fn diagnose_surreal_startup_mode(db_option_ext: &DbOptionExt) -> Result<()> {
+    use aios_core::options::DbConnMode;
+
+    let option = &db_option_ext.inner;
+    let sdb_cfg = option.effective_surrealdb();
+    let ws_cfg = &option.web_server;
+    let surrealdb_path = sdb_cfg
+        .path
+        .clone()
+        .unwrap_or_else(|| option.surrealdb_data_path());
+    let startup_data_path = ws_cfg.effective_data_path(sdb_cfg.path.as_deref());
+
+    println!("\n🧪 SurrealDB 启动诊断（只读，不打开 embedded RocksDB）");
+    println!("====================================================");
+    print_surreal_startup_diagnostics(db_option_ext);
+
+    println!("\n📁 数据目录检查:");
+    let data_path = Path::new(&surrealdb_path);
+    let startup_path = Path::new(startup_data_path);
+    let lock_path = data_path.join("LOCK");
+    println!("   - embedded 数据目录: {}", data_path.display());
+    println!("   - embedded 数据目录存在: {}", data_path.exists());
+    println!("   - embedded 数据目录是目录: {}", data_path.is_dir());
+    println!("   - embedded LOCK 存在: {}", lock_path.exists());
+    if startup_path != data_path {
+        println!("   - surreal start 数据目录: {}", startup_path.display());
+        println!("   - surreal start 数据目录存在: {}", startup_path.exists());
+    }
+    if let Some(parent) = data_path.parent() {
+        println!("   - 父目录: {}", parent.display());
+        println!("   - 父目录存在: {}", parent.exists());
+    }
+
+    println!("\n🌐 端口检查:");
+    let ws_ip = if sdb_cfg.ip == "localhost" {
+        "127.0.0.1"
+    } else {
+        &sdb_cfg.ip
+    };
+    let ws_addr = format!("{}:{}", ws_ip, sdb_cfg.port);
+    let ws_reachable = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&ws_addr),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false);
+    println!(
+        "   - [surrealdb] ws 目标 {} 可连接: {}",
+        ws_addr, ws_reachable
+    );
+    println!("   - [web_server] surreal_bind: {}", ws_cfg.surreal_bind);
+
+    println!("\n🧭 诊断判断:");
+    match sdb_cfg.mode {
+        DbConnMode::File => {
+            println!(
+                "   - 当前为 file/embedded 模式。诊断命令不会打开 RocksDB，避免复现 native 崩溃。"
+            );
+            if lock_path.exists() {
+                println!("   - 风险: LOCK 文件存在，可能是旧进程持有或崩溃残留。");
+                println!(
+                    "   - 处理: 先停止相关 aios-database/surreal 进程；确认无进程持有后再备份或清理 LOCK。"
+                );
+            }
+            if !data_path.exists() {
+                println!(
+                    "   - 提示: 数据目录不存在，首次解析会创建；若创建阶段崩溃，优先检查父目录权限和杀软拦截。"
+                );
+            }
+            println!("   - 若解析仍以 -1073741819/0xC0000005 崩溃：");
+            println!("     1) 先把数据目录改名备份后重试，判断是否 RocksDB 目录损坏。");
+            println!("     2) 再用上面的“手动启动测试命令”单独启动 surreal server 验证同一路径。");
+            println!(
+                "     3) 仍崩溃时用 ProcDump 抓 dump: procdump -e -ma -x .\\dumps aios-database.exe"
+            );
+        }
+        DbConnMode::Ws => {
+            if ws_reachable {
+                println!(
+                    "   - 当前 ws 目标可连接。若业务仍失败，重点查认证、namespace/db 或 schema 初始化。"
+                );
+            } else {
+                println!(
+                    "   - 当前 ws 目标不可连接。处理: 复制上面的“手动启动测试命令”启动 SurrealDB，或检查 bind/port/firewall。"
+                );
+            }
+        }
+    }
+
+    println!("\n✅ 诊断完成：未执行 ensure_surreal_init，未打开 embedded RocksDB。");
     Ok(())
 }
 
@@ -3570,6 +3727,32 @@ pub async fn export_dbnum_instances_parquet_mode(
     )
     .await?;
 
+    #[cfg(feature = "sqlite-index")]
+    {
+        use aios_database::spatial_index::SqliteSpatialIndex;
+        use aios_database::sqlite_index::SqliteAabbIndex;
+
+        let idx_path = SqliteSpatialIndex::default_path();
+        if let Some(parent) = idx_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let idx = SqliteAabbIndex::open(&idx_path)?;
+        let import_stats = idx.refresh_dbnum_from_parquet_dir(dbnum, &output_dir)?;
+        println!(
+            "   - SQLite spatial index 刷新: dbnum={}, inserted={}, path={}",
+            dbnum,
+            import_stats.total_inserted,
+            idx_path.display()
+        );
+    }
+
+    #[cfg(not(feature = "sqlite-index"))]
+    {
+        println!(
+            "   - SQLite spatial index refresh skipped because sqlite-index feature is disabled"
+        );
+    }
+
     println!("\n🎉 Parquet 导出完成！");
     println!("📊 统计信息:");
     println!("   - 实例数量 (instances): {}", stats.instance_count);
@@ -3590,95 +3773,74 @@ pub async fn export_dbnum_instances_parquet_mode(
     Ok(())
 }
 
-/// 导出指定 dbnum 的 PDMS Tree（TreeIndex + name/noun/children_count）为 Parquet
-///
-/// 输出目录默认为：output/<project>/scene_tree_parquet/
-#[cfg(feature = "parquet-export")]
-pub async fn export_pdms_tree_parquet_mode(
+/// 从 Parquet 目录导入 SQLite 空间索引
+#[cfg(all(feature = "sqlite-index", feature = "parquet-export"))]
+pub fn import_spatial_index_parquet_mode(
+    parquet_dir: &Path,
     dbnum: u32,
+    sqlite_path: &Path,
     verbose: bool,
-    output_override: Option<PathBuf>,
-    db_option_ext: &DbOptionExt,
 ) -> Result<()> {
-    use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet;
+    use aios_database::sqlite_index::{SqliteAabbIndex, i64_to_refno_str};
 
-    println!("\n🎯 导出 PDMS Tree 为 Parquet（供前端查询模型树）");
-    println!("==============================================");
-    println!("   - dbnum: {}", dbnum);
+    println!("\n🗃️ 从 Parquet 导入 SQLite 空间索引");
+    println!("==========================================");
+    println!("   - DBNUM: {}", dbnum);
+    println!("   - 输入目录: {}", parquet_dir.display());
+    println!("   - 输出文件: {}", sqlite_path.display());
 
-    // 输出目录：默认 output/<project>/scene_tree_parquet
-    let output_dir = output_override.unwrap_or_else(|| {
-        db_option_ext
-            .get_project_output_dir()
-            .join("scene_tree_parquet")
-    });
-    println!("   - 输出目录: {}", output_dir.display());
-
-    println!("📡 连接数据库...");
-    if let Err(e) = init_surreal().await {
-        println!("⚠️  数据库连接失败，将回退到离线 name 兜底模式：{e}");
-    } else {
-        println!("✅ 数据库连接成功");
+    if !parquet_dir.is_dir() {
+        return Err(anyhow!(
+            "输入目录不存在或不是目录: {}",
+            parquet_dir.display()
+        ));
     }
 
-    let stats = export_pdms_tree_parquet(dbnum, &output_dir, verbose).await?;
+    if let Some(parent) = sqlite_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
-    println!("\n🎉 PDMS Tree Parquet 导出完成！");
+    let idx = SqliteAabbIndex::open(sqlite_path)?;
+    idx.init_schema()?;
+    let stats = idx.refresh_dbnum_from_parquet_dir(dbnum, parquet_dir)?;
+
+    println!("\n🎉 Parquet 导入完成！");
     println!("📊 统计信息:");
-    println!("   - 节点数量: {}", stats.node_count);
-    println!(
-        "   - 输出文件: {}",
-        output_dir.join(&stats.file_name).display()
-    );
-    println!("   - 文件大小: {} 字节", stats.total_bytes);
-    println!("   - generated_at: {}", stats.generated_at);
+    println!("   - DBNUM: {}", dbnum);
+    println!("   - EQUI (聚合): {}", stats.equi_count);
+    println!("   - Children: {}", stats.children_count);
+    println!("   - Tubings: {}", stats.tubings_count);
+    println!("   - 跳过空 AABB: {}", stats.skipped_empty_aabb_count);
+    println!("   - 总计写入: {}", stats.total_inserted);
+    println!("   - 去重后唯一记录: {}", stats.unique_count);
+    println!("   - SQLite: {}", sqlite_path.display());
+
+    if verbose {
+        let all_aabbs = idx.query_all_aabbs()?;
+        println!("\n🔍 验证查询:");
+        println!("   查询到 {} 条 AABB 记录", all_aabbs.len());
+        if let Some((id, minx, maxx, miny, maxy, minz, maxz)) = all_aabbs.first() {
+            let refno = i64_to_refno_str(*id);
+            println!(
+                "   示例: refno={}, AABB=[{:.1},{:.1}]x[{:.1},{:.1}]x[{:.1},{:.1}]",
+                refno, minx, maxx, miny, maxy, minz, maxz
+            );
+        }
+    }
 
     Ok(())
 }
 
-/// 导出 WORL -> SITE 节点列表为 Parquet（替代后端 e3d children 对 WORL 的特判）
-///
-/// 输出目录默认为：output/<project>/scene_tree_parquet/
-#[cfg(feature = "parquet-export")]
-pub async fn export_world_sites_parquet_mode(
-    verbose: bool,
-    output_override: Option<PathBuf>,
-    db_option_ext: &DbOptionExt,
+#[cfg(not(all(feature = "sqlite-index", feature = "parquet-export")))]
+pub fn import_spatial_index_parquet_mode(
+    _parquet_dir: &Path,
+    _dbnum: u32,
+    _sqlite_path: &Path,
+    _verbose: bool,
 ) -> Result<()> {
-    use aios_database::fast_model::export_model::export_pdms_tree_parquet::export_world_sites_parquet;
-
-    println!("\n🎯 导出 WORL -> SITE 节点列表为 Parquet（供前端查询）");
-    println!("==========================================================");
-
-    // 输出目录：默认 output/<project>/scene_tree_parquet
-    let output_dir = output_override.unwrap_or_else(|| {
-        db_option_ext
-            .get_project_output_dir()
-            .join("scene_tree_parquet")
-    });
-    println!("   - 输出目录: {}", output_dir.display());
-
-    println!("📡 连接数据库...");
-    if let Err(e) = init_surreal().await {
-        println!("⚠️  数据库连接失败，将回退到离线 tree 扫描模式：{e}");
-    } else {
-        println!("✅ 数据库连接成功");
-    }
-
-    let stats = export_world_sites_parquet(&output_dir, verbose).await?;
-
-    println!("\n🎉 WORL->SITE Parquet 导出完成！");
-    println!("📊 统计信息:");
-    println!("   - world_refno: {}", stats.world_refno);
-    println!("   - SITE 数量: {}", stats.site_count);
-    println!(
-        "   - 输出文件: {}",
-        output_dir.join(&stats.file_name).display()
-    );
-    println!("   - 文件大小: {} 字节", stats.total_bytes);
-    println!("   - generated_at: {}", stats.generated_at);
-
-    Ok(())
+    Err(anyhow!(
+        "当前二进制未包含 Parquet -> SQLite 空间索引导入能力，请启用 sqlite-index 与 parquet-export features 后重新构建"
+    ))
 }
 
 /// 导入 instances.json 到 SQLite 空间索引
@@ -4679,6 +4841,14 @@ pub async fn spatial_query_refno_mode(
         "   - 索引路径: {}",
         SqliteSpatialIndex::default_path().display()
     );
+    let spatial_stats = spatial_index.get_stats()?;
+    if spatial_stats.total_elements == 0 {
+        anyhow::bail!(
+            "SQLite spatial index 为空: {}。请先完成 Parquet 导出后自动刷新，或运行 --import-spatial-index-parquet <PARQUET_DIR> --dbnum <DBNUM> --spatial-index-output {} 重建索引。",
+            SqliteSpatialIndex::default_path().display(),
+            SqliteSpatialIndex::default_path().display()
+        );
+    }
 
     let target_aabb =
         resolve_spatial_query_target_aabb(&spatial_index, query_refno, &query_refno_display)
@@ -4995,7 +5165,8 @@ mod tests {
     use super::{
         build_room_compute_panel_calc_options, build_room_compute_panel_gen_option,
         build_room_compute_panel_gen_refnos, build_room_compute_panel_spatial_index_roots,
-        derive_room_compute_panel_dbnums, resolve_room_compute_generation_target,
+        derive_room_compute_panel_dbnums, powershell_quote, resolve_room_compute_generation_target,
+        surreal_start_test_command,
     };
     use aios_core::RefnoEnum;
     use std::str::FromStr;
@@ -5013,6 +5184,30 @@ mod tests {
         );
 
         assert_eq!(target, refno("24381/145018"));
+    }
+
+    #[test]
+    fn test_powershell_quote_escapes_single_quotes() {
+        assert_eq!(
+            powershell_quote("C:\\data\\plant's.db"),
+            "'C:\\data\\plant''s.db'"
+        );
+    }
+
+    #[test]
+    fn test_surreal_start_test_command_prints_copyable_rocksdb_command() {
+        let command = surreal_start_test_command(
+            "surreal",
+            "127.0.0.1:18651",
+            "root",
+            "root",
+            "runtime/admin_sites/demo/data/surreal.db",
+        );
+
+        assert_eq!(
+            command,
+            "'surreal' start --user 'root' --pass 'root' --bind '127.0.0.1:18651' 'rocksdb://runtime/admin_sites/demo/data/surreal.db'",
+        );
     }
 
     #[test]

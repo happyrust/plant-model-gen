@@ -18,10 +18,25 @@ rustflags = []
 # 如需启用请在本机通过环境变量设置：
 #   export RUSTC_WRAPPER=sccache
 
+[env]
+# 固定本仓库的本地迭代编译环境，避免不同 shell 中 CARGO_INCREMENTAL
+# 状态不同导致大依赖反复重建。
+CARGO_INCREMENTAL = { value = "1", force = true }
+
 # 增大主线程栈大小，避免 debug 模式下 async 函数状态机导致的栈溢出
 # 16MB 栈大小足以应对深度 async 调用链
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-args=/STACK:16777216"]
+# 快赢 #1: 用工具链自带 rust-lld 替换慢速 link.exe（链接耗时 -50%~-80%）。
+#   本 nightly(1.98) 无 -Zlinker-features，改用 -Clinker=rust-lld + lld-link flavor，
+#   rustc 会自动从 sysroot 解析 rust-lld，无需写死路径（已实测可链接）。
+# 快赢 #3: nightly 并行前端，缓解单体 crate 的类型检查耗时（-20%~-40%）。
+# 注意：rustflags 变更会使构建指纹失效，首次为一次全量重建，之后增量才提速。
+rustflags = [
+    "-C", "link-args=/STACK:16777216",
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=lld-link",
+    "-Zthreads=8",
+]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "link-args=/STACK:16777216"]
@@ -36,18 +51,29 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 
-# [unstable]
-# codegen-backend = true
+# 启用 per-profile codegen-backend（nightly 不稳定特性）
+[unstable]
+codegen-backend = true
 
 [profile.dev]
-# codegen-backend = "cranelift"
+# 根 crate(aios-database) 用 cranelift：debug 迭代编译显著加快（codegen -20%~-30%）
+# 依赖仍走 LLVM（见下方 package."*"），避免个别 crate 在 cranelift 下不兼容。
+codegen-backend = "cranelift"
 debug = 1              # 仅行号表，加快编译和链接
 incremental = true     # 显式开启增量编译（dev 默认已开，防止被环境变量覆盖）
 split-debuginfo = "unpacked"  # macOS 关键优化：调试信息不打包，大幅缩短链接时间
                                # Linux 下此选项为默认行为，无负面影响
+                               # 注：Windows MSVC 上此项为 no-op（调试信息走 PDB）
+
+# 快赢 #6: 让 build script 与 proc-macro（serde/rkyv/strum derive、cc）在 opt-level=3
+# 下运行，加快每次构建的宏展开/脚本执行。只影响编译期工具代码，不影响产物运行性能。
+[profile.dev.build-override]
+opt-level = 3
 
 [profile.dev.package."*"]
-# codegen-backend = "llvm"
+# 所有依赖固定用 LLVM：依赖只编译一次（已缓存），且避免 cranelift 对个别
+# 含 inline asm / 特殊 intrinsic 的 crate 不兼容。仅根 crate 走 cranelift。
+codegen-backend = "llvm"
 #opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
 
 [profile.test]

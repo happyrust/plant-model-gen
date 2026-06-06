@@ -61,6 +61,10 @@ function businessClass(value?: boolean | null) {
         {{ site?.parse_status ?? '-' }}
       </div>
       <div v-if="runtime?.parse_running" class="text-xs text-blue-600 mt-1">解析进行中...</div>
+      <div v-if="runtime?.sidecar_job_id" class="mt-2 space-y-1 text-xs text-muted-foreground">
+        <div>Sidecar: {{ runtime.sidecar_job_kind ?? '-' }} / {{ runtime.sidecar_job_status ?? '-' }}</div>
+        <div class="truncate font-mono" :title="runtime.sidecar_job_id">Job: {{ runtime.sidecar_job_id }}</div>
+      </div>
     </div>
   </div>
 </template>

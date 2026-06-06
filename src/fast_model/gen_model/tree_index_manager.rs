@@ -1,6 +1,6 @@
 //! TreeIndex 管理器
 //!
-//! 统一管理 `output/scene_tree/{dbnum}.tree` 文件的加载和查询
+//! 统一管理当前配置 `<output_root>/<project>/scene_tree/{dbnum}.tree` 文件的加载和查询
 //!
 //! ## 重要说明：从 refno 获取 dbnum
 //!
@@ -16,7 +16,7 @@
 //! let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
 //! ```
 
-use crate::versioned_db::db_meta_info::DEFAULT_TREE_DIR;
+use crate::versioned_db::db_meta_info::{self, DEFAULT_TREE_DIR};
 use aios_core::pdms_types::BRAN_COMPONENT_NOUN_NAMES;
 use aios_core::pe::SPdmsElement;
 use aios_core::tool::db_tool::{db1_dehash, db1_hash};
@@ -31,29 +31,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 static TREE_INDEX_CACHE: Lazy<DashMap<(PathBuf, u32), Arc<TreeIndex>>> = Lazy::new(DashMap::new);
-
-/// 从 DbOption.toml 读取 project_name，返回 output/{project}/scene_tree 路径
-/// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
-fn get_project_tree_dir() -> Option<PathBuf> {
-    let config_name =
-        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-    let config_file = format!("{}.toml", config_name);
-    let content = std::fs::read_to_string(&config_file).ok()?;
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.starts_with("project_name") {
-            if let Some(value) = line.split('=').nth(1) {
-                let name = value.trim().trim_matches('"').trim_matches('\'');
-                if !name.is_empty() {
-                    return Some(PathBuf::from("output").join(name).join("scene_tree"));
-                }
-            }
-        }
-    }
-
-    None
-}
 
 /// 从全局缓存中尝试获取已加载的 TreeIndex（不会触发磁盘读取/反序列化）。
 pub fn try_get_cached_index(tree_dir: impl AsRef<Path>, dbnum: u32) -> Option<Arc<TreeIndex>> {
@@ -135,7 +112,7 @@ impl TreeIndexManager {
     /// 创建新的 TreeIndexManager
     ///
     /// # Arguments
-    /// * `tree_dir` - TreeIndex 文件目录 (如 "output/scene_tree")
+    /// * `tree_dir` - TreeIndex 文件目录 (如 "<output_root>/<project>/scene_tree")
     /// * `dbnums` - 要管理的 dbnum 列表
     pub fn new(tree_dir: impl AsRef<Path>, dbnums: Vec<u32>) -> Self {
         Self {
@@ -146,10 +123,11 @@ impl TreeIndexManager {
 
     /// 使用默认目录创建 Manager
     ///
-    /// 优先从 DbOption.toml 读取 project_name，使用 output/{project}/scene_tree
+    /// 优先从当前 DB_OPTION_FILE 读取 project_name/output_root，使用 <output_root>/<project>/scene_tree
     /// 如果读取失败，回退到旧路径 output/scene_tree
     pub fn with_default_dir(dbnums: Vec<u32>) -> Self {
-        let tree_dir = get_project_tree_dir().unwrap_or_else(|| DEFAULT_TREE_DIR.into());
+        let tree_dir =
+            db_meta_info::get_current_project_tree_dir().unwrap_or_else(|| DEFAULT_TREE_DIR.into());
         Self::new(tree_dir, dbnums)
     }
 
@@ -240,8 +218,8 @@ impl TreeIndexManager {
         anyhow::bail!(
             "无法从缓存推导 refno 的 dbnum（cache-only 不回退 SurrealDB）：refno={}\n\
              处理建议：\n\
-             - 先生成 output/scene_tree/db_meta_info.json（例如 parse-db/生成 tree 阶段会产出）\n\
-             - 或确认当前运行目录/配置指向了正确的输出目录",
+             - 先生成当前 DB_OPTION_FILE 对应的 <output_root>/<project>/scene_tree/db_meta_info.json\n\
+             - 或确认当前运行目录/配置指向了正确的输出目录（output/scene_tree 仅为旧路径 fallback）",
             refno
         )
     }

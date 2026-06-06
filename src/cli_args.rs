@@ -29,18 +29,6 @@ pub fn add_export_instance_args(command: Command) -> Command {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("export-pdms-tree-parquet")
-                .long("export-pdms-tree-parquet")
-                .help("Export PDMS TreeIndex + pe.name as Parquet (pdms_tree_{dbnum}.parquet) for model tree queries")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("export-world-sites-parquet")
-                .long("export-world-sites-parquet")
-                .help("Export WORL->SITE nodes as Parquet (world_sites.parquet)")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
             Arg::new("export-dbnum-instances")
                 .long("export-dbnum-instances")
                 .help("Export dbnum instances from SurrealDB (default: Parquet format; use --export-dbnum-instances-json for JSON). If --dbnum is omitted, scans all distinct dbnums from inst_relate and exports each")

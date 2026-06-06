@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowLeft, Cpu, ExternalLink, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square } from 'lucide-vue-next'
+import { ArrowLeft, Cpu, Database, ExternalLink, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square } from 'lucide-vue-next'
 import type { ManagedProjectSite } from '@/types/site'
 import {
   canDeploySite,
@@ -46,6 +46,7 @@ defineEmits<{
   generate: []
   deploy: []
   refresh: []
+  browseData: []
   openViewer: []
   edit: []
 }>()
@@ -55,6 +56,12 @@ function canStart() {
 }
 function canStop() {
   return props.site ? canStopSite(props.site) : false
+}
+function stopLabel() {
+  if (!props.site) return '停止'
+  if (props.site.parse_status === 'Running') return '停止解析'
+  if (props.site.status === 'Starting') return '停止部署'
+  return '停止'
 }
 function canRestart() {
   return props.site ? canRestartSite(props.site) : false
@@ -70,6 +77,9 @@ function canDeploy() {
 }
 function canEdit() {
   return props.site ? canEditSite(props.site) : false
+}
+function canBrowseData() {
+  return props.site?.status === 'Running' && props.site.runtime_db_mode === 'ws'
 }
 </script>
 
@@ -158,8 +168,9 @@ function canEdit() {
           v-if="canStop()"
           @click="$emit('stop')"
           class="inline-flex h-9 items-center gap-2 rounded-md bg-amber-600 px-4 text-sm font-medium text-white shadow hover:bg-amber-700 transition-colors"
+          :title="stopLabel() + '（中止当前部署/解析子进程并停止站点）'"
         >
-          <Square class="h-4 w-4" /> 停止
+          <Square class="h-4 w-4" /> {{ stopLabel() }}
         </button>
         <button
           v-if="canRestart()"
@@ -168,6 +179,14 @@ function canEdit() {
           title="重启（先停后启）"
         >
           <RotateCcw class="h-4 w-4" /> 重启
+        </button>
+        <button
+          v-if="canBrowseData()"
+          @click="$emit('browseData')"
+          class="inline-flex h-9 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-sm font-medium hover:bg-accent transition-colors"
+          title="浏览当前站点运行库"
+        >
+          <Database class="h-4 w-4" /> 浏览数据
         </button>
         <button
           v-if="site.status === 'Running' && viewerUrl"

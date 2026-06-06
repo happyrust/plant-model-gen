@@ -84,6 +84,16 @@ pub struct VisibleInstsResponse {
     pub refno: RefnoEnum,
     pub refnos: Vec<RefnoEnum>,
     pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<VisibleInstsDebug>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VisibleInstsDebug {
+    pub candidates_count: usize,
+    pub filtered_count: usize,
+    pub visible_count: usize,
+    pub source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -254,22 +264,27 @@ async fn get_children(
             let db_option = aios_core::get_db_option();
             let mdb_name = db_option.mdb_name.clone();
 
-            match aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI).await {
-                Ok(eles) if !eles.is_empty() => eles
-                    .into_iter()
-                    .map(|mut ele| {
-                        ele.owner = parent_refno;
-                        TreeNodeDto {
-                            refno: ele.refno,
-                            name: ele.name,
-                            noun: ele.noun,
-                            owner: Some(parent_refno),
-                            children_count: Some(i32::from(ele.children_count)),
-                        }
-                    })
-                    .collect(),
-                _ => offline_world_children(parent_refno),
-            }
+            let mut children =
+                match aios_core::get_mdb_world_site_ele_nodes(mdb_name, aios_core::DBType::DESI)
+                    .await
+                {
+                    Ok(eles) if !eles.is_empty() => eles
+                        .into_iter()
+                        .map(|mut ele| {
+                            ele.owner = parent_refno;
+                            TreeNodeDto {
+                                refno: ele.refno,
+                                name: ele.name,
+                                noun: ele.noun,
+                                owner: Some(parent_refno),
+                                children_count: Some(i32::from(ele.children_count)),
+                            }
+                        })
+                        .collect(),
+                    _ => offline_world_children(parent_refno),
+                };
+            hydrate_tree_node_names(&mut children).await;
+            children
         } else {
             match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
                 Ok(dbnum) => {
@@ -316,6 +331,26 @@ async fn get_children(
         truncated,
         error_message: None,
     }))
+}
+
+async fn hydrate_tree_node_names(nodes: &mut [TreeNodeDto]) {
+    for (idx, node) in nodes.iter_mut().enumerate() {
+        let pe_name = crate::fast_model::query_provider::get_pe(node.refno)
+            .await
+            .ok()
+            .flatten()
+            .map(|pe| pe.name)
+            .unwrap_or_default();
+
+        if !pe_name.trim().is_empty() {
+            node.name = pe_name;
+            continue;
+        }
+
+        if node.name.trim().is_empty() || node.name == node.refno.to_string() {
+            node.name = format!("{} {}", node.noun, idx + 1);
+        }
+    }
 }
 
 fn resolve_offline_world_refno() -> Option<RefnoEnum> {
@@ -556,7 +591,30 @@ async fn get_visible_insts(
     let refno = parse_refno_path(&refno)?;
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
     // 层级查询统一走 indextree（TreeIndex）
-    let mut candidates =
+    let mut candidates = if is_offline_world_refno(refno) {
+        let mut out = Vec::new();
+        for child in offline_world_children(refno) {
+            match crate::fast_model::query_compat::query_deep_visible_inst_refnos(child.refno).await
+            {
+                Ok(mut values) => out.append(&mut values),
+                Err(e) => {
+                    return Ok(Json(VisibleInstsResponse {
+                        success: false,
+                        refno,
+                        refnos: vec![],
+                        error_message: Some(format!(
+                            "query_deep_visible_inst_refnos failed for child {}: {e}",
+                            child.refno
+                        )),
+                        debug: None,
+                    }));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    } else {
         match crate::fast_model::query_compat::query_deep_visible_inst_refnos(refno).await {
             Ok(v) => v,
             Err(e) => {
@@ -565,14 +623,17 @@ async fn get_visible_insts(
                     refno,
                     refnos: vec![],
                     error_message: Some(format!("query_deep_visible_inst_refnos failed: {e}")),
+                    debug: None,
                 }));
             }
-        };
+        }
+    };
 
     // 兼容：如果没有子孙可见节点，至少包含自己
     if candidates.is_empty() {
         candidates.push(refno);
     }
+    let candidates_count = candidates.len();
 
     let bran_hang_load_roots: HashSet<RefnoEnum> = if let Ok(dbnum) =
         crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
@@ -607,6 +668,13 @@ async fn get_visible_insts(
             r,
         )
         .ok()
+        .or_else(|| {
+            if is_offline_world_refno(r) {
+                Some((r.refno().0 >> 32) as u32)
+            } else {
+                None
+            }
+        })
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
@@ -684,8 +752,8 @@ async fn get_visible_insts(
 
     // 文件读取/解析成功时：直接使用文件过滤结果（允许为空）
     // 文件缺失/解析失败：回退到 inst_relate 几何实例过滤。
-    let refnos = if file_ok {
-        refnos
+    let (refnos, source) = if file_ok {
+        (refnos, "instances_json")
     } else {
         match crate::fast_model::export_model::model_exporter::query_geometry_instances(
             &candidates,
@@ -699,7 +767,7 @@ async fn get_visible_insts(
                 out.extend(bran_hang_load_roots.iter().copied());
                 out.sort();
                 out.dedup();
-                out
+                (out, "surreal_geometry")
             }
             Err(e) => {
                 return Ok(Json(VisibleInstsResponse {
@@ -707,16 +775,24 @@ async fn get_visible_insts(
                     refno,
                     refnos: vec![],
                     error_message: Some(format!("query_geometry_instances failed: {e}")),
+                    debug: None,
                 }));
             }
         }
     };
+    let visible_count = refnos.len();
 
     Ok(Json(VisibleInstsResponse {
         success: true,
         refno,
         refnos,
         error_message: None,
+        debug: Some(VisibleInstsDebug {
+            candidates_count,
+            filtered_count: candidates_count.saturating_sub(visible_count),
+            visible_count,
+            source: source.to_string(),
+        }),
     }))
 }
 

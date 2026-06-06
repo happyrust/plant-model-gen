@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { formatDisplayPath } from '@/lib/utils'
 import type { ManagedProjectSite } from '@/types/site'
 import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from './parse-db-types'
 
@@ -40,7 +41,7 @@ function yesNo(value: boolean | undefined) {
       <div class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
         <span class="text-muted-foreground">项目名称</span><span>{{ site.project_name }}</span>
         <span class="text-muted-foreground">项目代码</span><span>{{ site.project_code }}</span>
-        <span class="text-muted-foreground">项目路径</span><span class="break-all">{{ site.project_path }}</span>
+        <span class="text-muted-foreground">项目路径</span><span class="break-all">{{ formatDisplayPath(site.project_path) || '-' }}</span>
         <span class="text-muted-foreground">关联工程</span>
         <span>{{ site.associated_project || site.project_name }} <span v-if="!site.associated_project" class="text-xs text-muted-foreground">(默认)</span></span>
       </div>
@@ -58,7 +59,7 @@ function yesNo(value: boolean | undefined) {
           class="rounded-md border border-border/60 bg-muted/20 p-3 text-sm"
         >
           <div class="flex flex-wrap items-center gap-2">
-            <span class="font-medium">{{ proj.name || proj.path }}</span>
+            <span class="font-medium">{{ proj.name || formatDisplayPath(proj.path) }}</span>
             <span class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs">
               {{ proj.role === 'library' ? '元件库' : '设计' }}
             </span>
@@ -69,7 +70,7 @@ function yesNo(value: boolean | undefined) {
               主工程
             </span>
           </div>
-          <div class="mt-1 break-all font-mono text-xs text-muted-foreground">{{ proj.path }}</div>
+          <div class="mt-1 break-all font-mono text-xs text-muted-foreground">{{ formatDisplayPath(proj.path) || '-' }}</div>
         </div>
       </div>
     </div>
@@ -128,9 +129,9 @@ function yesNo(value: boolean | undefined) {
     <div class="rounded-lg border border-border bg-card p-5">
       <h4 class="text-sm font-medium text-muted-foreground mb-3">路径信息</h4>
       <div class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
-        <span class="text-muted-foreground">配置路径</span><span class="break-all font-mono text-xs">{{ site.config_path }}</span>
-        <span class="text-muted-foreground">运行目录</span><span class="break-all font-mono text-xs">{{ site.runtime_dir }}</span>
-        <span class="text-muted-foreground">数据目录</span><span class="break-all font-mono text-xs">{{ site.db_data_path }}</span>
+        <span class="text-muted-foreground">配置路径</span><span class="break-all font-mono text-xs">{{ formatDisplayPath(site.config_path) || '-' }}</span>
+        <span class="text-muted-foreground">运行目录</span><span class="break-all font-mono text-xs">{{ formatDisplayPath(site.runtime_dir) || '-' }}</span>
+        <span class="text-muted-foreground">数据目录</span><span class="break-all font-mono text-xs">{{ formatDisplayPath(site.db_data_path) || '-' }}</span>
       </div>
     </div>
 

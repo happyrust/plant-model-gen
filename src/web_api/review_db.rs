@@ -13,7 +13,7 @@ use aios_core::options::{DbConnMode, DbOption};
 static REVIEW_PRIMARY_DB: OnceCell<Surreal<Client>> = OnceCell::new();
 static REVIEW_QUERY_INDEXES_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-const REVIEW_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const REVIEW_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REVIEW_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_DDL_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SLOW_QUERY_WARN: Duration = Duration::from_millis(1000);

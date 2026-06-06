@@ -30,8 +30,12 @@ if (-not $OutputRoot) {
 $PackageRoot = Join-Path $OutputRoot $BundleName
 $TargetTriple = "x86_64-pc-windows-msvc"
 $FrontendDist = Join-Path $FrontendRoot "dist"
+$FrontendBuildCacheRoot = Join-Path $OutputRoot "_frontend-builds"
+$ViewerFallbackDist = Join-Path $FrontendBuildCacheRoot "viewer"
+$ViewerRootDist = Join-Path $FrontendBuildCacheRoot "viewer-root"
 $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
+$NginxCacheExe = Join-Path $RepoRoot "tools/nginx/windows/nginx.exe"
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
 $Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,kv-rocksdb"
 if ($BuildProfile -eq "both") {
@@ -101,9 +105,9 @@ function Invoke-BackendCargoBuild([string]$Profile) {
     if (Test-DebugCraneliftEnabled $Profile) {
         Assert-CraneliftAvailable
         Write-Host "Using rustc_codegen_cranelift for debug backend build (profile.dev in .cargo/config.toml)" -ForegroundColor Yellow
-        & cargo +nightly build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        & cargo +nightly build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
     } else {
-        & cargo build @profileArgs --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        & cargo build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
     }
 
     if ($LASTEXITCODE -ne 0) {
@@ -117,6 +121,30 @@ function Copy-Tree([string]$Source, [string]$Destination) {
     }
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
     Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
+}
+
+function Invoke-FrontendBuild([string]$BasePath, [string]$Label, [string]$Destination) {
+    Step "Build plant3d-web for $Label"
+    Push-Location $FrontendRoot
+    $oldBase = $env:VITE_BASE_PATH
+    $oldApi = $env:VITE_GEN_MODEL_API_BASE_URL
+    try {
+        $env:VITE_BASE_PATH = $BasePath
+        Remove-Item Env:\VITE_GEN_MODEL_API_BASE_URL -ErrorAction SilentlyContinue
+        & npm run build-only
+        if ($LASTEXITCODE -ne 0) { throw "frontend build failed for $Label" }
+    } finally {
+        if ($null -ne $oldBase) { $env:VITE_BASE_PATH = $oldBase } else { Remove-Item Env:\VITE_BASE_PATH -ErrorAction SilentlyContinue }
+        if ($null -ne $oldApi) { $env:VITE_GEN_MODEL_API_BASE_URL = $oldApi } else { Remove-Item Env:\VITE_GEN_MODEL_API_BASE_URL -ErrorAction SilentlyContinue }
+        Pop-Location
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $FrontendDist "index.html") -PathType Leaf)) {
+        throw "Frontend dist missing after $Label build: $FrontendDist"
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force
+    }
+    Copy-Tree $FrontendDist $Destination
 }
 
 function Get-GitCommit([string]$Path) {
@@ -367,23 +395,21 @@ foreach ($profile in $RequestedProfiles) {
 }
 
 if (-not $SkipFrontendBuild) {
-    Step "Build plant3d-web for /viewer/"
-    Push-Location $FrontendRoot
-    $oldBase = $env:VITE_BASE_PATH
-    $oldApi = $env:VITE_GEN_MODEL_API_BASE_URL
-    try {
-        $env:VITE_BASE_PATH = "/viewer/"
-        Remove-Item Env:\VITE_GEN_MODEL_API_BASE_URL -ErrorAction SilentlyContinue
-        & npm run build-only
-        if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
-    } finally {
-        if ($null -ne $oldBase) { $env:VITE_BASE_PATH = $oldBase } else { Remove-Item Env:\VITE_BASE_PATH -ErrorAction SilentlyContinue }
-        if ($null -ne $oldApi) { $env:VITE_GEN_MODEL_API_BASE_URL = $oldApi } else { Remove-Item Env:\VITE_GEN_MODEL_API_BASE_URL -ErrorAction SilentlyContinue }
-        Pop-Location
+    if (Test-Path -LiteralPath $FrontendBuildCacheRoot) {
+        Remove-Item -LiteralPath $FrontendBuildCacheRoot -Recurse -Force
     }
+    New-Item -ItemType Directory -Force -Path $FrontendBuildCacheRoot | Out-Null
+    Invoke-FrontendBuild "/viewer/" "/viewer/ fallback" $ViewerFallbackDist
+    Invoke-FrontendBuild "/" "Nginx root /" $ViewerRootDist
+} else {
+    Write-Warning "-SkipFrontendBuild specified; using existing $FrontendDist for both viewer/ and viewer-root/. Ensure the dist base path matches your target."
+    $ViewerFallbackDist = $FrontendDist
+    $ViewerRootDist = $FrontendDist
 }
-if (-not (Test-Path -LiteralPath (Join-Path $FrontendDist "index.html") -PathType Leaf)) {
-    throw "Frontend dist missing: $FrontendDist"
+foreach ($dist in @($ViewerFallbackDist, $ViewerRootDist)) {
+    if (-not (Test-Path -LiteralPath (Join-Path $dist "index.html") -PathType Leaf)) {
+        throw "Frontend dist missing: $dist"
+    }
 }
 
 Step "Resolve bundled SurrealDB"
@@ -403,7 +429,7 @@ if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
 }
 foreach ($profile in $RequestedProfiles) {
     $profilePackageRoot = Join-Path $PackageRoot $profile
-    foreach ($dir in @("bin", "bin/surreal", "viewer", "src/web_server/static/admin", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
+    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static/admin", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $profilePackageRoot $dir) | Out-Null
     }
 
@@ -416,14 +442,24 @@ foreach ($profile in $RequestedProfiles) {
     Copy-Item -LiteralPath $offlineDeployerExe -Destination (Join-Path $profilePackageRoot "offline_deployer.exe") -Force
     Copy-Item -LiteralPath $aiosDatabaseExe -Destination (Join-Path $profilePackageRoot "bin/aios-database.exe") -Force
     Copy-Item -LiteralPath $ResolvedSurreal -Destination (Join-Path $profilePackageRoot "bin/surreal/surreal.exe") -Force
-    Copy-Tree $FrontendDist (Join-Path $profilePackageRoot "viewer")
+    $nginxBundled = $false
+    if (Test-Path -LiteralPath $NginxCacheExe -PathType Leaf) {
+        Copy-Item -LiteralPath $NginxCacheExe -Destination (Join-Path $profilePackageRoot "bin/nginx/nginx.exe") -Force
+        $nginxBundled = $true
+    } else {
+        Write-Warning "Optional nginx.exe not found at $NginxCacheExe; package will use /viewer/ fallback unless AIOS_NGINX_BIN is provided at runtime."
+    }
+    Copy-Tree $ViewerFallbackDist (Join-Path $profilePackageRoot "viewer")
+    Copy-Tree $ViewerRootDist (Join-Path $profilePackageRoot "viewer-root")
     Copy-Tree $AdminStaticDist (Join-Path $profilePackageRoot "src/web_server/static/admin")
     Copy-Tree $SurrealResourceDir (Join-Path $profilePackageRoot "resource/surreal")
     Copy-Item -Path (Join-Path $RepoRoot "db_options/*") -Destination (Join-Path $profilePackageRoot "db_options") -Recurse -Force
     Update-PackageDbOption (Join-Path $profilePackageRoot "db_options/DbOption.toml")
 
     Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.bat") -Destination (Join-Path $profilePackageRoot "start-plant3d.bat") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.ps1") -Destination (Join-Path $profilePackageRoot "start-plant3d.ps1") -Force
     Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.bat") -Destination (Join-Path $profilePackageRoot "install-service.bat") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.ps1") -Destination (Join-Path $profilePackageRoot "install-service.ps1") -Force
 
     $buildInfo = [ordered]@{
         name = "Plant3D AIOS Windows x64"
@@ -439,15 +475,23 @@ foreach ($profile in $RequestedProfiles) {
         surrealVersionText = $surrealVersionText
         surrealSha256 = $surrealSha
         surrealBundled = $true
+        nginxBundled = $nginxBundled
+        nginxExe = if ($nginxBundled) { "bin/nginx/nginx.exe" } else { $null }
         aiosDatabaseBundled = $true
         aiosDatabaseSha256 = $aiosDatabaseSha
         databaseDataIncluded = $false
         webPort = 3100
         viewerUrl = "http://127.0.0.1:3100/viewer/"
+        viewerFallbackUrl = "http://127.0.0.1:3100/viewer/"
+        customerViewerUrlTemplate = "http://<host>/?output_project=<project>&show_dbnum=<dbnum>"
+        nginxMode = "on"
+        nginxRequiredByDefault = $true
+        nginxStaticRoot = "viewer-root"
         offlineDeployWizardUrl = "http://127.0.0.1:3100/admin/#/offline-deploy"
         offlineDeployExe = "offline_deployer.exe"
         startupScript = "start-plant3d.bat"
         serviceScript = "install-service.bat"
+        servicePowerShellScript = "install-service.ps1"
     }
     $buildInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $profilePackageRoot "BUILD_INFO.json") -Encoding UTF8
 
@@ -463,10 +507,24 @@ foreach ($profile in $RequestedProfiles) {
 start-plant3d.bat
 ```
 
-3. 浏览器打开：
+3. 主后台启动成功后，本地 fallback Viewer 可打开：
 
 ```text
 http://127.0.0.1:3100/viewer/
+```
+
+默认启动脚本会准备 Nginx 配置，把 `viewer-root/` 作为客户根入口。注意：
+Nginx 根入口会在站点完成部署并启动后监听，不是主后台刚启动时立即监听。
+站点运行后可在管理后台查看实际 `viewer_url`，或使用如下模板：
+
+```text
+http://<本机IP>/?output_project=<project>&show_dbnum=<dbnum>
+```
+
+如需临时回到非强制 fallback 模式，可运行：
+
+```bat
+start-plant3d.bat /EnableNginx auto
 ```
 
 ## 离线部署向导
@@ -504,8 +562,10 @@ install-service.bat /Uninstall
 - `offline_deployer.exe`：离线部署向导入口，启动本地网页并打开 `/admin/#/offline-deploy`。
 - `bin/aios-database.exe`：站点部署/解析使用的数据库导入执行文件。
 - `bin/surreal/surreal.exe`：随包分发的 SurrealDB。
+- `bin/nginx/nginx.exe`：随包分发的 Nginx。默认启动会准备 Nginx 配置；站点启动阶段会配置/启动 Nginx 根入口。显式 `/EnableNginx auto` 时允许回退到 `/viewer/` fallback。
 - `resource/surreal/`：初始化函数与 `att_meta` 属性元数据脚本。
-- `viewer/`：plant3d-web 静态前端，挂载在 `/viewer/`。
+- `viewer/`：plant3d-web 静态前端，使用 `/viewer/` base，挂载在内置 fallback `/viewer/`。
+- `viewer-root/`：plant3d-web 静态前端，使用 `/` base，供 Nginx 客户根入口使用。
 - `src/web_server/static/admin/`：站点部署管理后台，挂载在 `/admin`。
 - `db_options/DbOption.toml`：默认运行配置。
 - `runtime/surrealdb/`：目标电脑首次启动时创建的新 SurrealDB 数据目录；安装包不包含本机数据库数据。

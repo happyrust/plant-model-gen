@@ -140,12 +140,24 @@ export interface ManagedSiteParseHealth {
   detail: string | null
 }
 
+export interface ManagedSiteParsePlanEntry {
+  file_name: string
+  dbnum?: number | null
+  db_type?: string | null
+  source: string
+  priority: number
+}
+
 export interface ManagedSiteParsePlan {
   mode: ManagedSiteParsePlanMode
   label: string
   detail: string
   includes_system_db_files: boolean
   included_db_files: string[]
+  /** 「自动解析依赖库」根据 ref0→dbnum 依赖闭包额外纳入的目标文件子集（included_db_files 的子集）。仅预览返回。 */
+  auto_related_db_files: string[]
+  entries?: ManagedSiteParsePlanEntry[]
+  warnings?: string[]
 }
 
 export interface ManagedProjectSite {
@@ -156,8 +168,10 @@ export interface ManagedProjectSite {
   project_code: number
   project_path: string
   manual_db_nums: number[]
+  generate_db_nums: number[]
   parse_db_types: string[]
   force_rebuild_system_db: boolean
+  auto_parse_related_dbnums: boolean
   gen_model: boolean
   gen_mesh: boolean
   gen_spatial_tree: boolean
@@ -238,6 +252,9 @@ export interface ManagedSiteRuntimeStatus {
   web_pid: number | null
   viewer_pid?: number | null
   parse_pid: number | null
+  sidecar_job_kind?: string | null
+  sidecar_job_id?: string | null
+  sidecar_job_status?: string | null
   db_port?: number
   web_port?: number
   auto_deploy?: boolean
@@ -357,6 +374,59 @@ export interface ManagedSiteActionResponse {
   task_id?: string
 }
 
+export interface AppendManagedSiteDbFileRequest {
+  db_file: string
+  dbnum?: number | null
+  stop_running?: boolean
+}
+
+export interface AppendManagedSiteDbFileResponse {
+  site_id: string
+  dbnum: number
+  resolved_db_file?: string | null
+  already_present: boolean
+  stopped_site: boolean
+  manual_db_nums: number[]
+  site: ManagedProjectSite
+  task_id?: string | null
+}
+
+export interface QuickDeploySiteRequest {
+  /** 目标 db 文件：绝对路径 / 文件名 / 相对 project_path 的路径；仅传绝对路径时后端会自动推断 project_path。 */
+  db_file: string
+  /** 工程根目录；省略时要求 db_file 为绝对路径。 */
+  project_path?: string
+  /** E3D 项目名 / 站点显示名；省略时后端按工程目录名和 dbnum 生成。 */
+  project_name?: string
+  project_code?: number
+  dbnum?: number
+  auto_parse_related_dbnums?: boolean
+  gen_model?: boolean
+  gen_mesh?: boolean
+  gen_spatial_tree?: boolean
+  start_site?: boolean
+  web_port?: number
+  /** true=等待管线结束；false=后台执行并立即返回 site_id。 */
+  wait?: boolean
+  force_recreate?: boolean
+  pipeline_db_mode?: ManagedSiteDbMode
+}
+
+export interface QuickDeploySiteResponse {
+  success: boolean
+  site_id: string
+  dbnum?: number | null
+  resolved_db_file?: string | null
+  parse_status: string
+  generated: boolean
+  entry_url?: string | null
+  duration_ms: number
+  parse_log_tail: string[]
+  generate_log_tail: string[]
+  warnings: string[]
+  message?: string | null
+}
+
 export interface ManagedSiteReconcileRequest {
   cleanup_orphans?: boolean
 }
@@ -375,8 +445,12 @@ export interface CreateManagedSiteRequest {
   project_path: string
   project_code: number
   manual_db_nums?: number[]
+  manual_db_files?: string[]
+  generate_db_nums?: number[]
+  generate_db_files?: string[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
+  auto_parse_related_dbnums?: boolean
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -403,8 +477,12 @@ export interface UpdateManagedSiteRequest {
   project_path?: string
   project_code?: number
   manual_db_nums?: number[]
+  manual_db_files?: string[]
+  generate_db_nums?: number[]
+  generate_db_files?: string[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
+  auto_parse_related_dbnums?: boolean
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -430,8 +508,12 @@ export interface PreviewManagedSiteParsePlanRequest {
   project_name: string
   project_path: string
   manual_db_nums?: number[]
+  manual_db_files?: string[]
+  generate_db_nums?: number[]
+  generate_db_files?: string[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
+  auto_parse_related_dbnums?: boolean
   web_port: number
   bind_host?: string
   public_base_url?: string

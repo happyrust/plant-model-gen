@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AlertTriangle,
@@ -29,8 +29,10 @@ import SiteRecentActivityPanel from '@/components/sites/SiteRecentActivityPanel.
 import SiteConfigSections from '@/components/sites/SiteConfigSections.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import { matchParsePreset, parseDbTypeLabelMap, splitParseDbTypes } from '@/components/sites/parse-db-types'
+import { groupParsePlanFilesByDbType } from '@/components/sites/parse-plan-files'
 import { parsePlanClass, siteActionLabelMap } from '@/components/sites/site-status'
 import { OFFLINE_DEPLOY_ENABLED } from '@/lib/features'
+import { preflightPortConflicts, resolvePortConflicts } from '@/lib/port-conflicts'
 import { buildViewerUrl } from '@/lib/viewer'
 import type {
   ManagedProjectSite,
@@ -141,7 +143,13 @@ watch(() => route.query.task_id, (next) => {
     deployTaskError.value = ''
   }
 })
-const activeLogTab = ref<ManagedSiteLogKind>('parse')
+const LOG_TABS: ManagedSiteLogKind[] = ['parse', 'generate', 'db', 'web', 'viewer']
+function normalizeLogKind(value: unknown): ManagedSiteLogKind {
+  return typeof value === 'string' && LOG_TABS.includes(value as ManagedSiteLogKind)
+    ? value as ManagedSiteLogKind
+    : 'parse'
+}
+const activeLogTab = ref<ManagedSiteLogKind>(normalizeLogKind(route.query.log))
 const drawerOpen = ref(false)
 const downloadPending = ref(false)
 const downloadError = ref('')
@@ -221,6 +229,7 @@ const siteId = computed(() => String(route.params.id ?? ''))
 const resources = computed(() => runtime.value?.resources ?? null)
 const actionError = computed(() => sitesStore.getSiteActionError(siteId.value))
 const parsePlan = computed(() => runtime.value?.parse_plan ?? site.value?.parse_plan ?? null)
+const parsePlanFileGroups = computed(() => groupParsePlanFilesByDbType(parsePlan.value))
 const groupedParseDbTypes = computed(() => splitParseDbTypes(site.value?.parse_db_types ?? []))
 const matchedPreset = computed(() => matchParsePreset(
   site.value?.parse_db_types ?? [],
@@ -246,6 +255,19 @@ const needsReconcile = computed(() => {
 
 const selectedLogState = computed(() => detailLogs.value[activeLogTab.value])
 const selectedLogs = computed(() => selectedLogState.value.lines)
+
+watch(() => route.query.log, (next) => {
+  const logKind = normalizeLogKind(next)
+  if (activeLogTab.value !== logKind) {
+    activeLogTab.value = logKind
+  }
+  if (detailLogs.value[logKind].lines.length === 0 && !detailLogs.value[logKind].loading) {
+    void fetchKindLog(logKind)
+  }
+})
+watch(() => route.hash, () => {
+  void scrollToLogsIfRequested()
+})
 
 const processCards = computed(() => [
   {
@@ -273,6 +295,9 @@ const processCards = computed(() => [
     process: resources.value?.parse_process ?? null,
   },
 ])
+const runningProcessCount = computed(() =>
+  processCards.value.filter((card) => card.process?.running === true).length,
+)
 
 type DeployStepState = 'complete' | 'current' | 'pending' | 'warning' | 'error' | 'skipped'
 
@@ -652,6 +677,12 @@ function onLogTabChange(tab: ManagedSiteLogKind) {
   }
 }
 
+async function scrollToLogsIfRequested() {
+  if (route.hash !== '#site-logs') return
+  await nextTick()
+  document.getElementById('site-logs')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 async function loadMoreLog() {
   const kind = activeLogTab.value
   const cur = detailLogs.value[kind]
@@ -833,6 +864,8 @@ function handleDrawerSaved() {
 
 async function handleStart() {
   try {
+    activeTab.value = 'deploy'
+    if (!await ensurePreflightPortsClear('启动站点前需要先处理端口冲突。')) return
     await sitesStore.startSite(siteId.value)
     await fetchAll()
   } catch {
@@ -880,8 +913,7 @@ async function handleGenerate() {
 async function handleDeploy() {
   try {
     activeTab.value = 'deploy'
-    await fetchPreflight()
-    if (preflight.value && !preflight.value.ready) return
+    if (!await ensurePreflightPortsClear('运行部署前需要先处理端口冲突。')) return
     const submitted = await sitesStore.deploySite(siteId.value)
     if (submitted?.task_id) {
       await setDeployTaskId(submitted.task_id)
@@ -897,6 +929,27 @@ async function handleDeploy() {
   } catch {
     // 错误已写入 store，页面横幅会显示
   }
+}
+
+async function ensurePreflightPortsClear(context: string) {
+  await fetchPreflight()
+  let report = preflight.value
+  const conflicts = preflightPortConflicts(report)
+  if (conflicts.length > 0) {
+    const result = await resolvePortConflicts(conflicts, context)
+    if (!result.ok) {
+      preflightError.value = result.message || '端口冲突未处理，已取消操作。'
+      return false
+    }
+    await fetchPreflight()
+    report = preflight.value
+  }
+  if (report && !report.ready) {
+    const blocking = report.checks.find((check) => check.status === 'blocking')
+    preflightError.value = blocking?.message || '预检未通过，已取消操作。'
+    return false
+  }
+  return true
 }
 
 function copyText(text: string) {
@@ -961,6 +1014,7 @@ onMounted(async () => {
       await fetchRemoteDeployStatus()
     }
   }
+  await scrollToLogsIfRequested()
   startPolling()
   startDeployTaskPolling()
 })
@@ -979,6 +1033,7 @@ onMounted(async () => {
       @generate="handleGenerate"
       @deploy="handleDeploy"
       @refresh="fetchAll"
+      @browse-data="router.push({ name: 'data-browser', query: { site_id: siteId } })"
       @open-viewer="openViewer()"
       @edit="openEditDrawer"
     />
@@ -1096,14 +1151,28 @@ onMounted(async () => {
           </div>
           <div class="rounded-lg border border-border/60 bg-background p-4">
             <div class="text-xs text-muted-foreground">当前解析文件</div>
-            <div v-if="parsePlan.included_db_files.length" class="mt-2 flex flex-wrap gap-2">
-              <span
-                v-for="file in parsePlan.included_db_files"
-                :key="file"
-                class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+            <div v-if="parsePlan.included_db_files.length" class="mt-2 space-y-3">
+              <div
+                v-for="group in parsePlanFileGroups"
+                :key="group.dbType"
+                class="rounded-md border border-border/60 bg-muted/20 p-2"
               >
-                {{ file }}
-              </span>
+                <div class="mb-2 flex items-center gap-2">
+                  <span class="text-xs font-medium">{{ group.label }}</span>
+                  <span class="inline-flex items-center rounded-full bg-background px-2 py-0.5 text-[11px] text-muted-foreground">
+                    {{ group.files.length }} 个
+                  </span>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <span
+                    v-for="file in group.files"
+                    :key="file"
+                    class="inline-flex items-center rounded-full border border-border bg-background px-2 py-0.5 text-xs"
+                  >
+                    {{ file }}
+                  </span>
+                </div>
+              </div>
             </div>
             <div v-else class="mt-2 text-sm text-muted-foreground">按项目配置做全量解析</div>
           </div>
@@ -1112,11 +1181,19 @@ onMounted(async () => {
 
       <SiteRecentActivityPanel :runtime="runtime" />
 
-      <div class="rounded-lg border p-5" :class="riskTone.card">
-        <div class="mb-4 flex items-center gap-2">
-          <ShieldAlert class="h-4 w-4" :class="riskTone.text" />
-          <h3 class="text-base font-medium">风险摘要</h3>
-        </div>
+      <details class="group rounded-lg border" :class="riskTone.card">
+        <summary class="flex cursor-pointer list-none items-center justify-between gap-3 p-5">
+          <div class="flex items-center gap-2">
+            <ShieldAlert class="h-4 w-4" :class="riskTone.text" />
+            <h3 class="text-base font-medium">风险摘要</h3>
+          </div>
+          <div class="flex items-center gap-3 text-sm text-muted-foreground">
+            <span>{{ runtime?.warnings.length ? `${runtime.warnings.length} 项风险` : '无明显风险' }}</span>
+            <span class="text-xs group-open:hidden">展开</span>
+            <span class="hidden text-xs group-open:inline">收起</span>
+          </div>
+        </summary>
+        <div class="border-t border-border/60 px-5 pb-5 pt-4">
         <div class="space-y-4 text-sm">
           <div class="flex flex-wrap items-center gap-3">
             <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium" :class="riskTone.badge">
@@ -1140,13 +1217,22 @@ onMounted(async () => {
             <div class="mt-1 text-sm text-muted-foreground">{{ runtime?.parse_health.detail ?? '当前没有额外说明。' }}</div>
           </div>
         </div>
-      </div>
-
-      <div class="rounded-lg border border-border bg-card p-5">
-        <div class="mb-4 flex items-center gap-2">
-          <HardDrive class="h-4 w-4 text-muted-foreground" />
-          <h3 class="text-base font-medium">进程资源</h3>
         </div>
+      </details>
+
+      <details class="group rounded-lg border border-border bg-card">
+        <summary class="flex cursor-pointer list-none items-center justify-between gap-3 p-5">
+          <div class="flex items-center gap-2">
+            <HardDrive class="h-4 w-4 text-muted-foreground" />
+            <h3 class="text-base font-medium">进程资源</h3>
+          </div>
+          <div class="flex items-center gap-3 text-sm text-muted-foreground">
+            <span>{{ runningProcessCount }}/{{ processCards.length }} 运行中</span>
+            <span class="text-xs group-open:hidden">展开</span>
+            <span class="hidden text-xs group-open:inline">收起</span>
+          </div>
+        </summary>
+        <div class="border-t border-border/60 px-5 pb-5 pt-4">
         <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <div v-for="card in processCards" :key="card.key" class="rounded-lg border border-border/60 bg-background p-4">
             <div class="flex items-center justify-between">
@@ -1174,13 +1260,22 @@ onMounted(async () => {
             </div>
           </div>
         </div>
-      </div>
-
-      <div class="rounded-lg border border-border bg-card p-5">
-        <div class="mb-4 flex items-center gap-2">
-          <FolderArchive class="h-4 w-4 text-muted-foreground" />
-          <h3 class="text-base font-medium">目录与解析</h3>
         </div>
+      </details>
+
+      <details class="group rounded-lg border border-border bg-card">
+        <summary class="flex cursor-pointer list-none items-center justify-between gap-3 p-5">
+          <div class="flex items-center gap-2">
+            <FolderArchive class="h-4 w-4 text-muted-foreground" />
+            <h3 class="text-base font-medium">目录与解析</h3>
+          </div>
+          <div class="flex items-center gap-3 text-sm text-muted-foreground">
+            <span>运行 {{ formatBytes(resources?.runtime_dir_size_bytes) }} · 数据 {{ formatBytes(resources?.data_dir_size_bytes) }}</span>
+            <span class="text-xs group-open:hidden">展开</span>
+            <span class="hidden text-xs group-open:inline">收起</span>
+          </div>
+        </summary>
+        <div class="border-t border-border/60 px-5 pb-5 pt-4">
         <div class="grid gap-4 lg:grid-cols-2">
           <div class="rounded-lg border border-border/60 bg-background p-4">
             <div class="grid gap-3 text-sm">
@@ -1213,7 +1308,8 @@ onMounted(async () => {
             </div>
           </div>
         </div>
-      </div>
+        </div>
+      </details>
 
       <div v-if="runtime?.last_error" class="rounded-lg border border-destructive/50 bg-destructive/5 p-4">
         <div class="text-sm font-medium text-destructive">最近错误</div>
@@ -1233,7 +1329,21 @@ onMounted(async () => {
         </div>
       </div>
 
-      <div class="rounded-lg border border-border bg-card p-5">
+      <details class="group rounded-lg border border-border bg-card">
+        <summary class="flex cursor-pointer list-none items-center justify-between gap-3 p-5">
+          <div>
+            <h3 class="text-base font-medium">运行态对账</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              {{ needsReconcile ? '状态与进程/端口信号不完全一致' : '当前没有发现明显半启动或端口残留' }}
+            </p>
+          </div>
+          <div class="flex items-center gap-3 text-sm text-muted-foreground">
+            <span>{{ needsReconcile ? '建议对账' : '状态正常' }}</span>
+            <span class="text-xs group-open:hidden">展开</span>
+            <span class="hidden text-xs group-open:inline">收起</span>
+          </div>
+        </summary>
+        <div class="border-t border-border/60 p-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h3 class="text-base font-medium">运行态对账</h3>
@@ -1265,7 +1375,8 @@ onMounted(async () => {
         <div v-if="reconcileActions.length" class="mt-3 rounded-md border border-border/60 bg-background px-3 py-2 text-xs text-muted-foreground">
           <div v-for="action in reconcileActions" :key="action">{{ action }}</div>
         </div>
-      </div>
+        </div>
+      </details>
 
       <div v-if="runtime?.entry_url" class="rounded-lg border border-border bg-card p-4">
         <div class="text-sm text-muted-foreground mb-2">访问地址</div>
@@ -1305,7 +1416,7 @@ onMounted(async () => {
 
       <SiteLogSummaryPanel v-if="logsData?.streams" :streams="logsData.streams" />
 
-      <div class="rounded-lg border border-border bg-card">
+      <div id="site-logs" class="scroll-mt-20 rounded-lg border border-border bg-card">
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2">
           <div class="flex flex-wrap items-center gap-2">
             <button

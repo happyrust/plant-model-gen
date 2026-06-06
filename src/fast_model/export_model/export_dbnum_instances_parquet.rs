@@ -36,6 +36,7 @@ use serde_json::json;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
+use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
 // =============================================================================
@@ -859,7 +860,7 @@ fn normalize_cata_hash(value: Option<serde_json::Value>) -> Option<String> {
     match value? {
         serde_json::Value::String(s) => {
             let trimmed = s.trim().to_string();
-            (!trimmed.is_empty() && trimmed != "NONE" && trimmed != "null").then_some(trimmed)
+            is_valid_cata_hash(&trimmed).then_some(trimmed)
         }
         serde_json::Value::Array(values) => values
             .into_iter()

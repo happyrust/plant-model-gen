@@ -1,0 +1,77 @@
+# Nginx reverse proxy example for standalone plant3d-web
+#
+# Customer-facing URL shape:
+#   http://123.57.182.243/?output_project=AvevaMarineSample&show_dbnum=7997
+#
+# plant3d-web is served at `/`. It should not need `backend=...` in the URL.
+# The backend is reached through same-origin proxy rules below.
+#
+# Runtime/admin configuration:
+#   AIOS_VIEWER_BASE_URL=http://123.57.182.243
+# If unset, the admin backend will default the Viewer base to http://<local-ip>.
+# On Windows without Nginx on port 80, the admin UI combines that default local IP
+# with the managed viewer_port and opens http://<local-ip>:<viewer_port>/...
+#
+# Managed vite-preview fallback:
+#   AIOS_VIEWER_BIND_HOST=0.0.0.0
+# Use 127.0.0.1 only when the Viewer should be reachable from the local machine
+# and not through the machine's LAN/public IP.
+#
+# Replace:
+#   /var/www/plant3d-web/        -> plant3d-web dist directory
+#   http://127.0.0.1:3102        -> target plant-model-gen web_server
+
+server {
+    listen 80;
+    server_name 123.57.182.243;
+
+    root /var/www/plant3d-web;
+    index index.html;
+
+    # plant3d-web SPA entry. Query parameters such as output_project/show_dbnum
+    # are preserved by the browser and handled by the frontend.
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache" always;
+    }
+
+    # Hashed frontend assets can be cached aggressively.
+    location /assets/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }
+
+    # Same-origin backend API for plant3d-web.
+    location /api/ {
+        proxy_pass         http://127.0.0.1:3102/api/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+        proxy_buffering    off;
+    }
+
+    # Model artifacts: parquet, glb, textures, generated bundles.
+    location /files/ {
+        proxy_pass         http://127.0.0.1:3102/files/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_read_timeout 300s;
+    }
+
+    # WebSocket/SSE-compatible upgrade path if plant3d-web enables realtime APIs.
+    location /ws/ {
+        proxy_pass         http://127.0.0.1:3102/ws/;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        "upgrade";
+        proxy_set_header   Host              $host;
+        proxy_read_timeout 3600s;
+    }
+
+    access_log /var/log/nginx/plant3d-web.access.log;
+    error_log  /var/log/nginx/plant3d-web.error.log warn;
+}

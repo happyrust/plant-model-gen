@@ -1549,7 +1549,13 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
         let mut from_meta = Vec::new();
         match db_meta().ensure_loaded() {
             Ok(_) => {
-                from_meta = db_meta().get_all_dbnums();
+                from_meta = db_meta().get_dbnums_by_type(&db_option.inner.module);
+                if from_meta.is_empty() && db_option.inner.module.eq_ignore_ascii_case("DESI") {
+                    log::warn!(
+                        "[IndexTree] db_meta_info.json 中未发现 DESI 数据库，回退到所有 dbnum"
+                    );
+                    from_meta = db_meta().get_all_dbnums();
+                }
             }
             Err(e) => {
                 log::warn!(
@@ -1560,9 +1566,10 @@ async fn get_filtered_dbnums(db_option: &DbOptionExt) -> Result<Vec<u32>> {
         }
 
         if from_meta.is_empty() {
-            return Err(IndexTreeError::DatabaseError(
-                "db_meta_info.json 为空且无其他 dbnum 来源，请先运行 --parse-db".to_string(),
-            ));
+            return Err(IndexTreeError::DatabaseError(format!(
+                "db_meta_info.json 中未找到 module={} 对应的 dbnum，请先完成解析或指定 manual_db_nums",
+                db_option.inner.module
+            )));
         } else {
             from_meta
         }

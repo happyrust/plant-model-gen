@@ -1,5 +1,65 @@
 # Changelog
 
+## 2026-06-06
+
+### Added — Windows release 包 Nginx 客户根入口
+
+> release 部署包现在能稳定提供客户可直接访问的 `plant3d-web` 根站点入口 `http://<host>/?output_project=<project>&show_dbnum=<dbnum>`，同时保留 `/viewer/` fallback。
+
+- `scripts/package/build-windows-bundle.ps1`：打包两份前端静态产物 `viewer/`（`/viewer/` base）与 `viewer-root/`（`/` base）；`BUILD_INFO.json` 区分 fallback URL 与客户入口模板；可选复制 `tools/nginx/windows/nginx.exe` 到 `bin/nginx/nginx.exe`。
+- `managed_project_sites.rs`：Nginx root 优先使用 `AIOS_VIEWER_STATIC_ROOT` 或包内 `viewer-root/`；listen 端口跟随 `AIOS_VIEWER_BASE_URL`；新增 `/admin/`、`/api/admin/` 代理到主控 `web_server`；Windows Nginx 失败默认降级，仅 `AIOS_REQUIRE_NGINX=1` 时 fatal。
+- `start-plant3d.ps1/.bat`、`install-service.ps1/.bat`：新增 `EnableNginx`、`ViewerHost`、`ViewerPort`、`RequireNginx` 参数，自动设置 Nginx/Viewer 环境变量。
+- `shells/deploy/nginx-plant3d-web.conf.example`：补充客户根入口与 `/admin/` 代理示例。
+- 验证：
+  - release 包布局 smoke：`viewer/index.html` 引用 `/viewer/assets/...`，`viewer-root/index.html` 引用 `/assets/...`。
+  - bundled Nginx smoke：`/`、`/assets/`、`/api/`、`/files/`、`/admin/` 均返回 200。
+
+### Added — aios-database parse sidecar 边界迁移
+
+> `web_server` 继续作为 BFF/控制面；工程扫描、解析预览、DB 文件头事实、`db_index`、parse/generate job 与 WS 事件改由 `aios-database` sidecar 提供，控制面不再直接读取 E3D 工程数据。
+
+- `src/parse_sidecar.rs`、`src/web_server/parse_sidecar_client.rs`：新增 parse sidecar HTTP/WS 服务与 `web_server` 客户端。
+- `src/data_interface/db_index.rs`：集中 `db_index` 读写与 preview/formal 索引提升逻辑。
+- `managed_project_sites.rs` / `admin_handlers.rs`：站点创建、quick deploy、解析预览改走 sidecar；`parse-plan-manifest.json` 承载结构化 facts、`inputs_hash` 与 `db_index` 元数据。
+- `scripts/guard/web_server_parse_boundary_guard.ps1` 与 `scripts/smoke/sidecar_*.ps1`：静态边界 guard 与 HTTP/WS smoke。
+- `.cursor/rules/aios-database-sidecar-boundary.mdc`：固化 sidecar 职责边界与验收方式。
+- 验证：
+  - `scripts/guard/web_server_parse_boundary_guard.ps1` 通过。
+  - `sidecar_preview_facts_smoke.ps1`、`sidecar_preview_index_smoke.ps1`、`admin_manifest_hash_smoke.ps1`、`sidecar_job_events_smoke.ps1` 通过。
+
+### Added — Admin 数据浏览器
+
+> 管理端新增「数据浏览器」，可按站点浏览 SurrealDB 表记录并执行只读/受控写查询，便于部署后快速核对解析与模型数据。
+
+- `ui/admin/src/views/DataBrowserView.vue`：表列表、分页记录、SurrealQL 查询面板与写模式开关。
+- `ui/admin/src/api/data-browser.ts`、`ui/admin/src/lib/data-browser-surreal.ts`：连接解析与查询封装。
+- `admin_handlers.rs`：暴露数据浏览器连接与表记录 API。
+- 验证：`vue-tsc` / admin 静态产物已重新打包进 `src/web_server/static/admin/`。
+
+### Fixed — Quick deploy 解析范围与后台化
+
+> admin quick deploy 默认后台执行并返回 `task_id`；单库部署在开启 `auto_parse_related_dbnums` 时也会执行 `db_index` 预扫，避免 AMS 等样例把解析范围放大到整库 CATA。
+
+- `admin_handlers.rs`：`POST /api/admin/quick-deploy` 改为 `quick_deploy_admin()`，鉴权入口始终 `202 Accepted` 后台执行。
+- `managed_project_sites.rs`：新增 `QuickDeployProfile`，admin 与 test 入口分离凭据语义；默认禁用 CATA type fallback；`should_run_db_index_prescan()` 在 `auto_parse_related_dbnums=true` 时始终预扫。
+- `models.rs`：`QuickDeployTestResponse` 结构化返回 `task_id`。
+- 验证：`cargo check --bin web_server --features web_server` 通过。
+
+### Changed — SQLite spatial index Parquet 导入加固
+
+> Parquet 导出后的 SQLite RTree 刷新改为保留真实 `refno_u64` 主键，并按 `items.dbnum` 局部替换；支持独立 CLI 从已有 Parquet 包重建索引。
+
+- `sqlite_index.rs`：跳过空 `aabb_hash` 行并统计；按 dbnum 局部替换并清理历史错误 id range。
+- `cli_modes.rs` / `main.rs`：保留 `--import-spatial-index-parquet` 独立重建入口。
+- 验证：quick deploy 导出后 `spatial query-refno` smoke 返回候选集。
+
+### Removed — DuckLake model writer 实验目标与工具二进制
+
+> 移除尚未纳入主线的 DuckLake parity / model writer verify 实验入口，避免与当前 sidecar + Parquet 主路径混淆。
+
+- 删除 `goals/ducklake-model-writer/` 与 `src/bin/ducklake_parity.rs`、`src/bin/model_writer_verify.rs`。
+- 删除 `src/fast_model/export_model/export_pdms_tree_parquet.rs` 与相关 CLI/feature 接线。
+
 ## 2026-06-03
 
 ### Changed — Admin 离线部署入口默认隐藏

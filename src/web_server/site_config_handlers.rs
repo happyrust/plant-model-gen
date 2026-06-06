@@ -7,7 +7,6 @@ use rusqlite;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
-use std::net::{IpAddr, UdpSocket};
 use std::path::Path;
 use toml;
 
@@ -72,7 +71,7 @@ pub async fn get_server_ip(
     _state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // 使用UdpSocket连接到外部地址，获取本地IP
-    let local_ip = match get_local_ip_via_udp() {
+    let local_ip = match super::get_local_ip_via_udp() {
         Ok(ip) => ip,
         Err(_) => {
             // 如果失败，返回127.0.0.1作为fallback
@@ -84,24 +83,6 @@ pub async fn get_server_ip(
         "status": "success",
         "ip": local_ip
     })))
-}
-
-/// 通过UdpSocket获取本机IP地址
-fn get_local_ip_via_udp() -> Result<String, std::io::Error> {
-    // 连接到一个外部地址（不需要实际连接成功）
-    // 这个方法会返回用于发送数据包的网络接口的IP地址
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    let local_addr = socket.local_addr()?;
-
-    if let IpAddr::V4(ipv4) = local_addr.ip() {
-        Ok(ipv4.to_string())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "无法获取IPv4地址",
-        ))
-    }
 }
 
 /// 读取当前配置

@@ -590,7 +590,8 @@ async fn dispatch_admin_task(task_id: String) {
         Ok(()) => {
             if matches!(
                 task_type_for_poll,
-                TaskType::DataGeneration
+                TaskType::ParsePdmsData
+                    | TaskType::DataGeneration
                     | TaskType::FullGeneration
                     | TaskType::StartManagedSite
                     | TaskType::DeployManagedSite

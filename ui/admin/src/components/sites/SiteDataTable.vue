@@ -2,12 +2,12 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
+import type { ManagedSiteLogKind } from '@/api/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Cpu, Eye, ExternalLink, FolderPlus, Loader2, Pencil, Play, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Cpu, Eye, ExternalLink, FilePlus2, FolderPlus, Loader2, Pencil, Play, RefreshCcw, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canDeploySite,
-  canEditSite,
   canGenerateSite,
   canParseSite,
   canRestartSite,
@@ -19,6 +19,7 @@ import {
   statusLabelMap,
 } from './site-status'
 import { buildViewerUrl } from '@/lib/viewer'
+import { checkPortConflicts, resolvePortConflicts } from '@/lib/port-conflicts'
 import SiteDeleteDialog from './SiteDeleteDialog.vue'
 
 const props = defineProps<{
@@ -154,11 +155,26 @@ const canGenerate = canGenerateSite
 const canDeploy = canDeploySite
 const canRestart = canRestartSite
 const canDelete = canDeleteSite
-const canEdit = canEditSite
-
-// D2 / Sprint D · 修 G9：用 hi-fi 弹框替代 window.confirm
+// D2 / Sprint D · 修 G9：危险操作统一走受控弹框
 const deleteTarget = ref<ManagedProjectSite | null>(null)
 const deletePending = ref(false)
+const appendTarget = ref<ManagedProjectSite | null>(null)
+const appendDbFileValue = ref('')
+const appendError = ref('')
+const appendPending = ref(false)
+const redeployTarget = ref<ManagedProjectSite | null>(null)
+const redeployPending = ref(false)
+
+const appendRequiresStop = computed(() => {
+  const site = appendTarget.value
+  return Boolean(
+    site
+      && (site.status === 'Running'
+        || site.status === 'Starting'
+        || site.status === 'Stopping'
+        || site.parse_status === 'Running'),
+  )
+})
 
 function confirmDelete(site: ManagedProjectSite) {
   deleteTarget.value = site
@@ -182,19 +198,94 @@ async function executeDelete() {
     deletePending.value = false
   }
 }
+
+function openAppendDbFileDialog(site: ManagedProjectSite) {
+  appendTarget.value = site
+  appendDbFileValue.value = ''
+  appendError.value = ''
+}
+
+function cancelAppendDbFile() {
+  if (appendPending.value) return
+  appendTarget.value = null
+  appendDbFileValue.value = ''
+  appendError.value = ''
+}
+
+async function executeAppendDbFile() {
+  const site = appendTarget.value
+  const dbFile = appendDbFileValue.value.trim()
+  if (!site || appendPending.value) return
+  if (!dbFile) {
+    appendError.value = '请输入 dbfile 绝对路径、相对 project_path 的路径，或文件名。'
+    return
+  }
+  appendPending.value = true
+  appendError.value = ''
+  try {
+    await sitesStore.appendDbFile(site.site_id, dbFile)
+    appendTarget.value = null
+    appendDbFileValue.value = ''
+    appendError.value = ''
+  } catch {
+    appendError.value = sitesStore.getSiteActionError(site.site_id)?.message ?? '提交追加 DB file 任务失败'
+  } finally {
+    appendPending.value = false
+  }
+}
+
+async function confirmRedeploy(site: ManagedProjectSite) {
+  if (!await ensureSitePortsClear(site, '重新部署前需要先处理端口冲突。')) return
+  redeployTarget.value = site
+}
+
+function cancelRedeploy() {
+  if (redeployPending.value) return
+  redeployTarget.value = null
+}
+
+async function executeRedeploy() {
+  const site = redeployTarget.value
+  if (!site || redeployPending.value) return
+  redeployPending.value = true
+  try {
+    await sitesStore.redeploySite(site.site_id)
+    redeployTarget.value = null
+  } catch {
+    // 错误已写入 store，弹框保持打开方便用户重试或关闭
+  } finally {
+    redeployPending.value = false
+  }
+}
 function riskSummary(site: ManagedProjectSite) {
   return site.risk_reasons[0] ?? '当前无明显风险'
+}
+function riskLogKind(site: ManagedProjectSite): ManagedSiteLogKind {
+  const text = [site.last_error, ...site.risk_reasons].filter(Boolean).join(' ')
+  if (site.parse_status === 'Failed' || /parse|解析/i.test(text)) return 'parse'
+  if (/viewer/i.test(text)) return 'viewer'
+  if (/db|surreal|数据库/i.test(text)) return 'db'
+  if (/web|站点|启动|运行/i.test(text)) return 'web'
+  return 'parse'
 }
 function openDetail(siteId: string) {
   router.push({ path: '/sites/' + siteId })
 }
+function errorLogHref(site: ManagedProjectSite) {
+  return `#/sites/${site.site_id}?tab=overview&log=${riskLogKind(site)}#site-logs`
+}
+function siteViewerHref(site: ManagedProjectSite) {
+  return buildViewerUrl(site)
+}
 function openViewer(site: ManagedProjectSite) {
-  const url = buildViewerUrl(site)
+  const url = siteViewerHref(site)
   if (url) window.open(url, '_blank')
 }
 
 async function handleStart(siteId: string) {
   try {
+    const site = props.sites.find((item) => item.site_id === siteId)
+    if (site && !(await ensureSitePortsClear(site, '启动站点前需要先处理端口冲突。'))) return
     await sitesStore.startSite(siteId)
   } catch {
     // 错误已写入 store
@@ -235,10 +326,23 @@ async function handleGenerate(siteId: string) {
 
 async function handleDeploy(siteId: string) {
   try {
+    const site = props.sites.find((item) => item.site_id === siteId)
+    if (site && !(await ensureSitePortsClear(site, '运行部署前需要先处理端口冲突。'))) return
     await sitesStore.deploySite(siteId)
   } catch {
     // 错误已写入 store
   }
+}
+
+async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
+  const ports = [
+    { label: 'DB', port: site.db_port },
+    { label: 'Web', port: site.web_port },
+    { label: 'Viewer', port: site.viewer_port },
+  ]
+  const conflicts = await checkPortConflicts(ports, site.bind_host || undefined)
+  const result = await resolvePortConflicts(conflicts, context)
+  return result.ok
 }
 
 </script>
@@ -319,14 +423,14 @@ async function handleDeploy(siteId: string) {
             <div class="font-medium">{{ site.project_name }}</div>
             <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>
             <a
-              v-if="site.entry_url && site.status === 'Running'"
-              :href="site.public_entry_url || site.entry_url"
+              v-if="siteViewerHref(site) && site.status === 'Running'"
+              :href="siteViewerHref(site) || undefined"
               target="_blank"
               rel="noreferrer"
               class="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline"
               @click.stop
             >
-              {{ site.public_entry_url || site.entry_url }}
+              {{ siteViewerHref(site) }}
               <ExternalLink class="h-3 w-3" />
             </a>
             <div v-if="site.last_error" class="mt-1 max-w-[280px] truncate text-xs text-destructive" :title="site.last_error">
@@ -369,15 +473,21 @@ async function handleDeploy(siteId: string) {
             >
               {{ riskConfig[site.risk_level]?.label ?? site.risk_level }}
             </span>
-            <div v-if="riskSummary(site) !== '当前无明显风险'" class="mt-1 max-w-[200px] truncate text-xs text-muted-foreground" :title="site.risk_reasons.join('；')">
+            <a
+              v-if="riskSummary(site) !== '当前无明显风险'"
+              class="mt-1 block max-w-[200px] truncate text-left text-xs text-muted-foreground hover:text-primary hover:underline"
+              :href="errorLogHref(site)"
+              :title="`${site.risk_reasons.join('；')}\n点击查看对应日志`"
+              @click.stop
+            >
               {{ riskSummary(site) }}
-            </div>
+            </a>
           </td>
           <td class="px-4 py-3 text-right align-top" @click.stop>
             <div v-if="isPending(site.site_id)" class="flex items-center justify-end gap-2">
               <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
               <span class="text-xs text-muted-foreground">
-                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : pendingAction(site.site_id) === 'generate' ? '生成中' : pendingAction(site.site_id) === 'deploy' ? '部署中' : '处理中' }}
+                {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : pendingAction(site.site_id) === 'append_dbfile' ? '追加中' : pendingAction(site.site_id) === 'generate' ? '生成中' : pendingAction(site.site_id) === 'deploy' ? '部署中' : pendingAction(site.site_id) === 'redeploy' ? '重新部署中' : '处理中' }}
               </span>
             </div>
             <div v-else class="flex items-center justify-end gap-1">
@@ -388,6 +498,14 @@ async function handleDeploy(siteId: string) {
                 title="完整部署（解析/生成/启动）"
               >
                 <Play class="h-3.5 w-3.5 text-blue-600" />
+              </button>
+              <button
+                v-if="canDeploy(site)"
+                @click="confirmRedeploy(site)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="重新部署（删除旧数据后重新解析/生成/启动）"
+              >
+                <RefreshCcw class="h-3.5 w-3.5 text-orange-600" />
               </button>
               <button
                 v-if="canStart(site)"
@@ -401,7 +519,7 @@ async function handleDeploy(siteId: string) {
                 v-if="canStop(site)"
                 @click="handleStop(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="停止"
+                :title="site.parse_status === 'Running' ? '停止解析（中止部署）' : site.status === 'Starting' ? '停止部署' : '停止'"
               >
                 <Square class="h-3.5 w-3.5 text-amber-600" />
               </button>
@@ -422,6 +540,13 @@ async function handleDeploy(siteId: string) {
                 <RefreshCw class="h-3.5 w-3.5" />
               </button>
               <button
+                @click="openAppendDbFileDialog(site)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="追加 DB file（保留原数据，继续解析/生成/启动）"
+              >
+                <FilePlus2 class="h-3.5 w-3.5 text-violet-600" />
+              </button>
+              <button
                 v-if="canGenerate(site)"
                 @click="handleGenerate(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
@@ -433,22 +558,16 @@ async function handleDeploy(siteId: string) {
                 v-if="site.status === 'Running' && buildViewerUrl(site)"
                 @click="openViewer(site)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                :title="`打开 Viewer (${site.associated_project || site.project_name})`"
+                :title="`打开前端 Viewer (${site.associated_project || site.project_name})`"
               >
                 <Eye class="h-3.5 w-3.5 text-primary" />
               </button>
               <button
-                @click="openDetail(site.site_id)"
+                type="button"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="详情"
-              >
-                <ExternalLink class="h-3.5 w-3.5" />
-              </button>
-              <button
-                v-if="canEdit(site)"
+                title="打开站点创建配置表单并编辑保存"
+                aria-label="查看/编辑配置"
                 @click="emit('edit-site', site.site_id)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="编辑配置"
               >
                 <Pencil class="h-3.5 w-3.5" />
               </button>
@@ -479,5 +598,109 @@ async function handleDeploy(siteId: string) {
       @cancel="cancelDelete"
       @confirm="executeDelete"
     />
+    <Teleport to="body">
+      <div v-if="appendTarget" class="fixed inset-0 z-50">
+        <div class="absolute inset-0 bg-black/50" @click="cancelAppendDbFile" />
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="site-append-dbfile-title"
+          class="absolute left-1/2 top-1/2 w-full max-w-[480px] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-background shadow-xl"
+        >
+          <div class="border-b border-border px-6 py-4">
+            <h3 id="site-append-dbfile-title" class="text-lg font-semibold">追加 DB file</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              将 DB file 加入「{{ appendTarget.project_name }}」解析范围，并提交后续部署任务。
+            </p>
+          </div>
+          <div class="space-y-4 px-6 py-4">
+            <label class="block space-y-1.5">
+              <span class="text-sm font-medium">DB file</span>
+              <input
+                v-model="appendDbFileValue"
+                :disabled="appendPending"
+                class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none transition-colors placeholder:text-muted-foreground focus:border-primary disabled:opacity-50"
+                placeholder="绝对路径、相对 project_path 的路径，或文件名"
+                @keydown.enter.prevent="executeAppendDbFile"
+              />
+            </label>
+            <div
+              v-if="appendRequiresStop"
+              class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200"
+            >
+              当前站点正在运行或处理中，追加前会先停止站点；停止失败或端口冲突时不会继续修改配置。
+            </div>
+            <div v-if="appendError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {{ appendError }}
+            </div>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-border bg-muted/30 px-6 py-4">
+            <button
+              type="button"
+              :disabled="appendPending"
+              class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+              @click="cancelAppendDbFile"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              :disabled="appendPending"
+              class="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50"
+              @click="executeAppendDbFile"
+            >
+              <Loader2 v-if="appendPending" class="h-3.5 w-3.5 animate-spin" />
+              {{ appendPending ? '提交中...' : '追加并部署' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+    <Teleport to="body">
+      <div v-if="redeployTarget" class="fixed inset-0 z-50">
+        <div class="absolute inset-0 bg-black/50" @click="cancelRedeploy" />
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="site-redeploy-title"
+          class="absolute left-1/2 top-1/2 w-full max-w-[480px] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-background shadow-xl"
+        >
+          <div class="border-b border-border px-6 py-4">
+            <h3 id="site-redeploy-title" class="text-lg font-semibold text-destructive">重新部署站点</h3>
+            <p class="mt-1 text-sm text-muted-foreground">
+              将停止「{{ redeployTarget.project_name }}」并删除旧数据，再重新执行解析 → 生成 → 启动。
+            </p>
+          </div>
+          <div class="space-y-3 px-6 py-4">
+            <div class="rounded-md border border-border bg-muted/40 px-3 py-2">
+              <div class="text-xs uppercase tracking-wider text-muted-foreground">Site ID</div>
+              <div class="mt-0.5 font-mono text-sm">{{ redeployTarget.site_id }}</div>
+            </div>
+            <p class="text-sm text-muted-foreground">
+              站点配置会保留，但已解析的 SurrealDB 数据会被清理。此操作不可撤销。
+            </p>
+          </div>
+          <div class="flex justify-end gap-3 border-t border-border bg-muted/30 px-6 py-4">
+            <button
+              type="button"
+              :disabled="redeployPending"
+              class="inline-flex h-9 items-center rounded-md border border-input bg-transparent px-4 text-sm font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+              @click="cancelRedeploy"
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              :disabled="redeployPending"
+              class="inline-flex h-9 items-center gap-2 rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 transition-colors disabled:pointer-events-none disabled:opacity-50"
+              @click="executeRedeploy"
+            >
+              <Loader2 v-if="redeployPending" class="h-3.5 w-3.5 animate-spin" />
+              {{ redeployPending ? '提交中...' : '确认重新部署' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>

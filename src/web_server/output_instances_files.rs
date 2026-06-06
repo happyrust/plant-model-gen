@@ -28,14 +28,15 @@ async fn read_file_response(path: &StdPath, file_name: &str) -> Response {
     }
 }
 
+fn output_root() -> PathBuf {
+    crate::versioned_db::db_meta_info::get_output_root()
+}
+
 pub async fn get_project_instances_file(Path((project, file)): Path<(String, String)>) -> Response {
     if !is_safe_segment(&project) || !is_safe_segment(&file) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let path = PathBuf::from("output")
-        .join(project)
-        .join("instances")
-        .join(&file);
+    let path = output_root().join(project).join("instances").join(&file);
     read_file_response(&path, &file).await
 }
 
@@ -43,6 +44,6 @@ pub async fn get_root_instances_file(Path(file): Path<String>) -> Response {
     if !is_safe_segment(&file) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let path = PathBuf::from("output").join("instances").join(&file);
+    let path = output_root().join("instances").join(&file);
     read_file_response(&path, &file).await
 }

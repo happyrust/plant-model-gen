@@ -120,7 +120,7 @@ impl DbMetaManager {
 
     /// 尝试从默认路径加载
     ///
-    /// 只使用项目目录 output/{project_name}/scene_tree/db_meta_info.json
+    /// 只使用项目目录 <output_root>/{project_name}/scene_tree/db_meta_info.json
     /// 若不存在，自动触发解析生成
     pub fn try_load_default(&self) -> Result<()> {
         // 尝试从 DbOption 获取 project_name
@@ -152,31 +152,14 @@ impl DbMetaManager {
 
     /// 获取基于项目名称的路径列表
     ///
-    /// 从配置文件读取 project_name，构建 output/{project_name}/scene_tree/ 路径
+    /// 从配置文件读取 project_name，构建 <output_root>/{project_name}/scene_tree/ 路径
     /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
     fn get_project_based_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
 
-        // 优先使用环境变量指定的配置文件，否则回退到默认
-        let config_name =
-            std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-        let config_file = format!("{}.toml", config_name);
-
-        if let Ok(content) = std::fs::read_to_string(&config_file) {
-            // 简单解析 project_name = "xxx"
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with("project_name") {
-                    if let Some(value) = line.split('=').nth(1) {
-                        let name = value.trim().trim_matches('"').trim_matches('\'');
-                        if !name.is_empty() {
-                            let path = format!("output/{}/scene_tree/db_meta_info.json", name);
-                            paths.push(path);
-                            break;
-                        }
-                    }
-                }
-            }
+        if let Some(tree_dir) = crate::versioned_db::db_meta_info::get_current_project_tree_dir() {
+            let path = tree_dir.join("db_meta_info.json");
+            paths.push(path.to_string_lossy().to_string());
         }
 
         paths
@@ -262,14 +245,15 @@ impl DbMetaManager {
 
     /// 从指定项目目录加载
     pub fn load_from_project(&self, project_name: &str) -> Result<()> {
-        let path = format!("output/{}/scene_tree/db_meta_info.json", project_name);
-        if Path::new(&path).exists() {
+        let path = crate::versioned_db::db_meta_info::get_project_tree_dir(project_name)
+            .join("db_meta_info.json");
+        if path.exists() {
             self.load(&path)
         } else {
             anyhow::bail!(
                 "项目 {} 的 db_meta_info.json 不存在: {}",
                 project_name,
-                path
+                path.display()
             )
         }
     }
@@ -300,6 +284,18 @@ impl DbMetaManager {
     /// 获取所有 dbnum 列表
     pub fn get_all_dbnums(&self) -> Vec<u32> {
         self.db_files.read().unwrap().keys().copied().collect()
+    }
+
+    /// 按数据库类型获取 dbnum 列表（例如 DESI / CATA / DICT）。
+    pub fn get_dbnums_by_type(&self, db_type: &str) -> Vec<u32> {
+        let target = db_type.trim().to_ascii_uppercase();
+        self.db_files
+            .read()
+            .unwrap()
+            .values()
+            .filter(|info| info.db_type.trim().eq_ignore_ascii_case(&target))
+            .map(|info| info.dbnum)
+            .collect()
     }
 
     /// 根据 dbnum 获取文件信息
@@ -429,6 +425,25 @@ pub(crate) fn indextree_project_dir_candidates(
 
 /// 生成所有 DESI 类型的 indextree 文件
 pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_indextree_for_types(&["DESI"], ignore_manual_dbnum)
+}
+
+/// 生成全部库类型（DESI/CATA/DICT/SYST/GLB/GLOB）的 indextree。
+///
+/// 用于全量预扫描 ref0↔dbnum 映射：只有覆盖全部库类型，才能把"外部引用 ref0"
+/// 正确反查到所属 dbnum（仅 DESI 时外部库 ref0 缺失）。这是关联库精确解析的基础。
+pub fn generate_all_types_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_indextree_for_types(
+        &["DESI", "CATA", "DICT", "SYST", "GLB", "GLOB"],
+        ignore_manual_dbnum,
+    )
+}
+
+/// 按给定 db 类型集合做 gen_tree_only 轻量解析并写出 `db_meta_info.json`。
+fn generate_indextree_for_types(
+    db_types: &[&str],
+    ignore_manual_dbnum: bool,
+) -> anyhow::Result<()> {
     use crate::versioned_db::database::sync_total_async_threaded;
     use aios_core::options::DbOption;
     use dashmap::DashSet;
@@ -457,8 +472,8 @@ pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> 
 
     let project_name = db_option.project_name.clone();
     println!(
-        "🔄 正在生成 DESI 类型 indextree (项目: {})...",
-        project_name
+        "🔄 正在生成 indextree (项目: {}, 类型: {:?})...",
+        project_name, db_types
     );
 
     // 使用 tokio runtime 执行异步生成
@@ -466,7 +481,7 @@ pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> 
         Ok(handle) => tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let cur_dbno_set = Arc::new(DashSet::new());
-                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, &["DESI"], 100)
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, db_types, 100)
                     .await
             })
         }),
@@ -474,7 +489,7 @@ pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> 
             let rt = build_indextree_runtime()?;
             rt.block_on(async {
                 let cur_dbno_set = Arc::new(DashSet::new());
-                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, &["DESI"], 100)
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, db_types, 100)
                     .await
             })
         }

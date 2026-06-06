@@ -11,7 +11,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Component, Path};
+use std::net::{IpAddr, UdpSocket};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
@@ -48,6 +49,7 @@ pub mod mqtt_monitor_handlers;
 pub mod output_instances_files;
 #[cfg(feature = "parquet-export")]
 pub mod parquet_compact_worker;
+pub mod parse_sidecar_client;
 pub mod remote_runtime;
 pub mod remote_sync_handlers;
 pub mod remote_sync_template;
@@ -67,6 +69,21 @@ pub mod topology_handlers; // 拓扑配置处理器
 pub mod web_listen; // 当前进程 HTTP 监听与站点身份（一 web_server 一站）
 pub mod wizard_handlers;
 pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
+
+pub(crate) fn get_local_ip_via_udp() -> Result<String, std::io::Error> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    let local_addr = socket.local_addr()?;
+
+    if let IpAddr::V4(ipv4) = local_addr.ip() {
+        Ok(ipv4.to_string())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "无法获取IPv4地址",
+        ))
+    }
+}
 
 use crate::web_api::{
     CollisionApiState, E3dTreeApiState, NounHierarchyApiState, SearchApiState,
@@ -272,6 +289,10 @@ fn maybe_print_registered_routes() {
     );
 }
 
+fn files_output_root() -> PathBuf {
+    crate::versioned_db::db_meta_info::get_output_root()
+}
+
 pub async fn start_web_server_with_config(
     port: u16,
     config_file: Option<&str>,
@@ -341,26 +362,12 @@ pub async fn start_web_server_with_config(
     {
         eprintln!("⚠️ 数据库命名空间切换失败，后续将继续后台重试: {}", e);
     }
-    if let Err(error) = crate::web_api::review_db::init_review_primary_db(&db_option).await {
-        eprintln!(
-            "⚠️ review 专用数据库连接初始化失败，后续校审接口可能不可用: {}",
-            error
-        );
-    }
-    tokio::spawn(async {
-        match crate::web_api::review_db::warm_review_schema().await {
-            Ok(_) => println!("✅ review schema/index 后台预热完成"),
-            Err(error) => eprintln!("⚠️ review schema/index 后台预热失败: {}", error),
-        }
-        match crate::web_api::platform_api::review_form::warm_review_forms_schema().await {
-            Ok(_) => println!("✅ review_forms schema 后台预热完成"),
-            Err(error) => eprintln!("⚠️ review_forms schema 后台预热失败: {}", error),
-        }
-    });
+    let initialize_scene_tree_on_startup = db_option.gen_model || db_option.gen_spatial_tree;
     let config_name_for_init = config_name.clone();
     let startup_ns = db_option.surreal_ns.clone();
     let startup_db = db_option.project_name.clone();
-    tokio::spawn(async move {
+    let db_option_for_init = db_option.clone();
+    let db_init_handle = tokio::spawn(async move {
         match aios_core::initialize_databases(&db_option).await {
             Ok(_) => {
                 if let Err(error) =
@@ -369,6 +376,29 @@ pub async fn start_web_server_with_config(
                     eprintln!("⚠️ 数据库初始化成功，但最终命名空间切换失败: {}", error);
                 }
                 println!("✅ 数据库连接初始化成功");
+                let db_option_for_review = db_option_for_init.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        crate::web_api::review_db::init_review_primary_db(&db_option_for_review)
+                            .await
+                    {
+                        eprintln!(
+                            "⚠️ review 专用数据库连接初始化失败，后续校审接口可能不可用: {}",
+                            error
+                        );
+                    }
+                    match crate::web_api::review_db::warm_review_schema().await {
+                        Ok(_) => println!("✅ review schema/index 后台预热完成"),
+                        Err(error) => eprintln!("⚠️ review schema/index 后台预热失败: {}", error),
+                    }
+                    match crate::web_api::platform_api::review_form::warm_review_forms_schema()
+                        .await
+                    {
+                        Ok(_) => println!("✅ review_forms schema 后台预热完成"),
+                        Err(error) => eprintln!("⚠️ review_forms schema 后台预热失败: {}", error),
+                    }
+                });
+                true
             }
             Err(e) => {
                 let error_msg = e.to_string();
@@ -380,6 +410,7 @@ pub async fn start_web_server_with_config(
                 eprintln!("   配置信息: {}", db_option.connection_summary());
                 // 不直接返回错误，允许 web-server 继续启动（某些功能可能不需要数据库）
                 eprintln!("⚠️ 警告: 数据库连接失败，某些功能可能不可用");
+                false
             }
         }
     });
@@ -403,14 +434,28 @@ pub async fn start_web_server_with_config(
         }
     });
 
-    // 确保 Scene Tree 已初始化
-    println!("🌳 检查 Scene Tree 初始化状态...");
-    match crate::scene_tree::ensure_initialized().await {
-        Ok(_) => println!("✅ Scene Tree 初始化检查完成"),
-        Err(e) => {
-            eprintln!("⚠️ Scene Tree 初始化失败: {}", e);
-            // 不阻塞启动，允许后续手动初始化
+    // 仅在模型/空间树功能需要时做启动期 Scene Tree 初始化；解析/验证站点按需懒加载。
+    if initialize_scene_tree_on_startup {
+        match db_init_handle.await {
+            Ok(true) => {
+                println!("🌳 检查 Scene Tree 初始化状态...");
+                match crate::scene_tree::ensure_initialized().await {
+                    Ok(_) => println!("✅ Scene Tree 初始化检查完成"),
+                    Err(e) => {
+                        eprintln!("⚠️ Scene Tree 初始化失败: {}", e);
+                        // 不阻塞启动，允许后续手动初始化
+                    }
+                }
+            }
+            Ok(false) => {
+                eprintln!("⚠️ 数据库初始化未完成，跳过启动期 Scene Tree 初始化");
+            }
+            Err(error) => {
+                eprintln!("⚠️ 数据库初始化任务异常，跳过启动期 Scene Tree 初始化: {error}");
+            }
         }
+    } else {
+        println!("🌳 当前站点未启用模型/空间树生成，跳过启动期 Scene Tree 初始化");
     }
 
     #[cfg(feature = "parquet-export")]
@@ -537,6 +582,11 @@ pub async fn start_web_server_with_config(
         .route(
             "/api/model/writer-verify",
             post(model_writer_verify::api_model_writer_verify),
+        )
+        // 一键部署测试（免鉴权快测）：建站→解析(单库)→生成→(可选)启动
+        .route(
+            "/api/admin/quick-deploy-test",
+            post(admin_handlers::quick_deploy_test),
         )
         // 实时查库返回实例数据（用于 parquet miss 回填）
         .route(
@@ -1087,8 +1137,9 @@ pub async fn start_web_server_with_config(
         //
         // 说明：不能在同一 Router 上同时注册 `/files/output` 的 nest_service 与其子路由，
         // 否则 axum 会在路由树插入阶段报冲突。因此把“兜底路由 + ServeDir”一起 nest 进去。
-        .nest(
-            "/files/output",
+        .nest("/files/output", {
+            let output_root = files_output_root();
+            println!("💡 Serving output files from: {:?}", output_root);
             Router::new()
                 // instances 文件兜底：兼容 instances_cache_for_index 的落盘结构
                 .route(
@@ -1099,8 +1150,8 @@ pub async fn start_web_server_with_config(
                     "/instances/{file}",
                     get(output_instances_files::get_root_instances_file),
                 )
-                .fallback_service(ServeDir::new("output")),
-        )
+                .fallback_service(ServeDir::new(output_root))
+        })
         .nest_service(
             "/files/output/database_models",
             ServeDir::new("assets/database_models"),
@@ -1624,7 +1675,11 @@ async fn viewer_static_or_index(AxumPath(path): AxumPath<String>) -> Result<Resp
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let local_path = Path::new(VIEWER_DIST_DIR).join(path.trim_start_matches('/'));
+    let relative = path
+        .trim_start_matches('/')
+        .strip_prefix("viewer/")
+        .unwrap_or_else(|| path.trim_start_matches('/'));
+    let local_path = Path::new(VIEWER_DIST_DIR).join(relative);
     if local_path.is_file() {
         let bytes = tokio::fs::read(&local_path)
             .await

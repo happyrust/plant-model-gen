@@ -1,0 +1,23 @@
+---
+description: aios-database sidecar boundary and verification rules
+globs: "{src/web_server/**/*.rs,src/parse_sidecar.rs,scripts/smoke/**/*.ps1,scripts/guard/**/*.ps1,docs/**/*.md,.planning/**/*.md}"
+alwaysApply: false
+---
+
+# aios-database Sidecar Boundary
+
+- UI and admin callers continue to use `web_server`; `web_server` is the BFF/control plane.
+- `web_server` must not read E3D project data, scan project roots for DB facts, open DB files, parse DB headers, or compute dependency closure locally.
+- Parsing-domain facts belong to `aios-database` sidecar: project scan, preview parse plan, DB file header/dbnum/db_type facts, `db_index`, parse jobs, generate jobs, job status, cancellation, and WS events.
+- `DbOption-parse.toml` stays compatible: keep the plain `included_db_files` array. Put structured facts, sources, warnings, `inputs_hash`, and `db_index` metadata in `parse-plan-manifest.json`.
+- Preview indexes live under `runtime/preview-index/<inputs_hash>/db_index.sqlite`; formal site indexes live under `runtime/admin_sites/<site_id>/db_index.sqlite`. Promote preview index only when `inputs_hash` matches.
+
+## Verification
+
+- Do not use `cargo test` for `web_server`; verify with running service + HTTP/CLI smoke, `cargo check`, and static guards.
+- Run `scripts/guard/web_server_parse_boundary_guard.ps1` after touching `src/web_server` parse/sidecar paths.
+- Useful smoke scripts:
+  - `scripts/smoke/sidecar_preview_facts_smoke.ps1`
+  - `scripts/smoke/sidecar_preview_index_smoke.ps1`
+  - `scripts/smoke/admin_manifest_hash_smoke.ps1`
+  - `scripts/smoke/sidecar_job_events_smoke.ps1`

@@ -45,9 +45,6 @@ pub mod pe_parquet_writer;
 pub mod export_dbnum_instances_parquet;
 
 #[cfg(feature = "parquet-export")]
-pub mod export_pdms_tree_parquet;
-
-#[cfg(feature = "parquet-export")]
 pub(super) mod spec_info;
 
 pub use export_common::*;

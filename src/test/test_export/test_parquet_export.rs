@@ -69,46 +69,6 @@ async fn test_export_dbnum_instances_parquet() {
     }
 }
 
-/// 测试导出 PDMS Tree 为 Parquet
-#[tokio::test]
-#[cfg(feature = "parquet-export")]
-#[ignore = "requires a SurrealDB build with rocksdb support and seeded export data"]
-async fn test_export_pdms_tree_parquet() {
-    // 初始化测试数据库
-    aios_core::init_surreal().await.unwrap();
-
-    let dbnum = 1112;
-    let output_dir = PathBuf::from("output/test/parquet/pdms_tree");
-
-    // 调用导出函数
-    let result =
-        crate::fast_model::export_model::export_pdms_tree_parquet::export_pdms_tree_parquet(
-            dbnum,
-            &output_dir,
-            true, // verbose
-        )
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "PDMS Tree Parquet 导出应该成功: {:?}",
-        result.err()
-    );
-
-    let stats = result.unwrap();
-    println!("📊 PDMS Tree 导出统计:");
-    println!("   - 节点数量: {}", stats.node_count);
-    println!("   - 文件大小: {} 字节", stats.total_bytes);
-    println!("   - 文件名: {}", stats.file_name);
-
-    // 验证生成的 Parquet 文件
-    let parquet_file = output_dir.join(&stats.file_name);
-    assert!(parquet_file.exists(), "PDMS Tree Parquet 文件应该存在");
-
-    // 验证统计数据
-    assert!(stats.node_count > 0, "应该有导出的节点");
-}
-
 /// 测试导出 Scene Tree 为 Parquet
 ///
 /// 注意：scene_node 表需要先通过 scene_tree::init 初始化才有数据，

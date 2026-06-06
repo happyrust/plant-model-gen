@@ -838,16 +838,36 @@ pub struct ManagedSiteParsePlan {
     pub includes_system_db_files: bool,
     #[serde(default)]
     pub included_db_files: Vec<String>,
+    /// 「自动解析依赖库」根据 ref0→dbnum 依赖闭包额外纳入的目标文件子集（included_db_files 的子集）。
+    /// 仅预览路径填充，供前端单独高亮展示；持久化的 parse_plan 默认空。
+    #[serde(default)]
+    pub auto_related_db_files: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<ParsePlanFact>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// sidecar 返回的单个解析目标事实，用于解释 included_db_files 的来源。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ParsePlanFact {
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_type: Option<String>,
+    pub source: String,
+    pub priority: u32,
 }
 
 /// 受管站点数据库连接模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ManagedSiteDbMode {
-    /// 嵌入式文件模式，用于解析/模型生成，避免依赖已启动的 ws 服务。
-    #[default]
+    /// 嵌入式文件模式，用于显式选择离线文件管线。
     File,
-    /// WebSocket 模式，用于站点运行时，便于 Web 服务访问独立 SurrealDB 进程。
+    /// WebSocket 模式，用于默认解析/生成管线和站点运行时。
+    #[default]
     Ws,
 }
 
@@ -941,10 +961,17 @@ pub struct ManagedProjectSite {
     pub projects: Vec<SiteProject>,
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
+    /// 模型生成阶段手动指定的数据库编号；为空时沿用解析范围，兼容旧站点。
+    #[serde(default)]
+    pub generate_db_nums: Vec<u32>,
     #[serde(default)]
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
+    /// 是否自动解析目标 dbnum 关联的依赖库（如元件库 CATA / 字典库 DICT）。
+    /// 默认关闭；开启后解析范围会额外纳入依赖库（首版按 db 类型粗粒度纳入，后续完善为按引用精确解析）。
+    #[serde(default)]
+    pub auto_parse_related_dbnums: bool,
     #[serde(default = "default_true")]
     pub gen_model: bool,
     #[serde(default)]
@@ -1040,9 +1067,18 @@ pub struct CreateManagedSiteRequest {
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
     #[serde(default)]
+    pub manual_db_files: Vec<String>,
+    #[serde(default)]
+    pub generate_db_nums: Vec<u32>,
+    #[serde(default)]
+    pub generate_db_files: Vec<String>,
+    #[serde(default)]
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
+    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
+    #[serde(default)]
+    pub auto_parse_related_dbnums: bool,
     #[serde(default)]
     pub gen_model: Option<bool>,
     #[serde(default)]
@@ -1095,9 +1131,18 @@ pub struct UpdateManagedSiteRequest {
     #[serde(default)]
     pub manual_db_nums: Option<Vec<u32>>,
     #[serde(default)]
+    pub manual_db_files: Vec<String>,
+    #[serde(default)]
+    pub generate_db_nums: Option<Vec<u32>>,
+    #[serde(default)]
+    pub generate_db_files: Vec<String>,
+    #[serde(default)]
     pub parse_db_types: Option<Vec<String>>,
     #[serde(default)]
     pub force_rebuild_system_db: Option<bool>,
+    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。None 表示不修改。
+    #[serde(default)]
+    pub auto_parse_related_dbnums: Option<bool>,
     #[serde(default)]
     pub gen_model: Option<bool>,
     #[serde(default)]
@@ -1146,9 +1191,18 @@ pub struct PreviewManagedSiteParsePlanRequest {
     #[serde(default)]
     pub manual_db_nums: Vec<u32>,
     #[serde(default)]
+    pub manual_db_files: Vec<String>,
+    #[serde(default)]
+    pub generate_db_nums: Vec<u32>,
+    #[serde(default)]
+    pub generate_db_files: Vec<String>,
+    #[serde(default)]
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
+    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
+    #[serde(default)]
+    pub auto_parse_related_dbnums: bool,
     pub web_port: u16,
     #[serde(default)]
     pub bind_host: Option<String>,
@@ -1156,6 +1210,109 @@ pub struct PreviewManagedSiteParsePlanRequest {
     pub public_base_url: Option<String>,
     #[serde(default)]
     pub associated_project: Option<String>,
+}
+
+/// 一键部署测试请求（免鉴权快测专用）：
+/// 传项目路径 + 目标 db 文件（路径/文件名）或 dbnum，单次完成 建站→解析(单库)→生成→(可选)启动。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickDeployTestRequest {
+    /// 工程根目录（绝对路径）
+    #[serde(default)]
+    pub project_path: String,
+    /// E3D 项目名；缺省取 project_path 目录名，站点显示名用默认递增名 quicktest-N
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// 项目代号；缺省 1
+    #[serde(default)]
+    pub project_code: Option<u32>,
+    /// 目标 db 文件：文件名 / 绝对路径 / 相对 project_path 的路径（与 dbnum 二选一）
+    #[serde(default)]
+    pub db_file: Option<String>,
+    /// 直接指定 dbnum（给了就跳过文件头解析）
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    /// 是否自动纳入关联依赖库（CATA/DICT，首版粗粒度）。
+    /// None 表示由具体入口决定默认值；快速部署默认关闭，便于快速 smoke。
+    #[serde(default)]
+    pub auto_parse_related_dbnums: Option<bool>,
+    #[serde(default = "default_true")]
+    pub gen_model: bool,
+    #[serde(default)]
+    pub gen_mesh: bool,
+    #[serde(default)]
+    pub gen_spatial_tree: bool,
+    /// 是否在产数据后顺带启动站点（web + viewer）。默认开启，让快部署产物生成后可直接在 plant3d-web 中查看。
+    #[serde(default = "default_true")]
+    pub start_site: bool,
+    /// 站点 web 端口；缺省自动分配
+    #[serde(default)]
+    pub web_port: Option<u16>,
+    /// true=同步等到结束返回 summary；false=后台执行并立即返回 site_id
+    #[serde(default = "default_true")]
+    pub wait: bool,
+    /// 已存在同名站点时是否删除重建
+    #[serde(default)]
+    pub force_recreate: bool,
+    /// 管线（解析/生成）数据库模式：缺省 file（嵌入式 RocksDB，需 kv-rocksdb 构建）；
+    /// 传 "ws" 则解析/生成连接临时 SurrealDB，免 kv-rocksdb，便于快测验证。
+    #[serde(default)]
+    pub pipeline_db_mode: Option<ManagedSiteDbMode>,
+}
+
+/// 一键部署测试响应
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QuickDeployTestResponse {
+    pub success: bool,
+    pub site_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_db_file: Option<String>,
+    pub parse_status: String,
+    pub generated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_url: Option<String>,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub parse_log_tail: Vec<String>,
+    #[serde(default)]
+    pub generate_log_tail: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// 追加单个 dbfile 到既有站点的解析范围。
+///
+/// 后端读取 dbfile 文件头得到真实 dbnum，合并到站点 manual_db_nums 后，
+/// 调用方再提交普通完整部署任务；该路径不清空旧数据，用于增量追加解析/生成。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendManagedSiteDbFileRequest {
+    /// 目标 db 文件：文件名 / 绝对路径 / 相对站点 project_path 的路径。
+    pub db_file: String,
+    /// 可选直接指定 dbnum；提供后仍会保留 db_file 作为前端展示/审计信息。
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    /// 运行中的站点是否自动停止后追加。默认 true，便于从列表直接操作。
+    #[serde(default = "default_true")]
+    pub stop_running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppendManagedSiteDbFileResponse {
+    pub site_id: String,
+    pub dbnum: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_db_file: Option<String>,
+    pub already_present: bool,
+    pub stopped_site: bool,
+    pub manual_db_nums: Vec<u32>,
+    pub site: ManagedProjectSite,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// 管理后台站点运行态
@@ -1179,6 +1336,12 @@ pub struct ManagedSiteRuntimeStatus {
     #[serde(default)]
     pub viewer_pid: Option<u32>,
     pub parse_pid: Option<u32>,
+    #[serde(default)]
+    pub sidecar_job_kind: Option<String>,
+    #[serde(default)]
+    pub sidecar_job_id: Option<String>,
+    #[serde(default)]
+    pub sidecar_job_status: Option<String>,
     pub db_port: u16,
     pub web_port: u16,
     #[serde(default)]
@@ -1297,6 +1460,10 @@ pub struct ManagedRemoteTarget {
     pub ssh_port: u16,
     pub ssh_user: String,
     pub password_env: String,
+    /// 明文 SSH 密码：仅用于服务端内部部署链路，**永不**序列化回前端
+    /// （`skip_serializing`），避免 `GET /api/admin/remote-targets` 泄露明文。
+    /// 反序列化仍保留（兼容内部构造 / 测试），默认 `None`。
+    #[serde(skip_serializing)]
     pub ssh_password: Option<String>,
     pub remote_root: String,
     pub remote_db_path: String,

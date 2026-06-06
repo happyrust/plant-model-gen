@@ -495,6 +495,12 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("diagnose-surreal")
+                .long("diagnose-surreal")
+                .help("Print SurrealDB startup diagnostics and copyable test commands without opening embedded RocksDB")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("defer-db-write")
                 .long("defer-db-write")
                 .help("Deprecated and ignored: DB writes always stay online during model generation")
@@ -718,6 +724,12 @@ async fn main() -> anyhow::Result<()> {
                 .value_name("JSON_PATH"),
         )
         .arg(
+            Arg::new("import-spatial-index-parquet")
+                .long("import-spatial-index-parquet")
+                .help("Import dbnum Parquet directory (aabb/instances/tubings.parquet) to SQLite spatial index")
+                .value_name("PARQUET_DIR"),
+        )
+        .arg(
             Arg::new("import-rvm")
                 .long("import-rvm")
                 .help("Import an RVM file into SQLite relation tables")
@@ -891,6 +903,57 @@ async fn main() -> anyhow::Result<()> {
                             .help("输出目录")),
                 ),
         )
+        .subcommand(
+            Command::new("scan-db-index")
+                .about(
+                    "index-only 预扫描所有 db 文件 ref0/dbnum（pdms-io INDEX 直扫）写入 SQLite，并记录设计库精确依赖边（关联库精确解析基础）",
+                )
+                .arg(
+                    Arg::new("no-scan")
+                        .long("no-scan")
+                        .help("增量模式：仅重扫指纹（mtime/size）变化的库（默认全量重扫）")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("serve")
+                .about("启动 aios-database 解析域 sidecar HTTP/WS 服务")
+                .arg(
+                    Arg::new("site-key")
+                        .long("site-key")
+                        .help("sidecar 生命周期 key，例如 site:<site_id> 或 preview:<hash>")
+                        .required(true)
+                        .value_name("SITE_KEY"),
+                )
+                .arg(
+                    Arg::new("bind-host")
+                        .long("bind-host")
+                        .help("sidecar 监听地址，默认只绑定本机")
+                        .default_value("127.0.0.1")
+                        .value_name("HOST"),
+                )
+                .arg(
+                    Arg::new("http-port")
+                        .long("http-port")
+                        .help("sidecar HTTP/WS 监听端口")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u16))
+                        .value_name("PORT"),
+                )
+                .arg(
+                    Arg::new("runtime-dir")
+                        .long("runtime-dir")
+                        .help("sidecar runtime 目录")
+                        .required(true)
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("token")
+                        .long("token")
+                        .help("web_server 调用 sidecar 时使用的 Bearer token；为空则不启用内部鉴权")
+                        .value_name("TOKEN"),
+                ),
+        )
         // ========== pe_transform 刷新命令 ==========
         .arg(
             Arg::new("refresh-transform")
@@ -1030,6 +1093,46 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    if let Some(serve_matches) = matches.subcommand_matches("serve") {
+        #[cfg(feature = "web_server")]
+        {
+            let site_key = serve_matches
+                .get_one::<String>("site-key")
+                .expect("required by clap")
+                .to_string();
+            let bind_host = serve_matches
+                .get_one::<String>("bind-host")
+                .expect("default value ensures this exists")
+                .to_string();
+            let http_port = serve_matches
+                .get_one::<u16>("http-port")
+                .copied()
+                .expect("required by clap");
+            let runtime_dir = serve_matches
+                .get_one::<String>("runtime-dir")
+                .expect("required by clap");
+            let token = serve_matches
+                .get_one::<String>("token")
+                .cloned()
+                .or_else(|| std::env::var("AIOS_SIDECAR_TOKEN").ok())
+                .filter(|value| !value.trim().is_empty());
+            return aios_database::parse_sidecar::run_parse_sidecar(
+                aios_database::parse_sidecar::ParseSidecarOptions {
+                    site_key,
+                    bind_host,
+                    http_port,
+                    runtime_dir: PathBuf::from(runtime_dir),
+                    token,
+                },
+            )
+            .await;
+        }
+        #[cfg(not(feature = "web_server"))]
+        {
+            anyhow::bail!("serve sidecar requires the web_server feature");
+        }
+    }
+
     if let Some(lod_str) = matches.get_one::<String>("gen-lod").map(|s| s.as_str()) {
         if let Some(lod) = parse_lod_level(lod_str) {
             println!(
@@ -1165,6 +1268,10 @@ async fn main() -> anyhow::Result<()> {
     if matches.get_flag("export-parquet-after-gen") {
         db_option_ext.export_parquet_after_gen = true;
         println!("🔧 模型生成完成后将自动导出 Parquet（按 manual_db_nums）");
+    }
+
+    if matches.get_flag("diagnose-surreal") {
+        return cli_modes::diagnose_surreal_startup_mode(&db_option_ext).await;
     }
 
     // 同步精度配置到 rs-core 全局 active_precision，保证布尔/导出等逻辑使用同一套 LOD
@@ -1500,8 +1607,6 @@ async fn main() -> anyhow::Result<()> {
         || matches.get_flag("export-dbnum-instances-json")
         || matches.get_flag("export-parquet")
         || matches.get_flag("export-dbnum-instances")
-        || matches.get_flag("export-pdms-tree-parquet")
-        || matches.get_flag("export-world-sites-parquet")
         || matches.get_flag("export-dbnum-instances-web")
         || matches.get_flag("export-parquet-after-gen")
         || matches.get_flag("export-v3");
@@ -2221,32 +2326,6 @@ async fn main() -> anyhow::Result<()> {
         return merge_v3_instances_mode(verbose, export_bundle_dir, &db_option_ext);
     }
 
-    // 导出 WORL -> SITE 节点列表为 Parquet（Full Parquet Mode 的根节点 children 数据源）
-    #[cfg(feature = "parquet-export")]
-    if matches.get_flag("export-world-sites-parquet") {
-        use crate::cli_modes::export_world_sites_parquet_mode;
-        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
-        return export_world_sites_parquet_mode(verbose, export_bundle_dir, &db_option_ext).await;
-    }
-
-    // 导出指定 dbnum 的 PDMS Tree 为 Parquet（TreeIndex + pe.name）
-    #[cfg(feature = "parquet-export")]
-    if matches.get_flag("export-pdms-tree-parquet") {
-        use crate::cli_modes::export_pdms_tree_parquet_mode;
-        let dbnum = matches.get_one::<u32>("dbnum").copied();
-        let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
-        let dbnum = match dbnum {
-            Some(n) => n,
-            None => {
-                eprintln!("❌ 错误: --export-pdms-tree-parquet 需要提供 --dbnum 参数");
-                eprintln!("   例如: cargo run -- --export-pdms-tree-parquet --dbnum 7997");
-                std::process::exit(1);
-            }
-        };
-        return export_pdms_tree_parquet_mode(dbnum, verbose, export_bundle_dir, &db_option_ext)
-            .await;
-    }
-
     // 导出 dbnum 实例数据为 Parquet（显式 --export-parquet）
     // 或默认格式（--export-dbnum-instances，默认 Parquet）
     if matches.get_flag("export-parquet") || matches.get_flag("export-dbnum-instances") {
@@ -2346,6 +2425,26 @@ async fn main() -> anyhow::Result<()> {
             root_refno,
         )
         .await;
+    }
+
+    // 从 Parquet 目录导入 SQLite 空间索引（新生产路径的独立重建入口）
+    if let Some(parquet_dir) = matches.get_one::<String>("import-spatial-index-parquet") {
+        use crate::cli_modes::import_spatial_index_parquet_mode;
+
+        let dbnum = matches.get_one::<u32>("dbnum").copied().ok_or_else(|| {
+            anyhow::anyhow!("--import-spatial-index-parquet 需要同时指定 --dbnum")
+        })?;
+        let sqlite_path = matches
+            .get_one::<String>("spatial-index-output")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("output/spatial_index.sqlite"));
+
+        return import_spatial_index_parquet_mode(
+            Path::new(parquet_dir),
+            dbnum,
+            &sqlite_path,
+            verbose,
+        );
     }
 
     // 导入 instances.json 到 SQLite 空间索引
@@ -2462,6 +2561,28 @@ async fn main() -> anyhow::Result<()> {
             &db_option_ext,
         )
         .await;
+    }
+
+    // ========== 处理 scan-db-index 子命令 ==========
+    if let Some(scan_matches) = matches.subcommand_matches("scan-db-index") {
+        let no_scan = scan_matches.get_flag("no-scan");
+        #[cfg(feature = "sqlite-index")]
+        {
+            // index-only 预扫（pdms-io INDEX 直扫）+ 设计库精确依赖边。
+            // 默认全量重扫；--no-scan 走指纹（mtime/size）增量，仅重扫变化的库。
+            let report =
+                aios_database::data_interface::db_index::rebuild_from_config(!no_scan).await?;
+            println!(
+                "✅ scan-db-index 完成: {} 个库, {} 条 ref0 映射",
+                report.db_files, report.ref0_total
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "sqlite-index"))]
+        {
+            let _ = no_scan;
+            anyhow::bail!("scan-db-index 需要 sqlite-index feature（默认/web_server 构建已含）");
+        }
     }
 
     // ========== 处理 spatial 子命令 ==========

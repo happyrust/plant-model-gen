@@ -110,6 +110,93 @@ fn resolve_single_indextree_chunk_size(db_option: &DbOption) -> usize {
         .max(1)
 }
 
+#[derive(Debug, Clone)]
+struct ParsedDbArtifact {
+    project_name: String,
+    dbnum: u32,
+    db_type: String,
+    file_name: String,
+    tree_node_count: usize,
+}
+
+fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow::Result<()> {
+    if artifacts.is_empty() {
+        warn!("[indextree] 本轮解析没有实际处理任何 DB 文件，跳过 scene_tree 产物校验");
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+
+    for artifact in artifacts {
+        let tree_dir = db_meta_info::get_project_tree_dir(&artifact.project_name);
+        let meta_path = tree_dir.join("db_meta_info.json");
+        let meta = match std::fs::read_to_string(&meta_path) {
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    errors.push(format!(
+                        "dbnum={} file={} db_meta_info.json 解析失败({}): {}",
+                        artifact.dbnum,
+                        artifact.file_name,
+                        meta_path.display(),
+                        err
+                    ));
+                    None
+                }
+            },
+            Err(err) => {
+                errors.push(format!(
+                    "dbnum={} file={} 缺少 db_meta_info.json({}): {}",
+                    artifact.dbnum,
+                    artifact.file_name,
+                    meta_path.display(),
+                    err
+                ));
+                None
+            }
+        };
+
+        if let Some(meta) = meta.as_ref() {
+            let dbnum_key = artifact.dbnum.to_string();
+            let has_db_file = meta
+                .get("db_files")
+                .and_then(|value| value.as_object())
+                .map(|files| files.contains_key(&dbnum_key))
+                .unwrap_or(false);
+            if !has_db_file {
+                errors.push(format!(
+                    "dbnum={} file={} 未写入 db_meta_info.json.db_files",
+                    artifact.dbnum, artifact.file_name
+                ));
+            }
+        }
+
+        if artifact.tree_node_count == 0 {
+            warn!(
+                "[indextree] dbnum={} file={} db_type={} 解析得到 0 个 tree node，按约定只告警不失败",
+                artifact.dbnum, artifact.file_name, artifact.db_type
+            );
+            continue;
+        }
+
+        let tree_path = tree_dir.join(format!("{}.tree", artifact.dbnum));
+        if !tree_path.exists() {
+            errors.push(format!(
+                "dbnum={} file={} 缺少 tree 文件: {}",
+                artifact.dbnum,
+                artifact.file_name,
+                tree_path.display()
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("scene_tree 解析期产物校验失败:\n{}", errors.join("\n"))
+    }
+}
+
 const SYSTEM_SYNC_DB_TYPES: &[&str] = &["DICT", "SYST", "GLB", "GLOB"];
 const DEFAULT_DATA_SYNC_DB_TYPES: &[&str] = &["DESI", "CATA"];
 
@@ -506,7 +593,7 @@ where
                     }
                 }
                 Err(e) => {
-                    info!("{}", e.to_string());
+                    return Err(e.context(format!("同步系统库失败(project={})", project)));
                 }
             }
         }
@@ -534,7 +621,7 @@ where
                     info!("同步数据成功。");
                 }
                 Err(e) => {
-                    info!("{}", e.to_string());
+                    return Err(e.context(format!("同步数据失败(project={})", project)));
                 }
             }
         }
@@ -651,7 +738,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     // 同步数据失败，打印错误信息
-                    info!("{}", e.to_string());
+                    return Err(e.context(format!("同步系统库失败(project={})", project)));
                 }
             }
         }
@@ -678,7 +765,7 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     // 同步数据失败，打印错误信息
-                    info!("{}", e.to_string());
+                    return Err(e.context(format!("同步数据失败(project={})", project)));
                 }
             }
         }
@@ -1090,6 +1177,7 @@ where
     let selected_file_names = selected_db_file_names(db_option);
     let selected_dbnums = selected_dbnums(db_option);
     let force_include = is_parse_sys && is_total_sync && selected_file_names.is_empty();
+    let mut parsed_artifacts = Vec::new();
 
     for (file_idx, path) in children_files.into_iter().enumerate() {
         let total_files = total_files; // 仅为语义清晰
@@ -1191,6 +1279,7 @@ where
         // 读取 sesno、存储 refno->sesno map
         let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
         let mut sesno = 0;
+        let mut sesno_timestamp: Option<i64> = None;
         {
             let mut io = PdmsIO::new(project.as_str(), path.clone(), true);
             if io.open().is_ok() {
@@ -1204,6 +1293,9 @@ where
                         0
                     }
                 };
+                if sesno > 0 {
+                    sesno_timestamp = io.get_sesno_timestamp(sesno).ok();
+                }
 
                 if sesno == 0 && is_sync_history {
                     // 同步历史需要有效 sesno；否则无法进行该流程。
@@ -1397,16 +1489,6 @@ where
                                 }
                             }
                         }
-
-                        if let Err(e) = export_tree_file(
-                            dbnum,
-                            db_basic.as_ref(),
-                            &tree_nodes,
-                            &db_basic.children_map,
-                            &db_meta_info::get_project_tree_dir(&project_name),
-                        ) {
-                            warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
-                        }
                     }
                 }
                 Err(e) => {
@@ -1427,6 +1509,64 @@ where
                 );
             }
         }
+        let output_dir = db_meta_info::get_project_tree_dir(&project_name);
+        let mut ref0s = BTreeSet::new();
+        for refno in tree_nodes.keys() {
+            ref0s.insert(refno.get_0());
+        }
+
+        let header_hex_60 = (|| -> Option<String> {
+            let mut f = std::fs::File::open(&path).ok()?;
+            let mut buf = [0u8; 60];
+            f.read_exact(&mut buf).ok()?;
+            Some(hex::encode(buf))
+        })();
+
+        db_meta_info::update_db_meta_info_json(
+            &output_dir,
+            db_meta_info::DbFileMetaUpdate {
+                dbnum,
+                db_type: &db_type,
+                file_name: &file_name,
+                file_path: &path,
+                header_hex_60,
+                header_debug: None,
+                latest_sesno: Some(sesno as u32),
+                sesno_timestamp,
+                ref0s,
+            },
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "[db_meta_info] 更新失败(dbnum={}, file={}): {}",
+                dbnum,
+                file_name,
+                e
+            )
+        })?;
+
+        if tree_nodes.is_empty() {
+            warn!(
+                "[tree_export] dbnum={} file={} 解析得到 0 个 tree node，跳过 .tree 导出",
+                dbnum, file_name
+            );
+        }
+        export_tree_file(
+            dbnum,
+            db_basic.as_ref(),
+            &tree_nodes,
+            &db_basic.children_map,
+            &output_dir,
+        )
+        .map_err(|e| anyhow::anyhow!("[tree_export] dbnum={} 导出失败: {}", dbnum, e))?;
+
+        parsed_artifacts.push(ParsedDbArtifact {
+            project_name: project_name.clone(),
+            dbnum,
+            db_type: db_type.clone(),
+            file_name: file_name.clone(),
+            tree_node_count: tree_nodes.len(),
+        });
 
         info!(
             "解析任务完成, 耗时: {} s, 总数量: {}",
@@ -1452,6 +1592,7 @@ where
     while let Some(_result) = insert_handles.next().await {
         // 可在此加入错误处理或日志
     }
+    validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
 
     Ok(())
 }
@@ -1764,7 +1905,8 @@ pub async fn sync_total_async_threaded(
     let children_files_len = children_files.len();
     let db_file_progress_chunk = (proj_progress_chunk as f32 / children_files_len as f32) as usize;
     // let progress_sender_clone = progress_sender.clone();
-    tokio::spawn(async move {
+    let parse_handle = tokio::spawn(async move {
+        let mut parsed_artifacts = Vec::new();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
         // let mut db_info_sql = vec![];
         for path in children_files {
@@ -2120,7 +2262,7 @@ pub async fn sync_total_async_threaded(
                     // 这里避免再引用它导致借用错误；用 header_hex_60 足以做 header 排查。
                     let header_debug = None;
 
-                    if let Err(e) = db_meta_info::update_db_meta_info_json(
+                    db_meta_info::update_db_meta_info_json(
                         &db_meta_info::get_project_tree_dir(&project_name),
                         db_meta_info::DbFileMetaUpdate {
                             dbnum,
@@ -2133,26 +2275,42 @@ pub async fn sync_total_async_threaded(
                             sesno_timestamp,
                             ref0s,
                         },
-                    ) {
-                        warn!(
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
                             "[db_meta_info] 更新失败(dbnum={}, file={}): {}",
-                            dbnum, file_name, e
-                        );
-                    }
+                            dbnum,
+                            file_name,
+                            e
+                        )
+                    })?;
                 }
                 let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
                 let tree_export_stage_start = Instant::now();
-                if let Err(e) = export_tree_file(
+                if tree_nodes.is_empty() {
+                    warn!(
+                        "[tree_export] dbnum={} file={} 解析得到 0 个 tree node，跳过 .tree 导出",
+                        dbnum, file_name
+                    );
+                }
+                export_tree_file(
                     dbnum,
                     db_basic.as_ref(),
                     &tree_nodes,
                     &db_basic.children_map,
                     &db_meta_info::get_project_tree_dir(&project_name),
-                ) {
-                    warn!("[tree_export] dbnum={} 导出失败: {}", dbnum, e);
-                }
+                )
+                .map_err(|e| anyhow::anyhow!("[tree_export] dbnum={} 导出失败: {}", dbnum, e))?;
                 let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
+
+                parsed_artifacts.push(ParsedDbArtifact {
+                    project_name: project_name.clone(),
+                    dbnum,
+                    db_type: db_type.clone(),
+                    file_name: file_name.clone(),
+                    tree_node_count: tree_nodes.len(),
+                });
 
             info!(
                 "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
@@ -2183,9 +2341,11 @@ pub async fn sync_total_async_threaded(
         // if !db_info_sql.is_empty() {
         //     project_primary_db().query(&db_info_sql).await.expect("save db_info failed");
         // }
+        validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
+        anyhow::Ok(())
     })
     .await
-    .unwrap();
+    .map_err(|e| anyhow::anyhow!("解析任务 join 失败: {}", e))??;
     drop(sender);
     // insert_handles.push(parse_handle);
     while let Some(result) = insert_handles.next().await {
@@ -2272,6 +2432,119 @@ async fn test_threads() {
     dbg!(&map.len());
     for v in Arc::try_unwrap(map).unwrap() {
         dbg!(v);
+    }
+}
+
+#[cfg(test)]
+mod scene_tree_artifact_tests {
+    use super::{ParsedDbArtifact, validate_parse_scene_tree_artifacts};
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aios-scene-tree-test-{}-{}",
+            name,
+            std::process::id()
+        ))
+    }
+
+    fn with_output_root<T>(name: &str, test: impl FnOnce(PathBuf) -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = unique_temp_dir(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("DbOption.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "project_name = \"demo\"\noutput_root = \"{}\"\n",
+                dir.join("output").to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let old = std::env::var("DB_OPTION_FILE").ok();
+        unsafe {
+            std::env::set_var(
+                "DB_OPTION_FILE",
+                config_path.with_extension("").to_string_lossy().to_string(),
+            );
+        }
+
+        let result = test(dir.clone());
+
+        unsafe {
+            if let Some(old) = old {
+                std::env::set_var("DB_OPTION_FILE", old);
+            } else {
+                std::env::remove_var("DB_OPTION_FILE");
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
+    fn artifact(nodes: usize) -> ParsedDbArtifact {
+        ParsedDbArtifact {
+            project_name: "demo".to_string(),
+            dbnum: 42,
+            db_type: "DESI".to_string(),
+            file_name: "DESI0001".to_string(),
+            tree_node_count: nodes,
+        }
+    }
+
+    #[test]
+    fn validate_parse_scene_tree_artifacts_requires_meta() {
+        with_output_root("missing-meta", |_| {
+            let err = validate_parse_scene_tree_artifacts(&[artifact(1)]).unwrap_err();
+            assert!(err.to_string().contains("缺少 db_meta_info.json"));
+        });
+    }
+
+    #[test]
+    fn validate_parse_scene_tree_artifacts_requires_tree_for_non_empty_db() {
+        with_output_root("missing-tree", |_| {
+            let tree_dir = crate::versioned_db::db_meta_info::get_project_tree_dir("demo");
+            fs::create_dir_all(&tree_dir).unwrap();
+            fs::write(
+                tree_dir.join("db_meta_info.json"),
+                serde_json::to_string(&json!({
+                    "version": 1,
+                    "ref0_to_dbnum": {},
+                    "db_files": { "42": { "dbnum": 42, "db_type": "DESI", "file_name": "DESI0001", "ref0s": [] } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let err = validate_parse_scene_tree_artifacts(&[artifact(1)]).unwrap_err();
+            assert!(err.to_string().contains("缺少 tree 文件"));
+        });
+    }
+
+    #[test]
+    fn validate_parse_scene_tree_artifacts_allows_empty_tree_nodes_with_meta() {
+        with_output_root("empty-tree", |_| {
+            let tree_dir = crate::versioned_db::db_meta_info::get_project_tree_dir("demo");
+            fs::create_dir_all(&tree_dir).unwrap();
+            fs::write(
+                tree_dir.join("db_meta_info.json"),
+                serde_json::to_string(&json!({
+                    "version": 1,
+                    "ref0_to_dbnum": {},
+                    "db_files": { "42": { "dbnum": 42, "db_type": "DESI", "file_name": "DESI0001", "ref0s": [] } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            validate_parse_scene_tree_artifacts(&[artifact(0)]).unwrap();
+        });
     }
 }
 
@@ -2437,7 +2710,7 @@ pub async fn parse_single_db_file(
         }
     };
 
-    if let Err(e) = db_meta_info::update_db_meta_info_json(
+    db_meta_info::update_db_meta_info_json(
         &output_dir,
         db_meta_info::DbFileMetaUpdate {
             dbnum: target_dbnum,
@@ -2450,10 +2723,24 @@ pub async fn parse_single_db_file(
             sesno_timestamp: None,
             ref0s,
         },
-    ) {
-        warn!("update_db_meta_info_json 失败: {}", e);
-    }
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "[db_meta_info] 更新失败(dbnum={}, file={}): {}",
+            target_dbnum,
+            file_name,
+            e
+        )
+    })?;
     let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
+
+    validate_parse_scene_tree_artifacts(&[ParsedDbArtifact {
+        project_name: project_name.to_string(),
+        dbnum: target_dbnum,
+        db_type: db_type.clone(),
+        file_name: file_name.clone(),
+        tree_node_count: tree_nodes.len(),
+    }])?;
 
     println!(
         "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点 [db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",

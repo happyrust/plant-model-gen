@@ -50,56 +50,18 @@ fn persist_task_progress(task: &TaskInfo) {
     }
 }
 
-/// 检查端口占用情况
+/// 检查端口占用情况（跨平台：复用 managed_project_sites 的 netstat/lsof 实现）
 async fn check_port_usage(port: u16) -> Result<Vec<u32>, std::io::Error> {
-    let output = TokioCommand::new("lsof")
-        .args(["-ti", &format!(":{}", port)])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        let pids_str = String::from_utf8_lossy(&output.stdout);
-        let pids: Vec<u32> = pids_str
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect();
-        Ok(pids)
-    } else {
-        Ok(vec![])
-    }
+    crate::web_server::managed_project_sites::process_ids_on_port(port)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// 强制关闭占用端口的进程
 pub async fn kill_port_processes(port: u16) -> Result<Vec<u32>, String> {
-    let pids = check_port_usage(port).await.map_err(|e| e.to_string())?;
-    let mut killed_pids = vec![];
-
-    for pid in pids {
-        let output = TokioCommand::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if output.status.success() {
-            killed_pids.push(pid);
-            // 等待进程优雅退出
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-            // 如果进程仍在运行，强制杀死
-            if check_port_usage(port)
-                .await
-                .map_err(|e| e.to_string())?
-                .contains(&pid)
-            {
-                let _ = TokioCommand::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .output()
-                    .await;
-            }
-        }
-    }
-
+    let (killed_pids, _) = crate::web_server::managed_project_sites::kill_processes_on_port(port)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(killed_pids)
 }
 

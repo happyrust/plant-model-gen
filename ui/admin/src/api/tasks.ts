@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from './client'
+import { apiGet, apiPost, apiDelete } from './client'
 import type { TaskInfo } from '@/types/task'
 
 export const tasksApi = {
@@ -13,4 +13,6 @@ export const tasksApi = {
   cancel: (id: string) => apiPost<{ task_id: string }>(`/api/admin/tasks/${id}/cancel`),
 
   retry: (id: string) => apiPost<TaskInfo>(`/api/admin/tasks/${id}/retry`),
+
+  remove: (id: string) => apiDelete<{ id: string; deleted: boolean }>(`/api/admin/tasks/${id}`),
 }

@@ -3,6 +3,11 @@ setlocal
 
 set "TASK_NAME=Plant3D-AIOS"
 set "PORT=3100"
+set "ENABLE_NGINX=on"
+set "VIEWER_HOST="
+set "VIEWER_PORT=80"
+set "REQUIRE_NGINX=1"
+set "REQUIRE_NGINX_EXPLICIT=0"
 set "RUN_NOW=0"
 set "UNINSTALL=0"
 
@@ -36,6 +41,54 @@ if /I "%~1"=="-port" (
     shift
     goto parse_args
 )
+if /I "%~1"=="/enablenginx" (
+    set "ENABLE_NGINX=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="-enablenginx" (
+    set "ENABLE_NGINX=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="/viewerhost" (
+    set "VIEWER_HOST=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="-viewerhost" (
+    set "VIEWER_HOST=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="/viewerport" (
+    set "VIEWER_PORT=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="-viewerport" (
+    set "VIEWER_PORT=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /I "%~1"=="/requirenginx" (
+    set "REQUIRE_NGINX=1"
+    set "REQUIRE_NGINX_EXPLICIT=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="-requirenginx" (
+    set "REQUIRE_NGINX=1"
+    set "REQUIRE_NGINX_EXPLICIT=1"
+    shift
+    goto parse_args
+)
 if /I "%~1"=="/runnow" (
     set "RUN_NOW=1"
     shift
@@ -60,6 +113,11 @@ echo Unknown argument: %~1
 goto usage_error
 
 :args_done
+if "%REQUIRE_NGINX_EXPLICIT%"=="0" (
+    if /I "%ENABLE_NGINX%"=="on" set "REQUIRE_NGINX=1"
+    if /I "%ENABLE_NGINX%"=="auto" set "REQUIRE_NGINX=0"
+    if /I "%ENABLE_NGINX%"=="off" set "REQUIRE_NGINX=0"
+)
 set "ROOT=%~dp0"
 if not exist "%ROOT%start-plant3d.bat" if exist "%CD%\start-plant3d.bat" set "ROOT=%CD%\"
 set "START_SCRIPT=%ROOT%start-plant3d.bat"
@@ -82,12 +140,18 @@ if not exist "%START_SCRIPT%" (
     exit /b 1
 )
 
-schtasks.exe /Create /TN "%TASK_NAME%" /SC ONLOGON /RL HIGHEST /F /TR "\"%START_SCRIPT%\" /Port %PORT% /NoBrowser"
+set "TR_ARGS=\"%START_SCRIPT%\" /Port %PORT% /NoBrowser /EnableNginx %ENABLE_NGINX% /ViewerPort %VIEWER_PORT%"
+if not "%VIEWER_HOST%"=="" set "TR_ARGS=%TR_ARGS% /ViewerHost %VIEWER_HOST%"
+if "%REQUIRE_NGINX%"=="1" set "TR_ARGS=%TR_ARGS% /RequireNginx"
+
+schtasks.exe /Create /TN "%TASK_NAME%" /SC ONLOGON /RL HIGHEST /F /TR "%TR_ARGS%"
 if errorlevel 1 exit /b 1
 
 echo Registered scheduled task: %TASK_NAME%
 echo Install root: %ROOT%
-echo Viewer URL: http://127.0.0.1:%PORT%/viewer/
+echo Fallback Viewer URL: http://127.0.0.1:%PORT%/viewer/
+echo Nginx mode: %ENABLE_NGINX%
+echo Nginx required: %REQUIRE_NGINX%
 
 if "%RUN_NOW%"=="1" (
     schtasks.exe /Run /TN "%TASK_NAME%"
@@ -98,12 +162,14 @@ if "%RUN_NOW%"=="1" (
 exit /b 0
 
 :usage
-echo Usage: install-service.bat [/TaskName Plant3D-AIOS] [/Port 3100] [/RunNow] [/Uninstall]
+echo Usage: install-service.bat [/TaskName Plant3D-AIOS] [/Port 3100] [/EnableNginx auto^|on^|off] [/ViewerHost host] [/ViewerPort 80] [/RequireNginx] [/RunNow] [/Uninstall]
+echo Default: /EnableNginx on, which requires Nginx configuration to succeed. Use /EnableNginx auto for fallback mode.
 echo.
 echo Registers a Windows scheduled task without using PowerShell.
 echo Run this script from an elevated Administrator command prompt.
 exit /b 0
 
 :usage_error
-echo Usage: install-service.bat [/TaskName Plant3D-AIOS] [/Port 3100] [/RunNow] [/Uninstall]
+echo Usage: install-service.bat [/TaskName Plant3D-AIOS] [/Port 3100] [/EnableNginx auto^|on^|off] [/ViewerHost host] [/ViewerPort 80] [/RequireNginx] [/RunNow] [/Uninstall]
+echo Default: /EnableNginx on, which requires Nginx configuration to succeed. Use /EnableNginx auto for fallback mode.
 exit /b 2

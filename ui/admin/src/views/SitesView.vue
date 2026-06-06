@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, MemoryStick, Play, RadioTower, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
+import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, Loader2, MemoryStick, Play, RadioTower, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
+import { extractErrorMessage } from '@/api/client'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
@@ -11,7 +12,8 @@ import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
 import { useSitesStore, type SiteBulkAction } from '@/stores/sites'
 import { matchesQuickFilter, computeStats, siteActionLabelMap, type QuickFilter } from '@/components/sites/site-status'
-import type { AdminResourceSummary, ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
+import { AVEVA_PLANT_SAMPLE_APS250160_DB_FILE } from '@/components/sites/site-presets'
+import type { AdminResourceSummary, ManagedProjectSite, ManagedSiteDbMode, ManagedSiteRiskLevel } from '@/types/site'
 
 const sitesStore = useSitesStore()
 const router = useRouter()
@@ -50,6 +52,13 @@ const refreshing = ref(false)
 const resourceSummary = ref<AdminResourceSummary | null>(null)
 const resourceLoading = ref(false)
 const resourceError = ref('')
+const quickDeployDbFile = ref('')
+const quickDeployDbMode = ref<ManagedSiteDbMode>('ws')
+const quickDeployAutoDeps = ref(false)
+const quickDeployGenMesh = ref(true)
+const quickDeployLoading = ref(false)
+const quickDeployError = ref('')
+const quickDeployMessage = ref('')
 
 const siteStats = computed(() => computeStats(sitesStore.sites))
 
@@ -254,6 +263,35 @@ async function fetchResourceSummary() {
   }
 }
 
+async function submitQuickDeploy() {
+  const dbFile = quickDeployDbFile.value.trim()
+  if (!dbFile || quickDeployLoading.value) return
+  quickDeployLoading.value = true
+  quickDeployError.value = ''
+  quickDeployMessage.value = ''
+  try {
+    const result = await sitesApi.quickDeploy({
+      db_file: dbFile,
+      auto_parse_related_dbnums: quickDeployAutoDeps.value,
+      gen_model: true,
+      gen_mesh: quickDeployGenMesh.value,
+      gen_spatial_tree: true,
+      start_site: false,
+      wait: false,
+      pipeline_db_mode: quickDeployDbMode.value,
+    })
+    const dbnumText = result.dbnum ? `（dbnum=${result.dbnum}）` : ''
+    const fileText = result.resolved_db_file ? `，目标文件 ${result.resolved_db_file}` : ''
+    quickDeployMessage.value = `已创建部署配置：${result.site_id}${dbnumText}${fileText}；请到站点详情手动执行部署或启动。`
+    await fetchPageData()
+    void router.push({ path: `/sites/${result.site_id}`, query: { tab: 'deploy' } })
+  } catch (err: unknown) {
+    quickDeployError.value = extractErrorMessage(err)
+  } finally {
+    quickDeployLoading.value = false
+  }
+}
+
 async function fetchPageData() {
   refreshing.value = true
   await Promise.allSettled([sitesStore.fetchSites(), fetchResourceSummary()])
@@ -319,6 +357,62 @@ onMounted(async () => {
         <span v-else>实时未连接</span>
       </div>
     </div>
+
+    <section class="rounded-lg border border-primary/20 bg-primary/5 p-4">
+      <div class="flex flex-col gap-3 lg:flex-row lg:items-end">
+        <div class="min-w-0 flex-1 space-y-1.5">
+          <div class="flex items-center gap-2">
+            <Play class="h-4 w-4 text-primary" />
+            <h3 class="text-base font-medium">快速创建部署 dbfile</h3>
+          </div>
+          <p class="text-sm text-muted-foreground">
+            输入单个 E3D dbfile 绝对路径，后端会自动推断工程根、读取文件头得到 dbnum；这里只创建站点和配置文件，部署/启动由用户在站点详情手动执行。
+          </p>
+          <input
+            v-model="quickDeployDbFile"
+            type="text"
+            class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            :placeholder="AVEVA_PLANT_SAMPLE_APS250160_DB_FILE"
+            @keydown.enter.prevent="submitQuickDeploy"
+          />
+        </div>
+        <div class="flex flex-wrap items-center gap-3 text-sm">
+          <label class="flex items-center gap-1.5">
+            <span>解析/生成 DB 模式</span>
+            <select
+              v-model="quickDeployDbMode"
+              class="h-9 rounded-md border border-input bg-background px-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <option value="ws">ws（默认，连接服务）</option>
+              <option value="file">file（离线文件）</option>
+            </select>
+          </label>
+          <label class="flex items-center gap-1.5">
+            <input v-model="quickDeployAutoDeps" type="checkbox" class="h-4 w-4 rounded border-input" />
+            <span>自动解析依赖库</span>
+          </label>
+          <label class="flex items-center gap-1.5">
+            <input v-model="quickDeployGenMesh" type="checkbox" class="h-4 w-4 rounded border-input" />
+            <span>配置生成 Viewer 网格</span>
+          </label>
+          <button
+            :disabled="quickDeployLoading || !quickDeployDbFile.trim()"
+            class="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50"
+            @click="submitQuickDeploy"
+          >
+            <Loader2 v-if="quickDeployLoading" class="h-4 w-4 animate-spin" />
+            <Play v-else class="h-4 w-4" />
+            {{ quickDeployLoading ? '提交中...' : '快速创建部署' }}
+          </button>
+        </div>
+      </div>
+      <div v-if="quickDeployError" class="mt-3 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        {{ quickDeployError }}
+      </div>
+      <div v-else-if="quickDeployMessage" class="mt-3 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
+        {{ quickDeployMessage }}
+      </div>
+    </section>
 
     <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
       <div class="rounded-lg border border-border bg-card p-4">

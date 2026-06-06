@@ -184,6 +184,9 @@ pub mod sqlite_index;
 #[cfg(feature = "sqlite-index")]
 pub mod spatial_index;
 
+#[cfg(feature = "web_server")]
+pub mod parse_sidecar;
+
 pub mod model_relation_store;
 
 #[cfg(feature = "rvm-import")]
@@ -354,6 +357,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         if let Err(e) = sync_pdms(&db_option).await {
             log::error!("同步PDMS数据失败: {}", e);
+            return Err(e);
         }
 
         //记录进度
@@ -405,13 +409,15 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         if db_option_ext.export_parquet_after_gen {
             #[cfg(feature = "parquet-export")]
             {
+                use crate::data_interface::db_meta_manager::db_meta;
                 use crate::fast_model::export_model::export_dbnum_instances_parquet::{
                     export_dbnum_instances_parquet, query_distinct_dbnums_from_inst_relate,
                 };
-                use aios_core::init_surreal;
                 use std::sync::Arc;
 
-                init_surreal().await?;
+                // gen_all_geos_data has already initialized the active DB context.
+                // Re-initializing here can fail in lean managed-site schemas while
+                // still leaving the generated inst_relate data ready for export.
                 let mut dbnums = db_option_ext
                     .inner
                     .manual_db_nums
@@ -420,20 +426,29 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                     .unwrap_or_else(Vec::new);
 
                 let dbnum_source = if dbnums.is_empty() {
-                    match query_distinct_dbnums_from_inst_relate().await {
-                        Ok(discovered) if !discovered.is_empty() => {
-                            dbnums = discovered;
-                            "inst_relate"
-                        }
-                        Ok(_) => {
-                            log::warn!(
-                                "export_parquet_after_gen 已启用，但 inst_relate 未发现可导出的 dbnum"
-                            );
-                            "inst_relate_empty"
-                        }
-                        Err(err) => {
-                            log::error!("自动发现 Parquet 导出 dbnum 失败: {}", err);
-                            "inst_relate_error"
+                    if db_meta().ensure_loaded().is_ok() {
+                        dbnums = db_meta().get_dbnums_by_type(&db_option_ext.inner.module);
+                        "db_meta_module"
+                    } else {
+                        match query_distinct_dbnums_from_inst_relate().await {
+                            Ok(discovered) if !discovered.is_empty() => {
+                                log::warn!(
+                                    "db_meta_info.json 不可用，临时从 inst_relate 发现 Parquet 导出 dbnum；可能包含非 DESI 库: {:?}",
+                                    discovered
+                                );
+                                dbnums = discovered;
+                                "inst_relate_fallback"
+                            }
+                            Ok(_) => {
+                                log::warn!(
+                                    "export_parquet_after_gen 已启用，但 inst_relate 未发现可导出的 dbnum"
+                                );
+                                "inst_relate_empty"
+                            }
+                            Err(err) => {
+                                log::error!("自动发现 Parquet 导出 dbnum 失败: {}", err);
+                                "inst_relate_error"
+                            }
                         }
                     }
                 } else {
@@ -454,6 +469,17 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                         dbnum_source,
                         dbnums
                     );
+                    log::info!("🔄 Parquet 导出前刷新 pe_transform: dbnums={:?}", dbnums);
+                    let refreshed = crate::pe_transform_refresh::refresh_pe_transform_for_dbnums(
+                        &dbnums,
+                        &db_option_ext,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Parquet 导出前刷新 pe_transform 失败: {}", e))?;
+                    log::info!(
+                        "✅ Parquet 导出前 pe_transform 刷新完成: {} 个节点",
+                        refreshed
+                    );
                 }
 
                 let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
@@ -461,7 +487,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                 for dbnum in dbnums {
                     log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
                     let output_dir = base_output_dir.join(dbnum.to_string());
-                    if let Err(e) = export_dbnum_instances_parquet(
+                    export_dbnum_instances_parquet(
                         dbnum,
                         &output_dir,
                         db_option.clone(),
@@ -470,8 +496,33 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                         None, // root_refno
                     )
                     .await
+                    .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
+
+                    #[cfg(feature = "sqlite-index")]
                     {
-                        log::error!("Parquet 导出 dbnum={} 失败: {}", dbnum, e);
+                        use crate::spatial_index::SqliteSpatialIndex;
+                        use crate::sqlite_index::SqliteAabbIndex;
+
+                        let idx_path = SqliteSpatialIndex::default_path();
+                        if let Some(parent) = idx_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let idx = SqliteAabbIndex::open(&idx_path)?;
+                        let import_stats =
+                            idx.refresh_dbnum_from_parquet_dir(dbnum, &output_dir)?;
+                        log::info!(
+                            "SQLite spatial index refreshed from Parquet: dbnum={}, inserted={}, path={}",
+                            dbnum,
+                            import_stats.total_inserted,
+                            idx_path.display()
+                        );
+                    }
+
+                    #[cfg(not(feature = "sqlite-index"))]
+                    {
+                        log::warn!(
+                            "SQLite spatial index refresh skipped because sqlite-index feature is disabled"
+                        );
                     }
                 }
             }

@@ -35,6 +35,11 @@ const router = createRouter({
           component: () => import('@/views/RegistrySitesView.vue'),
         },
         {
+          path: 'data',
+          name: 'data-browser',
+          component: () => import('@/views/DataBrowserView.vue'),
+        },
+        {
           path: 'offline-deploy',
           name: 'offline-deploy',
           ...(OFFLINE_DEPLOY_ENABLED

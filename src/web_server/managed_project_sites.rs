@@ -527,6 +527,26 @@ fn env_allow_public_bind() -> bool {
         .unwrap_or(false)
 }
 
+/// 受管站点 web 监听 `bind_host` 的默认值（仅当请求未显式指定时生效）。
+///
+/// - 设置 `AIOS_ALLOW_PUBLIC_BIND=1`：默认 `0.0.0.0`，允许跨机直连站点 web_port
+///   （与 `assert_bind_host_safe` 的同一开关一致放行）。
+/// - 未设置：回退 `127.0.0.1`，仅本机/Nginx 回环代理可达（安全默认，维持原行为）。
+fn default_web_bind_host() -> String {
+    if env_allow_public_bind() {
+        "0.0.0.0".to_string()
+    } else {
+        "127.0.0.1".to_string()
+    }
+}
+
+/// 同 `normalize_host`，但空值时回退到调用方指定的默认（而非硬编码 127.0.0.1）。
+fn normalize_host_or(host: Option<String>, default: &str) -> String {
+    host.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn require_db_user(user: Option<String>) -> Result<String> {
     user.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -3232,7 +3252,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     })?;
     let site_id = infer_site_id(&site_name, web_port);
     let created_at = now_rfc3339();
-    let bind_host = normalize_host(req.bind_host);
+    let bind_host = normalize_host_or(req.bind_host, &default_web_bind_host());
     assert_bind_host_safe(&bind_host)?;
     let public_base_url = req
         .public_base_url
@@ -3919,7 +3939,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
     site.force_rebuild_system_db = force_rebuild_system_db;
     site.auto_parse_related_dbnums = req.auto_parse_related_dbnums;
     site.web_port = req.web_port;
-    site.bind_host = normalize_host(req.bind_host);
+    site.bind_host = normalize_host_or(req.bind_host, &default_web_bind_host());
     site.public_base_url = req
         .public_base_url
         .map(|value| value.trim().to_string())

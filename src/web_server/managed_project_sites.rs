@@ -7213,6 +7213,23 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
 
 // ─── Port helpers ───────────────────────────────────────────────────────────
 
+#[cfg(windows)]
+fn netstat_listening_pid_for_port(line: &str, port: u16) -> Option<u32> {
+    if !line.contains("LISTENING") {
+        return None;
+    }
+
+    let mut fields = line.split_whitespace();
+    let _proto = fields.next()?;
+    let local_addr = fields.next()?;
+    let local_port = local_addr.rsplit(':').next()?.parse::<u16>().ok()?;
+    if local_port != port {
+        return None;
+    }
+
+    fields.last()?.parse::<u32>().ok()
+}
+
 /// 列出占用指定端口的进程 PID 列表。
 ///
 /// 实现：Unix 走 `lsof -i:PORT -sTCP:LISTEN`，Windows 走
@@ -7242,11 +7259,9 @@ pub(crate) async fn process_ids_on_port(port: u16) -> Result<Vec<u32>> {
             .output()
             .await
             .context("读取端口进程失败")?;
-        let want = format!(":{port}");
         let ids = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|line| line.contains(&want) && line.contains("LISTENING"))
-            .filter_map(|line| line.split_whitespace().last()?.trim().parse::<u32>().ok())
+            .filter_map(|line| netstat_listening_pid_for_port(line, port))
             .collect::<Vec<_>>();
         Ok(ids)
     }
@@ -7296,12 +7311,10 @@ fn collect_port_pids_sync(port: u16) -> Vec<u32> {
         let output = std::process::Command::new("netstat")
             .args(["-ano"])
             .output();
-        let want = format!(":{port}");
         match output {
             Ok(out) => String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter(|line| line.contains(&want) && line.contains("LISTENING"))
-                .filter_map(|line| line.split_whitespace().last()?.trim().parse::<u32>().ok())
+                .filter_map(|line| netstat_listening_pid_for_port(line, port))
                 .collect(),
             Err(_) => Vec::new(),
         }

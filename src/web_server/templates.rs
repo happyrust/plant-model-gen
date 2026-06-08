@@ -570,9 +570,8 @@ pub fn render_dashboard_page() -> String {
     <link href="/static/simple-tailwind.css" rel="stylesheet">
     <link href="/static/simple-icons.css" rel="stylesheet">
     <script src="/static/alpine.min.js" defer></script>
-    <!-- 本地优先，若不存在则回退 CDN -->
+    <!-- 离线部署要求：只加载本地 Chart.js，不回退公网 CDN -->
     <script src="/static/chart.umd.min.js"></script>
-    <script>if(typeof Chart==='undefined'){var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js';document.head.appendChild(s);}</script>
 </head>
 <body class="bg-gray-50" x-data="dashboard()">
     <div class="min-h-screen">

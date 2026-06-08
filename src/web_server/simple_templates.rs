@@ -335,7 +335,6 @@ pub fn render_xtk_viewer_page() -> String {
         label { color:#cbd5f5; font-weight:600; }
         input { color:#0f172a; }
     </style>
-    <script src=\"https://cdn.jsdelivr.net/npm/@xeokit/xeokit-sdk/dist/xeokit-sdk.min.js\"></script>
 </head>
 <body>
     <header class=\"toolbar shadow-md\">
@@ -346,7 +345,7 @@ pub fn render_xtk_viewer_page() -> String {
             </div>
             <div class=\"status-chip\">
                 <span class=\"inline-block w-2 h-2 rounded-full bg-green-400\"></span>
-                xeokit SDK 在线加载
+                xeokit SDK 本地加载
             </div>
         </div>
     </header>
@@ -444,28 +443,25 @@ pub fn render_xtk_viewer_page() -> String {
         </section>
     </main>
 
-    <script>
-        (function() {
-            if (!window.xeokit) {
-                document.getElementById('modelStatus').innerText = 'xeokit SDK 未加载';
-                return;
-            }
+    <script type=\"module\">
+        import {Viewer, XKTLoaderPlugin} from '/static/xeokit-sdk.es.js';
 
-            const viewer = new xeokit.Viewer({
+        (function() {
+            const viewer = new Viewer({
                 canvasId: 'viewerCanvas',
                 transparent: true,
                 xrayPickable: true
             });
 
-            new xeokit.CameraControl(viewer, {
-                doublePickFlyTo: true
-            });
+            if (viewer.cameraControl) {
+                viewer.cameraControl.doublePickFlyTo = true;
+            }
 
             viewer.camera.eye = [120, 60, 120];
             viewer.camera.look = [0, 0, 0];
             viewer.camera.up = [0, 1, 0];
 
-            const xktLoader = new xeokit.XKTLoaderPlugin(viewer, {
+            const xktLoader = new XKTLoaderPlugin(viewer, {
                 edges: true
             });
 

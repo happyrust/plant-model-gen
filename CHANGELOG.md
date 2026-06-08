@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-09
+
+### Changed — 离线部署静态资源本地化与站点操作收口
+
+> release 包改为携带完整 `src/web_server/static` 静态目录，内置页面不再依赖公网 CDN；站点列表区分“直接启动”和“完整部署”，降低误触发解析/生成流程的概率。
+
+- `scripts/package/build-windows-bundle.ps1`：打包前校验 `src/web_server/static`，并将完整静态目录复制进 release 包，覆盖 admin、viewer 依赖库和通用静态资源。
+- `simple_templates.rs` / `templates.rs` / `grpc-client.js` / `CameraControl_firstPerson_Duplex.html`：xeokit、Chart.js、gRPC-Web、Font Awesome 等依赖改为本地加载；缺失本地库时直接报错，不再回退公网 CDN。
+- `managed_project_sites.rs`：Windows `netstat` 监听端口解析改为按本地端口精确匹配，避免 `:8080` 误命中 `:18080` 等相邻端口。
+- `SiteDataTable.vue`：站点操作区同时展示“直接启动已部署站点”和“完整部署”按钮，并用不同颜色区分启动与部署语义；admin 静态产物已重新生成。
+
 ## 2026-06-08
 
 ### Fixed — 受管站点 web 支持跨机直连（bind_host）

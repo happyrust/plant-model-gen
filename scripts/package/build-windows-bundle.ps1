@@ -33,6 +33,7 @@ $FrontendDist = Join-Path $FrontendRoot "dist"
 $FrontendBuildCacheRoot = Join-Path $OutputRoot "_frontend-builds"
 $ViewerFallbackDist = Join-Path $FrontendBuildCacheRoot "viewer"
 $ViewerRootDist = Join-Path $FrontendBuildCacheRoot "viewer-root"
+$WebStaticDist = Join-Path $RepoRoot "src/web_server/static"
 $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $NginxCacheExe = Join-Path $RepoRoot "tools/nginx/windows/nginx.exe"
@@ -402,6 +403,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $FrontendRoot "package.json"))) {
 if (-not (Test-Path -LiteralPath (Join-Path $AdminStaticDist "index.html") -PathType Leaf)) {
     throw "Admin static dist not found: $AdminStaticDist"
 }
+if (-not (Test-Path -LiteralPath $WebStaticDist -PathType Container)) {
+    throw "Web static dist not found: $WebStaticDist"
+}
 if (-not $SkipBackendBuild) {
     Step "Build backend web_server, offline_deployer and aios-database ($($RequestedProfiles -join ', '))"
     $env:CARGO_INCREMENTAL = "1"
@@ -460,7 +464,7 @@ if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
 }
 foreach ($profile in $RequestedProfiles) {
     $profilePackageRoot = Join-Path $PackageRoot $profile
-    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static/admin", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
+    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $profilePackageRoot $dir) | Out-Null
     }
 
@@ -482,7 +486,7 @@ foreach ($profile in $RequestedProfiles) {
     }
     Copy-Tree $ViewerFallbackDist (Join-Path $profilePackageRoot "viewer")
     Copy-Tree $ViewerRootDist (Join-Path $profilePackageRoot "viewer-root")
-    Copy-Tree $AdminStaticDist (Join-Path $profilePackageRoot "src/web_server/static/admin")
+    Copy-Tree $WebStaticDist (Join-Path $profilePackageRoot "src/web_server/static")
     Copy-Tree $SurrealResourceDir (Join-Path $profilePackageRoot "resource/surreal")
     Copy-Item -Path (Join-Path $RepoRoot "db_options/*") -Destination (Join-Path $profilePackageRoot "db_options") -Recurse -Force
     Update-PackageDbOption (Join-Path $profilePackageRoot "db_options/DbOption.toml")

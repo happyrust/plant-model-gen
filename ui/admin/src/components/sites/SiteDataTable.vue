@@ -525,20 +525,20 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
             </div>
             <div v-else class="relative flex items-center justify-end gap-1">
               <button
+                v-if="canStart(site)"
+                @click="handleStart(site.site_id)"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
+                title="直接启动已部署站点（不重新解析/生成/部署）"
+              >
+                <Play class="h-3.5 w-3.5 text-green-600" />
+              </button>
+              <button
                 v-if="canDeploy(site)"
                 @click="handleDeploy(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="完整部署（解析/生成/启动）"
               >
                 <Play class="h-3.5 w-3.5 text-blue-600" />
-              </button>
-              <button
-                v-else-if="canStart(site)"
-                @click="handleStart(site.site_id)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="启动"
-              >
-                <Play class="h-3.5 w-3.5 text-green-600" />
               </button>
               <button
                 v-else-if="canStop(site)"

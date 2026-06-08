@@ -17,7 +17,7 @@ class GrpcSpatialQueryClient {
      * Load gRPC-Web libraries
      */
     async loadGrpcWeb() {
-        // 本地优先加载 /static/grpc-web.min.js，不存在则回退到 CDN
+        // 离线部署要求：只加载本地 /static/grpc-web.min.js，不回退公网 CDN
         if (typeof grpc === 'undefined') {
             const tryLoad = (src) => new Promise((resolve) => {
                 const s = document.createElement('script');
@@ -30,7 +30,7 @@ class GrpcSpatialQueryClient {
             // 先尝试本地
             const okLocal = await tryLoad('/static/grpc-web.min.js');
             if (!okLocal) {
-                await tryLoad('https://cdn.jsdelivr.net/npm/grpc-web@1.4.2/index.min.js');
+                throw new Error('本地 gRPC-Web 库缺失: /static/grpc-web.min.js');
             }
         }
         this.initializeClient();

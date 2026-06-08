@@ -7979,8 +7979,6 @@ fn render_spatial_visualization_page() -> String {
     <title>空间查询可视化 - AIOS</title>
     <link href="/static/simple-tailwind.css" rel="stylesheet">
     <link href="/static/simple-icons.css" rel="stylesheet">
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <style>
         .spatial-container {
             display: flex;
@@ -8159,8 +8157,7 @@ fn render_spatial_visualization_page() -> String {
 
         function renderVisualization(data) {
             const container = document.getElementById('reactRoot');
-            container.innerHTML = '<div style="padding: 2rem; text-align: center; color: #6b7280;">React Flow 组件加载中...</div>';
-            // 这里将由前端React组件接管
+            container.innerHTML = '<div style="padding: 2rem; text-align: center; color: #6b7280;">空间查询结果可视化加载中...</div>';
         }
 
         function showError(msg) {

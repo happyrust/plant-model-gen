@@ -1,3 +1,36 @@
+# Release 包 sidecar job 终态竞态修复发现
+
+## 2026-06-08 Discovery
+
+- [任务] 用户要求使用 `planning-with-files` 制定开发计划，目标是解决 release 包站点部署中 `aios-database sidecar 解析作业失败: error sending request for url http://127.0.0.1:<port>/jobs/<job_id>`。
+- [环境] 当前运行目录为 `D:\work\plant-code\plant-model-gen\dist\package\Plant3D-AIOS-win-x64\release`，不是源码目录直接运行。
+- [证据] `netstat` 显示主控 `3100` 和主控 SurrealDB `8020` 正在运行；截图中的 sidecar 临时端口 `53081` 已无监听。
+- [证据] `runtime/admin_sites/quicktest-250160-8080/logs/parse.log` 显示 parse job `f29566ec-dc7b-47da-a223-9e5deaafbb21` 已完成：
+  - `sidecar 解析 job ... status=submitted`
+  - `sidecar 解析 job ... status=running`
+  - `sidecar 解析 event job_done: status=succeeded, exit_code=0`
+- [结论] 这不是 dbfile 路径错误、SurrealDB 连接失败、文件头读取失败或解析 CLI 失败；解析实际成功，UI 的失败发生在主控取 job 终态阶段。
+- [代码证据] `src/web_server/parse_sidecar_client.rs::run_cli_job_with_status()` 在 submit 后每 500ms 通过 `GET /jobs/{job_id}` 轮询终态；若该 HTTP 请求失败，会直接返回 `SidecarProxyError`。
+- [代码证据] `src/web_server/parse_sidecar_client.rs::spawn_sidecar()` 对 job sidecar 传入 `--shutdown-after-job --shutdown-delay-ms 1000`。
+- [代码证据] `src/parse_sidecar.rs::schedule_shutdown_after_job()` 在 job 完成后按 `shutdown_delay_ms` 发送 shutdown 信号，关闭 sidecar HTTP 服务。
+- [根因] Windows release 包现场存在竞态：sidecar 已通过 websocket event 发出 `job_done/succeeded`，但主控下一次 `/jobs/{id}` HTTP 轮询发生时 sidecar 已自动退出，导致 `error sending request` 被误判为解析失败。
+- [短期修复] 将 job sidecar shutdown delay 从 `1000ms` 提高到 `10000ms`，并支持 `ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS` 环境变量覆盖。
+- [修复] `src/web_server/parse_sidecar_client.rs` 已新增 `DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS = 10_000` 与 `JOB_SIDECAR_SHUTDOWN_DELAY_ENV = "ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS"`；`job_sidecar_shutdown_delay_ms()` 会读取环境变量中的正整数毫秒值，否则回退默认 10 秒。
+- [修复] 只有 `key.starts_with("job:")` 的 sidecar 使用延迟关闭配置；preview/scan/resolve/db-index 常驻 sidecar 行为不变。
+- [长期修复] 让 websocket terminal event (`job_done/job_failed/job_cancelled`) 参与最终判定；当 HTTP `/jobs/{id}` 失败但已经收到 terminal event 时，以 terminal event 为准。
+- [修复] `src/web_server/managed_project_sites.rs::run_sidecar_cli_job_with_site_events()` 已记录 submitted job_id 与 websocket terminal status；如果 `run_cli_job_with_status()` 因 HTTP 轮询失败返回错误，会短暂等待 terminal event，若已有 `succeeded/failed/cancelled` 则转换为 `RunCliJobResponse`。
+- [修复] terminal event 兜底会写入日志：`HTTP 终态轮询失败，但已收到 websocket 终态事件；按 event status=... 继续`，便于现场确认是否命中兜底路径。
+- [语义] 如果 HTTP 轮询失败且没有收到 websocket terminal event，仍保留原始 `SidecarProxyError`，避免掩盖真正的 sidecar 通信失败。
+- [部署注意] 源码修复提交后不会自动影响 `dist/package/.../release` 中的 exe；必须重建 release 包或替换 `bin/web_server.exe` / 必要的 `bin/aios-database.exe`。
+- [验证] 已使用 `cargo build --bin web_server --features web_server --release --target-dir target-sidecar-fix-release` 构建新 `web_server.exe`，SHA256 `96934A1F697E4A4863ABE081DEEDC45FA765325C46AC45474BF837163C2DFFBD`。
+- [验证] 已备份并替换 release 包内 `bin/web_server.exe`；旧文件备份为 `bin/web_server.exe.bak-20260608-180944`。
+- [验证] 重启 release 包后 `/api/version` 返回 commit `cd50f3c865ce778d2206f779e1eb328124f05482`。
+- [验证] 新建 `sidecarracefixonly-8080` 并执行完整部署，最终状态 `Running / Parsed`，未再出现 `/jobs/{id}` error sending request 误失败。
+- [验证] `parse.log` 与 `generate.log` 都显示 websocket event 和 HTTP 轮询终态均成功记录 `status=succeeded, exit_code=0`。
+- [验证] 部署校验 `blocking=0 warning=1`，唯一 warning 为 synthetic root `api_e3d_subtree_refnos`，符合此前诊断策略。
+
+## Archived Previous Findings
+
 # Release 包 Nginx 客户入口开发发现
 
 ## 2026-06-05 Discovery

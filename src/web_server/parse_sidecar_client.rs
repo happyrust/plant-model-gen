@@ -25,6 +25,8 @@ use crate::web_server::models::PreviewManagedSiteParsePlanRequest;
 const SIDECAR_HOST: &str = "127.0.0.1";
 const SIDECAR_HEALTH_ATTEMPTS: usize = 40;
 const SIDECAR_HEALTH_DELAY_MS: u64 = 100;
+const DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS: u64 = 10_000;
+const JOB_SIDECAR_SHUTDOWN_DELAY_ENV: &str = "ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS";
 
 #[derive(Debug, Clone)]
 struct SidecarHandle {
@@ -78,6 +80,14 @@ pub struct DbIndexRoot {
 fn sidecars() -> &'static Mutex<HashMap<String, SidecarHandle>> {
     static SIDECARS: OnceLock<Mutex<HashMap<String, SidecarHandle>>> = OnceLock::new();
     SIDECARS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn job_sidecar_shutdown_delay_ms() -> u64 {
+    std::env::var(JOB_SIDECAR_SHUTDOWN_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS)
 }
 
 pub async fn preview_parse_plan(
@@ -397,7 +407,7 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
         command
             .arg("--shutdown-after-job")
             .arg("--shutdown-delay-ms")
-            .arg("1000");
+            .arg(job_sidecar_shutdown_delay_ms().to_string());
     }
 
     let _child = command.spawn().context("启动 aios-database sidecar 失败")?;

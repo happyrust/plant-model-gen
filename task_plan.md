@@ -1,3 +1,81 @@
+# Release 包 sidecar job 终态竞态修复计划
+
+## Goal
+
+修复 Windows release 包站点部署中 `aios-database sidecar 解析作业失败: error sending request for url http://127.0.0.1:<ephemeral>/jobs/<job_id>` 的误失败问题。
+
+关键目标：
+
+- 当 sidecar CLI job 已经成功 (`job_done: status=succeeded, exit_code=0`) 时，`web_server` 不应因为后续 `/jobs/{id}` HTTP 轮询撞上 sidecar 自动退出而把解析/生成任务标记为失败。
+- 短期降低 release 包现场竞态概率：延长 job sidecar 自动 shutdown delay，并允许环境变量覆盖。
+- 长期修复方向：让 websocket terminal event 参与最终判定，HTTP 轮询失败时可用已收到的 `job_done/job_failed/job_cancelled` 事件兜底。
+
+## Current Phase
+
+Complete
+
+## Phases
+
+### Phase S1: 现状定界与证据固化
+
+- [x] 检查当前运行 release 包：`D:\work\plant-code\plant-model-gen\dist\package\Plant3D-AIOS-win-x64\release`。
+- [x] 确认主控端口 `3100` 与主控 SurrealDB `8020` 运行中，截图里的 sidecar 临时端口 `53081` 已无监听。
+- [x] 读取 `runtime/admin_sites/quicktest-250160-8080/logs/parse.log`，确认 sidecar parse job `f29566ec-dc7b-47da-a223-9e5deaafbb21` 实际 `job_done: status=succeeded, exit_code=0`。
+- [x] 读取源码，确认 `parse_sidecar_client::run_cli_job_with_status()` 每 500ms 轮询 `/jobs/{job_id}`，而 job sidecar 当前 `--shutdown-after-job --shutdown-delay-ms 1000`。
+- **Status:** complete
+
+### Phase S2: 短期止血修复
+
+- [x] 修改 `src/web_server/parse_sidecar_client.rs`：把 job sidecar shutdown delay 默认从 `1000ms` 提升到 `10000ms`。
+- [x] 增加环境变量覆盖 `ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS`，用于现场慢机器临时调大到 `30000ms`。
+- [x] 保持非 job sidecar 行为不变，避免影响 preview/scan 常驻 sidecar。
+- **Status:** complete
+
+### Phase S3: 稳态修复设计/实现
+
+- [x] 设计 terminal event 兜底：当 websocket event 已收到 `job_done/job_failed/job_cancelled`，HTTP `/jobs/{id}` 后续失败不应直接覆盖终态。
+- [x] 在 `run_sidecar_cli_job_with_site_events()` 层面保存 terminal event 状态；HTTP 轮询返回错误时等待短时间读取 terminal event。
+- [x] 确保失败语义清晰：未收到 terminal event + HTTP 失败才算 sidecar 通信失败。
+- **Status:** complete
+
+### Phase S4: 验证与 release 包更新
+
+- [x] 运行允许的编译检查：`cargo check --bin web_server --features web_server`。
+- [x] 不运行 Rust test；按仓库规则使用运行服务 + HTTP/CLI smoke。
+- [x] 重新构建并替换 release 包中的 `bin/web_server.exe`（本修复无需替换 `bin/aios-database.exe`）。
+- [x] 使用 release 包 `stop-plant3d.ps1` 停旧进程，确认端口无 LISTENING。
+- [x] 重新启动 release 包，复跑新 quick deploy `sidecarracefixonly-8080`，确认 parse/generate job 成功后 UI 不再出现 `/jobs/{id}` error sending request 误失败。
+- [x] 跑 `deploy-validation`，结果 `blocking=0`、`warning=1`（synthetic root subtree-refnos warning，符合预期）。
+- **Status:** complete
+
+## Decisions Made
+
+| Decision | Rationale |
+|----------|-----------|
+| 先做 shutdown delay 止血 | 当前 release 包现场问题是 sidecar 完成后 1 秒自动退出，延长延迟改动小、风险低。 |
+| 后续用 websocket terminal event 兜底 | parse.log 已能收到 `job_done: status=succeeded`，它应参与最终判定，避免 HTTP 轮询成为唯一真相。 |
+| 不把当前问题归因到 dbfile/解析失败 | `parse.log` 已明确 `exit_code=0`，错误发生在终态获取链路。 |
+| release 包必须重建或替换二进制 | 当前运行目录是已打包产物，源码提交/推送不会自动改变 `dist/package/.../release/bin/*.exe`。 |
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|-------|---------|------------|
+| `session-catchup.py` 不存在 | 按 `planning-with-files` 首步运行 catchup | 记录为非阻塞；继续读取现有 planning 文件并前置本计划。 |
+| UI 显示 sidecar parse job 失败 | 读取 release 包 `parse.log` 和端口状态 | 确认 job 实际 succeeded，失败来自后续 `/jobs/{id}` HTTP 轮询撞上 sidecar 退出。 |
+
+## Notes
+
+- 当前现场失败 URL：`http://127.0.0.1:53081/jobs/f29566ec-dc7b-47da-a223-9e5deaafbb21`。
+- 当前 parse log 关键行：`sidecar 解析 event job_done: status=succeeded, exit_code=0`。
+- 当前源码关键点：
+  - `src/web_server/parse_sidecar_client.rs::run_cli_job_with_status`
+  - `src/web_server/parse_sidecar_client.rs::spawn_sidecar`
+  - `src/parse_sidecar.rs::schedule_shutdown_after_job`
+  - `src/web_server/managed_project_sites.rs::run_sidecar_cli_job_with_site_events`
+
+## Archived Previous Plan
+
 # Release 包 Nginx 客户入口修复计划
 
 ## Goal

@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -5871,6 +5871,50 @@ async fn wait_for_sidecar_job_terminal(site_id: &str, job: &ActiveSidecarJob) ->
     false
 }
 
+fn terminal_sidecar_status_from_event(
+    event: &Value,
+) -> Option<crate::web_server::parse_sidecar_client::RunCliJobStatus> {
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    if !matches!(event_type, "job_done" | "job_failed" | "job_cancelled") {
+        return None;
+    }
+    let status = event
+        .get("job")
+        .and_then(|job| job.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| event.get("status").and_then(Value::as_str))?;
+    let exit_code = event
+        .get("job")
+        .and_then(|job| job.get("exit_code"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok());
+    Some(crate::web_server::parse_sidecar_client::RunCliJobStatus {
+        status: status.to_string(),
+        exit_code,
+    })
+}
+
+async fn terminal_sidecar_event_response(
+    job_id: Arc<Mutex<Option<String>>>,
+    terminal_status: Arc<Mutex<Option<crate::web_server::parse_sidecar_client::RunCliJobStatus>>>,
+) -> Option<crate::web_server::parse_sidecar_client::RunCliJobResponse> {
+    for _ in 0..20 {
+        let job_id_value = job_id.lock().ok().and_then(|guard| guard.clone());
+        let status = terminal_status.lock().ok().and_then(|guard| guard.clone());
+        if let (Some(job_id), Some(status)) = (job_id_value, status) {
+            if matches!(status.status.as_str(), "succeeded" | "failed" | "cancelled") {
+                return Some(crate::web_server::parse_sidecar_client::RunCliJobResponse {
+                    success: status.status == "succeeded",
+                    exit_code: status.exit_code,
+                    job_id,
+                });
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
 async fn run_sidecar_cli_job_with_site_events(
     site_id: &str,
     kind: SidecarCliJobKind,
@@ -5887,14 +5931,25 @@ async fn run_sidecar_cli_job_with_site_events(
     let log_path = stdout_path.clone();
     let label = kind.label();
     let key_for_status = key.clone();
+    let submitted_job_id = Arc::new(Mutex::new(None::<String>));
+    let terminal_status = Arc::new(Mutex::new(
+        None::<crate::web_server::parse_sidecar_client::RunCliJobStatus>,
+    ));
+    let fallback_job_id = submitted_job_id.clone();
+    let fallback_terminal_status = terminal_status.clone();
+    let fallback_log_path = stdout_path.clone();
+    let fallback_label = label.to_string();
     let mut event_stream_started = false;
-    crate::web_server::parse_sidecar_client::run_cli_job_with_status(
+    let result = crate::web_server::parse_sidecar_client::run_cli_job_with_status(
         &key,
         config_no_ext,
         cwd,
         stdout_path.to_string_lossy().to_string(),
         stderr_path.to_string_lossy().to_string(),
         move |job_id, status| {
+            if let Ok(mut guard) = submitted_job_id.lock() {
+                *guard = Some(job_id.to_string());
+            }
             let exit_code = status
                 .exit_code
                 .map(|code| format!(", exit_code={code}"))
@@ -5916,12 +5971,18 @@ async fn run_sidecar_cli_job_with_site_events(
                 let event_log_path = log_path.clone();
                 let event_site_id = site_id_for_status.clone();
                 let event_label = label.to_string();
+                let event_terminal_status = terminal_status.clone();
                 tokio::spawn(async move {
                     while let Some(event) = event_rx.recv().await {
                         append_log_line(
                             &event_log_path,
                             &sidecar_job_event_log_line(&event_label, &event),
                         );
+                        if let Some(status) = terminal_sidecar_status_from_event(&event) {
+                            if let Ok(mut guard) = event_terminal_status.lock() {
+                                *guard = Some(status);
+                            }
+                        }
                         if let Err(err) = update_runtime(&event_site_id, RuntimeUpdate::default()) {
                             tracing::warn!(
                                 site = %event_site_id,
@@ -5958,7 +6019,33 @@ async fn run_sidecar_cli_job_with_site_events(
             }
         },
     )
-    .await
+    .await;
+    match result {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if let Some(response) =
+                terminal_sidecar_event_response(fallback_job_id, fallback_terminal_status).await
+            {
+                append_log_line(
+                    &fallback_log_path,
+                    &format!(
+                        "⚠️ sidecar {fallback_label} HTTP 终态轮询失败，但已收到 websocket 终态事件；按 event status={}{} 继续",
+                        if response.success {
+                            "succeeded"
+                        } else {
+                            "failed/cancelled"
+                        },
+                        response
+                            .exit_code
+                            .map(|code| format!(", exit_code={code}"))
+                            .unwrap_or_default()
+                    ),
+                );
+                return Ok(response);
+            }
+            Err(err)
+        }
+    }
 }
 
 fn sidecar_job_event_log_line(label: &str, event: &Value) -> String {

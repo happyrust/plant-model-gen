@@ -1,3 +1,85 @@
+# Release 包 sidecar job 终态竞态修复进度
+
+## 2026-06-08
+
+- 已按用户要求使用 `planning-with-files` 制定 sidecar job 终态竞态修复计划。
+- 已读取项目内 `planning-with-files` skill，确认规划文件写入项目根目录：`task_plan.md`、`findings.md`、`progress.md`。
+- 已尝试运行 session catchup：
+  - 命令：`python "$env:USERPROFILE\.cursor\skills\planning-with-files\scripts\session-catchup.py" (Get-Location)`
+  - 结果：失败，用户级 skill 目录没有 `scripts/session-catchup.py`。
+  - 处理：记录为非阻塞，继续读取现有 planning 文件并前置新计划。
+- 已完成 release 包现场证据采集：
+  - 当前运行目录：`D:\work\plant-code\plant-model-gen\dist\package\Plant3D-AIOS-win-x64\release`。
+  - 主控 `3100` 和主控 SurrealDB `8020` 正在运行。
+  - 截图中的 sidecar 临时端口 `53081` 已无监听。
+  - `runtime/admin_sites/quicktest-250160-8080/logs/parse.log` 显示 job `f29566ec-dc7b-47da-a223-9e5deaafbb21` 实际 `job_done: status=succeeded, exit_code=0`。
+- 已完成源码定界：
+  - `parse_sidecar_client::run_cli_job_with_status()` submit 后每 500ms 轮询 `/jobs/{job_id}`。
+  - `parse_sidecar_client::spawn_sidecar()` 对 job sidecar 使用 `--shutdown-after-job --shutdown-delay-ms 1000`。
+  - `parse_sidecar.rs::schedule_shutdown_after_job()` 在 job 完成后按 delay 关闭 sidecar。
+- 当前结论：
+  - 解析 CLI 已成功，UI 的失败是主控获取终态时撞上 sidecar 自动退出。
+  - 短期修复：job sidecar shutdown delay 默认提升到 10s，并支持环境变量覆盖。
+  - 长期修复：websocket terminal event 参与最终判定，避免 HTTP 轮询成为唯一真相。
+- 已完成 Phase S2 短期止血修复：
+  - `src/web_server/parse_sidecar_client.rs` 新增 `DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS = 10_000`。
+  - 新增环境变量 `ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS`，只接受正整数毫秒值；无效/未设置时回退 10 秒。
+  - `job:` sidecar 继续使用 `--shutdown-after-job`，但 `--shutdown-delay-ms` 改为来自 helper；preview/scan 等非 job sidecar 不受影响。
+  - `rustfmt --edition 2024 src/web_server/parse_sidecar_client.rs` 通过。
+  - `cargo check --bin web_server --features web_server` 通过；仅有上游 `pdms_io` / `parse_pdms_db` 既有 warning。
+- 已完成 Phase S3 稳态兜底实现：
+  - `run_sidecar_cli_job_with_site_events()` 现在会记录 submitted `job_id` 与 websocket terminal event 状态。
+  - websocket event task 收到 `job_done/job_failed/job_cancelled` 后，会保存 `RunCliJobStatus`。
+  - `run_cli_job_with_status()` 如果因 `/jobs/{id}` HTTP 轮询失败返回错误，会短暂等待 terminal event；若已收到终态，就按 event status 构造 `RunCliJobResponse`。
+  - 命中兜底时会写入 parse/generate log，明确说明 HTTP 轮询失败但已收到 websocket 终态事件。
+  - 未收到 terminal event 时仍返回原始 HTTP/sidecar 错误。
+  - `rustfmt --edition 2024 src/web_server/managed_project_sites.rs src/web_server/parse_sidecar_client.rs` 通过。
+  - `cargo check --bin web_server --features web_server` 通过；仅有上游 `pdms_io` / `parse_pdms_db` 既有 warning。
+- 当前 Phase 已推进到 S4：release 包更新与运行态验证。
+- 已完成 Phase S4 release 包更新与运行态验证：
+  - 使用独立 target 目录构建 release `web_server.exe`：`cargo build --bin web_server --features web_server --release --target-dir target-sidecar-fix-release`，耗时较长但最终通过。
+  - 新 binary：`target-sidecar-fix-release/release/web_server.exe`，SHA256 `96934A1F697E4A4863ABE081DEEDC45FA765325C46AC45474BF837163C2DFFBD`。
+  - 已备份旧包内二进制：`dist/package/Plant3D-AIOS-win-x64/release/bin/web_server.exe.bak-20260608-180944`。
+  - 已替换 release 包内：`dist/package/Plant3D-AIOS-win-x64/release/bin/web_server.exe`。
+  - 已重启 release 包，`/api/version` 返回 commit `cd50f3c865ce778d2206f779e1eb328124f05482`。
+  - 第一次 smoke 脚本误把 quick-deploy 创建失败后继续轮询，实际是主控还未复现稳定；随后用 `RUST_BACKTRACE=1` 重启并单独复现 quick-deploy API，返回 `202` 且主控保持可用。
+  - 新建站点 `sidecarracefixonly-8080` 并执行完整部署，轮询结果最终 `status=Running parse=Parsed`。
+  - `parse.log` 显示 `sidecar 解析 event job_done: status=succeeded, exit_code=0`，随后 HTTP 轮询也记录 `sidecar 解析 job ... status=succeeded, exit_code=0`。
+  - `generate.log` 显示 `sidecar 模型生成 event job_done: status=succeeded, exit_code=0`，随后 HTTP 轮询也记录 `sidecar 模型生成 job ... status=succeeded, exit_code=0`。
+  - 部署校验：`blocking=0 warning=1 checks=26`；唯一 warning 是 synthetic root `api_e3d_subtree_refnos`，符合预期，不阻断模型加载。
+  - Cursor 浏览器打开 `http://127.0.0.1/?output_project=SidecarRaceFixOnly&show_dbnum=250160` 成功，页面标题为 `plant3d-web - 3D 模型查看`。
+  - 浏览器页面模型树显示 `SITE SITE-EQUIPMENT-AREA03`，说明 `show_dbnum=250160` 的模型树已加载。
+  - 浏览器 resource 记录显示 `manifest_250160.json`、`instances.parquet`、`geo_instances.parquet`、`transforms.parquet`、`aabb.parquet` 均被请求，并加载了多条 `files/meshes/lod_L1/*.glb`。
+  - 页面文本中没有出现 `show_dbnum Parquet 加载失败`，截图中之前的 DuckDB trap 不再复现。
+
+## Test Results
+
+| Check | Input | Expected | Actual | Status |
+|-------|-------|----------|--------|--------|
+| planning-with-files skill 读取 | `.cursor/skills/planning-with-files/SKILL.md` | 确认三文件规划约定 | 已读取 | PASS |
+| session catchup | 用户级 `planning-with-files/scripts/session-catchup.py` | 恢复未同步上下文 | 脚本缺失，非阻塞 | WARN |
+| release 端口状态 | `netstat :3100/:8020/:53081` | 判断主控与 sidecar 状态 | `3100/8020` 运行，`53081` 无监听 | PASS |
+| parse log | `runtime/admin_sites/quicktest-250160-8080/logs/parse.log` | 判断 parse job 真实状态 | `job_done: status=succeeded, exit_code=0` | PASS |
+| 源码定界 | `parse_sidecar_client.rs` / `parse_sidecar.rs` | 找到 shutdown 竞态机制 | job sidecar delay 当前 1000ms | PASS |
+| Phase S2 编译检查 | `cargo check --bin web_server --features web_server` | 编译通过 | 通过；仅上游既有 warning | PASS |
+| Phase S3 编译检查 | `cargo check --bin web_server --features web_server` | 编译通过 | 通过；仅上游既有 warning | PASS |
+| Release web_server 构建 | `cargo build --bin web_server --features web_server --release --target-dir target-sidecar-fix-release` | 构建成功 | 成功，已生成并替换包内 `web_server.exe` | PASS |
+| Release quick deploy smoke | `sidecarracefixonly-8080` 完整部署 | 不再出现 `/jobs/{id}` error sending request | 最终 Running / Parsed | PASS |
+| Deploy validation | `POST /api/admin/sites/sidecarracefixonly-8080/deploy-validation` | blocking=0 | blocking=0, warning=1 | PASS |
+| Cursor Browser Viewer smoke | `http://127.0.0.1/?output_project=SidecarRaceFixOnly&show_dbnum=250160` | 模型能加载 | 模型树显示 `SITE SITE-EQUIPMENT-AREA03`，GLB 资源已加载 | PASS |
+
+## 5-Question Reboot Check
+
+| Question | Answer |
+|----------|--------|
+| Where am I? | Active plan 已切换到 release 包 sidecar job 终态竞态修复，所有计划阶段已完成。 |
+| Where am I going? | 下一步可提交/推送本轮修复，或继续清理 release smoke 站点/进程。 |
+| What's the goal? | 避免 parse/generate job 已成功却因 sidecar 自动退出导致 UI 误报失败。 |
+| What have I learned? | 当前 release 包里 parse job 实际成功，失败发生在 `/jobs/{id}` 终态轮询链路。 |
+| What have I done? | 已固化证据、根因、短期与长期修复方向，完成 shutdown delay 止血、websocket terminal event 兜底，并替换 release 包 `web_server.exe` 后通过真实 quick deploy smoke。 |
+
+## Archived Previous Progress
+
 # Release 包 Nginx 客户入口开发进度
 
 ## 2026-06-05

@@ -423,3 +423,58 @@ The Viewer should report via `postMessage`:
 ```
 
 This should be implemented only after first-version backend validation is in place.
+
+### DuckDB-WASM Trap Diagnostics
+
+Browser errors such as:
+
+```text
+RuntimeError: null function or function signature mismatch
+RuntimeError: table index is out of bounds
+... at gt.OnMessage
+... at _duckdb_web_query_run_buffer
+```
+
+must be treated as DuckDB-WASM worker traps, not as direct business-function stack traces.
+
+`gt.OnMessage` is typically a minified worker message handler. It does not identify the application function that caused the failure.
+
+Common causes to distinguish:
+
+- Browser worker memory pressure or OOM corrupts the worker state.
+- A specific Parquet query, `registerFileURL`, or HTTP Range read triggers a DuckDB-WASM internal bug.
+- Remote deployment mixes stale browser cache with new static assets, causing old worker code and new `.wasm` binaries to be used together.
+- Reverse proxy or cache serves mismatched Viewer assets from different builds.
+- `-SkipFrontendBuild` or manual package overwrites leave the remote package with assets that do not match the local build.
+
+Browser-native smoke should therefore report these stages separately:
+
+```text
+viewer_asset_version
+duckdb_worker_asset
+duckdb_wasm_asset
+duckdb_worker_boot
+duckdb_register_manifest
+duckdb_register_parquet_files
+duckdb_query_instances
+duckdb_query_geo_instances
+model_scene_load
+```
+
+When a DuckDB-WASM trap occurs, the smoke report must include:
+
+- Main JS asset URL and cache status.
+- DuckDB worker JS URL and cache status.
+- DuckDB WASM URL and cache status.
+- Parquet URL being registered or queried.
+- Whether the response used HTTP Range.
+- Row count or query that was executing.
+- Browser name/version and available memory signal when available.
+
+The first remediation step for this class of error is not code-level stack chasing. It is to prove asset and data coherence:
+
+1. Disable browser cache or use an incognito window.
+2. Verify all Viewer, worker, and WASM assets come from the same deployment build.
+3. Verify Parquet URLs return real Parquet bytes, not HTML/JSON error pages.
+4. Reproduce with a minimal DuckDB query against one Parquet file.
+5. Only then investigate DuckDB-WASM version or Parquet encoding compatibility.

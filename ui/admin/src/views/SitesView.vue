@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, Loader2, MemoryStick, Play, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
 import { extractErrorMessage } from '@/api/client'
@@ -52,7 +52,28 @@ const refreshing = ref(false)
 const resourceSummary = ref<AdminResourceSummary | null>(null)
 const resourceLoading = ref(false)
 const resourceError = ref('')
-const quickDeployDbFile = ref('')
+const QUICK_DEPLOY_DBFILE_STORAGE_KEY = 'admin:quick-deploy:last-dbfile'
+
+function loadQuickDeployDbFile() {
+  try {
+    const saved = localStorage.getItem(QUICK_DEPLOY_DBFILE_STORAGE_KEY)?.trim()
+    return saved || AVEVA_PLANT_SAMPLE_APS250160_DB_FILE
+  } catch {
+    return AVEVA_PLANT_SAMPLE_APS250160_DB_FILE
+  }
+}
+
+function rememberQuickDeployDbFile(value: string) {
+  const trimmed = value.trim()
+  if (!trimmed) return
+  try {
+    localStorage.setItem(QUICK_DEPLOY_DBFILE_STORAGE_KEY, trimmed)
+  } catch {
+    // localStorage may be unavailable in restricted browser contexts.
+  }
+}
+
+const quickDeployDbFile = ref(loadQuickDeployDbFile())
 const quickDeployDbMode = ref<ManagedSiteDbMode>('ws')
 const quickDeployAutoDeps = ref(false)
 const quickDeployGenMesh = ref(true)
@@ -112,6 +133,10 @@ const resourceCards = computed(() => [
     icon: FolderKanban,
   },
 ])
+
+watch(quickDeployDbFile, (value) => {
+  rememberQuickDeployDbFile(value)
+})
 
 const resourceRiskBanner = computed(() => {
   if (resourceSummary.value === null && resourceError.value) {
@@ -266,6 +291,7 @@ async function fetchResourceSummary() {
 async function submitQuickDeploy() {
   const dbFile = quickDeployDbFile.value.trim()
   if (!dbFile || quickDeployLoading.value) return
+  rememberQuickDeployDbFile(dbFile)
   quickDeployLoading.value = true
   quickDeployError.value = ''
   quickDeployMessage.value = ''
@@ -347,6 +373,7 @@ onMounted(async () => {
           </div>
           <p class="text-sm text-muted-foreground">
             输入单个 E3D dbfile 绝对路径，后端会自动推断工程根、读取文件头得到 dbnum；这里只创建站点和配置文件，部署/启动由用户在站点详情手动执行。
+            首次默认填入可直接使用的 AvevaPlantSample 路径；修改后会记住最近一次输入。
           </p>
           <input
             v-model="quickDeployDbFile"

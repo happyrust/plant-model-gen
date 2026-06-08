@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { useSitesStore } from '@/stores/sites'
 import type { ManagedSiteLogKind } from '@/api/sites'
 import type { ManagedProjectSite, ManagedSiteRiskLevel } from '@/types/site'
-import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Cpu, Eye, ExternalLink, FilePlus2, FolderPlus, Loader2, Pencil, Play, RefreshCcw, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
+import { ArrowDown, ArrowUp, ArrowUpDown, Copy, Cpu, Eye, ExternalLink, FilePlus2, FolderPlus, Loader2, MoreHorizontal, Pencil, Play, RefreshCcw, RefreshCw, RotateCcw, Square, Trash2 } from 'lucide-vue-next'
 import {
   canDeleteSite,
   canDeploySite,
@@ -164,6 +164,7 @@ const appendError = ref('')
 const appendPending = ref(false)
 const redeployTarget = ref<ManagedProjectSite | null>(null)
 const redeployPending = ref(false)
+const actionMenuOpen = ref<string | null>(null)
 
 const appendRequiresStop = computed(() => {
   const site = appendTarget.value
@@ -177,6 +178,7 @@ const appendRequiresStop = computed(() => {
 })
 
 function confirmDelete(site: ManagedProjectSite) {
+  actionMenuOpen.value = null
   deleteTarget.value = site
 }
 
@@ -200,6 +202,7 @@ async function executeDelete() {
 }
 
 function openAppendDbFileDialog(site: ManagedProjectSite) {
+  actionMenuOpen.value = null
   appendTarget.value = site
   appendDbFileValue.value = ''
   appendError.value = ''
@@ -235,6 +238,7 @@ async function executeAppendDbFile() {
 }
 
 async function confirmRedeploy(site: ManagedProjectSite) {
+  actionMenuOpen.value = null
   if (!await ensureSitePortsClear(site, '重新部署前需要先处理端口冲突。')) return
   redeployTarget.value = site
 }
@@ -280,6 +284,24 @@ function siteViewerHref(site: ManagedProjectSite) {
 function openViewer(site: ManagedProjectSite) {
   const url = siteViewerHref(site)
   if (url) window.open(url, '_blank')
+}
+
+function toggleActionMenu(siteId: string) {
+  actionMenuOpen.value = actionMenuOpen.value === siteId ? null : siteId
+}
+
+function closeActionMenu() {
+  actionMenuOpen.value = null
+}
+
+function editSite(siteId: string) {
+  closeActionMenu()
+  emit('edit-site', siteId)
+}
+
+function cloneSite(siteId: string) {
+  closeActionMenu()
+  emit('clone-site', siteId)
 }
 
 async function handleStart(siteId: string) {
@@ -366,7 +388,15 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
       <p class="mt-3 text-sm font-medium text-muted-foreground">还没有站点</p>
       <p class="mt-1 text-xs text-muted-foreground">点击右上角「新建站点」开始创建第一个站点</p>
     </div>
-    <table v-else class="w-full text-sm">
+    <table v-else class="w-full table-fixed text-sm">
+      <colgroup>
+        <col class="w-10" />
+        <col />
+        <col class="w-[210px]" />
+        <col class="w-[96px]" />
+        <col class="w-[132px]" />
+        <col class="w-[148px]" />
+      </colgroup>
       <thead>
         <tr class="border-b border-border bg-muted/50">
           <th class="w-10 px-3 py-3 text-left font-medium text-muted-foreground">
@@ -420,17 +450,20 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
             />
           </td>
           <td class="px-4 py-3 align-top">
-            <div class="font-medium">{{ site.project_name }}</div>
-            <div class="text-xs text-muted-foreground">{{ site.site_id }}</div>
+            <div class="min-w-0">
+              <div class="truncate font-medium" :title="site.project_name">{{ site.project_name }}</div>
+              <div class="truncate text-xs text-muted-foreground" :title="site.site_id">{{ site.site_id }}</div>
+            </div>
             <a
               v-if="siteViewerHref(site) && site.status === 'Running'"
               :href="siteViewerHref(site) || undefined"
               target="_blank"
               rel="noreferrer"
               class="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline"
+              :title="siteViewerHref(site) || undefined"
               @click.stop
             >
-              {{ siteViewerHref(site) }}
+              打开 Viewer
               <ExternalLink class="h-3 w-3" />
             </a>
             <div v-if="site.last_error" class="mt-1 max-w-[280px] truncate text-xs text-destructive" :title="site.last_error">
@@ -446,14 +479,14 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 {{ site.parse_status }}
               </span>
             </div>
-            <div v-if="site.parse_plan?.label" class="mt-2 space-y-1">
+            <div v-if="site.parse_plan?.label" class="mt-1 flex min-w-0 items-center gap-1.5">
               <span
-                class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                class="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium"
                 :class="getParsePlanClass(site.parse_plan)"
               >
                 {{ site.parse_plan.label }}
               </span>
-              <div class="max-w-[260px] truncate text-xs text-muted-foreground" :title="site.parse_plan.detail">
+              <div class="min-w-0 truncate text-xs text-muted-foreground" :title="site.parse_plan.detail">
                 {{ site.parse_plan.detail }}
               </div>
             </div>
@@ -490,7 +523,7 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 {{ pendingAction(site.site_id) === 'start' ? '启动中' : pendingAction(site.site_id) === 'stop' ? '停止中' : pendingAction(site.site_id) === 'restart' ? '重启中' : pendingAction(site.site_id) === 'parse' ? '解析中' : pendingAction(site.site_id) === 'append_dbfile' ? '追加中' : pendingAction(site.site_id) === 'generate' ? '生成中' : pendingAction(site.site_id) === 'deploy' ? '部署中' : pendingAction(site.site_id) === 'redeploy' ? '重新部署中' : '处理中' }}
               </span>
             </div>
-            <div v-else class="flex items-center justify-end gap-1">
+            <div v-else class="relative flex items-center justify-end gap-1">
               <button
                 v-if="canDeploy(site)"
                 @click="handleDeploy(site.site_id)"
@@ -500,15 +533,7 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 <Play class="h-3.5 w-3.5 text-blue-600" />
               </button>
               <button
-                v-if="canDeploy(site)"
-                @click="confirmRedeploy(site)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="重新部署（删除旧数据后重新解析/生成/启动）"
-              >
-                <RefreshCcw class="h-3.5 w-3.5 text-orange-600" />
-              </button>
-              <button
-                v-if="canStart(site)"
+                v-else-if="canStart(site)"
                 @click="handleStart(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="启动"
@@ -516,7 +541,7 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 <Play class="h-3.5 w-3.5 text-green-600" />
               </button>
               <button
-                v-if="canStop(site)"
+                v-else-if="canStop(site)"
                 @click="handleStop(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 :title="site.parse_status === 'Running' ? '停止解析（中止部署）' : site.status === 'Starting' ? '停止部署' : '停止'"
@@ -524,35 +549,12 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 <Square class="h-3.5 w-3.5 text-amber-600" />
               </button>
               <button
-                v-if="canRestart(site)"
+                v-else-if="canRestart(site)"
                 @click="handleRestart(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="重启"
               >
                 <RotateCcw class="h-3.5 w-3.5 text-blue-600" />
-              </button>
-              <button
-                v-if="canParse(site)"
-                @click="handleParse(site.site_id)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="解析"
-              >
-                <RefreshCw class="h-3.5 w-3.5" />
-              </button>
-              <button
-                @click="openAppendDbFileDialog(site)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="追加 DB file（保留原数据，继续解析/生成/启动）"
-              >
-                <FilePlus2 class="h-3.5 w-3.5 text-violet-600" />
-              </button>
-              <button
-                v-if="canGenerate(site)"
-                @click="handleGenerate(site.site_id)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="生成模型（未解析时会先解析）"
-              >
-                <Cpu class="h-3.5 w-3.5 text-cyan-600" />
               </button>
               <button
                 v-if="site.status === 'Running' && buildViewerUrl(site)"
@@ -567,25 +569,77 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
                 title="打开站点创建配置表单并编辑保存"
                 aria-label="查看/编辑配置"
-                @click="emit('edit-site', site.site_id)"
+                @click="editSite(site.site_id)"
               >
                 <Pencil class="h-3.5 w-3.5" />
               </button>
               <button
-                @click="emit('clone-site', site.site_id)"
+                @click="toggleActionMenu(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="克隆站点（端口自动 +1，需重填凭据）"
+                title="更多操作"
+                :aria-expanded="actionMenuOpen === site.site_id"
               >
-                <Copy class="h-3.5 w-3.5" />
+                <MoreHorizontal class="h-3.5 w-3.5" />
               </button>
-              <button
-                v-if="canDelete(site)"
-                @click="confirmDelete(site)"
-                class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="删除"
+              <div
+                v-if="actionMenuOpen === site.site_id"
+                class="absolute right-0 top-8 z-20 w-44 overflow-hidden rounded-md border border-border bg-popover py-1 text-left shadow-lg"
               >
-                <Trash2 class="h-3.5 w-3.5 text-destructive" />
-              </button>
+                <button
+                  v-if="canDeploy(site)"
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="confirmRedeploy(site)"
+                >
+                  <RefreshCcw class="h-3.5 w-3.5 text-orange-600" /> 重新部署
+                </button>
+                <button
+                  v-if="canParse(site)"
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="closeActionMenu(); handleParse(site.site_id)"
+                >
+                  <RefreshCw class="h-3.5 w-3.5" /> 解析
+                </button>
+                <button
+                  v-if="canGenerate(site)"
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="closeActionMenu(); handleGenerate(site.site_id)"
+                >
+                  <Cpu class="h-3.5 w-3.5 text-cyan-600" /> 生成模型
+                </button>
+                <button
+                  v-if="canRestart(site)"
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="closeActionMenu(); handleRestart(site.site_id)"
+                >
+                  <RotateCcw class="h-3.5 w-3.5 text-blue-600" /> 重启
+                </button>
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="openAppendDbFileDialog(site)"
+                >
+                  <FilePlus2 class="h-3.5 w-3.5 text-violet-600" /> 追加 DB file
+                </button>
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
+                  @click="cloneSite(site.site_id)"
+                >
+                  <Copy class="h-3.5 w-3.5" /> 克隆站点
+                </button>
+                <button
+                  v-if="canDelete(site)"
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs text-destructive hover:bg-destructive/10"
+                  @click="confirmDelete(site)"
+                >
+                  <Trash2 class="h-3.5 w-3.5" /> 删除
+                </button>
+              </div>
             </div>
           </td>
         </tr>

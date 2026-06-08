@@ -123,6 +123,33 @@ function Copy-Tree([string]$Source, [string]$Destination) {
     Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
 }
 
+function Assert-DuckDbOfflineDist([string]$Dist, [string]$Label) {
+    $duckdbDir = Join-Path $Dist "duckdb"
+    $required = @(
+        "duckdb-browser-mvp.worker.js",
+        "duckdb-browser-eh.worker.js",
+        "duckdb-browser-coi.worker.js",
+        "duckdb-browser-coi.pthread.worker.js",
+        "duckdb-mvp.wasm",
+        "duckdb-eh.wasm",
+        "duckdb-coi.wasm"
+    )
+    foreach ($file in $required) {
+        $path = Join-Path $duckdbDir $file
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "DuckDB offline asset missing for ${Label}: $path"
+        }
+    }
+
+    $jsFiles = Get-ChildItem -LiteralPath $Dist -Recurse -File -Include "*.js" -ErrorAction SilentlyContinue
+    foreach ($file in $jsFiles) {
+        $content = Get-Content -LiteralPath $file.FullName -Raw
+        if ($content -match "https://cdn\.jsdelivr\.net/(npm/)?@duckdb/duckdb-wasm") {
+            throw "DuckDB CDN URL found in ${Label}: $($file.FullName). Rebuild plant3d-web with local DuckDB bundles before packaging."
+        }
+    }
+}
+
 function Invoke-FrontendBuild([string]$BasePath, [string]$Label, [string]$Destination) {
     Step "Build plant3d-web for $Label"
     Push-Location $FrontendRoot
@@ -145,6 +172,7 @@ function Invoke-FrontendBuild([string]$BasePath, [string]$Label, [string]$Destin
         Remove-Item -LiteralPath $Destination -Recurse -Force
     }
     Copy-Tree $FrontendDist $Destination
+    Assert-DuckDbOfflineDist $Destination $Label
 }
 
 function Get-GitCommit([string]$Path) {
@@ -411,6 +439,8 @@ foreach ($dist in @($ViewerFallbackDist, $ViewerRootDist)) {
         throw "Frontend dist missing: $dist"
     }
 }
+Assert-DuckDbOfflineDist $ViewerFallbackDist "/viewer/ fallback"
+Assert-DuckDbOfflineDist $ViewerRootDist "Nginx root /"
 
 Step "Resolve bundled SurrealDB"
 $ResolvedSurreal = Resolve-SurrealExe
@@ -458,6 +488,10 @@ foreach ($profile in $RequestedProfiles) {
 
     Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.bat") -Destination (Join-Path $profilePackageRoot "start-plant3d.bat") -Force
     Copy-Item -LiteralPath (Join-Path $ScriptDir "start-plant3d.ps1") -Destination (Join-Path $profilePackageRoot "start-plant3d.ps1") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "stop-plant3d.bat") -Destination (Join-Path $profilePackageRoot "stop-plant3d.bat") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "stop-plant3d.ps1") -Destination (Join-Path $profilePackageRoot "stop-plant3d.ps1") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "verify-offline-viewer.bat") -Destination (Join-Path $profilePackageRoot "verify-offline-viewer.bat") -Force
+    Copy-Item -LiteralPath (Join-Path $ScriptDir "verify-offline-viewer.ps1") -Destination (Join-Path $profilePackageRoot "verify-offline-viewer.ps1") -Force
     Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.bat") -Destination (Join-Path $profilePackageRoot "install-service.bat") -Force
     Copy-Item -LiteralPath (Join-Path $ScriptDir "install-service.ps1") -Destination (Join-Path $profilePackageRoot "install-service.ps1") -Force
 
@@ -490,6 +524,9 @@ foreach ($profile in $RequestedProfiles) {
         offlineDeployWizardUrl = "http://127.0.0.1:3100/admin/#/offline-deploy"
         offlineDeployExe = "offline_deployer.exe"
         startupScript = "start-plant3d.bat"
+        stopScript = "stop-plant3d.bat"
+        stopPowerShellScript = "stop-plant3d.ps1"
+        offlineViewerVerifyScript = "verify-offline-viewer.bat"
         serviceScript = "install-service.bat"
         servicePowerShellScript = "install-service.ps1"
     }
@@ -527,6 +564,20 @@ http://<本机IP>/?output_project=<project>&show_dbnum=<dbnum>
 start-plant3d.bat /EnableNginx auto
 ```
 
+## 停止后台
+
+停止当前安装包启动的站点部署 admin、包内 Nginx/SurrealDB 进程，并释放默认端口：
+
+```bat
+stop-plant3d.bat
+```
+
+如只想停止 admin，保留包内 Nginx 或 SurrealDB，可运行：
+
+```bat
+stop-plant3d.bat /KeepNginx /KeepSurreal
+```
+
 ## 离线部署向导
 
 如果只想打开"把本机站点推送到远端服务器"的安装部署向导，双击：
@@ -556,10 +607,28 @@ install-service.bat /RunNow
 install-service.bat /Uninstall
 ```
 
+## 离线 Viewer 验证
+
+打包后可在安装根目录运行：
+
+```bat
+verify-offline-viewer.bat
+```
+
+或直接调用 PowerShell 脚本：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-offline-viewer.ps1
+```
+
+该脚本会检查 `viewer/` 与 `viewer-root/` 是否包含 DuckDB-WASM 离线资源（worker + wasm），并阻断 `cdn.jsdelivr.net` 等公网 CDN 旧构建产物。
+
 ## 目录说明
 
 - `bin/web_server.exe`：后端服务。
 - `offline_deployer.exe`：离线部署向导入口，启动本地网页并打开 `/admin/#/offline-deploy`。
+- `start-plant3d.bat` / `stop-plant3d.bat`：启动 / 停止站点部署 admin 的便捷脚本。
+- `verify-offline-viewer.bat` / `verify-offline-viewer.ps1`：离线 Viewer 验证脚本，用于确认前端不依赖公网 CDN。
 - `bin/aios-database.exe`：站点部署/解析使用的数据库导入执行文件。
 - `bin/surreal/surreal.exe`：随包分发的 SurrealDB。
 - `bin/nginx/nginx.exe`：随包分发的 Nginx。默认启动会准备 Nginx 配置；站点启动阶段会配置/启动 Nginx 根入口。显式 `/EnableNginx auto` 时允许回退到 `/viewer/` fallback。

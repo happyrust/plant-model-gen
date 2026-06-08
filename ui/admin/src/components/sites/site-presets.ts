@@ -45,6 +45,7 @@ export const MANAGED_SITE_FORM_PRESETS: ManagedSiteFormPreset[] = [
       manual_db_nums: [],
       parse_db_types: ['SYST', 'DESI', 'CATA', 'DICT', 'GLB', 'GLOB'],
       force_rebuild_system_db: false,
+      auto_parse_related_dbnums: false,
       gen_model: true,
       gen_mesh: true,
       gen_spatial_tree: true,

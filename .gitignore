@@ -22,6 +22,7 @@ build/
 D:
 d:
 .ace-tool/
+.codegraph/
 rustc-ice-*.txt
 
 # ═══════════════════════════════════════════════════════════════
@@ -91,6 +92,18 @@ tmp/
 temp/
 .cache/
 nul
+/.tmp*
+/target_*/
+/target-*/
+/=ro
+/=ro&immutable=1
+
+# Local verification and packaged runtime output
+/runtime/*
+!/runtime/admin_verify/
+!/runtime/admin_verify/**
+!/runtime/local-collab/
+!/runtime/local-collab/**
 
 # ═══════════════════════════════════════════════════════════════
 # External binaries & tools

@@ -605,13 +605,31 @@ onBeforeUnmount(() => {
   }
 })
 
+const duplicateProjectNameSite = computed<ManagedProjectSite | null>(() => {
+  const projectName = form.value.project_name.trim().toLowerCase()
+  if (!projectName) return null
+  const currentSiteId = isEditing.value ? props.siteId : null
+  return sitesStore.sites.find((site) =>
+    site.site_id !== currentSiteId
+    && site.project_name.trim().toLowerCase() === projectName
+  ) ?? null
+})
+
 const canSubmit = computed(() => {
   if (!form.value.project_name || !form.value.project_path) return false
+  if (duplicateProjectNameSite.value) return false
   if (multiProjectError.value) return false
   if (!isEditing.value && (!form.value.db_user?.trim() || !form.value.db_password?.trim())) return false
   if (!isEditing.value && autoAllocatePorts.value) return true
   return !!form.value.db_port && !!form.value.web_port
 })
+
+function ensureProjectNameUnique() {
+  const duplicate = duplicateProjectNameSite.value
+  if (!duplicate) return true
+  error.value = `项目名已存在：${duplicate.project_name}。请修改项目名称后再保存。`
+  return false
+}
 
 async function ensureSubmitPortsAvailable() {
   if (!isEditing.value && autoAllocatePorts.value) return true
@@ -647,6 +665,7 @@ async function handleSubmit(autoDeploy = false) {
     form.value.mesh_tol_ratio = 3.0
   }
   try {
+    if (!ensureProjectNameUnique()) return
     if (!await ensureSubmitPortsAvailable()) return
     // 克隆模式走 create 路径（不是 update），保持新建语义
     const siteNameTrimmed = siteName.value.trim()
@@ -747,6 +766,9 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <div class="space-y-2">
                 <label class="text-sm font-medium">项目名称 *</label>
                 <input v-model="form.project_name" type="text" required placeholder="例：AvevaMarineSample" :class="inputClass" />
+                <p v-if="duplicateProjectNameSite" class="text-xs text-destructive">
+                  项目名已存在：{{ duplicateProjectNameSite.project_name }}。请修改后再保存。
+                </p>
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">项目路径 *</label>

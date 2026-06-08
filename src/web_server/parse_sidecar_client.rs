@@ -147,7 +147,7 @@ pub async fn run_cli_job(
 }
 
 pub async fn cancel_cli_job(key: &str, job_id: &str) -> Result<Value, SidecarProxyError> {
-    let handle = ensure_sidecar(&format!("job:{}", stable_key(key)))
+    let handle = ensure_sidecar(&cli_job_sidecar_key(key))
         .await
         .map_err(internal_proxy_error)?;
     post_sidecar_with_client(
@@ -180,7 +180,7 @@ pub async fn run_cli_job_with_status<F>(
 where
     F: FnMut(&str, &RunCliJobStatus),
 {
-    let handle = ensure_sidecar(&format!("job:{}", stable_key(key)))
+    let handle = ensure_sidecar(&cli_job_sidecar_key(key))
         .await
         .map_err(internal_proxy_error)?;
     let client = sidecar_job_http_client().map_err(internal_proxy_error)?;
@@ -228,6 +228,7 @@ where
         }
         match record.status.as_str() {
             "succeeded" => {
+                forget_cli_job_sidecar(key).await;
                 return Ok(RunCliJobResponse {
                     success: true,
                     exit_code: record.exit_code,
@@ -235,6 +236,7 @@ where
                 });
             }
             "failed" | "cancelled" => {
+                forget_cli_job_sidecar(key).await;
                 return Ok(RunCliJobResponse {
                     success: false,
                     exit_code: record.exit_code,
@@ -251,7 +253,7 @@ async fn stream_cli_job_events(
     job_id: &str,
     tx: mpsc::UnboundedSender<Value>,
 ) -> Result<()> {
-    let handle = ensure_sidecar(&format!("job:{}", stable_key(key))).await?;
+    let handle = ensure_sidecar(&cli_job_sidecar_key(key)).await?;
     let ws_url = handle
         .base_url
         .replacen("http://", "ws://", 1)
@@ -337,6 +339,15 @@ fn preview_sidecar_key(payload: &PreviewManagedSiteParsePlanRequest) -> String {
     format!("preview:{}", stable_key(&material))
 }
 
+fn cli_job_sidecar_key(key: &str) -> String {
+    format!("job:{}", stable_key(key))
+}
+
+pub async fn forget_cli_job_sidecar(key: &str) {
+    let mut guard = sidecars().lock().await;
+    guard.remove(&cli_job_sidecar_key(key));
+}
+
 fn stable_key(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -382,6 +393,12 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
         .arg(&token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if key.starts_with("job:") {
+        command
+            .arg("--shutdown-after-job")
+            .arg("--shutdown-delay-ms")
+            .arg("1000");
+    }
 
     let _child = command.spawn().context("启动 aios-database sidecar 失败")?;
     let handle = SidecarHandle {

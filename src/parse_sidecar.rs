@@ -41,6 +41,8 @@ pub struct ParseSidecarOptions {
     pub http_port: u16,
     pub runtime_dir: PathBuf,
     pub token: Option<String>,
+    pub shutdown_after_job: bool,
+    pub shutdown_delay_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,9 @@ struct ParseSidecarState {
     site_key: String,
     runtime_dir: PathBuf,
     token: Option<String>,
+    shutdown_after_job: bool,
+    shutdown_delay_ms: u64,
+    shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     events_tx: broadcast::Sender<Value>,
     jobs: Arc<Mutex<BTreeMap<String, SidecarJobRecord>>>,
     job_cancels: Arc<Mutex<BTreeMap<String, oneshot::Sender<()>>>>,
@@ -259,10 +264,14 @@ pub enum ManagedSiteParsePlanMode {
 
 pub async fn run_parse_sidecar(options: ParseSidecarOptions) -> Result<()> {
     let (events_tx, _) = broadcast::channel(256);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let state = ParseSidecarState {
         site_key: options.site_key,
         runtime_dir: options.runtime_dir,
         token: options.token,
+        shutdown_after_job: options.shutdown_after_job,
+        shutdown_delay_ms: options.shutdown_delay_ms,
+        shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         events_tx,
         jobs: Arc::new(Mutex::new(BTreeMap::new())),
         job_cancels: Arc::new(Mutex::new(BTreeMap::new())),
@@ -290,6 +299,10 @@ pub async fn run_parse_sidecar(options: ParseSidecarOptions) -> Result<()> {
         .with_context(|| format!("绑定 sidecar 监听地址失败: {addr}"))?;
     println!("🚀 aios-database parse sidecar listening on http://{addr}");
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+            println!("📴 aios-database parse sidecar graceful shutdown requested");
+        })
         .await
         .context("sidecar HTTP 服务异常退出")
 }
@@ -699,6 +712,29 @@ async fn run_submitted_cli_job(
             );
         }
     }
+    schedule_shutdown_after_job(&state).await;
+}
+
+async fn schedule_shutdown_after_job(state: &ParseSidecarState) {
+    if !state.shutdown_after_job {
+        return;
+    }
+    if !state.job_cancels.lock().await.is_empty() {
+        return;
+    }
+    let shutdown_tx = state.shutdown_tx.clone();
+    let delay = Duration::from_millis(state.shutdown_delay_ms);
+    let site_key = state.site_key.clone();
+    tokio::spawn(async move {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let Some(tx) = shutdown_tx.lock().await.take() else {
+            return;
+        };
+        println!("📴 aios-database sidecar {site_key} shutting down after terminal job");
+        let _ = tx.send(());
+    });
 }
 
 fn emit_job_stage_changed(

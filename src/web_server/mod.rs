@@ -521,6 +521,10 @@ pub async fn start_web_server_with_config(
     };
     let upload_routes = create_upload_routes(upload_state);
 
+    let admin_public_routes: Router<AppState> = Router::new()
+        .route("/api/admin/app-config", get(admin_handlers::get_app_config))
+        .with_state(());
+
     let admin_stateless_routes: Router<AppState> = Router::new()
         .merge(admin_handlers::create_admin_routes())
         .merge(admin_task_handlers::create_admin_task_routes())
@@ -530,6 +534,7 @@ pub async fn start_web_server_with_config(
         .with_state(());
 
     let admin_api_routes = Router::<AppState>::new()
+        .merge(admin_public_routes)
         .merge(admin_stateless_routes)
         .merge(admin_registry_handlers::create_admin_registry_routes())
         .with_state(app_state.clone())

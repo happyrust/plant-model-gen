@@ -35,7 +35,7 @@ use crate::web_server::{
 pub fn create_admin_routes() -> Router {
     Router::new()
         .route("/api/admin/resources/summary", get(get_resource_summary))
-        .route("/api/admin/app-config", get(get_app_config))
+        .route("/api/admin/system/quick-exit", post(quick_exit_admin))
         .route("/api/admin/data-browser/tables", get(list_data_tables))
         .route(
             "/api/admin/data-browser/tables/{table}/records",
@@ -119,6 +119,86 @@ pub fn create_admin_routes() -> Router {
             get(download_site_log),
         )
         .layer(middleware::from_fn(admin_auth_middleware))
+}
+
+#[derive(Debug, Serialize)]
+struct QuickExitResponse {
+    script_path: String,
+    port: u16,
+}
+
+async fn quick_exit_admin() -> impl IntoResponse {
+    match launch_quick_exit_script() {
+        Ok(response) => admin_response::ok("快速退出命令已发送", response),
+        Err(err) => admin_response::managed_error(err),
+    }
+}
+
+fn launch_quick_exit_script() -> Result<QuickExitResponse, String> {
+    let script = resolve_stop_script_path()
+        .ok_or_else(|| "未找到 stop-plant3d.ps1，无法执行快速退出".to_string())?;
+    let port = current_admin_port();
+    tracing::warn!(
+        script = %script.display(),
+        port,
+        "admin quick exit requested; launching stop script"
+    );
+
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script)
+            .arg("-Port")
+            .arg(port.to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+            .spawn()
+            .map_err(|err| format!("启动快速退出脚本失败: {err}"))?;
+        Ok(QuickExitResponse {
+            script_path: script.to_string_lossy().to_string(),
+            port,
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = script;
+        let _ = port;
+        Err("快速退出脚本当前仅支持 Windows 打包环境".to_string())
+    }
+}
+
+fn current_admin_port() -> u16 {
+    std::env::var("WEB_SERVER_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(3100)
+}
+
+fn resolve_stop_script_path() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(root) = bin_dir.parent() {
+                candidates.push(root.join("stop-plant3d.ps1"));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("stop-plant3d.ps1"));
+        candidates.push(cwd.join("scripts/package/stop-plant3d.ps1"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.exists() && path.is_file())
 }
 
 /// Admin 前端在启动时一次性拉取的"运行期可配置"项。
@@ -1090,7 +1170,7 @@ pub async fn update_site(
 }
 
 pub async fn delete_site(Path(site_id): Path<String>) -> impl IntoResponse {
-    match managed_sites::delete_site(&site_id) {
+    match managed_sites::delete_site(&site_id).await {
         Ok(true) => admin_response::ok(
             "删除站点成功",
             json!({ "site_id": site_id, "deleted": true }),

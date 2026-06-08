@@ -91,6 +91,7 @@ const WAIT_PORT_ATTEMPTS: usize = 30;
 const WAIT_HTTP_ATTEMPTS: usize = 40;
 const WAIT_STEP_MS: u64 = 500;
 const KILL_GRACE_MS: u64 = 1500;
+const SIDECAR_CANCEL_WAIT_ATTEMPTS: usize = 10;
 /// 停止互斥模式后等待端口释放的最大轮询次数（× WAIT_STEP_MS）。
 const WAIT_PORT_FREE_ATTEMPTS: usize = 20;
 
@@ -459,6 +460,34 @@ fn collect_site_names_with_conn(conn: &Connection) -> Result<HashSet<String>> {
 
 fn site_name_exists_with_conn(conn: &Connection, site_name: &str) -> Result<bool> {
     Ok(collect_site_names_with_conn(conn)?.contains(site_name.trim()))
+}
+
+fn project_name_conflict_with_conn(
+    conn: &Connection,
+    project_name: &str,
+    exclude_site_id: Option<&str>,
+) -> Result<Option<String>> {
+    let target = project_name.trim().to_lowercase();
+    if target.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT site_id, project_name FROM {table}",
+        table = TABLE_NAME
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (site_id, existing_project_name) = row?;
+        if matches!(exclude_site_id, Some(excluded) if site_id == excluded) {
+            continue;
+        }
+        if existing_project_name.trim().to_lowercase() == target {
+            return Ok(Some(existing_project_name));
+        }
+    }
+    Ok(None)
 }
 
 fn unique_site_name_with_conn(conn: &Connection, site_name: &str) -> Result<String> {
@@ -3057,6 +3086,51 @@ fn resolve_create_ports_with_conn(
     Ok((db_port, web_port))
 }
 
+fn reassign_db_port_if_occupied(site_id: &str) -> Result<Option<ManagedProjectSite>> {
+    let changed = with_tx(|conn| {
+        let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
+        if !port_in_use("127.0.0.1", site.db_port) {
+            return Ok(None);
+        }
+
+        let old_db_port = site.db_port;
+        let mut used = collect_reserved_ports_with_conn(conn, Some(site_id))?;
+        used.insert(site.web_port);
+        if let Some(viewer_port) = site.viewer_port {
+            used.insert(viewer_port);
+        }
+        site.db_port = first_available_port(&mut used, AUTO_DB_PORT_START, AUTO_PORT_END)?;
+        site.db_pid = None;
+        site.updated_at = now_rfc3339();
+
+        let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
+        persist_site_with_conn(conn, &site, &db_user, &db_password)?;
+        Ok(Some((site, db_user, db_password, old_db_port)))
+    })?;
+
+    let Some((site, db_user, db_password, old_db_port)) = changed else {
+        return Ok(None);
+    };
+
+    write_site_files(&site, &db_user, &db_password)?;
+    append_log_line(
+        &db_log_path(&site.site_id),
+        &format!(
+            "DB 端口 {old} 被占用，启动前已自动改用空闲端口 {new}",
+            old = old_db_port,
+            new = site.db_port
+        ),
+    );
+    crate::web_server::sse_handlers::push_admin_site_snapshot(
+        &site.site_id,
+        Some(&site.project_name),
+        status_to_str(&site.status),
+        parse_status_to_str(&site.parse_status),
+        site.last_error.as_deref(),
+    );
+    Ok(Some(site))
+}
+
 // ─── Public read-side API ───────────────────────────────────────────────────
 
 pub fn get_site(site_id: &str) -> Result<Option<ManagedProjectSite>> {
@@ -3143,6 +3217,14 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
     let _guard = lock_op()?;
 
     let (db_port, web_port) = with_conn(|conn| {
+        if let Some(existing_project_name) =
+            project_name_conflict_with_conn(conn, req.project_name.trim(), None)?
+        {
+            bail!(
+                "项目名已存在：{}。请修改项目名称后再保存。",
+                existing_project_name
+            );
+        }
         if site_name_exists_with_conn(conn, &site_name)? {
             bail!("站点名称已存在：{}。请修改站点名称后再创建。", site_name);
         }
@@ -4002,6 +4084,14 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     site.last_error = None;
 
     with_tx(|conn| {
+        if let Some(existing_project_name) =
+            project_name_conflict_with_conn(conn, &site.project_name, Some(site_id))?
+        {
+            bail!(
+                "项目名已存在：{}。请修改项目名称后再保存。",
+                existing_project_name
+            );
+        }
         assert_port_available_with_conn(conn, Some(site_id), site.db_port, site.web_port)?;
         persist_site_with_conn(conn, &site, &db_user, &db_password)?;
         Ok(())
@@ -5565,6 +5655,16 @@ fn current_exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("获取当前 web_server 可执行文件失败")
 }
 
+fn packaged_install_root() -> Option<PathBuf> {
+    let current = current_exe_path().ok()?;
+    let bin_dir = current.parent()?;
+    let root = bin_dir.parent()?;
+    root.join("bin")
+        .join("web_server.exe")
+        .exists()
+        .then_some(root.to_path_buf())
+}
+
 fn aios_database_exe_name() -> &'static str {
     if cfg!(windows) {
         "aios-database.exe"
@@ -5757,6 +5857,18 @@ fn unregister_active_sidecar_job(site_id: &str, job_id: &str) {
             guard.remove(site_id);
         }
     }
+}
+
+async fn wait_for_sidecar_job_terminal(site_id: &str, job: &ActiveSidecarJob) -> bool {
+    for _ in 0..SIDECAR_CANCEL_WAIT_ATTEMPTS {
+        match active_sidecar_job(site_id) {
+            Some(current) if current.job_id == job.job_id => {
+                tokio::time::sleep(Duration::from_millis(WAIT_STEP_MS)).await;
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 async fn run_sidecar_cli_job_with_site_events(
@@ -6992,6 +7104,33 @@ fn unregister_site_processes(site_id: &str) {
     });
 }
 
+fn registered_site_processes(site_id: &str) -> Vec<(String, u32)> {
+    with_conn(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT role, pid FROM {table} WHERE site_id = ?1",
+            table = PROC_REGISTRY_TABLE
+        ))?;
+        let rows = stmt.query_map([site_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+        })?;
+        let mut processes = Vec::new();
+        for row in rows {
+            let (role, pid) = row?;
+            if pid != 0 {
+                processes.push((role, pid));
+            }
+        }
+        Ok(processes)
+    })
+    .unwrap_or_default()
+}
+
+async fn kill_registered_site_processes(site_id: &str) {
+    for (role, pid) in registered_site_processes(site_id) {
+        let _ = kill_pid_guarded(site_id, &role, pid).await;
+    }
+}
+
 /// 读取登记的 start_token；外层 None=无登记行，内层 None=登记时未取到 token。
 fn registered_start_token(site_id: &str, role: &str) -> Option<Option<u64>> {
     with_conn(|conn| {
@@ -7911,11 +8050,19 @@ struct WindowsNginxConfig {
 }
 
 #[cfg(windows)]
+fn bundled_nginx_binary() -> Option<PathBuf> {
+    let root = packaged_install_root()?;
+    let candidate = root.join("bin").join("nginx").join("nginx.exe");
+    candidate.exists().then_some(candidate)
+}
+
+#[cfg(windows)]
 fn windows_nginx_config(site_id: &str) -> Option<WindowsNginxConfig> {
     let bin = std::env::var("AIOS_NGINX_BIN")
         .ok()
         .map(PathBuf::from)
         .filter(|path| path.exists())
+        .or_else(bundled_nginx_binary)
         .or_else(|| {
             ["C:\\nginx\\nginx.exe", "D:\\nginx\\nginx.exe"]
                 .into_iter()
@@ -7926,7 +8073,11 @@ fn windows_nginx_config(site_id: &str) -> Option<WindowsNginxConfig> {
     let root = std::env::var("AIOS_NGINX_ROOT")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| site_runtime_dir(site_id).join("nginx"));
+        .unwrap_or_else(|| {
+            packaged_install_root()
+                .map(|root| root.join("runtime").join("nginx"))
+                .unwrap_or_else(|| site_runtime_dir(site_id).join("nginx"))
+        });
 
     let conf_root = root.join("conf");
     let conf_dir = std::env::var("AIOS_NGINX_CONF_DIR")
@@ -7956,6 +8107,13 @@ fn viewer_static_root_for_nginx(viewer_dir: Option<&Path>) -> PathBuf {
 
     if let Ok(repo) = repo_root() {
         let packaged_root = repo.join("viewer-root");
+        if packaged_root.join("index.html").exists() {
+            return packaged_root;
+        }
+    }
+
+    if let Some(root) = packaged_install_root() {
+        let packaged_root = root.join("viewer-root");
         if packaged_root.join("index.html").exists() {
             return packaged_root;
         }
@@ -8060,12 +8218,17 @@ fn render_plant3d_web_nginx_conf(
 
     location / {{
         try_files $uri $uri/ /index.html;
-        add_header Cache-Control "no-cache" always;
+        add_header Cache-Control "no-store, must-revalidate" always;
     }}
 
     location /assets/ {{
         try_files $uri =404;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
+    }}
+
+    location /duckdb/ {{
+        try_files $uri =404;
+        add_header Cache-Control "no-store, must-revalidate" always;
     }}
 
     location /api/ {{
@@ -8159,6 +8322,7 @@ http {
         image/x-icon ico;
         font/woff woff;
         font/woff2 woff2;
+        application/wasm wasm;
         application/octet-stream parquet glb bin;
     }
     default_type application/octet-stream;
@@ -9153,13 +9317,22 @@ async fn run_start_pipeline_for_deploy(site_id: String) -> Result<()> {
 }
 
 async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result<()> {
-    let site = task::spawn_blocking({
+    let mut site = task::spawn_blocking({
         let site_id = site_id.clone();
         move || get_site(&site_id)
     })
     .await
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
+    if let Some(updated_site) = task::spawn_blocking({
+        let site_id = site_id.clone();
+        move || reassign_db_port_if_occupied(&site_id)
+    })
+    .await
+    .context("自动调整 DB 端口失败 (join error)")??
+    {
+        site = updated_site;
+    }
 
     task::spawn_blocking({
         let site_id = site_id.clone();
@@ -11362,14 +11535,40 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
             ),
         );
         match crate::web_server::parse_sidecar_client::cancel_cli_job(&job.key, &job.job_id).await {
-            Ok(_) => append_log_line(
-                &log_path,
-                &format!(
-                    "✅ sidecar {} job {} 取消请求已发送",
-                    job.kind.label(),
-                    job.job_id
-                ),
-            ),
+            Ok(_) => {
+                append_log_line(
+                    &log_path,
+                    &format!(
+                        "✅ sidecar {} job {} 取消请求已发送",
+                        job.kind.label(),
+                        job.job_id
+                    ),
+                );
+                if wait_for_sidecar_job_terminal(site_id, job).await {
+                    append_log_line(
+                        &log_path,
+                        &format!(
+                            "✅ sidecar {} job {} 已进入终态",
+                            job.kind.label(),
+                            job.job_id
+                        ),
+                    );
+                } else {
+                    append_log_line(
+                        &log_path,
+                        &format!(
+                            "⚠️ 等待 sidecar {} job {} 进入终态超时，将继续强制停止站点进程",
+                            job.kind.label(),
+                            job.job_id
+                        ),
+                    );
+                    tracing::warn!(
+                        site = %site_id,
+                        job_id = %job.job_id,
+                        "等待 sidecar job 取消完成超时，将继续停止站点进程"
+                    );
+                }
+            }
             Err(err) => {
                 append_log_line(
                     &log_path,
@@ -11405,6 +11604,8 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
     if let Some(pid) = site.db_pid {
         kill_pid_guarded(site_id, PROC_ROLE_DB, pid).await?;
     }
+    kill_registered_site_processes(site_id).await;
+    let _ = stop_site_ws_db_for_exclusivity(&site).await;
     // 兜底清理本站点的全部进程登记（覆盖 pid 为 None 未走 kill 的角色与历史残留行）。
     unregister_site_processes(site_id);
 
@@ -11515,27 +11716,36 @@ pub struct StopSiteResult {
     pub viewer_conflict_pids: Vec<u32>,
 }
 
-pub fn delete_site(site_id: &str) -> Result<bool> {
-    let _guard = lock_op()?;
+pub async fn delete_site(site_id: &str) -> Result<bool> {
+    let Some(site) = get_site(site_id)? else {
+        return Ok(false);
+    };
 
-    if let Some(site) = get_site(site_id)? {
-        if site_has_active_processes(&site)
-            || matches!(
-                site.status,
-                ManagedSiteStatus::Running
-                    | ManagedSiteStatus::Starting
-                    | ManagedSiteStatus::Stopping
-            )
-            || site.parse_status == ManagedSiteParseStatus::Running
-        {
-            let message = "站点运行中，不能删除".to_string();
-            record_site_error(site_id, message.clone(), Some(site.status.clone()), None);
-            bail!(message);
+    let should_stop = site_has_active_processes(&site)
+        || matches!(
+            site.status,
+            ManagedSiteStatus::Running | ManagedSiteStatus::Starting | ManagedSiteStatus::Stopping
+        )
+        || site.parse_status == ManagedSiteParseStatus::Running;
+    if should_stop {
+        let stop_result = stop_site(site_id).await?;
+        if stop_result.conflict {
+            bail!(
+                "删除站点前停止进程时检测到端口冲突（web={:?} db={:?} viewer={:?}），请先排查外部占用",
+                stop_result.web_conflict_pids,
+                stop_result.db_conflict_pids,
+                stop_result.viewer_conflict_pids
+            );
         }
     } else {
-        return Ok(false);
+        kill_registered_site_processes(site_id).await;
     }
+
+    let _guard = lock_op()?;
     let changed = with_tx(|conn| {
+        if load_site_with_conn(conn, site_id)?.is_none() {
+            return Ok(0);
+        }
         let rows = conn.execute(
             &format!("DELETE FROM {table} WHERE site_id = ?1", table = TABLE_NAME),
             [site_id],

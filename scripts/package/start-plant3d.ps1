@@ -22,6 +22,19 @@ function Resolve-InstallRoot {
     return [System.IO.Path]::GetFullPath((Join-Path $scriptDir "../.."))
 }
 
+function Assert-OfflineViewerIfVerifierExists([string]$Root) {
+    $verifier = Join-Path $Root "verify-offline-viewer.ps1"
+    if (-not (Test-Path -LiteralPath $verifier -PathType Leaf)) {
+        return
+    }
+
+    Write-Host "Verifying offline Viewer assets..." -ForegroundColor Cyan
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $verifier -Root $Root
+    if ($LASTEXITCODE -ne 0) {
+        throw "Offline Viewer verification failed. Rebuild the package with local DuckDB-WASM assets."
+    }
+}
+
 function Invoke-LocalHttpGet([string]$Url, [int]$TimeoutSec = 3) {
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.UseProxy = $false
@@ -294,6 +307,7 @@ $WebServer = Join-Path $Root "bin/web_server.exe"
 $LogDir = Join-Path $Root "logs"
 $AdminSitesUrl = "http://127.0.0.1:$EffectivePort/admin/#/sites"
 $FallbackViewerUrl = "http://127.0.0.1:$EffectivePort/viewer/"
+Assert-OfflineViewerIfVerifierExists $Root
 $nginxInfo = Enable-PackageNginxIfAvailable $Root
 
 if (-not (Test-Path -LiteralPath $WebServer -PathType Leaf)) {

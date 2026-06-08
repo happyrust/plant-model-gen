@@ -5,8 +5,11 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path as FsPath;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 static RUNTIME_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -127,15 +130,118 @@ pub async fn api_parquet_incremental_enqueue(
 }
 
 pub async fn api_parquet_version(Path(dbno): Path<u32>) -> impl IntoResponse {
+    if let Some(info) = find_parquet_manifest(dbno) {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "dbnum": dbno,
+                "revision": info.revision,
+                "updated_at": info.updated_at,
+                "manifest_base_dir": "parquet",
+                "files_base_dir": "parquet",
+                "running": false,
+                "pending_count": 0,
+                "last_error": null,
+                "source": "manifest",
+                "project_name": info.project_name,
+            })),
+        );
+    }
+
     (
         StatusCode::OK,
         Json(json!({
-            "success": true,
+            "success": false,
+            "dbnum": dbno,
+            "revision": 0,
+            "updated_at": null,
+            "manifest_base_dir": null,
+            "files_base_dir": null,
+            "running": false,
+            "pending_count": 0,
+            "last_error": format!("dbnum={dbno} 未找到 Parquet manifest"),
+            "source": "manifest-missing",
+            // Keep the legacy keys for older clients that only inspect dbno/version.
             "dbno": dbno,
             "version": 0,
-            "source": "placeholder"
         })),
     )
+}
+
+struct ParquetManifestInfo {
+    project_name: String,
+    revision: u64,
+    updated_at: Option<String>,
+}
+
+fn find_parquet_manifest(dbno: u32) -> Option<ParquetManifestInfo> {
+    let output_root = crate::versioned_db::db_meta_info::get_output_root();
+    let manifest_file = format!("manifest_{dbno}.json");
+    let mut candidates = Vec::new();
+
+    let configured_project = aios_core::get_db_option().project_name.trim().to_string();
+    if !configured_project.is_empty() {
+        candidates.push(output_root.join(&configured_project));
+    }
+
+    if let Ok(entries) = fs::read_dir(&output_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if candidates.iter().any(|candidate| candidate == &path) {
+                continue;
+            }
+            candidates.push(path);
+        }
+    }
+
+    for project_dir in candidates {
+        let manifest = project_dir.join("parquet").join(&manifest_file);
+        if !manifest.exists() {
+            continue;
+        }
+        let project_name = project_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        return Some(ParquetManifestInfo {
+            project_name,
+            revision: manifest_revision(&manifest),
+            updated_at: manifest_updated_at(&manifest),
+        });
+    }
+
+    None
+}
+
+fn manifest_revision(path: &FsPath) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(system_time_revision)
+        .unwrap_or(0)
+}
+
+fn system_time_revision(time: SystemTime) -> Option<u64> {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn manifest_updated_at(path: &FsPath) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("generated_at")
+                .and_then(|item| item.as_str())
+                .map(ToOwned::to_owned)
+        })
 }
 
 async fn query_realtime_instance_entries(

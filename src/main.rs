@@ -952,6 +952,20 @@ async fn main() -> anyhow::Result<()> {
                         .long("token")
                         .help("web_server 调用 sidecar 时使用的 Bearer token；为空则不启用内部鉴权")
                         .value_name("TOKEN"),
+                )
+                .arg(
+                    Arg::new("shutdown-after-job")
+                        .long("shutdown-after-job")
+                        .help("CLI job 进入 terminal 状态后优雅关闭 sidecar")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("shutdown-delay-ms")
+                        .long("shutdown-delay-ms")
+                        .help("CLI job 结束后延迟多少毫秒再关闭 sidecar")
+                        .default_value("1000")
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("MS"),
                 ),
         )
         // ========== pe_transform 刷新命令 ==========
@@ -1116,6 +1130,11 @@ async fn main() -> anyhow::Result<()> {
                 .cloned()
                 .or_else(|| std::env::var("AIOS_SIDECAR_TOKEN").ok())
                 .filter(|value| !value.trim().is_empty());
+            let shutdown_after_job = serve_matches.get_flag("shutdown-after-job");
+            let shutdown_delay_ms = serve_matches
+                .get_one::<u64>("shutdown-delay-ms")
+                .copied()
+                .unwrap_or(1000);
             return aios_database::parse_sidecar::run_parse_sidecar(
                 aios_database::parse_sidecar::ParseSidecarOptions {
                     site_key,
@@ -1123,6 +1142,8 @@ async fn main() -> anyhow::Result<()> {
                     http_port,
                     runtime_dir: PathBuf::from(runtime_dir),
                     token,
+                    shutdown_after_job,
+                    shutdown_delay_ms,
                 },
             )
             .await;

@@ -3833,7 +3833,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
         get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在: {}", site_id))?
     } else {
         let site_id = infer_site_id(project_name, req.web_port);
-        let bind_host = normalize_host(req.bind_host.clone());
+        let bind_host = normalize_host_or(req.bind_host.clone(), &default_web_bind_host());
         let public_base_url = req
             .public_base_url
             .as_deref()
@@ -9872,6 +9872,23 @@ pub async fn start_site(site_id: String) -> Result<()> {
             Some(site.status.clone()),
             Some(ManagedSiteParseStatus::Running),
         );
+        bail!(message);
+    }
+    if site.parse_status != ManagedSiteParseStatus::Parsed {
+        let message = "站点尚未完成解析，请先执行完整部署或解析/生成流程后再启动".to_string();
+        record_site_error(
+            &site_id,
+            message.clone(),
+            Some(site.status.clone()),
+            Some(site.parse_status.clone()),
+        );
+        bail!(message);
+    }
+    if (site.gen_model || site.gen_mesh)
+        && find_first_glb(&mesh_serve_root_for_site(&site)).is_none()
+    {
+        let message = "站点尚未生成可供 Viewer 加载的 GLB 模型文件，请先执行完整部署".to_string();
+        record_site_error(&site_id, message.clone(), Some(site.status.clone()), None);
         bail!(message);
     }
     update_runtime(

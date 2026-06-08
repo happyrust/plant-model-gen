@@ -161,6 +161,7 @@ function canBrowseData() {
           v-if="canStart()"
           @click="$emit('start')"
           class="inline-flex h-9 items-center gap-2 rounded-md bg-green-600 px-4 text-sm font-medium text-white shadow hover:bg-green-700 transition-colors"
+          title="启动已部署站点"
         >
           <Play class="h-4 w-4" /> 启动
         </button>

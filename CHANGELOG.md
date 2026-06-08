@@ -2,6 +2,15 @@
 
 ## 2026-06-09
 
+### Changed — 站点解析/生成任务提交与启动条件加固
+
+> 管理端解析和模型生成改为统一提交 admin 后台任务，并把返回的 `task_id` 绑定到详情页任务日志；直接启动仅允许已解析且具备 Viewer 模型产物的站点，避免误把未完成部署的站点拉起。
+
+- `admin_handlers.rs` / `admin_task_handlers.rs`：`parse_site`、`generate_site` 统一走 `create_and_dispatch_site_task`，返回 `task_id`；同一站点存在 `Pending` / `Running` 任务时拒绝重复提交，任务重试也复用同一互斥逻辑。
+- `managed_project_sites.rs`：`start_site` 增加解析完成与 GLB 产物检查；未完成解析/生成的站点会记录明确错误并拒绝启动。
+- `sites.ts` / `SiteDetailView.vue`：解析、生成动作消费后端返回的 `task_id`，自动切换到对应日志 tab 并刷新任务详情。
+- `site-status.ts` / `SiteDataTable.vue` / `SiteDetailHeader.vue`：前端启动按钮只对已解析、已具备 Viewer 条件且非忙碌站点开放，并补充启动语义提示；admin 静态产物已重新生成。
+
 ### Changed — 离线部署静态资源本地化与站点操作收口
 
 > release 包改为携带完整 `src/web_server/static` 静态目录，内置页面不再依赖公网 CDN；站点列表区分“直接启动”和“完整部署”，降低误触发解析/生成流程的概率。

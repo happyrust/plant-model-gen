@@ -12,6 +12,7 @@ use rusqlite::Row;
 use serde::Serialize;
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::web_server::admin_auth_handlers::admin_auth_middleware;
@@ -34,6 +35,11 @@ const ADMIN_TASK_POLL_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 struct StoredAdminTask {
     task: TaskInfo,
     site_id: Option<String>,
+}
+
+fn site_task_submit_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(serde::Deserialize)]
@@ -108,6 +114,18 @@ pub fn create_and_dispatch_site_task(
 
     let site_id = normalize_site_id(Some(site_id))
         .ok_or_else(|| "创建 admin 任务必须指定 site_id".to_string())?;
+    let _submit_guard = site_task_submit_lock()
+        .lock()
+        .map_err(|_| "站点任务提交锁已中毒".to_string())?;
+    if let Some(active) =
+        load_inflight_site_task(&site_id).map_err(|e| format!("检查站点运行中任务失败: {e}"))?
+    {
+        return Err(format!(
+            "同一站点已有任务正在运行: {} ({:?}, task_id={})",
+            active.name, active.task_type, active.id
+        ));
+    }
+
     let mut task = TaskInfo::new_with_priority(task_name, task_type, config, priority);
     task.site_id = Some(site_id.clone());
     mark_task_running(&mut task, ADMIN_TASK_SUBMITTED_STEP, 10.0);
@@ -190,28 +208,14 @@ async fn create_task(Json(payload): Json<CreateTaskRequest>) -> impl IntoRespons
         apply_config_overrides(&mut config, &overrides);
     }
 
-    let mut task = TaskInfo::new_with_priority(payload.task_name, task_type, config, priority);
-    mark_task_running(&mut task, ADMIN_TASK_SUBMITTED_STEP, 10.0);
-
-    match save_task(&task, Some(site_id.as_str())) {
-        Ok(_) => {
-            let task_id = task.id.clone();
-            tokio::spawn(async move {
-                if let Err(e) = std::panic::AssertUnwindSafe(dispatch_admin_task(task_id.clone()))
-                    .catch_unwind()
-                    .await
-                {
-                    eprintln!("❌ dispatch_admin_task({task_id}) panicked: {e:?}");
-                }
-            });
-            admin_response::response(
-                StatusCode::CREATED,
-                true,
-                "创建任务成功",
-                Some(redact_task_response(task)),
-            )
-        }
-        Err(e) => admin_response::server_error(format!("保存任务失败: {e}")),
+    match create_and_dispatch_site_task(site_id, payload.task_name, task_type, priority, config) {
+        Ok(task) => admin_response::response(
+            StatusCode::CREATED,
+            true,
+            "创建任务成功",
+            Some(redact_task_response(task)),
+        ),
+        Err(e) => admin_response::managed_error(e),
     }
 }
 
@@ -230,33 +234,20 @@ async fn retry_task(Path(task_id): Path<String>) -> impl IntoResponse {
                 return admin_response::conflict("任务缺少 site_id，无法重试");
             };
 
-            let mut retried = TaskInfo::new_with_priority(
+            match create_and_dispatch_site_task(
+                site_id,
                 stored.task.name.clone(),
                 stored.task.task_type.clone(),
-                stored.task.config.clone(),
                 stored.task.priority.clone(),
-            );
-            mark_task_running(&mut retried, ADMIN_TASK_SUBMITTED_STEP, 10.0);
-
-            match save_task(&retried, Some(site_id.as_str())) {
-                Ok(_) => {
-                    let retried_id = retried.id.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = AssertUnwindSafe(dispatch_admin_task(retried_id.clone()))
-                            .catch_unwind()
-                            .await
-                        {
-                            eprintln!("❌ dispatch_admin_task({retried_id}) panicked: {e:?}");
-                        }
-                    });
-                    admin_response::response(
-                        StatusCode::CREATED,
-                        true,
-                        "重试任务成功",
-                        Some(redact_task_response(retried)),
-                    )
-                }
-                Err(e) => admin_response::server_error(format!("保存重试任务失败: {e}")),
+                stored.task.config.clone(),
+            ) {
+                Ok(task) => admin_response::response(
+                    StatusCode::CREATED,
+                    true,
+                    "重试任务成功",
+                    Some(redact_task_response(task)),
+                ),
+                Err(e) => admin_response::managed_error(e),
             }
         }
         Ok(Some(_)) => admin_response::conflict("只有失败的任务可以重试"),
@@ -448,6 +439,35 @@ fn load_task_record_by_id(
     let mut rows = stmt.query(rusqlite::params![task_id])?;
     if let Some(row) = rows.next()? {
         return Ok(Some(task_from_row(row)?));
+    }
+    Ok(None)
+}
+
+fn load_inflight_site_task(site_id: &str) -> Result<Option<TaskInfo>, Box<dyn std::error::Error>> {
+    ensure_admin_tasks_table()?;
+    let conn = open_deployment_sites_sqlite()?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, name, task_type, status, priority, config_json, site_id,
+                created_at, updated_at, started_at, completed_at,
+                progress_pct, current_step, error, error_details, logs_json
+         FROM {TABLE_NAME}
+         WHERE site_id = ?1 AND status IN ('Pending', 'Running')
+         ORDER BY created_at DESC"
+    ))?;
+    let stored_tasks = stmt
+        .query_map(rusqlite::params![site_id], task_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    drop(conn);
+
+    for stored in stored_tasks {
+        let updated = reconcile_task_record(stored)?;
+        if matches!(
+            updated.task.status,
+            TaskStatus::Pending | TaskStatus::Running
+        ) {
+            return Ok(Some(updated.task));
+        }
     }
     Ok(None)
 }

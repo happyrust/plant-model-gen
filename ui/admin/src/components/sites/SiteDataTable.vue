@@ -528,7 +528,7 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
                 v-if="canStart(site)"
                 @click="handleStart(site.site_id)"
                 class="inline-flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent transition-colors"
-                title="直接启动已部署站点（不重新解析/生成/部署）"
+                title="启动已部署站点"
               >
                 <Play class="h-3.5 w-3.5 text-green-600" />
               </button>

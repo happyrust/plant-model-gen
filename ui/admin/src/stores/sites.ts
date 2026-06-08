@@ -178,10 +178,14 @@ export const useSitesStore = defineStore('sites', () => {
     await fetchSites()
   }
 
-  async function parseSite(id: string) {
-    await withAction(id, 'parse', async () => {
-      await sitesApi.parse(id)
+  async function parseSite(id: string): Promise<ManagedSiteActionResponse | undefined> {
+    return withAction(id, 'parse', async () => {
+      const response = await sitesApi.parse(id)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交解析任务失败')
+      }
       await fetchSites()
+      return response.data
     })
   }
 
@@ -196,10 +200,14 @@ export const useSitesStore = defineStore('sites', () => {
     })
   }
 
-  async function generateSite(id: string) {
-    await withAction(id, 'generate', async () => {
-      await sitesApi.generate(id)
+  async function generateSite(id: string): Promise<ManagedSiteActionResponse | undefined> {
+    return withAction(id, 'generate', async () => {
+      const response = await sitesApi.generate(id)
+      if (!response.success || !response.data) {
+        throw new Error(response.message || '提交模型生成任务失败')
+      }
       await fetchSites()
+      return response.data
     })
   }
 

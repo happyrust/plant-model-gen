@@ -943,7 +943,12 @@ async function handleRestart() {
 
 async function handleParse() {
   try {
-    await sitesStore.parseSite(siteId.value)
+    const submitted = await sitesStore.parseSite(siteId.value)
+    if (submitted?.task_id) {
+      await setDeployTaskId(submitted.task_id)
+      await fetchDeployTask()
+    }
+    activeLogTab.value = 'parse'
     await fetchAll()
   } catch {
     // 错误已写入 store，页面横幅会显示
@@ -952,7 +957,11 @@ async function handleParse() {
 
 async function handleGenerate() {
   try {
-    await sitesStore.generateSite(siteId.value)
+    const submitted = await sitesStore.generateSite(siteId.value)
+    if (submitted?.task_id) {
+      await setDeployTaskId(submitted.task_id)
+      await fetchDeployTask()
+    }
     activeLogTab.value = 'generate'
     await fetchAll()
   } catch {

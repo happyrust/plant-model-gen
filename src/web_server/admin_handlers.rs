@@ -1181,12 +1181,12 @@ pub async fn delete_site(Path(site_id): Path<String>) -> impl IntoResponse {
 }
 
 pub async fn parse_site(Path(site_id): Path<String>) -> impl IntoResponse {
-    match managed_sites::parse_site(site_id.clone()).await {
-        Ok(()) => admin_response::accepted(
+    match submit_managed_site_task(&site_id, TaskType::ParsePdmsData, "解析") {
+        Ok(task_id) => admin_response::accepted(
             "已提交解析任务",
-            json!({ "site_id": site_id, "action": "parse" }),
+            json!({ "site_id": site_id, "action": "parse", "task_id": task_id }),
         ),
-        Err(err) => admin_response::managed_error(err.to_string()),
+        Err(err) => admin_response::managed_error(err),
     }
 }
 
@@ -1226,12 +1226,12 @@ pub async fn rebuild_site_db_index(Path(site_id): Path<String>) -> impl IntoResp
 }
 
 pub async fn generate_site(Path(site_id): Path<String>) -> impl IntoResponse {
-    match managed_sites::generate_site(site_id.clone(), true).await {
-        Ok(()) => admin_response::accepted(
+    match submit_managed_site_task(&site_id, TaskType::FullGeneration, "模型生成") {
+        Ok(task_id) => admin_response::accepted(
             "已提交模型生成并启动 plant3d-web 任务",
-            json!({ "site_id": site_id, "action": "generate" }),
+            json!({ "site_id": site_id, "action": "generate", "task_id": task_id }),
         ),
-        Err(err) => admin_response::managed_error(err.to_string()),
+        Err(err) => admin_response::managed_error(err),
     }
 }
 

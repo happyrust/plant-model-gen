@@ -66,10 +66,12 @@ export function isSiteBusy(site: ManagedProjectSite): boolean {
 }
 
 export function canStartSite(site: ManagedProjectSite): boolean {
+  const needsGeneratedViewer = site.gen_model || site.gen_mesh
   return (
-    site.parse_status !== 'Running' &&
+    site.parse_status === 'Parsed' &&
     !isSiteBusy(site) &&
-    ['Stopped', 'Parsed', 'Failed', 'Draft'].includes(site.status)
+    ['Stopped', 'Parsed', 'Failed'].includes(site.status) &&
+    (!needsGeneratedViewer || site.viewer_port != null)
   )
 }
 

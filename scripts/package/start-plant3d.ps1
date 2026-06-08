@@ -150,16 +150,73 @@ function Clear-PortListeners([int]$Port) {
 
 function Get-LocalIpAddress {
     try {
-        $socket = [System.Net.Sockets.Socket]::new([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
-        try {
-            $socket.Connect("8.8.8.8", 80)
-            return ([System.Net.IPEndPoint]$socket.LocalEndPoint).Address.ToString()
-        } finally {
-            $socket.Dispose()
+        $candidates = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq [System.Net.NetworkInformation.OperationalStatus]::Up -and
+                $_.NetworkInterfaceType -ne [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback
+            } |
+            ForEach-Object {
+                $nic = $_
+                $props = $nic.GetIPProperties()
+                $nameText = "$($nic.Name) $($nic.Description)"
+                $hasGateway = @($props.GatewayAddresses | Where-Object {
+                    $_.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+                    $_.Address.ToString() -ne "0.0.0.0"
+                }).Count -gt 0
+                $looksVirtual = $nameText -match 'vEthernet|WSL|Docker|Hyper-V|Virtual|VMware|VirtualBox|Loopback|Teredo|isatap|Bluetooth|Npcap|Tailscale|WireGuard|ZeroTier'
+                foreach ($unicast in $props.UnicastAddresses) {
+                    if ($unicast.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+                    if ([System.Net.IPAddress]::IsLoopback($unicast.Address)) { continue }
+                    $ip = $unicast.Address.ToString()
+                    if ($ip.StartsWith("169.254.")) { continue }
+
+                    $score = 0
+                    if ($hasGateway) { $score += 1000 }
+                    if (-not $looksVirtual) { $score += 500 }
+                    if ($nic.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Wireless80211 -or
+                        $nic.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Ethernet) {
+                        $score += 200
+                    }
+                    if ($ip -match '^192\.168\.') {
+                        $score += 60
+                    } elseif ($ip -match '^10\.') {
+                        $score += 50
+                    } elseif ($ip -match '^172\.(1[6-9]|2\d|3[01])\.') {
+                        $score += 40
+                    }
+                    if ($looksVirtual -and $ip -match '^172\.(1[6-9]|2\d|3[01])\.') {
+                        $score -= 100
+                    }
+
+                    [pscustomobject]@{
+                        Address = $ip
+                        Score = $score
+                    }
+                }
+            }
+
+        $preferred = $candidates |
+            Sort-Object Score -Descending |
+            Select-Object -First 1 -ExpandProperty Address
+        if ($preferred) {
+            return $preferred
+        }
+        $first = $candidates | Select-Object -First 1 -ExpandProperty Address
+        if ($first) {
+            return $first
         }
     } catch {
         return "127.0.0.1"
     }
+    return "127.0.0.1"
+}
+
+function Format-UrlHost([string]$HostName) {
+    $trimmed = ($HostName -as [string]).Trim().TrimStart("[").TrimEnd("]")
+    if ($trimmed.Contains(":")) {
+        return "[$trimmed]"
+    }
+    return $trimmed
 }
 
 function Resolve-NginxBin([string]$Root) {
@@ -222,8 +279,8 @@ function Enable-PackageNginxIfAvailable([string]$Root) {
         $env:AIOS_NGINX_ROOT = Join-Path $Root "runtime/nginx"
     }
     $env:AIOS_VIEWER_STATIC_ROOT = $staticRoot
-    if (-not $env:AIOS_VIEWER_BASE_URL) {
-        $env:AIOS_VIEWER_BASE_URL = $baseUrl
+    if ($ViewerPort -gt 0 -and $ViewerPort -ne 80 -and -not $env:AIOS_VIEWER_PORT) {
+        $env:AIOS_VIEWER_PORT = "$ViewerPort"
     }
     if ($effectiveRequireNginx) {
         $env:AIOS_REQUIRE_NGINX = "1"
@@ -232,7 +289,13 @@ function Enable-PackageNginxIfAvailable([string]$Root) {
     }
 
     return [pscustomobject]@{
-        BaseUrl = $env:AIOS_VIEWER_BASE_URL
+        BaseUrl = if ($env:AIOS_VIEWER_BASE_URL) {
+            $env:AIOS_VIEWER_BASE_URL
+        } elseif ($env:AIOS_VIEWER_PORT) {
+            "http://$hostValue`:$($env:AIOS_VIEWER_PORT)"
+        } else {
+            "$baseUrl (site-specific port allocated at site start)"
+        }
         NginxBin = $env:AIOS_NGINX_BIN
         NginxRoot = $env:AIOS_NGINX_ROOT
         StaticRoot = $env:AIOS_VIEWER_STATIC_ROOT
@@ -305,8 +368,18 @@ $portChoice = Resolve-StartupPort $Port
 $EffectivePort = [int]$portChoice.Port
 $WebServer = Join-Path $Root "bin/web_server.exe"
 $LogDir = Join-Path $Root "logs"
-$AdminSitesUrl = "http://127.0.0.1:$EffectivePort/admin/#/sites"
-$FallbackViewerUrl = "http://127.0.0.1:$EffectivePort/viewer/"
+$PublicHost = if ($env:AIOS_PUBLIC_HOST) {
+    $env:AIOS_PUBLIC_HOST
+} elseif ($env:AIOS_LOCAL_IP) {
+    $env:AIOS_LOCAL_IP
+} else {
+    Get-LocalIpAddress
+}
+$PublicUrlHost = Format-UrlHost $PublicHost
+$AdminBaseUrl = "http://$PublicUrlHost`:$EffectivePort"
+$AdminApiUrl = "$AdminBaseUrl/api"
+$AdminSitesUrl = "$AdminBaseUrl/admin/#/sites"
+$FallbackViewerUrl = "$AdminBaseUrl/viewer/"
 Assert-OfflineViewerIfVerifierExists $Root
 $nginxInfo = Enable-PackageNginxIfAvailable $Root
 
@@ -321,6 +394,9 @@ $env:ADMIN_USER = "admin"
 $env:ADMIN_PASS = "admin"
 $env:AIOS_ALLOW_WEAK_DB_CREDS = "1"
 $env:AIOS_ALLOW_PUBLIC_BIND = "1"
+if (-not $env:AIOS_PUBLIC_HOST -and -not $env:AIOS_LOCAL_IP) {
+    $env:AIOS_PUBLIC_HOST = $PublicHost
+}
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $stdout = Join-Path $LogDir "web_server-$stamp.out.log"
@@ -332,6 +408,7 @@ if ($portChoice.Fallback) {
     Write-Warning "Port $Port is occupied but not serving a healthy AIOS backend. Using fallback port $EffectivePort."
 }
 Write-Host "Admin Sites: $AdminSitesUrl" -ForegroundColor Cyan
+Write-Host "Admin API: $AdminApiUrl" -ForegroundColor Cyan
 Write-Host "Fallback Viewer (available after backend is ready): $FallbackViewerUrl" -ForegroundColor Cyan
 if ($nginxInfo) {
     Write-Host "Nginx Viewer (available after a managed site is started): $($nginxInfo.BaseUrl)" -ForegroundColor Cyan

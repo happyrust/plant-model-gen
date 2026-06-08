@@ -2,6 +2,15 @@
 
 ## 2026-06-09
 
+### Fixed — Quicktest Viewer 入口、离线 DuckDB 扩展与模型聚焦
+
+> 受管站点 Viewer 改为使用分配的前端端口和 Nginx 代理，不再依赖 `backend=` 查询参数；release Viewer 完整本地化 DuckDB Parquet 扩展，避免运行时访问公网 `extensions.duckdb.org`；前端模型聚焦忽略少量远端离群对象，避免全量 AABB 过大导致主体不可见。
+
+- `managed_project_sites.rs` / `ui/admin/src/lib/viewer.ts`：Viewer URL 只生成 `output_project` 与 `show_dbnum`，前端 listen/base URL 使用站点分配端口；旧的 `backend=` URL 视为 legacy。
+- `scripts/package/start-plant3d.ps1`：启动脚本不再默认把 Viewer base URL 设为 `:80`，仅在显式非 80 端口时补充 `AIOS_VIEWER_PORT`。
+- `scripts/package/build-windows-bundle.ps1` / `verify-offline-viewer.ps1`：离线校验要求 `parquet.duckdb_extension.wasm` 的 `wasm_eh` / `wasm_mvp` / `wasm_threads` 三个平台文件齐备。
+- 验证：`plant3d-web npm run build` 通过；release `viewer-root` / `viewer` 离线校验通过；阻断 `https://extensions.duckdb.org/**` 后，`http://192.168.31.60:3102/?output_project=AvevaPlantSample&show_dbnum=250160` 可加载 625/625 个对象并正常聚焦。
+
 ### Changed — Admin/站点/数据库访问统一使用真实 IP
 
 > 站点部署、Admin 输出入口、Viewer 入口和 SurrealDB 连接配置不再生成 `127.0.0.1` / `localhost` 访问地址；默认优先使用显式环境变量，其次推断本机 LAN IPv4。

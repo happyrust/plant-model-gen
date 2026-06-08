@@ -108,7 +108,19 @@ function Invoke-BackendCargoBuild([string]$Profile) {
         Write-Host "Using rustc_codegen_cranelift for debug backend build (profile.dev in .cargo/config.toml)" -ForegroundColor Yellow
         & cargo +nightly build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
     } else {
-        & cargo build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        $previousDevCodegenBackend = $env:CARGO_PROFILE_DEV_CODEGEN_BACKEND
+        if ($Profile -eq "debug" -and $DebugCodegenBackend -eq "llvm") {
+            $env:CARGO_PROFILE_DEV_CODEGEN_BACKEND = "llvm"
+        }
+        try {
+            & cargo build @($profileArgs) --bin web_server --bin offline_deployer --bin aios-database --target $TargetTriple --no-default-features --features $Features
+        } finally {
+            if ($null -eq $previousDevCodegenBackend) {
+                Remove-Item Env:\CARGO_PROFILE_DEV_CODEGEN_BACKEND -ErrorAction SilentlyContinue
+            } else {
+                $env:CARGO_PROFILE_DEV_CODEGEN_BACKEND = $previousDevCodegenBackend
+            }
+        }
     }
 
     if ($LASTEXITCODE -ne 0) {
@@ -124,6 +136,37 @@ function Copy-Tree([string]$Source, [string]$Destination) {
     Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
 }
 
+function Get-ViewerTextFiles([string]$Dist) {
+    Get-ChildItem -LiteralPath $Dist -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $ext = $_.Extension.ToLowerInvariant()
+            $ext -eq ".html" -or $ext -eq ".js" -or $ext -eq ".mjs" -or $ext -eq ".css"
+        }
+}
+
+function Assert-NoExternalViewerLibraryUrls([string]$Dist, [string]$Label) {
+    $forbidden = @(
+        @{ Name = "DuckDB jsDelivr bundle"; Pattern = "https?://cdn\.jsdelivr\.net/(npm/)?@duckdb/duckdb-wasm" },
+        @{ Name = "DuckDB jsDelivr helper"; Pattern = "getJsDelivrBundles" },
+        @{ Name = "jsDelivr CDN"; Pattern = "https?://cdn\.jsdelivr\.net/" },
+        @{ Name = "unpkg CDN"; Pattern = "https?://unpkg\.com/" },
+        @{ Name = "cdnjs CDN"; Pattern = "https?://cdnjs\.cloudflare\.com/" },
+        @{ Name = "esm.sh CDN"; Pattern = "https?://esm\.sh/" },
+        @{ Name = "Skypack CDN"; Pattern = "https?://cdn\.skypack\.dev/" },
+        @{ Name = "Google Fonts CSS"; Pattern = "https?://fonts\.googleapis\.com/" },
+        @{ Name = "Google Fonts static"; Pattern = "https?://fonts\.gstatic\.com/" }
+    )
+
+    foreach ($file in (Get-ViewerTextFiles $Dist)) {
+        $content = Get-Content -LiteralPath $file.FullName -Raw
+        foreach ($rule in $forbidden) {
+            if ($content -match $rule.Pattern) {
+                throw "$($rule.Name) URL/helper found in ${Label}: $($file.FullName). Rebuild plant3d-web with offline local assets."
+            }
+        }
+    }
+}
+
 function Assert-DuckDbOfflineDist([string]$Dist, [string]$Label) {
     $duckdbDir = Join-Path $Dist "duckdb"
     $required = @(
@@ -133,7 +176,10 @@ function Assert-DuckDbOfflineDist([string]$Dist, [string]$Label) {
         "duckdb-browser-coi.pthread.worker.js",
         "duckdb-mvp.wasm",
         "duckdb-eh.wasm",
-        "duckdb-coi.wasm"
+        "duckdb-coi.wasm",
+        "extensions/v1.5.3/wasm_eh/parquet.duckdb_extension.wasm",
+        "extensions/v1.5.3/wasm_mvp/parquet.duckdb_extension.wasm",
+        "extensions/v1.5.3/wasm_threads/parquet.duckdb_extension.wasm"
     )
     foreach ($file in $required) {
         $path = Join-Path $duckdbDir $file
@@ -142,13 +188,7 @@ function Assert-DuckDbOfflineDist([string]$Dist, [string]$Label) {
         }
     }
 
-    $jsFiles = Get-ChildItem -LiteralPath $Dist -Recurse -File -Include "*.js" -ErrorAction SilentlyContinue
-    foreach ($file in $jsFiles) {
-        $content = Get-Content -LiteralPath $file.FullName -Raw
-        if ($content -match "https://cdn\.jsdelivr\.net/(npm/)?@duckdb/duckdb-wasm") {
-            throw "DuckDB CDN URL found in ${Label}: $($file.FullName). Rebuild plant3d-web with local DuckDB bundles before packaging."
-        }
-    }
+    Assert-NoExternalViewerLibraryUrls $Dist $Label
 }
 
 function Invoke-FrontendBuild([string]$BasePath, [string]$Label, [string]$Destination) {
@@ -185,7 +225,22 @@ function Get-GitCommit([string]$Path) {
 }
 
 function Get-FileSha256([string]$Path) {
-    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($getFileHash) {
+        return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $sha.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Assert-NasmAvailable {
@@ -482,7 +537,7 @@ foreach ($profile in $RequestedProfiles) {
         Copy-Item -LiteralPath $NginxCacheExe -Destination (Join-Path $profilePackageRoot "bin/nginx/nginx.exe") -Force
         $nginxBundled = $true
     } else {
-        Write-Warning "Optional nginx.exe not found at $NginxCacheExe; package will use /viewer/ fallback unless AIOS_NGINX_BIN is provided at runtime."
+        throw "Required nginx.exe not found at $NginxCacheExe; default startup uses -EnableNginx on and requires bundled nginx."
     }
     Copy-Tree $ViewerFallbackDist (Join-Path $profilePackageRoot "viewer")
     Copy-Tree $ViewerRootDist (Join-Path $profilePackageRoot "viewer-root")

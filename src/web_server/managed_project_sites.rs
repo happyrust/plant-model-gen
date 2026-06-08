@@ -521,6 +521,20 @@ fn local_port_probe_host() -> String {
     default_access_host()
 }
 
+fn local_port_in_use_any_host(port: u16) -> bool {
+    let mut seen = HashSet::new();
+    for host in ["127.0.0.1".to_string(), "localhost".to_string(), local_port_probe_host()] {
+        let host = host.trim();
+        if host.is_empty() || !seen.insert(host.to_ascii_lowercase()) {
+            continue;
+        }
+        if port_in_use(host, port) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 在写入 DB 之前对 `bind_host` 做安全校验。
 ///
 /// - `0.0.0.0` 默认拒绝（公网暴露风险）
@@ -1525,6 +1539,8 @@ fn build_site_config(
     set_toml_string(table, "mdb_name", db_option.mdb_name.clone());
     set_toml_string(table, "module", db_option.module.clone());
     let db_host = access_host_from_bind_host(&site.bind_host);
+    // aios_core still reads this legacy top-level ip for ws SurrealDB in some paths.
+    set_toml_string(table, "ip", db_host.clone());
     set_toml_string(table, "surreal_ip", db_host.clone());
     set_toml_integer(table, "surreal_port", site.db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
@@ -3055,10 +3071,10 @@ fn assert_port_available_with_conn(
             }
         }
     }
-    if port_in_use(&local_port_probe_host(), db_port) {
+    if local_port_in_use_any_host(db_port) {
         bail!("数据库端口 {} 已被当前机器上的其他进程占用", db_port);
     }
-    if port_in_use(&local_port_probe_host(), web_port) {
+    if local_port_in_use_any_host(web_port) {
         bail!("站点端口 {} 已被当前机器上的其他进程占用", web_port);
     }
     Ok(())
@@ -3094,7 +3110,7 @@ fn collect_reserved_ports_with_conn(
 
 fn first_available_port(used: &mut HashSet<u16>, start: u16, end: u16) -> Result<u16> {
     for port in start..=end {
-        if used.contains(&port) || port_in_use(&local_port_probe_host(), port) {
+        if used.contains(&port) || local_port_in_use_any_host(port) {
             continue;
         }
         used.insert(port);
@@ -3107,7 +3123,7 @@ fn reserve_explicit_port(used: &mut HashSet<u16>, port: u16, label: &str) -> Res
     if used.contains(&port) {
         bail!("{}端口 {} 已被已有站点使用", label, port);
     }
-    if port_in_use(&local_port_probe_host(), port) {
+    if local_port_in_use_any_host(port) {
         bail!("{}端口 {} 已被当前机器上的其他进程占用", label, port);
     }
     used.insert(port);
@@ -3137,7 +3153,7 @@ fn resolve_create_ports_with_conn(
 fn reassign_db_port_if_occupied(site_id: &str) -> Result<Option<ManagedProjectSite>> {
     let changed = with_tx(|conn| {
         let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-        if !port_in_use(&local_port_probe_host(), site.db_port) {
+        if !local_port_in_use_any_host(site.db_port) {
             return Ok(None);
         }
 
@@ -6174,7 +6190,7 @@ fn isolate_process_group(command: &mut Command) {
 
 async fn wait_for_port(port: u16, attempts: usize, delay_ms: u64) -> bool {
     for _ in 0..attempts {
-        if port_in_use(&local_port_probe_host(), port) {
+        if local_port_in_use_any_host(port) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -6185,7 +6201,7 @@ async fn wait_for_port(port: u16, attempts: usize, delay_ms: u64) -> bool {
 /// 等待端口被释放（与 `wait_for_port` 相反），用于停止互斥模式后确认端口已腾出。
 async fn wait_for_port_free(port: u16, attempts: usize, delay_ms: u64) -> bool {
     for _ in 0..attempts {
-        if !port_in_use(&local_port_probe_host(), port) {
+        if !local_port_in_use_any_host(port) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -8169,11 +8185,15 @@ async fn spawn_web_process(site: &ManagedProjectSite) -> Result<u32> {
     let exe = current_exe_path()?;
     let repo = repo_root()?;
     let (stdout, stderr) = open_log_file(&web_log_path(&site.site_id))?;
+    let db_host = access_host_from_bind_host(&site.bind_host);
     let mut command = Command::new(exe);
     command
         .arg("--config")
         .arg(config_no_ext)
         .env("WEB_SERVER_PORT", site.web_port.to_string())
+        .env("SURREAL_CONN_MODE", managed_db_mode_to_str(site.runtime_db_mode))
+        .env("SURREAL_CONN_IP", db_host)
+        .env("SURREAL_CONN_PORT", site.db_port.to_string())
         .current_dir(repo)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -8315,6 +8335,48 @@ async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
     bail!("未找到可用的 Viewer 端口 (3101..3120)");
 }
 
+async fn choose_nginx_viewer_port(site: &ManagedProjectSite) -> Result<u16> {
+    if let Some(port) = site.viewer_port {
+        if port == site.db_port || port == site.web_port {
+            tracing::warn!(
+                site = %site.site_id,
+                port,
+                "历史 Viewer 端口与站点 DB/Web 端口冲突，改为自动选择端口"
+            );
+        } else if !port_in_use(&local_port_probe_host(), port) || viewer_http_ok(port).await {
+            return Ok(port);
+        } else {
+            tracing::warn!(
+                site = %site.site_id,
+                port,
+                "历史 Viewer 端口已被非 Viewer 进程占用，改为自动选择端口"
+            );
+        }
+    }
+
+    if let Some(port) = configured_viewer_port()? {
+        if port == site.db_port || port == site.web_port {
+            bail!("AIOS_VIEWER_PORT {} 与站点 DB/Web 端口冲突", port);
+        }
+        if port_in_use(&local_port_probe_host(), port) && !viewer_http_ok(port).await {
+            bail!("AIOS_VIEWER_PORT {} 已被非 Viewer 进程占用", port);
+        }
+        return Ok(port);
+    }
+
+    for port in 3101..=3120 {
+        if port == site.db_port || port == site.web_port {
+            continue;
+        }
+        if port_in_use(&local_port_probe_host(), port) {
+            continue;
+        }
+        return Ok(port);
+    }
+
+    bail!("未找到可用的 Nginx Viewer 端口 (3101..3120)");
+}
+
 /// 探测 plant3d-web 构建产物的 base 路径。
 ///
 /// plant3d-web 可能以非根 base 构建（例如随安装包发布时 `VITE_BASE_PATH=/viewer/`），
@@ -8353,18 +8415,42 @@ fn configured_viewer_base_url(site: &ManagedProjectSite) -> Option<String> {
         })
 }
 
+fn viewer_base_url_for_port(site: &ManagedProjectSite, port: u16) -> String {
+    if let Some(base) = configured_viewer_base_url(site) {
+        let candidate = if base.starts_with("http://") || base.starts_with("https://") {
+            base
+        } else {
+            format!("http://{base}")
+        };
+        if let Ok(mut url) = reqwest::Url::parse(&candidate) {
+            let _ = url.set_port(Some(port));
+            url.set_path("/");
+            url.set_query(None);
+            url.set_fragment(None);
+            if let Some(normalized) = normalize_viewer_base_url(url.as_str()) {
+                return normalized;
+            }
+        }
+    }
+
+    super::get_local_ip_via_udp()
+        .map(|ip| format!("http://{ip}:{port}"))
+        .unwrap_or_else(|_| format!("http://{}:{port}", default_access_host()))
+}
+
+fn viewer_url_has_port(url: &str, port: u16) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+        .is_some_and(|actual| actual == port)
+        || url.contains(&format!(":{port}"))
+}
+
 fn build_viewer_url(site: &ManagedProjectSite, port: u16) -> String {
-    let base = configured_viewer_base_url(site)
-        .or_else(|| {
-            super::get_local_ip_via_udp()
-                .ok()
-                .map(|ip| format!("http://{ip}:{port}"))
-        })
-        .unwrap_or_else(|| format!("http://{}:{port}", default_access_host()));
+    let base = viewer_base_url_for_port(site, port);
     let project = site_source_project_name(site);
-    // plant3d-web is a standalone customer-facing site. It should discover the
-    // backend through same-origin config/proxying, not through admin-only
-    // `backend=...` query wrapping.
+    // Viewer API/files are resolved by the Nginx server bound to this
+    // site-specific frontend port.
     let mut url = format!(
         "{}/?output_project={}",
         base.trim_end_matches('/'),
@@ -8385,8 +8471,8 @@ fn is_legacy_viewer_url(url: &str) -> bool {
         || url.contains("data_source=")
 }
 
-fn viewer_url_needs_managed_port(site: &ManagedProjectSite, url: &str, viewer_port: u16) -> bool {
-    configured_viewer_base_url(site).is_none() && !url.contains(&format!(":{viewer_port}"))
+fn viewer_url_needs_managed_port(_site: &ManagedProjectSite, url: &str, viewer_port: u16) -> bool {
+    !viewer_url_has_port(url, viewer_port)
 }
 
 fn normalize_viewer_url_for_response(site: &mut ManagedProjectSite) {
@@ -8396,8 +8482,7 @@ fn normalize_viewer_url_for_response(site: &mut ManagedProjectSite) {
     let Some(viewer_port) = site.viewer_port else {
         return;
     };
-    if is_legacy_viewer_url(viewer_url)
-        || viewer_url_needs_managed_port(site, viewer_url, viewer_port)
+    if is_legacy_viewer_url(viewer_url) || viewer_url_needs_managed_port(site, viewer_url, viewer_port)
     {
         site.viewer_url = Some(build_viewer_url(site, viewer_port));
     }
@@ -8592,19 +8677,13 @@ fn viewer_base_listen_port(site: &ManagedProjectSite) -> u16 {
 }
 
 async fn choose_static_nginx_viewer_port(site: &ManagedProjectSite) -> Result<u16> {
-    if configured_viewer_base_url(site).is_some() {
-        return Ok(viewer_base_listen_port(site));
-    }
-
     if site.viewer_port == Some(80) {
         let mut site_without_legacy_port = site.clone();
         site_without_legacy_port.viewer_port = None;
-        return choose_viewer_port(&site_without_legacy_port)
-            .await
-            .map(|(port, _)| port);
+        return choose_nginx_viewer_port(&site_without_legacy_port).await;
     }
 
-    choose_viewer_port(site).await.map(|(port, _)| port)
+    choose_nginx_viewer_port(site).await
 }
 
 async fn try_launch_static_viewer_root(site: &ManagedProjectSite) -> Result<Option<ViewerLaunch>> {
@@ -9140,8 +9219,8 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
     if reuse_existing {
         let dist_base_path = detect_viewer_base_path(&viewer_dir);
         if dist_base_path == base_path {
-            configure_windows_nginx_if_available(site, Some(&viewer_dir), None).await?;
-            configure_linux_nginx_if_available(site, Some(&viewer_dir), None).await?;
+            configure_windows_nginx_if_available(site, Some(&viewer_dir), Some(port)).await?;
+            configure_linux_nginx_if_available(site, Some(&viewer_dir), Some(port)).await?;
             let url = build_viewer_url(site, port);
             tracing::info!(site = %site.site_id, port, "复用已运行的 plant3d-web Viewer");
             return Ok(Some(ViewerLaunch {
@@ -9203,8 +9282,8 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
         }
     }
 
-    configure_windows_nginx_if_available(site, Some(&viewer_dir), None).await?;
-    configure_linux_nginx_if_available(site, Some(&viewer_dir), None).await?;
+    configure_windows_nginx_if_available(site, Some(&viewer_dir), Some(port)).await?;
+    configure_linux_nginx_if_available(site, Some(&viewer_dir), Some(port)).await?;
 
     let url = build_viewer_url(site, port);
     let viewer_bind_host = managed_viewer_bind_host();
@@ -9281,7 +9360,7 @@ async fn stop_site_ws_db_for_exclusivity(site: &ManagedProjectSite) -> bool {
         }
     }
     // 2) 兜底：清理仍监听本站点 db 端口的任何残留/未登记 surreal server。
-    if port_in_use(&local_port_probe_host(), site.db_port) {
+    if local_port_in_use_any_host(site.db_port) {
         let pids = process_ids_on_port(site.db_port).await.unwrap_or_default();
         for pid in pids {
             if kill_pid(pid).await.is_ok() {

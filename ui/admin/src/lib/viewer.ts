@@ -13,8 +13,8 @@ import { resolveViewerBaseUrlInfo } from './app-config'
  * 调用方保持同步：前端在 `main.ts` 启动时 `await loadAppConfig()`，之后本函数
  * 可以安全地只读缓存；如果启动时拉取失败，会回退到 Vite env，不阻断 UI。
  *
- * 输出 query 只保留 plant3d-web 的业务参数。后端访问由 plant3d-web
- * 同源配置 / Nginx 反代负责，不把 admin/backend 内部地址暴露给客户 URL。
+ * 输出 query 只保留 plant3d-web 的业务参数；后端 API / files 由站点
+ * Viewer 端口上的 Nginx 配置代理。
  */
 function normalizeViewerBaseUrl(value: string | null | undefined): string | null {
   if (typeof value !== 'string') return null
@@ -33,7 +33,12 @@ function normalizeViewerBaseUrl(value: string | null | undefined): string | null
 
 function buildStandaloneViewerUrl(
   base: string,
-  site: Pick<ManagedProjectSite, 'project_name' | 'associated_project' | 'manual_db_nums'>,
+  site: Pick<
+    ManagedProjectSite,
+    | 'project_name'
+    | 'associated_project'
+    | 'manual_db_nums'
+  >,
 ): string {
   const url = new URL(`${base.replace(/\/$/, '')}/`, window.location.origin)
   url.searchParams.set('output_project', site.associated_project || site.project_name)

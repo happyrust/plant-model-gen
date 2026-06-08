@@ -19,6 +19,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
+| [Site Deployment Data and Viewer Validation](./site-deployment-validation.md) | Managed site validation contract for data, Parquet, HTTP, and Viewer readiness | Active |
 
 ---
 

@@ -57,6 +57,7 @@ pub mod room_api;
 pub mod room_page;
 pub mod simple_templates;
 pub mod site_config_handlers;
+pub mod site_data_validation;
 pub mod site_metadata;
 pub mod site_registry;
 pub mod sqlite_spatial_api;

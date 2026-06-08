@@ -470,8 +470,58 @@ function deployValidationStatusLabel(status: string) {
   if (normalized === 'blocking') return '阻断'
   if (normalized === 'warning') return '警告'
   if (normalized === 'pass') return '通过'
+  if (normalized === 'ok') return '通过'
   return status || '未知'
 }
+
+function deployValidationGroupForKey(key: string) {
+  if (key.startsWith('service_') || key === 'web_status' || key === 'site_identity') {
+    return { key: 'service', label: '服务健康' }
+  }
+  if (key.startsWith('viewer_') || key === 'viewer') {
+    return { key: 'viewer', label: 'Viewer 入口' }
+  }
+  if (key.startsWith('http_parquet_') || key.startsWith('parquet_manifest_') || key.startsWith('parquet_instances_') || key.startsWith('parquet_geo_instances_') || key.startsWith('parquet_transforms_') || key.startsWith('parquet_aabb_')) {
+    return { key: 'parquet-files', label: 'Parquet 文件' }
+  }
+  if (key.startsWith('parquet_')) {
+    return { key: 'data-consistency', label: '数据一致性' }
+  }
+  if (key.startsWith('mesh_') || key.startsWith('http_mesh_')) {
+    return { key: 'mesh', label: '模型资源' }
+  }
+  if (key.startsWith('api_e3d_')) {
+    return { key: 'api', label: '关键 API' }
+  }
+  return { key: 'other', label: '其他检查' }
+}
+
+const deployValidationGroups = computed(() => {
+  const groups = new Map<string, {
+    key: string
+    label: string
+    blocking: number
+    warning: number
+    checks: ManagedSiteDeployValidationCheck[]
+  }>()
+  for (const check of deployValidation.value?.checks ?? []) {
+    const meta = deployValidationGroupForKey(check.key)
+    const current = groups.get(meta.key) ?? {
+      key: meta.key,
+      label: meta.label,
+      blocking: 0,
+      warning: 0,
+      checks: [],
+    }
+    const status = check.status?.toLowerCase()
+    if (status === 'blocking') current.blocking += 1
+    if (status === 'warning') current.warning += 1
+    current.checks.push(check)
+    groups.set(meta.key, current)
+  }
+  const order = ['service', 'viewer', 'parquet-files', 'data-consistency', 'mesh', 'api', 'other']
+  return Array.from(groups.values()).sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key))
+})
 
 const riskTone = computed(() => toneForRisk(runtime.value?.risk_level ?? 'normal'))
 const parseHealthTone = computed(() => {
@@ -1792,11 +1842,11 @@ onMounted(async () => {
       <div class="rounded-lg border border-border bg-card p-5">
         <div class="mb-4 flex items-center justify-between gap-3">
           <div>
-            <h3 class="text-base font-medium">部署后验收</h3>
+            <h3 class="text-base font-medium">数据与前端加载校验</h3>
             <p class="mt-1 text-sm text-muted-foreground">
               {{ deployValidation?.exists
                 ? `检查时间 ${formatDateTime(deployValidation.checked_at)}，${deployValidation.blocking_count} 个阻断 / ${deployValidation.warning_count} 个警告`
-                : '部署成功后会生成验收报告，覆盖 Web、Viewer、Parquet 和 GLB 资源。' }}
+                : '检查站点服务、Viewer 入口、Parquet 文件、数据一致性和关键 API。' }}
             </p>
           </div>
           <button
@@ -1805,7 +1855,7 @@ onMounted(async () => {
             class="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
           >
             <Loader2 v-if="deployValidationLoading" class="h-3.5 w-3.5 animate-spin" />
-            {{ deployValidationLoading ? '加载中...' : '刷新验收' }}
+            {{ deployValidationLoading ? '检查中...' : '检查数据与前端加载' }}
           </button>
         </div>
 
@@ -1816,33 +1866,82 @@ onMounted(async () => {
           验收报告加载失败：{{ deployValidationError }}
         </div>
 
-        <div v-if="deployValidation?.exists && deployValidation.checks.length" class="space-y-3">
+        <div v-if="deployValidation?.exists && deployValidation.checks.length" class="space-y-4">
           <div
-            v-for="check in deployValidation.checks"
-            :key="check.key"
-            class="rounded-lg border p-4 text-sm"
-            :class="deployValidationCheckClass(check)"
+            v-for="group in deployValidationGroups"
+            :key="group.key"
+            class="rounded-lg border border-border bg-background/50 p-4"
           >
             <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="font-medium">{{ check.label }}</div>
-              <span class="rounded-full border border-current/20 px-2 py-0.5 text-xs">
-                {{ deployValidationStatusLabel(check.status) }}
+              <div>
+                <div class="font-medium">{{ group.label }}</div>
+                <div class="mt-1 text-xs text-muted-foreground">
+                  {{ group.checks.length }} 项检查 · {{ group.blocking }} 阻断 / {{ group.warning }} 警告
+                </div>
+              </div>
+              <span
+                class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+                :class="group.blocking > 0 ? 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200' : group.warning > 0 ? 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200' : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'"
+              >
+                {{ group.blocking > 0 ? '存在阻断' : group.warning > 0 ? '有警告' : '通过' }}
               </span>
             </div>
-            <div class="mt-2">{{ check.message }}</div>
-            <div v-if="check.detail" class="mt-1 text-xs text-muted-foreground break-all">{{ check.detail }}</div>
-            <a
-              v-if="check.url"
-              :href="check.url"
-              target="_blank"
-              class="mt-2 block text-xs text-primary hover:underline break-all"
-            >
-              {{ check.url }}
-            </a>
+
+            <div class="mt-3 space-y-2">
+              <div
+                v-for="check in group.checks"
+                :key="check.key"
+                class="rounded-md border p-3 text-sm"
+                :class="deployValidationCheckClass(check)"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <div class="font-medium">{{ check.label }}</div>
+                  <span class="rounded-full border border-current/20 px-2 py-0.5 text-xs">
+                    {{ deployValidationStatusLabel(check.status) }}
+                  </span>
+                </div>
+                <div class="mt-2">{{ check.message }}</div>
+                <div v-if="check.detail" class="mt-1 text-xs text-muted-foreground break-all">{{ check.detail }}</div>
+                <a
+                  v-if="check.url"
+                  :href="check.url"
+                  target="_blank"
+                  class="mt-2 inline-flex text-xs text-primary hover:underline break-all"
+                >
+                  打开检查 URL：{{ check.url }}
+                </a>
+              </div>
+            </div>
           </div>
+
+          <details class="rounded-lg border border-dashed border-border p-4 text-sm">
+            <summary class="cursor-pointer font-medium text-muted-foreground">
+              查看原始检查列表
+            </summary>
+            <div class="mt-3 space-y-2">
+              <div
+                v-for="check in deployValidation.checks"
+                :key="`raw-${check.key}`"
+                class="rounded-md border p-3 text-xs"
+                :class="deployValidationCheckClass(check)"
+              >
+                <div class="font-mono">{{ check.key }}</div>
+                <div class="mt-1">{{ check.label }} · {{ deployValidationStatusLabel(check.status) }}</div>
+                <div class="mt-1">{{ check.message }}</div>
+              </div>
+            </div>
+          </details>
         </div>
         <div v-else class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          暂无部署后验收报告。提交完整部署并等待任务完成后再刷新。
+          <div>暂无数据与前端加载校验报告。</div>
+          <button
+            :disabled="deployValidationLoading"
+            @click="refreshDeployValidation"
+            class="mt-3 inline-flex h-8 items-center gap-2 rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors disabled:pointer-events-none disabled:opacity-50"
+            >
+            <Loader2 v-if="deployValidationLoading" class="h-3.5 w-3.5 animate-spin" />
+            {{ deployValidationLoading ? '检查中...' : '立即检查' }}
+          </button>
         </div>
       </div>
 

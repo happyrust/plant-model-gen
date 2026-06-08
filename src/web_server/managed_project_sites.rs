@@ -6050,7 +6050,7 @@ async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
 // ─── Deploy readiness validation ────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct DeployValidationReport {
+pub(crate) struct DeployValidationReport {
     site_id: String,
     checked_at: String,
     blocking_count: usize,
@@ -6059,7 +6059,7 @@ struct DeployValidationReport {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct DeployValidationCheck {
+pub(crate) struct DeployValidationCheck {
     key: String,
     label: String,
     status: String,
@@ -6090,7 +6090,7 @@ impl DeployValidationReport {
     }
 }
 
-fn deploy_validation_check(
+pub(crate) fn deploy_validation_check(
     key: impl Into<String>,
     label: impl Into<String>,
     status: &'static str,
@@ -6163,6 +6163,47 @@ pub async fn refresh_deploy_validation_report(
     .ok_or_else(|| anyhow!("站点不存在"))?;
     let _ = validate_deploy_readiness(&site).await?;
     deploy_validation_report(site_id)
+}
+
+fn spawn_deploy_validation_refresh(site_id: String, reason: &'static str) {
+    tokio::spawn(async move {
+        let site = match task::spawn_blocking({
+            let site_id = site_id.clone();
+            move || get_site(&site_id)
+        })
+        .await
+        {
+            Ok(Ok(Some(site))) => site,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => {
+                append_log_line(
+                    &viewer_log_path(&site_id),
+                    &format!("⚠️ 自动刷新部署验收失败（{reason}）：读取站点失败：{err}"),
+                );
+                return;
+            }
+            Err(err) => {
+                append_log_line(
+                    &viewer_log_path(&site_id),
+                    &format!("⚠️ 自动刷新部署验收失败（{reason}）：join error：{err}"),
+                );
+                return;
+            }
+        };
+        match validate_deploy_readiness(&site).await {
+            Ok(report) => append_log_line(
+                &viewer_log_path(&site_id),
+                &format!(
+                    "✅ 自动刷新部署验收完成（{reason}）：{} 个阻断 / {} 个警告",
+                    report.blocking_count, report.warning_count
+                ),
+            ),
+            Err(err) => append_log_line(
+                &viewer_log_path(&site_id),
+                &format!("⚠️ 自动刷新部署验收失败（{reason}）：{err:#}"),
+            ),
+        }
+    });
 }
 
 fn write_deploy_validation_report(report: &DeployValidationReport) -> Result<()> {
@@ -6590,6 +6631,146 @@ async fn push_site_identity_check(
     }
 }
 
+fn extract_refno_for_url(value: &serde_json::Value) -> Option<String> {
+    let refno = value
+        .get("node")
+        .and_then(|node| node.get("refno"))
+        .or_else(|| value.get("refno"))?;
+    match refno {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+async fn push_json_success_check(
+    report: &mut DeployValidationReport,
+    client: &reqwest::Client,
+    key: impl Into<String>,
+    label: impl Into<String>,
+    url: String,
+    failure_status: &'static str,
+) -> Option<serde_json::Value> {
+    let key = key.into();
+    let label = label.into();
+    match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => {
+            let status = response.status();
+            match response.json::<serde_json::Value>().await {
+                Ok(value) => {
+                    let success = value
+                        .get("success")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true);
+                    report.push(deploy_validation_check(
+                        key,
+                        label,
+                        if success { "pass" } else { failure_status },
+                        if success {
+                            format!("HTTP {status}，JSON 响应可用")
+                        } else {
+                            format!("HTTP {status}，业务响应 success=false")
+                        },
+                        Some(value.to_string()),
+                        Some(url),
+                        None,
+                    ));
+                    Some(value)
+                }
+                Err(err) => {
+                    report.push(deploy_validation_check(
+                        key,
+                        label,
+                        "blocking",
+                        format!("HTTP {status} 但响应不是有效 JSON: {err}"),
+                        None,
+                        Some(url),
+                        None,
+                    ));
+                    None
+                }
+            }
+        }
+        Ok(response) => {
+            report.push(deploy_validation_check(
+                key,
+                label,
+                "blocking",
+                format!("HTTP 状态异常: {}", response.status()),
+                None,
+                Some(url),
+                None,
+            ));
+            None
+        }
+        Err(err) => {
+            report.push(deploy_validation_check(
+                key,
+                label,
+                "blocking",
+                format!("HTTP 请求失败: {err}"),
+                None,
+                Some(url),
+                None,
+            ));
+            None
+        }
+    }
+}
+
+async fn push_e3d_api_checks(
+    report: &mut DeployValidationReport,
+    client: &reqwest::Client,
+    base_url: &str,
+) {
+    let world_url = format!("{base_url}/api/e3d/world-root");
+    let Some(world_value) = push_json_success_check(
+        report,
+        client,
+        "api_e3d_world_root",
+        "E3D world-root API",
+        world_url,
+        "blocking",
+    )
+    .await
+    else {
+        return;
+    };
+
+    let Some(root_refno) = extract_refno_for_url(&world_value) else {
+        report.push(deploy_validation_check(
+            "api_e3d_root_refno",
+            "E3D root refno",
+            "blocking",
+            "world-root 响应缺少 node.refno，无法继续验证 subtree/visible-insts",
+            Some(world_value.to_string()),
+            None,
+            None,
+        ));
+        return;
+    };
+    let encoded_root = urlencoding::encode(&root_refno);
+
+    push_json_success_check(
+        report,
+        client,
+        "api_e3d_subtree_refnos",
+        "E3D subtree-refnos API",
+        format!("{base_url}/api/e3d/subtree-refnos/{encoded_root}?include_self=true&max_depth=1&limit=20"),
+        "warning",
+    )
+    .await;
+    push_json_success_check(
+        report,
+        client,
+        "api_e3d_visible_insts",
+        "E3D visible-insts API",
+        format!("{base_url}/api/e3d/visible-insts/{encoded_root}"),
+        "blocking",
+    )
+    .await;
+}
+
 async fn wait_for_business_status_ok(site: &ManagedProjectSite) -> bool {
     let client = match reqwest::Client::builder()
         .no_proxy()
@@ -6725,12 +6906,13 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
         format!("{local_base}/api/site/identity"),
     )
     .await;
+    push_e3d_api_checks(&mut report, &client, &local_base).await;
 
     if let Some(viewer_url) = site.viewer_url.clone() {
         push_required_http_check(
             &mut report,
             &client,
-            "viewer",
+            "viewer_entry_url",
             "plant3d-web Viewer",
             viewer_url,
             64,
@@ -6738,7 +6920,7 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
         .await;
     } else {
         report.push(deploy_validation_check(
-            "viewer",
+            "viewer_entry_url",
             "plant3d-web Viewer",
             "warning",
             "未记录 plant3d-web Viewer URL，跳过 Viewer 验收",
@@ -6771,6 +6953,8 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
             let dbnum_dir = parquet_root.join(dbnum.to_string());
             let instances_path = dbnum_dir.join("instances.parquet");
             let geo_instances_path = dbnum_dir.join("geo_instances.parquet");
+            let transforms_path = dbnum_dir.join("transforms.parquet");
+            let aabb_path = dbnum_dir.join("aabb.parquet");
 
             push_required_json_file_check(
                 &mut report,
@@ -6793,6 +6977,27 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
                 &geo_instances_path,
                 1,
             );
+            push_required_file_check(
+                &mut report,
+                format!("parquet_transforms_{dbnum}"),
+                format!("transforms.parquet {dbnum}"),
+                &transforms_path,
+                1,
+            );
+            push_required_file_check(
+                &mut report,
+                format!("parquet_aabb_{dbnum}"),
+                format!("aabb.parquet {dbnum}"),
+                &aabb_path,
+                1,
+            );
+            for check in crate::web_server::site_data_validation::validate_dbnum_parquet_data(
+                dbnum,
+                &dbnum_dir,
+                &mesh_serve_root_for_site(site),
+            ) {
+                report.push(check);
+            }
 
             let encoded_project = urlencoding::encode(&output_project);
             push_required_http_check(
@@ -6823,6 +7028,26 @@ async fn validate_deploy_readiness(site: &ManagedProjectSite) -> Result<DeployVa
                 format!("http_parquet_geo_instances_{dbnum}"),
                 format!("HTTP geo_instances.parquet {dbnum}"),
                 format!("{local_base}/files/output/{encoded_project}/parquet/{dbnum}/geo_instances.parquet"),
+                1,
+            )
+            .await;
+            push_required_http_check(
+                &mut report,
+                &client,
+                format!("http_parquet_transforms_{dbnum}"),
+                format!("HTTP transforms.parquet {dbnum}"),
+                format!(
+                    "{local_base}/files/output/{encoded_project}/parquet/{dbnum}/transforms.parquet"
+                ),
+                1,
+            )
+            .await;
+            push_required_http_check(
+                &mut report,
+                &client,
+                format!("http_parquet_aabb_{dbnum}"),
+                format!("HTTP aabb.parquet {dbnum}"),
+                format!("{local_base}/files/output/{encoded_project}/parquet/{dbnum}/aabb.parquet"),
                 1,
             )
             .await;
@@ -9482,6 +9707,9 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
             ..Default::default()
         },
     )?;
+    if mark_running {
+        spawn_deploy_validation_refresh(site_id.clone(), "start");
+    }
     Ok(())
 }
 
@@ -9501,6 +9729,7 @@ pub async fn start_site(site_id: String) -> Result<()> {
                 ..Default::default()
             },
         )?;
+        spawn_deploy_validation_refresh(site_id.clone(), "start_already_running");
         return Ok(());
     }
     if matches!(

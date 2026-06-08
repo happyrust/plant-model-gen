@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-06-08
+
+### Fixed — 受管站点 web 支持跨机直连（bind_host）
+
+> 受管站点 web_server 此前默认绑 `127.0.0.1`，仅同机 Nginx 反代（`:80`）可达，远程直连站点 web 端口（如 `:8080`）失败。新增 `AIOS_ALLOW_PUBLIC_BIND` 门控的默认绑定：开启后新建站点默认绑 `0.0.0.0`，未开启仍 `127.0.0.1`（安全默认不变）。
+
+- `managed_project_sites.rs`：新增 `default_web_bind_host()`（受 `AIOS_ALLOW_PUBLIC_BIND` 门控）与 `normalize_host_or()`；`create_site` 与 quick-deploy 的 `build_preview_site` 改用该默认。现有站点可改站点配置 `[web_server] bind_host`（推荐填具体内网 IP，不受 `assert_bind_host_safe` 拦截）或调 `update_site` 后重启。
+- 验证：`rust-analyzer` 无报错；完整 `cargo check` 需在具备本地 `../rs-core`、`../pdms-io-fork` patch 依赖的环境/CI 执行。
+
 ## 2026-06-06
 
 ### Added — Windows release 包 Nginx 客户根入口

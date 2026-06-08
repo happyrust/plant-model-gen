@@ -60,7 +60,7 @@ const remoteTargetForm = ref<ManagedRemoteTargetRequest>({
   open_firewall: true,
   allowed_cidrs: ['0.0.0.0/0'],
   web_bind_host: '0.0.0.0',
-  db_bind_host: '127.0.0.1',
+  db_bind_host: '123.57.182.243',
   local_web_bin: '',
   local_surreal_bin: '',
   local_resource_dir: '',
@@ -72,6 +72,7 @@ const busy = computed(() => loading.value || preflightLoading.value || prepareLo
 const blockingCount = computed(() => remoteStatus.value?.checks.filter((check) => check.status === 'blocking').length ?? 0)
 const warningCount = computed(() => remoteStatus.value?.checks.filter((check) => check.status === 'warning').length ?? 0)
 const remoteAgentStatusText = computed(() => remoteAgentStatus.value ? JSON.stringify(remoteAgentStatus.value, null, 2) : '')
+const remoteApiBaseUrl = computed(() => remoteStatus.value?.remote_api_base_url || apiBaseUrlFromEntry(remoteStatus.value?.remote_entry_url))
 const remoteAllowedCidrsText = computed({
   get: () => remoteTargetForm.value.allowed_cidrs?.join(', ') || '0.0.0.0/0',
   set: (value: string) => {
@@ -101,6 +102,15 @@ const deploySteps = computed(() => {
   ]
 })
 
+function apiBaseUrlFromEntry(entryUrl?: string | null) {
+  const trimmed = entryUrl?.trim()
+  return trimmed ? `${trimmed.replace(/\/+$/, '')}/api` : null
+}
+
+function copyText(text: string) {
+  navigator.clipboard.writeText(text)
+}
+
 function applyOsDefaults(os: ManagedRemoteTargetOs) {
   const siteId = selectedSiteId.value || 'site'
   if (os === 'windows') {
@@ -109,7 +119,7 @@ function applyOsDefaults(os: ManagedRemoteTargetOs) {
     remoteTargetForm.value.remote_db_path = `C:/Plant3D/runtime/surrealdb/${siteId}.db`
     remoteTargetForm.value.surreal_bin = 'C:/Plant3D/bin/surreal/surreal.exe'
     remoteTargetForm.value.remote_web_bin = 'C:/Plant3D/bin/web_server.exe'
-    remoteTargetForm.value.db_bind_host = '127.0.0.1'
+    remoteTargetForm.value.db_bind_host = remoteTargetForm.value.host || ''
     remoteTargetForm.value.web_bind_host = '0.0.0.0'
     return
   }
@@ -118,7 +128,7 @@ function applyOsDefaults(os: ManagedRemoteTargetOs) {
   remoteTargetForm.value.remote_db_path = `/root/surreal_data/${siteId}.db`
   remoteTargetForm.value.surreal_bin = '/usr/local/bin/surreal'
   remoteTargetForm.value.remote_web_bin = '/root/web_server'
-  remoteTargetForm.value.db_bind_host = '127.0.0.1'
+  remoteTargetForm.value.db_bind_host = remoteTargetForm.value.host || ''
   remoteTargetForm.value.web_bind_host = '0.0.0.0'
 }
 
@@ -385,7 +395,7 @@ onMounted(async () => {
         </label>
         <label class="space-y-1 text-xs text-muted-foreground">
           <span>DB 绑定地址</span>
-          <input v-model="remoteTargetForm.db_bind_host" placeholder="127.0.0.1" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+          <input v-model="remoteTargetForm.db_bind_host" placeholder="远端服务器 IP" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
         </label>
         <label class="space-y-1 text-xs text-muted-foreground md:col-span-2">
           <span>放行来源 CIDR</span>
@@ -498,9 +508,21 @@ onMounted(async () => {
               部署ID：{{ remoteStatus.deploy_id || '未生成' }} · 模式：{{ remoteStatus.deployment_mode || '未确定' }} · {{ remoteStatus.degraded ? '降级部署' : '完整部署' }}
             </div>
             <div v-if="remoteStatus.last_error" class="mt-1 text-xs text-destructive break-all">{{ remoteStatus.last_error }}</div>
-            <a v-if="remoteStatus.remote_entry_url" :href="remoteStatus.remote_entry_url" target="_blank" class="mt-1 block text-xs text-primary hover:underline break-all">
-              {{ remoteStatus.remote_entry_url }}
-            </a>
+            <div v-if="remoteStatus.remote_entry_url" class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span class="text-muted-foreground">Web</span>
+              <a :href="remoteStatus.remote_entry_url" target="_blank" class="text-primary hover:underline break-all">
+                {{ remoteStatus.remote_entry_url }}
+              </a>
+            </div>
+            <div v-if="remoteApiBaseUrl" class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span class="text-muted-foreground">后台 API</span>
+              <a :href="remoteApiBaseUrl" target="_blank" class="text-primary hover:underline break-all">
+                {{ remoteApiBaseUrl }}
+              </a>
+              <button type="button" @click="copyText(remoteApiBaseUrl || '')" class="text-muted-foreground hover:text-foreground transition-colors">
+                复制
+              </button>
+            </div>
           </div>
           <span
             class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"

@@ -86,7 +86,7 @@ const remoteTargetForm = ref<ManagedRemoteTargetRequest>({
   open_firewall: true,
   allowed_cidrs: ['0.0.0.0/0'],
   web_bind_host: '0.0.0.0',
-  db_bind_host: '127.0.0.1',
+  db_bind_host: '123.57.182.243',
   local_web_bin: '',
   local_surreal_bin: '',
   local_resource_dir: '',
@@ -176,7 +176,7 @@ function applyRemoteOsDefaults(os: ManagedRemoteTargetOs) {
     remoteTargetForm.value.remote_db_path = `C:/Plant3D/runtime/surrealdb/${siteId.value || 'site'}.db`
     remoteTargetForm.value.surreal_bin = 'C:/Plant3D/bin/surreal/surreal.exe'
     remoteTargetForm.value.remote_web_bin = 'C:/Plant3D/bin/web_server.exe'
-    remoteTargetForm.value.db_bind_host = '127.0.0.1'
+    remoteTargetForm.value.db_bind_host = remoteTargetForm.value.host || ''
     remoteTargetForm.value.web_bind_host = '0.0.0.0'
     return
   }
@@ -185,7 +185,7 @@ function applyRemoteOsDefaults(os: ManagedRemoteTargetOs) {
   remoteTargetForm.value.remote_db_path = `/root/surreal_data/${siteId.value || 'site'}.db`
   remoteTargetForm.value.surreal_bin = '/usr/local/bin/surreal'
   remoteTargetForm.value.remote_web_bin = '/root/web_server'
-  remoteTargetForm.value.db_bind_host = '127.0.0.1'
+  remoteTargetForm.value.db_bind_host = remoteTargetForm.value.host || ''
   remoteTargetForm.value.web_bind_host = '0.0.0.0'
 }
 
@@ -239,6 +239,8 @@ const deployProgressSteps = computed(() => buildDeployProgressSteps())
 const deployTaskPercent = computed(() => Math.round(deployTask.value?.progress.percentage ?? 0))
 const remoteBlockingCount = computed(() => remoteDeployStatus.value?.checks.filter((check) => check.status === 'blocking').length ?? 0)
 const remoteWarningCount = computed(() => remoteDeployStatus.value?.checks.filter((check) => check.status === 'warning').length ?? 0)
+const remoteDeployApiBaseUrl = computed(() => remoteDeployStatus.value?.remote_api_base_url || apiBaseUrlFromEntry(remoteDeployStatus.value?.remote_entry_url))
+const runtimeApiBaseUrl = computed(() => apiBaseUrlFromEntry(runtime.value?.public_entry_url || runtime.value?.entry_url))
 const remoteProgressSteps = computed(() => buildRemoteProgressSteps())
 const remoteBusy = computed(() => remotePreflightLoading.value || remotePrepareLoading.value || remoteDeployLoading.value)
 const needsReconcile = computed(() => {
@@ -456,6 +458,11 @@ function preflightStatusLabel(status: ManagedSitePreflightCheck['status']) {
   if (status === 'blocking') return '阻断'
   if (status === 'warning') return '警告'
   return '通过'
+}
+
+function apiBaseUrlFromEntry(entryUrl?: string | null) {
+  const trimmed = entryUrl?.trim()
+  return trimmed ? `${trimmed.replace(/\/+$/, '')}/api` : null
 }
 
 function deployValidationCheckClass(check: ManagedSiteDeployValidationCheck) {
@@ -1448,6 +1455,14 @@ onMounted(async () => {
             <button @click="copyText(runtime.public_entry_url || runtime.entry_url || '')"
               class="text-xs text-muted-foreground hover:text-foreground transition-colors">复制</button>
           </div>
+          <div v-if="runtimeApiBaseUrl" class="flex items-center gap-2">
+            <span class="text-xs text-muted-foreground w-16 shrink-0">后台 API</span>
+            <a :href="runtimeApiBaseUrl" target="_blank" class="text-sm text-primary hover:underline">
+              {{ runtimeApiBaseUrl }}
+            </a>
+            <button @click="copyText(runtimeApiBaseUrl || '')"
+              class="text-xs text-muted-foreground hover:text-foreground transition-colors">复制</button>
+          </div>
           <div v-if="runtime.local_entry_url && runtime.local_entry_url !== runtime.entry_url" class="flex items-center gap-2">
             <span class="text-xs text-muted-foreground w-16 shrink-0">本机调试</span>
             <a :href="runtime.local_entry_url" target="_blank" class="text-sm text-muted-foreground hover:underline">
@@ -1732,7 +1747,7 @@ onMounted(async () => {
           </label>
           <label class="space-y-1 text-xs text-muted-foreground">
             <span>DB 绑定地址</span>
-            <input v-model="remoteTargetForm.db_bind_host" placeholder="127.0.0.1" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
+            <input v-model="remoteTargetForm.db_bind_host" placeholder="远端服务器 IP" class="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground" />
           </label>
           <label class="space-y-1 text-xs text-muted-foreground md:col-span-2">
             <span>放行来源 CIDR</span>
@@ -1817,14 +1832,20 @@ onMounted(async () => {
               <div v-if="remoteDeployStatus.last_error" class="mt-1 text-xs text-destructive break-all">
                 {{ remoteDeployStatus.last_error }}
               </div>
-              <a
-                v-if="remoteDeployStatus.remote_entry_url"
-                :href="remoteDeployStatus.remote_entry_url"
-                target="_blank"
-                class="mt-1 block text-xs text-primary hover:underline break-all"
-              >
-                {{ remoteDeployStatus.remote_entry_url }}
-              </a>
+              <div v-if="remoteDeployStatus.remote_entry_url" class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                <span class="text-muted-foreground">Web</span>
+                <a :href="remoteDeployStatus.remote_entry_url" target="_blank" class="text-primary hover:underline break-all">
+                  {{ remoteDeployStatus.remote_entry_url }}
+                </a>
+              </div>
+              <div v-if="remoteDeployApiBaseUrl" class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                <span class="text-muted-foreground">后台 API</span>
+                <a :href="remoteDeployApiBaseUrl" target="_blank" class="text-primary hover:underline break-all">
+                  {{ remoteDeployApiBaseUrl }}
+                </a>
+                <button @click="copyText(remoteDeployApiBaseUrl || '')"
+                  class="text-muted-foreground hover:text-foreground transition-colors">复制</button>
+              </div>
             </div>
             <span
               class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"

@@ -1074,7 +1074,7 @@ pub fn render_database_connection_page() -> String {
                 <div class="grid grid-cols-2 gap-4 mb-4">
                     <div>
                         <label class="block text-sm font-medium text-gray-700 mb-1">服务器地址</label>
-                        <input type="text" id="db-ip" value="127.0.0.1"
+                        <input type="text" id="db-ip" value=""
                                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
                     </div>
                     <div>
@@ -1185,11 +1185,11 @@ pub fn render_database_connection_page() -> String {
                             数据库连接状态
                         </h2>
                         <div class="mt-1 text-xs text-gray-500">
-                            <span id="current-target-left">目标: 127.0.0.1:8009</span>
+                            <span id="current-target-left">目标: 请填写服务器IP:8009</span>
                         </div>
                     </div>
                     <div class="flex items-center space-x-3">
-                        <span id="current-target" class="text-sm text-gray-600 hidden sm:inline">目标: 127.0.0.1:8009</span>
+                        <span id="current-target" class="text-sm text-gray-600 hidden sm:inline">目标: 请填写服务器IP:8009</span>
                         <button id="refresh-status" onclick="checkConnectionStatus()"
                                 class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors">
                             <i class="fas fa-sync-alt mr-2"></i>刷新状态
@@ -1242,7 +1242,7 @@ pub fn render_database_connection_page() -> String {
 
             // 初始化数据库启动管理器
             if (window.dbStartupManager) {
-                const ip = document.getElementById('db-ip').value || '127.0.0.1';
+                const ip = document.getElementById('db-ip').value || '';
                 const port = parseInt(document.getElementById('db-port').value || '8009');
                 window.dbStartupManager.initializePageState(ip, port);
             }
@@ -1263,7 +1263,7 @@ pub fn render_database_connection_page() -> String {
 
             try {
                 // 将界面上的配置透传给后端做体检，并更新目标标签
-                const ipRaw = document.getElementById('db-ip').value || '127.0.0.1';
+                const ipRaw = document.getElementById('db-ip').value || '';
                 const portRaw = document.getElementById('db-port').value || '8009';
                 if (targetLabel) { targetLabel.textContent = `目标: ${ipRaw}:${portRaw}`; }
                 const targetLabelLeft = document.getElementById('current-target-left');

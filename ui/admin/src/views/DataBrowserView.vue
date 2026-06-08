@@ -50,7 +50,7 @@ const selectedSiteCanBrowse = computed(() =>
 
 const directBrowserBlockReason = computed(() => {
   if (!selectedSiteCanBrowse.value) return selectedSiteBlockReason.value
-  if (!isLoopbackHost()) return '当前页面不是通过 localhost / 127.0.0.1 访问，已禁用浏览器直连本机 SurrealDB。'
+  if (isLoopbackHost()) return '当前页面通过 loopback 地址访问，已禁用；请使用服务器真实 IP 打开 Admin。'
   return ''
 })
 

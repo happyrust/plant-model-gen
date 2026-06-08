@@ -287,8 +287,9 @@
         alert('project_code 必须为正整数');
         return;
       }
-      const frontendUrl = prompt('前端地址', 'http://127.0.0.1:5173') || '';
-      const backendUrl = prompt('后端地址', window.location.origin || 'http://127.0.0.1:3100') || '';
+      const currentOrigin = window.location.origin || '';
+      const frontendUrl = prompt('前端地址', currentOrigin.replace(/:\d+$/, ':5173')) || '';
+      const backendUrl = prompt('后端地址', currentOrigin) || '';
       const bindHost = prompt('监听 Host', '0.0.0.0') || '0.0.0.0';
       const bindPort = Number(prompt('监听 Port', window.location.port || '3100') || '3100');
       if(!Number.isInteger(bindPort) || bindPort <= 0){
@@ -324,7 +325,7 @@
           module: 'DESI',
           db_type: 'surrealdb',
           surreal_ns: projectCode,
-          db_ip: 'localhost',
+          db_ip: window.location.hostname || '',
           db_port: '8009',
           db_user: 'root',
           db_password: 'root',

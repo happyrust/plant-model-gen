@@ -424,7 +424,7 @@ pub async fn execute_batch_operation(
         // 创建任务配置
         let config = DatabaseConfig {
             name: format!("Task_DB_{}", db_num),
-            db_ip: "127.0.0.1".to_string(),
+            db_ip: super::get_local_ip_via_udp().unwrap_or_default(),
             db_port: "8009".to_string(),
             db_user: "root".to_string(),
             db_password: "root".to_string(),

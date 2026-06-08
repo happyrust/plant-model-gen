@@ -74,12 +74,36 @@ fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> Strin
         let _ = parsed.set_port(Some(5173));
         return parsed.to_string();
     }
-    let host = if bind_host.trim().is_empty() || bind_host == "0.0.0.0" {
-        "127.0.0.1"
+    format!("http://{}:5173", url_host(&runtime_access_host(bind_host)))
+}
+
+fn url_host(host: &str) -> String {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.contains(':') {
+        format!("[{trimmed}]")
     } else {
-        bind_host
-    };
-    format!("http://{}:5173", host)
+        trimmed.to_string()
+    }
+}
+
+fn runtime_access_host(bind_host: &str) -> String {
+    let trimmed = bind_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if super::is_loopback_or_unspecified_host(trimmed) {
+        super::get_local_ip_via_udp().unwrap_or_default()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn derive_runtime_backend_url(bind_host: &str, bind_port: u16) -> String {
+    format!(
+        "http://{}:{}",
+        url_host(&runtime_access_host(bind_host)),
+        bind_port
+    )
 }
 
 fn deployment_sites_sqlite_path() -> String {
@@ -1010,7 +1034,7 @@ pub fn load_web_server_runtime_config(explicit_port: u16) -> WebServerRuntimeCon
                 .and_then(|cfg| cfg.get_string("web_server.backend_url").ok())
         })
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", bind_port));
+        .unwrap_or_else(|| derive_runtime_backend_url(&bind_host, bind_port));
 
     let frontend_url = cfg_builder
         .as_ref()

@@ -183,11 +183,11 @@ pub fn render_index_page() -> String {
                         </div>
                         <div class="md:col-span-2">
                             <label class="block text-sm text-gray-600 mb-1">访问地址</label>
-                            <input id="proj_url" class="w-full border rounded px-3 py-2" placeholder="http://localhost:9000" />
+                            <input id="proj_url" class="w-full border rounded px-3 py-2" placeholder="http://192.168.1.10:9000" />
                         </div>
                         <div class="md:col-span-3">
                             <label class="block text-sm text-gray-600 mb-1">健康检查地址</label>
-                            <input id="proj_health" class="w-full border rounded px-3 py-2" placeholder="http://localhost:9000/health" />
+                            <input id="proj_health" class="w-full border rounded px-3 py-2" placeholder="http://192.168.1.10:9000/health" />
                         </div>
                     </div>
                     <div class="mt-4 flex items-center space-x-3">
@@ -4081,7 +4081,7 @@ pub fn render_deployment_sites_page() -> String {
                             <div class="grid grid-cols-2 gap-4">
                                 <div>
                                     <label class="block text-sm font-medium text-gray-700 mb-1">数据库IP</label>
-                                    <input type="text" x-model="newSite.config.db_ip" value="localhost"
+                                    <input type="text" x-model="newSite.config.db_ip" value=""
                                            class="w-full px-3 py-2 border border-gray-300 rounded-md">
                                 </div>
                                 <div>

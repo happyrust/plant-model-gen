@@ -4,7 +4,7 @@
  */
 
 class GrpcSpatialQueryClient {
-    constructor(endpoint = 'http://localhost:8080') {
+    constructor(endpoint = `${window.location.protocol}//${window.location.hostname}:8080`) {
         this.endpoint = endpoint;
         this.client = null;
         this.initialized = false;

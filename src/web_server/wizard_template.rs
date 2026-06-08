@@ -505,7 +505,7 @@ fn step3_parameter_configuration() -> String {
                                 <span x-text="surrealStatusText()"></span>
                             </div>
                             <div class="text-xs text-gray-500 mt-1">
-                                <span x-text="`目标: ${config.db_ip || '127.0.0.1'}:${parseInt(config.db_port || '8009') || 0}`"></span>
+                                <span x-text="`目标: ${config.db_ip || '请填写服务器IP'}:${parseInt(config.db_port || '8009') || 0}`"></span>
                             </div>
                         </div>
                     </div>
@@ -585,7 +585,7 @@ fn step3_parameter_configuration() -> String {
                             <input type="text"
                                    x-model="config.db_ip"
                                    class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                                   placeholder="127.0.0.1">
+                                   placeholder="例如 192.168.1.10">
                         </div>
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-2">端口</label>
@@ -1079,7 +1079,7 @@ fn wizard_javascript() -> String {
                     module: 'DESI',
                     db_type: 'surrealdb',
                     surreal_ns: 1516,
-                    db_ip: '127.0.0.1',
+                    db_ip: '',
                     db_port: '8009',
                     db_user: 'root',
                     db_password: 'root',

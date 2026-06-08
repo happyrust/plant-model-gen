@@ -36,7 +36,7 @@ function deploymentSitesApp() {
                 module: 'DESI',
                 db_type: 'surrealdb',
                 surreal_ns: 1516,
-                db_ip: 'localhost',
+                db_ip: window.location.hostname || '',
                 db_port: '8020',
                 db_user: 'root',
                 db_password: 'root',
@@ -54,7 +54,7 @@ function deploymentSitesApp() {
         },
 
         defaultForm() {
-            const backendUrl = window.location.origin || 'http://127.0.0.1:3100';
+            const backendUrl = window.location.origin || '';
             const frontendUrl = backendUrl.replace(/:\d+$/, ':5173');
             const bindPort = Number(window.location.port || 3100);
             return {
@@ -310,7 +310,7 @@ function deploymentSitesApp() {
             if (pathInput === null) {
                 return;
             }
-            const frontendUrl = window.prompt('请输入前端地址（必填，用于站点配置区域）', this.form?.frontend_url || 'http://127.0.0.1:5173');
+            const frontendUrl = window.prompt('请输入前端地址（必填，用于站点配置区域）', this.form?.frontend_url || (backendUrl ? backendUrl.replace(/:\d+$/, ':5173') : ''));
             if (frontendUrl === null) {
                 return;
             }

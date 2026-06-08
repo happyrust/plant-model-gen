@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -71,18 +71,69 @@ pub mod web_listen; // 当前进程 HTTP 监听与站点身份（一 web_server 
 pub mod wizard_handlers;
 pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 
-pub(crate) fn get_local_ip_via_udp() -> Result<String, std::io::Error> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    let local_addr = socket.local_addr()?;
+pub(crate) fn is_loopback_or_unspecified_host(host: &str) -> bool {
+    let normalized = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "" | "0.0.0.0" | "::" | "127.0.0.1" | "localhost" | "::1"
+    ) {
+        return true;
+    }
+    normalized
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback() || ip.is_unspecified())
+        .unwrap_or(false)
+}
 
-    if let IpAddr::V4(ipv4) = local_addr.ip() {
-        Ok(ipv4.to_string())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "无法获取IPv4地址",
-        ))
+pub fn get_local_ip_via_udp() -> Result<String, std::io::Error> {
+    fn host_from_url_or_host(value: &str) -> Option<&str> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let without_scheme = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+            .unwrap_or(trimmed);
+        without_scheme
+            .split('/')
+            .next()
+            .and_then(|host_port| host_port.split(':').next())
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    }
+
+    for key in [
+        "AIOS_PUBLIC_HOST",
+        "AIOS_LOCAL_IP",
+        "AIOS_VIEWER_HOST",
+        "AIOS_VIEWER_BASE_URL",
+    ] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        let Some(host) = host_from_url_or_host(&value) else {
+            continue;
+        };
+        if let Ok(IpAddr::V4(ipv4)) = host.parse::<IpAddr>() {
+            if !ipv4.is_unspecified() && !ipv4.is_loopback() {
+                return Ok(ipv4.to_string());
+            }
+        }
+    }
+
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80))?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(ipv4) if !ipv4.is_unspecified() && !ipv4.is_loopback() => Ok(ipv4.to_string()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "无法推断本机真实 IPv4，请设置 AIOS_PUBLIC_HOST 或 AIOS_LOCAL_IP",
+        )),
     }
 }
 
@@ -1356,7 +1407,7 @@ pub async fn start_web_server_with_config(
     admin_auth_handlers::start_session_cleanup_timer();
     maybe_print_registered_routes();
     println!("🚀 Web UI服务器启动成功！");
-    println!("📱 访问地址: http://localhost:{}", listen_port);
+    println!("📱 访问地址: {}", runtime_site_config.backend_url);
     println!("🌐 对外后端地址: {}", runtime_site_config.backend_url);
     println!("🎯 功能包括:");
     println!("   - 数据库生成任务管理");

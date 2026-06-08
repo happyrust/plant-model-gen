@@ -2,6 +2,15 @@
 
 ## 2026-06-09
 
+### Changed — Admin/站点/数据库访问统一使用真实 IP
+
+> 站点部署、Admin 输出入口、Viewer 入口和 SurrealDB 连接配置不再生成 `127.0.0.1` / `localhost` 访问地址；默认优先使用显式环境变量，其次推断本机 LAN IPv4。
+
+- `web_server/mod.rs` / `managed_project_sites.rs` / `site_registry.rs`：新增真实 IP 解析与 loopback 过滤；站点 `entry_url`、Viewer URL、运行时 backend/frontend URL、站点配置中的 `surreal_ip` / `[surrealdb].ip` / `surreal_bind` 统一写真实 IP。
+- `admin_handlers.rs` / `handlers.rs` / `site_config_handlers.rs`：Admin 数据浏览器、数据库启动/状态/诊断接口改用真实 IP，并拒绝把 loopback 当作可访问地址。
+- `ui/admin` 与内置静态 JS/template：站点创建、远端部署、数据浏览器、Viewer fallback、协同配置等默认值和 placeholder 改为真实 IP 输入语义；admin 静态产物已重新生成。
+- 验证：`cargo fmt --check`、`cargo check --features web_server --bin web_server`、`cargo test --features web_server web_server::managed_project_sites`、`ui/admin npm run build` 通过。
+
 ### Changed — 站点解析/生成任务提交与启动条件加固
 
 > 管理端解析和模型生成改为统一提交 admin 后台任务，并把返回的 `task_id` 绑定到详情页任务日志；直接启动仅允许已解析且具备 Viewer 模型产物的站点，避免误把未完成部署的站点拉起。

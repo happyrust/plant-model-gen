@@ -281,7 +281,7 @@ impl Default for DatabaseConfig {
             module: "DESI".to_string(),
             db_type: "surrealdb".to_string(),
             surreal_ns: 1516,
-            db_ip: "localhost".to_string(),
+            db_ip: super::get_local_ip_via_udp().unwrap_or_default(),
             db_port: "8020".to_string(), // 修改为与 DbOption.toml 一致的端口
             db_user: "root".to_string(),
             db_password: "root".to_string(),
@@ -1515,7 +1515,7 @@ impl Default for ManagedRemoteTarget {
             open_firewall: true,
             allowed_cidrs: vec!["0.0.0.0/0".to_string()],
             web_bind_host: "0.0.0.0".to_string(),
-            db_bind_host: "127.0.0.1".to_string(),
+            db_bind_host: String::new(),
             local_web_bin: None,
             local_surreal_bin: None,
             local_resource_dir: None,
@@ -1606,6 +1606,8 @@ pub struct ManagedRemoteDeployStatus {
     pub status: String,
     pub current_step: String,
     pub remote_entry_url: Option<String>,
+    #[serde(default)]
+    pub remote_api_base_url: Option<String>,
     pub checked_at: String,
     pub last_error: Option<String>,
     #[serde(default)]
@@ -2904,7 +2906,7 @@ mod tests {
             "module": "DESI",
             "db_type": "surrealdb",
             "surreal_ns": 1516,
-            "db_ip": "localhost",
+            "db_ip": "10.0.0.3",
             "db_port": "8020",
             "db_user": "root",
             "db_password": "root",

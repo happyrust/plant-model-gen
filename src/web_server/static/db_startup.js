@@ -376,7 +376,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (startBtn) {
         startBtn.addEventListener('click', async () => {
             const config = {
-                ip: document.getElementById('db-ip').value || '127.0.0.1',
+                ip: document.getElementById('db-ip').value || window.location.hostname || '',
                 port: parseInt(document.getElementById('db-port').value || '8009'),
                 user: document.getElementById('db-user').value || 'root',
                 password: document.getElementById('db-password').value || 'root',
@@ -395,7 +395,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            const ip = document.getElementById('db-ip').value || '127.0.0.1';
+            const ip = document.getElementById('db-ip').value || window.location.hostname || '';
             const port = parseInt(document.getElementById('db-port').value || '8009');
 
             try {
@@ -430,7 +430,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // 初始化页面状态
-    const ip = document.getElementById('db-ip')?.value || '127.0.0.1';
+    const ip = document.getElementById('db-ip')?.value || window.location.hostname || '';
     const port = parseInt(document.getElementById('db-port')?.value || '8009');
     window.dbStartupManager.initializePageState(ip, port);
 
@@ -438,7 +438,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const testBtn = document.getElementById('db-test-button');
     if (testBtn) {
         testBtn.addEventListener('click', async () => {
-            const ip = document.getElementById('db-ip').value || '127.0.0.1';
+            const ip = document.getElementById('db-ip').value || window.location.hostname || '';
             const port = parseInt(document.getElementById('db-port').value || '8009');
             const user = document.getElementById('db-user').value || 'root';
             const password = document.getElementById('db-password').value || '';

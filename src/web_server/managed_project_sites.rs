@@ -498,7 +498,27 @@ fn unique_site_name_with_conn(conn: &Connection, site_name: &str) -> Result<Stri
 fn normalize_host(host: Option<String>) -> String {
     host.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+        .unwrap_or_else(default_access_host)
+}
+
+fn default_access_host() -> String {
+    super::get_local_ip_via_udp().unwrap_or_else(|err| {
+        tracing::warn!("无法推断本机真实 IPv4: {err}");
+        "0.0.0.0".to_string()
+    })
+}
+
+fn access_host_from_bind_host(bind_host: &str) -> String {
+    let trimmed = bind_host.trim();
+    if !super::is_loopback_or_unspecified_host(trimmed) {
+        trimmed.to_string()
+    } else {
+        default_access_host()
+    }
+}
+
+fn local_port_probe_host() -> String {
+    default_access_host()
 }
 
 /// 在写入 DB 之前对 `bind_host` 做安全校验。
@@ -506,7 +526,7 @@ fn normalize_host(host: Option<String>) -> String {
 /// - `0.0.0.0` 默认拒绝（公网暴露风险）
 /// - `AIOS_ALLOW_PUBLIC_BIND=1` / `=true` 时放行，便于需要内网/跨机部署的场景
 ///
-/// 设计动机：继 `normalize_host` 在空值时默认 `127.0.0.1` 之后，为"用户显式传
+/// 设计动机：继 `normalize_host` 在空值时默认真实 IP 之后，为"用户显式传
 /// 0.0.0.0 也要兜一下"补第二道保险（PDMS Hardening 续篇：admin 站点安全收口，
 /// 详见 `docs/plans/2026-04-24-admin-site-security-hardening-plan.md`）。
 fn assert_bind_host_safe(host: &str) -> Result<()> {
@@ -514,7 +534,7 @@ fn assert_bind_host_safe(host: &str) -> Result<()> {
     if trimmed == "0.0.0.0" && !env_allow_public_bind() {
         bail!(
             "bind_host=0.0.0.0 会将站点暴露到所有网络接口。\
-             请改用 127.0.0.1 或具体的内网地址；\
+             请改用具体的内网 IP 地址；\
              如确需公网绑定，请设置 AIOS_ALLOW_PUBLIC_BIND=1 并自行承担风险。"
         );
     }
@@ -529,18 +549,13 @@ fn env_allow_public_bind() -> bool {
 
 /// 受管站点 web 监听 `bind_host` 的默认值（仅当请求未显式指定时生效）。
 ///
-/// - 设置 `AIOS_ALLOW_PUBLIC_BIND=1`：默认 `0.0.0.0`，允许跨机直连站点 web_port
-///   （与 `assert_bind_host_safe` 的同一开关一致放行）。
-/// - 未设置：回退 `127.0.0.1`，仅本机/Nginx 回环代理可达（安全默认，维持原行为）。
+/// - 默认使用可访问的本机真实 IPv4，避免对外展示 loopback 地址。
+/// - 显式传入 `0.0.0.0` 仍需 `AIOS_ALLOW_PUBLIC_BIND=1` 放行。
 fn default_web_bind_host() -> String {
-    if env_allow_public_bind() {
-        "0.0.0.0".to_string()
-    } else {
-        "127.0.0.1".to_string()
-    }
+    default_access_host()
 }
 
-/// 同 `normalize_host`，但空值时回退到调用方指定的默认（而非硬编码 127.0.0.1）。
+/// 同 `normalize_host`，但空值时回退到调用方指定的默认。
 fn normalize_host_or(host: Option<String>, default: &str) -> String {
     host.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -1384,6 +1399,7 @@ fn apply_site_db_mode_config(
     db_password: &str,
     mode: ManagedSiteDbMode,
 ) {
+    let db_host = access_host_from_bind_host(&site.bind_host);
     let web_server = ensure_table(table, "web_server");
     set_toml_bool(
         web_server,
@@ -1395,7 +1411,7 @@ fn apply_site_db_mode_config(
     set_toml_string(
         web_server,
         "surreal_bind",
-        format!("127.0.0.1:{}", site.db_port),
+        format!("{}:{}", db_host, site.db_port),
     );
     set_toml_string(web_server, "surreal_user", db_user.to_string());
     set_toml_string(web_server, "surreal_password", db_password.to_string());
@@ -1405,7 +1421,7 @@ fn apply_site_db_mode_config(
     set_toml_string(surrealdb, "path", site.db_data_path.replace('\\', "/"));
     match mode {
         ManagedSiteDbMode::Ws => {
-            set_toml_string(surrealdb, "ip", "127.0.0.1");
+            set_toml_string(surrealdb, "ip", db_host);
             set_toml_integer(surrealdb, "port", site.db_port as i64);
             set_toml_string(surrealdb, "user", db_user.to_string());
             set_toml_string(surrealdb, "password", db_password.to_string());
@@ -1472,7 +1488,7 @@ fn build_site_config(
         project_code: site.project_code,
         manual_db_nums: site_generate_db_nums(site),
         surreal_ns: site.project_code,
-        db_ip: "127.0.0.1".to_string(),
+        db_ip: access_host_from_bind_host(&site.bind_host),
         db_port: site.db_port.to_string(),
         db_user: db_user.to_string(),
         db_password: db_password.to_string(),
@@ -1508,7 +1524,8 @@ fn build_site_config(
     set_toml_string(table, "surreal_ns", site.project_code.to_string());
     set_toml_string(table, "mdb_name", db_option.mdb_name.clone());
     set_toml_string(table, "module", db_option.module.clone());
-    set_toml_string(table, "surreal_ip", "127.0.0.1");
+    let db_host = access_host_from_bind_host(&site.bind_host);
+    set_toml_string(table, "surreal_ip", db_host.clone());
     set_toml_integer(table, "surreal_port", site.db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
     set_toml_string(table, "surreal_password", db_password.to_string());
@@ -1569,7 +1586,7 @@ fn build_site_config(
     set_toml_string(
         web_server,
         "surreal_bind",
-        format!("127.0.0.1:{}", site.db_port),
+        format!("{}:{}", db_host, site.db_port),
     );
     apply_site_db_mode_config(table, site, db_user, db_password, ManagedSiteDbMode::Ws);
 
@@ -1878,16 +1895,17 @@ fn derive_entry_urls(
     bind_host: &str,
     public_base_url: &Option<String>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    let local = format!("http://127.0.0.1:{}", web_port);
+    let access_host = access_host_from_bind_host(bind_host);
+    let local = format!("http://{}:{}", url_host(&access_host), web_port);
     let public = public_base_url
         .as_ref()
         .map(|url| url.trim_end_matches('/').to_string())
         .or_else(|| {
             let h = bind_host.trim();
-            if !h.is_empty() && h != "0.0.0.0" && h != "127.0.0.1" && h != "localhost" {
-                Some(format!("http://{}:{}", h, web_port))
+            if !super::is_loopback_or_unspecified_host(h) {
+                Some(format!("http://{}:{}", url_host(h), web_port))
             } else {
-                None
+                Some(local.clone())
             }
         });
     let entry = public.clone().unwrap_or_else(|| local.clone());
@@ -1917,7 +1935,7 @@ fn url_host(host: &str) -> String {
 
 fn site_probe_host(site: &ManagedProjectSite) -> String {
     if is_unspecified_or_loopback_host(&site.bind_host) {
-        "127.0.0.1".to_string()
+        default_access_host()
     } else {
         site.bind_host.trim().to_string()
     }
@@ -2127,7 +2145,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             open_firewall INTEGER NOT NULL DEFAULT 1,
             allowed_cidrs_json TEXT NOT NULL DEFAULT '["0.0.0.0/0"]',
             web_bind_host TEXT NOT NULL DEFAULT '0.0.0.0',
-            db_bind_host TEXT NOT NULL DEFAULT '127.0.0.1',
+            db_bind_host TEXT NOT NULL DEFAULT '',
             local_web_bin TEXT,
             local_surreal_bin TEXT,
             local_resource_dir TEXT,
@@ -2173,7 +2191,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             "TEXT NOT NULL DEFAULT '[\"0.0.0.0/0\"]'",
         ),
         ("web_bind_host", "TEXT NOT NULL DEFAULT '0.0.0.0'"),
-        ("db_bind_host", "TEXT NOT NULL DEFAULT '127.0.0.1'"),
+        ("db_bind_host", "TEXT NOT NULL DEFAULT ''"),
         ("local_web_bin", "TEXT"),
         ("local_surreal_bin", "TEXT"),
         ("local_resource_dir", "TEXT"),
@@ -2539,7 +2557,7 @@ fn row_to_remote_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedRemo
             .get::<_, Option<String>>("db_bind_host")
             .unwrap_or(None)
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string()),
+            .unwrap_or_else(default_access_host),
         local_web_bin: row.get("local_web_bin").unwrap_or(None),
         local_surreal_bin: row.get("local_surreal_bin").unwrap_or(None),
         local_resource_dir: row.get("local_resource_dir").unwrap_or(None),
@@ -2656,7 +2674,12 @@ fn normalize_remote_target(mut target: ManagedRemoteTarget, site_id: &str) -> Ma
     }
     target.allowed_cidrs = normalize_remote_allowed_cidrs(target.allowed_cidrs);
     target.web_bind_host = normalize_remote_bind_host(target.web_bind_host, "0.0.0.0");
-    target.db_bind_host = normalize_remote_bind_host(target.db_bind_host, "127.0.0.1");
+    let default_db_bind_host = if super::is_loopback_or_unspecified_host(&target.host) {
+        default_access_host()
+    } else {
+        target.host.clone()
+    };
+    target.db_bind_host = normalize_remote_bind_host(target.db_bind_host, &default_db_bind_host);
     target.local_web_bin = normalize_optional_path(target.local_web_bin);
     target.local_surreal_bin = normalize_optional_path(target.local_surreal_bin);
     target.local_resource_dir = normalize_optional_path(target.local_resource_dir);
@@ -2905,6 +2928,7 @@ pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStat
             .query_row(&sql, [site_id], |row| {
                 let checks_json: String = row.get(11)?;
                 let checks = serde_json::from_str(&checks_json).unwrap_or_default();
+                let remote_entry_url: Option<String> = row.get(8)?;
                 Ok(ManagedRemoteDeployStatus {
                     site_id: row.get(0)?,
                     target_id: row.get(1)?,
@@ -2914,7 +2938,10 @@ pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStat
                     degraded: row_bool_index(row, 5, false),
                     status: row.get(6)?,
                     current_step: row.get(7)?,
-                    remote_entry_url: row.get(8)?,
+                    remote_api_base_url: remote_api_base_url_from_entry(
+                        remote_entry_url.as_deref(),
+                    ),
+                    remote_entry_url,
                     checked_at: row.get(9)?,
                     last_error: row.get(10)?,
                     checks,
@@ -2931,6 +2958,7 @@ pub fn get_remote_deploy_status(site_id: &str) -> Result<ManagedRemoteDeployStat
             status: "idle".to_string(),
             current_step: "尚未远端部署".to_string(),
             remote_entry_url: None,
+            remote_api_base_url: None,
             checked_at: now_rfc3339(),
             last_error: None,
             checks: Vec::new(),
@@ -3027,10 +3055,10 @@ fn assert_port_available_with_conn(
             }
         }
     }
-    if port_in_use("127.0.0.1", db_port) {
+    if port_in_use(&local_port_probe_host(), db_port) {
         bail!("数据库端口 {} 已被当前机器上的其他进程占用", db_port);
     }
-    if port_in_use("127.0.0.1", web_port) {
+    if port_in_use(&local_port_probe_host(), web_port) {
         bail!("站点端口 {} 已被当前机器上的其他进程占用", web_port);
     }
     Ok(())
@@ -3066,7 +3094,7 @@ fn collect_reserved_ports_with_conn(
 
 fn first_available_port(used: &mut HashSet<u16>, start: u16, end: u16) -> Result<u16> {
     for port in start..=end {
-        if used.contains(&port) || port_in_use("127.0.0.1", port) {
+        if used.contains(&port) || port_in_use(&local_port_probe_host(), port) {
             continue;
         }
         used.insert(port);
@@ -3079,7 +3107,7 @@ fn reserve_explicit_port(used: &mut HashSet<u16>, port: u16, label: &str) -> Res
     if used.contains(&port) {
         bail!("{}端口 {} 已被已有站点使用", label, port);
     }
-    if port_in_use("127.0.0.1", port) {
+    if port_in_use(&local_port_probe_host(), port) {
         bail!("{}端口 {} 已被当前机器上的其他进程占用", label, port);
     }
     used.insert(port);
@@ -3109,7 +3137,7 @@ fn resolve_create_ports_with_conn(
 fn reassign_db_port_if_occupied(site_id: &str) -> Result<Option<ManagedProjectSite>> {
     let changed = with_tx(|conn| {
         let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
-        if !port_in_use("127.0.0.1", site.db_port) {
+        if !port_in_use(&local_port_probe_host(), site.db_port) {
             return Ok(None);
         }
 
@@ -3382,10 +3410,16 @@ impl QuickDeployProfile {
     }
 }
 
-async fn resolve_db_file_via_sidecar(project_root: &Path, db_file: &str) -> Result<(u32, String)> {
-    let root = project_root.to_string_lossy().to_string();
+async fn resolve_db_file_via_sidecar(
+    project_roots: &[PathBuf],
+    db_file: &str,
+) -> Result<(u32, String)> {
+    let roots = project_roots
+        .iter()
+        .map(|root| root.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     let resolved =
-        crate::web_server::parse_sidecar_client::resolve_db_file(vec![root], db_file.to_string())
+        crate::web_server::parse_sidecar_client::resolve_db_file(roots, db_file.to_string())
             .await
             .map_err(|err| anyhow!("aios-database sidecar DB 文件解析失败: {}", err.message))?;
     Ok((resolved.dbnum, resolved.file_name))
@@ -3467,7 +3501,7 @@ async fn quick_create_deploy_config(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("必须提供 db_file（文件名/路径）或 dbnum"))?;
-            resolve_db_file_via_sidecar(&canonical, db_file).await?
+            resolve_db_file_via_sidecar(std::slice::from_ref(&canonical), db_file).await?
         }
     };
 
@@ -3594,7 +3628,7 @@ async fn quick_deploy(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("必须提供 db_file（文件名/路径）或 dbnum"))?;
-            resolve_db_file_via_sidecar(&canonical, db_file).await?
+            resolve_db_file_via_sidecar(std::slice::from_ref(&canonical), db_file).await?
         }
     };
 
@@ -4150,7 +4184,7 @@ pub async fn append_db_file_to_site(
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
 
-    let canonical_root = canonical_project_path(&site.project_path)?;
+    let project_roots = site_existing_project_roots(&site)?;
     let (dbnum, resolved_db_file) = match req.dbnum {
         Some(value) if value > 0 => {
             let resolved = if db_file.is_empty() {
@@ -4161,7 +4195,7 @@ pub async fn append_db_file_to_site(
             (value, resolved)
         }
         _ => {
-            let (dbnum, rel) = resolve_db_file_via_sidecar(&canonical_root, &db_file).await?;
+            let (dbnum, rel) = resolve_db_file_via_sidecar(&project_roots, &db_file).await?;
             (dbnum, Some(rel))
         }
     };
@@ -4341,7 +4375,11 @@ fn record_site_error(
 // ─── Pure runtime state derivation ─────────────────────────────────────────
 
 fn port_in_use(host: &str, port: u16) -> bool {
-    let host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    let host = if host == "0.0.0.0" {
+        local_port_probe_host()
+    } else {
+        host.to_string()
+    };
     let addr = format!("{}:{}", host, port);
     match addr.to_socket_addrs() {
         Ok(mut addrs) => addrs
@@ -4561,7 +4599,7 @@ fn site_viewer_running(site: &ManagedProjectSite) -> bool {
     }
     site.viewer_port
         .map(|port| {
-            port_in_use("127.0.0.1", port)
+            port_in_use(&local_port_probe_host(), port)
                 && site.viewer_url.is_some()
                 && matches!(
                     site.status,
@@ -5059,8 +5097,9 @@ fn evaluate_site_risk(
 }
 
 fn annotate_site_risk(site: &mut ManagedProjectSite) {
-    let db_running = pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port);
-    let web_running = pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port);
+    let probe_host = local_port_probe_host();
+    let db_running = pid_running(site.db_pid) || port_in_use(&probe_host, site.db_port);
+    let web_running = pid_running(site.web_pid) || port_in_use(&probe_host, site.web_port);
     let viewer_running = site_viewer_running(site);
     let parse_running = pid_running(site.parse_pid);
     let resources =
@@ -5075,8 +5114,8 @@ fn annotate_sites_risks(sites: &mut [ManagedProjectSite]) {
         .iter()
         .map(|site| {
             (
-                pid_running(site.db_pid) || port_in_use("127.0.0.1", site.db_port),
-                pid_running(site.web_pid) || port_in_use("127.0.0.1", site.web_port),
+                pid_running(site.db_pid) || port_in_use(&local_port_probe_host(), site.db_port),
+                pid_running(site.web_pid) || port_in_use(&local_port_probe_host(), site.web_port),
                 site_viewer_running(site),
                 pid_running(site.parse_pid),
             )
@@ -5415,6 +5454,26 @@ async fn preflight_viewer(site: &ManagedProjectSite) -> ManagedSitePreflightChec
             ),
             Vec::new(),
         );
+    }
+
+    if viewer_static_root_exists_for_nginx(None) {
+        let static_root = viewer_static_root_for_nginx(None);
+        return match choose_static_nginx_viewer_port(site).await {
+            Ok(port) => preflight_pass(
+                "viewer",
+                "plant3d-web",
+                format!("安装包静态 Viewer 可用，Nginx 将监听端口 {port}"),
+                Some(static_root.display().to_string()),
+            ),
+            Err(err) => preflight_blocking(
+                "viewer",
+                "plant3d-web",
+                "安装包静态 Viewer 可用，但未找到可用监听端口",
+                Some(format!("{}; root={}", err, static_root.display())),
+                Some("释放 Viewer 端口，或设置 AIOS_VIEWER_PORT/AIOS_VIEWER_BASE_URL".to_string()),
+                Vec::new(),
+            ),
+        };
     }
 
     let viewer_dir = match viewer_project_dir() {
@@ -6115,7 +6174,7 @@ fn isolate_process_group(command: &mut Command) {
 
 async fn wait_for_port(port: u16, attempts: usize, delay_ms: u64) -> bool {
     for _ in 0..attempts {
-        if port_in_use("127.0.0.1", port) {
+        if port_in_use(&local_port_probe_host(), port) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -6126,12 +6185,12 @@ async fn wait_for_port(port: u16, attempts: usize, delay_ms: u64) -> bool {
 /// 等待端口被释放（与 `wait_for_port` 相反），用于停止互斥模式后确认端口已腾出。
 async fn wait_for_port_free(port: u16, attempts: usize, delay_ms: u64) -> bool {
     for _ in 0..attempts {
-        if !port_in_use("127.0.0.1", port) {
+        if !port_in_use(&local_port_probe_host(), port) {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    !port_in_use("127.0.0.1", port)
+    !port_in_use(&local_port_probe_host(), port)
 }
 
 async fn wait_for_http_ok(url: &str, attempts: usize, delay_ms: u64) -> bool {
@@ -8078,7 +8137,11 @@ async fn spawn_db_process(site: &ManagedProjectSite) -> Result<u32> {
         .arg("--pass")
         .arg(&db_password)
         .arg("--bind")
-        .arg(format!("127.0.0.1:{}", site.db_port))
+        .arg(format!(
+            "{}:{}",
+            access_host_from_bind_host(&site.bind_host),
+            site.db_port
+        ))
         .arg(format!("rocksdb://{}", site.db_data_path))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -8190,7 +8253,7 @@ async fn viewer_http_ok(port: u16) -> bool {
         Ok(client) => client,
         Err(_) => return false,
     };
-    let url = format!("http://127.0.0.1:{port}/");
+    let url = format!("http://{}:{port}/", local_port_probe_host());
     let Ok(response) = client.get(url).send().await else {
         return false;
     };
@@ -8210,7 +8273,7 @@ async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
                 port,
                 "历史 Viewer 端口与站点 DB/Web 端口冲突，改为自动选择端口"
             );
-        } else if port_in_use("127.0.0.1", port) {
+        } else if port_in_use(&local_port_probe_host(), port) {
             if viewer_http_ok(port).await {
                 return Ok((port, true));
             }
@@ -8228,7 +8291,7 @@ async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
         if port == site.db_port || port == site.web_port {
             bail!("AIOS_VIEWER_PORT {} 与站点 DB/Web 端口冲突", port);
         }
-        if port_in_use("127.0.0.1", port) {
+        if port_in_use(&local_port_probe_host(), port) {
             if viewer_http_ok(port).await {
                 return Ok((port, true));
             }
@@ -8241,7 +8304,7 @@ async fn choose_viewer_port(site: &ManagedProjectSite) -> Result<(u16, bool)> {
         if port == site.db_port || port == site.web_port {
             continue;
         }
-        if port_in_use("127.0.0.1", port) {
+        if port_in_use(&local_port_probe_host(), port) {
             if viewer_http_ok(port).await {
                 return Ok((port, true));
             }
@@ -8297,7 +8360,7 @@ fn build_viewer_url(site: &ManagedProjectSite, port: u16) -> String {
                 .ok()
                 .map(|ip| format!("http://{ip}:{port}"))
         })
-        .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+        .unwrap_or_else(|| format!("http://{}:{port}", default_access_host()));
     let project = site_source_project_name(site);
     // plant3d-web is a standalone customer-facing site. It should discover the
     // backend through same-origin config/proxying, not through admin-only
@@ -8497,7 +8560,7 @@ fn viewer_base_host_for_nginx(site: &ManagedProjectSite) -> String {
     let base = configured_viewer_base_url(site).unwrap_or_else(|| {
         super::get_local_ip_via_udp()
             .map(|ip| format!("http://{ip}"))
-            .unwrap_or_else(|_| "http://localhost".to_string())
+            .unwrap_or_else(|_| format!("http://{}", default_access_host()))
     });
     let without_scheme = base
         .trim()
@@ -8544,6 +8607,40 @@ async fn choose_static_nginx_viewer_port(site: &ManagedProjectSite) -> Result<u1
     choose_viewer_port(site).await.map(|(port, _)| port)
 }
 
+async fn try_launch_static_viewer_root(site: &ManagedProjectSite) -> Result<Option<ViewerLaunch>> {
+    if !viewer_static_root_exists_for_nginx(None) {
+        return Ok(None);
+    }
+
+    let listen_port = choose_static_nginx_viewer_port(site).await?;
+    let windows_nginx_configured =
+        configure_windows_nginx_if_available(site, None, Some(listen_port)).await?;
+    let linux_nginx_configured =
+        configure_linux_nginx_if_available(site, None, Some(listen_port)).await?;
+
+    if windows_nginx_configured || linux_nginx_configured {
+        let static_root = viewer_static_root_for_nginx(None);
+        let url = build_viewer_url(site, listen_port);
+        tracing::info!(
+            site = %site.site_id,
+            port = listen_port,
+            static_root = %static_root.display(),
+            "使用安装包静态 viewer-root 配置 Nginx Viewer"
+        );
+        return Ok(Some(ViewerLaunch {
+            port: listen_port,
+            pid: None,
+            url,
+        }));
+    }
+
+    if managed_nginx_required() {
+        bail!("RequireNginx 已启用，但安装包静态 viewer-root 未成功配置 Nginx");
+    }
+
+    Ok(None)
+}
+
 fn render_plant3d_web_nginx_conf(
     site: &ManagedProjectSite,
     static_root: &Path,
@@ -8553,6 +8650,7 @@ fn render_plant3d_web_nginx_conf(
     let dist_dir = nginx_path(static_root);
     let server_name = viewer_base_host_for_nginx(site);
     let web_port = site.web_port;
+    let upstream_host = access_host_from_bind_host(&site.bind_host);
     format!(
         r#"server {{
     listen {listen_port};
@@ -8577,7 +8675,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location /api/ {{
-        proxy_pass http://127.0.0.1:{web_port}/api/;
+        proxy_pass http://{upstream_host}:{web_port}/api/;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -8588,7 +8686,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location = /api/admin {{
-        proxy_pass http://127.0.0.1:{admin_port}/api/admin;
+        proxy_pass http://{upstream_host}:{admin_port}/api/admin;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -8599,7 +8697,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location /api/admin/ {{
-        proxy_pass http://127.0.0.1:{admin_port}/api/admin/;
+        proxy_pass http://{upstream_host}:{admin_port}/api/admin/;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -8610,7 +8708,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location /files/ {{
-        proxy_pass http://127.0.0.1:{web_port}/files/;
+        proxy_pass http://{upstream_host}:{web_port}/files/;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -8618,7 +8716,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location /ws/ {{
-        proxy_pass http://127.0.0.1:{web_port}/ws/;
+        proxy_pass http://{upstream_host}:{web_port}/ws/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -8631,7 +8729,7 @@ fn render_plant3d_web_nginx_conf(
     }}
 
     location /admin/ {{
-        proxy_pass http://127.0.0.1:{admin_port}/admin/;
+        proxy_pass http://{upstream_host}:{admin_port}/admin/;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -9026,27 +9124,10 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
         tracing::info!(site = %site.site_id, "受管 plant3d-web Viewer 启动已禁用");
         return Ok(None);
     }
+    if let Some(launch) = try_launch_static_viewer_root(site).await? {
+        return Ok(Some(launch));
+    }
     let Some(viewer_dir) = viewer_project_dir()? else {
-        if viewer_static_root_exists_for_nginx(None) {
-            let listen_port = choose_static_nginx_viewer_port(site).await?;
-            let windows_nginx_configured =
-                configure_windows_nginx_if_available(site, None, Some(listen_port)).await?;
-            let linux_nginx_configured =
-                configure_linux_nginx_if_available(site, None, Some(listen_port)).await?;
-            if windows_nginx_configured || linux_nginx_configured {
-                let url = build_viewer_url(site, listen_port);
-                tracing::info!(
-                    site = %site.site_id,
-                    port = listen_port,
-                    "使用 release 包静态 viewer-root 配置 Nginx Viewer"
-                );
-                return Ok(Some(ViewerLaunch {
-                    port: listen_port,
-                    pid: None,
-                    url,
-                }));
-            }
-        }
         tracing::warn!(
             site = %site.site_id,
             "未找到 plant3d-web 目录，且未成功配置静态 viewer-root Nginx，跳过受管 Viewer 启动（可设置 AIOS_VIEWER_PROJECT_DIR 或 AIOS_VIEWER_STATIC_ROOT）"
@@ -9161,7 +9242,7 @@ async fn spawn_viewer_process(site: &ManagedProjectSite) -> Result<Option<Viewer
     let pid = child.id().unwrap_or_default();
     register_process(&site.site_id, PROC_ROLE_VIEWER, pid);
     if !wait_for_http_ok(
-        &format!("http://127.0.0.1:{port}{base_path}"),
+        &format!("http://{}:{port}{base_path}", local_port_probe_host()),
         WAIT_HTTP_ATTEMPTS,
         WAIT_STEP_MS,
     )
@@ -9200,7 +9281,7 @@ async fn stop_site_ws_db_for_exclusivity(site: &ManagedProjectSite) -> bool {
         }
     }
     // 2) 兜底：清理仍监听本站点 db 端口的任何残留/未登记 surreal server。
-    if port_in_use("127.0.0.1", site.db_port) {
+    if port_in_use(&local_port_probe_host(), site.db_port) {
         let pids = process_ids_on_port(site.db_port).await.unwrap_or_default();
         for pid in pids {
             if kill_pid(pid).await.is_ok() {
@@ -9266,7 +9347,7 @@ async fn ensure_site_db_started(
         },
     )?;
     if !wait_for_port(site.db_port, WAIT_PORT_ATTEMPTS, WAIT_STEP_MS).await {
-        let _ = kill_pid(db_pid).await;
+        let _ = kill_pid_guarded(&site.site_id, PROC_ROLE_DB, db_pid).await;
         unregister_db_dir_owner(&site.db_data_path);
         let _ = update_runtime(
             &site.site_id,
@@ -9773,7 +9854,7 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
     )?;
     let status_url = format!("{}/api/status", site_probe_base_url(&site));
     if !wait_for_http_ok(&status_url, WAIT_HTTP_ATTEMPTS, WAIT_STEP_MS).await {
-        let _ = kill_pid(web_pid).await;
+        let _ = kill_pid_guarded(&site_id, PROC_ROLE_WEB, web_pid).await;
         cleanup_started_db(&site_id, db_pid).await;
         let _ = update_runtime(
             &site_id,
@@ -9788,7 +9869,7 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
     let viewer = match spawn_viewer_process(&site).await {
         Ok(viewer) => viewer,
         Err(err) => {
-            let _ = kill_pid(web_pid).await;
+            let _ = kill_pid_guarded(&site_id, PROC_ROLE_WEB, web_pid).await;
             cleanup_started_db(&site_id, db_pid).await;
             let _ = update_runtime(
                 &site_id,
@@ -10262,6 +10343,17 @@ fn remote_entry_url(target: &ManagedRemoteTarget) -> String {
         .clone()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("http://{}:{}", target.host, target.remote_web_port))
+}
+
+fn remote_api_base_url_from_entry(entry_url: Option<&str>) -> Option<String> {
+    entry_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{}/api", value.trim_end_matches('/')))
+}
+
+fn remote_api_base_url(target: &ManagedRemoteTarget) -> String {
+    format!("{}/api", remote_entry_url(target).trim_end_matches('/'))
 }
 
 fn remote_site_token(site_id: &str, deploy_id: Option<&str>) -> String {
@@ -10863,7 +10955,8 @@ fn build_remote_site_config(
     let table = value
         .as_table_mut()
         .ok_or_else(|| anyhow!("站点 DbOption 不是 table 结构"))?;
-    set_toml_string(table, "surreal_ip", "127.0.0.1");
+    let db_host = target.db_bind_host.clone();
+    set_toml_string(table, "surreal_ip", db_host.clone());
     set_toml_integer(table, "surreal_port", target.remote_db_port as i64);
     set_toml_string(table, "surreal_user", db_user.to_string());
     set_toml_string(table, "surreal_password", db_password.to_string());
@@ -10872,13 +10965,10 @@ fn build_remote_site_config(
     let web_server = ensure_table(table, "web_server");
     set_toml_integer(web_server, "port", target.remote_web_port as i64);
     set_toml_string(web_server, "bind_host", target.web_bind_host.clone());
-    set_toml_string(web_server, "public_base_url", remote_entry_url(target));
-    set_toml_string(web_server, "frontend_url", remote_entry_url(target));
-    set_toml_string(
-        web_server,
-        "backend_url",
-        format!("http://127.0.0.1:{}", target.remote_web_port),
-    );
+    let remote_entry = remote_entry_url(target);
+    set_toml_string(web_server, "public_base_url", remote_entry.clone());
+    set_toml_string(web_server, "frontend_url", remote_entry.clone());
+    set_toml_string(web_server, "backend_url", remote_entry);
     set_toml_bool(web_server, "auto_start_surreal", false);
     set_toml_string(web_server, "surreal_bin", target.surreal_bin.clone());
     set_toml_string(
@@ -10896,7 +10986,7 @@ fn build_remote_site_config(
 
     let surrealdb = ensure_table(table, "surrealdb");
     set_toml_string(surrealdb, "mode", "ws");
-    set_toml_string(surrealdb, "ip", "127.0.0.1");
+    set_toml_string(surrealdb, "ip", db_host);
     set_toml_integer(surrealdb, "port", target.remote_db_port as i64);
     set_toml_string(surrealdb, "user", db_user.to_string());
     set_toml_string(surrealdb, "password", db_password.to_string());
@@ -11310,6 +11400,7 @@ pub async fn remote_prepare_site(
         status: "running".to_string(),
         current_step: "remote_prepare".to_string(),
         remote_entry_url: Some(remote_entry_url(&target)),
+        remote_api_base_url: Some(remote_api_base_url(&target)),
         checked_at: now_rfc3339(),
         last_error: None,
         checks: Vec::new(),
@@ -11504,19 +11595,16 @@ pub async fn remote_preflight_site(
         resolve_local_viewer_dir(&target),
     );
 
-    if !matches!(
-        target.db_bind_host.as_str(),
-        "127.0.0.1" | "localhost" | "::1"
-    ) {
+    if super::is_loopback_or_unspecified_host(&target.db_bind_host) {
         checks.push(preflight_warning(
             "remote_db_bind_host",
             "远端数据库监听地址",
             format!(
-                "SurrealDB 将监听 {}:{}，建议默认只绑定 127.0.0.1",
+                "SurrealDB 将监听 {}:{}，不符合真实 IP 访问要求",
                 target.db_bind_host, target.remote_db_port
             ),
             None,
-            Some("除非明确需要外部访问数据库，否则保持 db_bind_host=127.0.0.1".to_string()),
+            Some("请改为远端机器的内网或公网 IP 地址".to_string()),
             Vec::new(),
         ));
     }
@@ -11655,6 +11743,7 @@ pub async fn remote_preflight_site(
         },
         current_step: format!("{blocking_count} 个阻断 / {warning_count} 个警告"),
         remote_entry_url: Some(remote_entry_url(&target)),
+        remote_api_base_url: Some(remote_api_base_url(&target)),
         checked_at: now_rfc3339(),
         last_error: None,
         checks,
@@ -11826,6 +11915,7 @@ pub async fn remote_deploy_site_with_task_id(
         "远端部署完成".to_string()
     };
     status.remote_entry_url = Some(remote_entry_url(&target));
+    status.remote_api_base_url = Some(remote_api_base_url(&target));
     status.checked_at = now_rfc3339();
     status.last_error = None;
     save_remote_deploy_status(&status)?;
@@ -11954,6 +12044,14 @@ pub async fn stop_site(site_id: &str) -> Result<StopSiteResult> {
                 );
             }
         }
+    }
+    let stopped_sidecars =
+        crate::web_server::parse_sidecar_client::shutdown_site_sidecars(site_id).await;
+    if stopped_sidecars > 0 {
+        append_log_line(
+            &parse_log_path(site_id),
+            &format!("已清理本站点 aios-database sidecar 数量: {stopped_sidecars}"),
+        );
     }
 
     // 顺序：生产者先停（parse、web），消费者（db）最后停，避免 parse 写库时 db 突然消失。
@@ -12104,6 +12202,7 @@ pub async fn delete_site(site_id: &str) -> Result<bool> {
             );
         }
     } else {
+        let _ = crate::web_server::parse_sidecar_client::shutdown_site_sidecars(site_id).await;
         kill_registered_site_processes(site_id).await;
     }
 
@@ -12332,7 +12431,7 @@ pub fn runtime_status(site_id: &str) -> Result<ManagedSiteRuntimeStatus> {
     let viewer_adopted_running = site
         .viewer_port
         .map(|port| {
-            port_in_use("127.0.0.1", port)
+            port_in_use(&local_port_probe_host(), port)
                 && site.viewer_url.is_some()
                 && matches!(
                     site.status,
@@ -13017,10 +13116,10 @@ mod tests {
     fn derive_entry_urls_prefers_public_base_url() {
         let (local, public, entry) = derive_entry_urls(
             8080,
-            "0.0.0.0",
+            "10.0.0.3",
             &Some("https://ops.example.com/admin/".to_string()),
         );
-        assert_eq!(local.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(local.as_deref(), Some("http://10.0.0.3:8080"));
         assert_eq!(public.as_deref(), Some("https://ops.example.com/admin"));
         assert_eq!(entry.as_deref(), Some("https://ops.example.com/admin"));
     }
@@ -13028,7 +13127,7 @@ mod tests {
     #[test]
     fn derive_entry_urls_falls_back_to_bind_host_when_public_missing() {
         let (local, public, entry) = derive_entry_urls(8080, "10.0.0.3", &None);
-        assert_eq!(local.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(local.as_deref(), Some("http://10.0.0.3:8080"));
         assert_eq!(public.as_deref(), Some("http://10.0.0.3:8080"));
         assert_eq!(entry.as_deref(), Some("http://10.0.0.3:8080"));
     }
@@ -13069,7 +13168,7 @@ mod tests {
             db_port: 8123,
             web_port: 8124,
             viewer_port: None,
-            bind_host: "127.0.0.1".to_string(),
+            bind_host: "10.0.0.3".to_string(),
             public_base_url: None,
             associated_project: None,
             db_pid: None,
@@ -13139,7 +13238,7 @@ mod tests {
             db_port: 8123,
             web_port: 8124,
             viewer_port: None,
-            bind_host: "127.0.0.1".to_string(),
+            bind_host: "10.0.0.3".to_string(),
             public_base_url: None,
             associated_project: None,
             db_pid: None,
@@ -13204,7 +13303,7 @@ mod tests {
             db_port: 8123,
             web_port: 8124,
             viewer_port: None,
-            bind_host: "127.0.0.1".to_string(),
+            bind_host: "10.0.0.3".to_string(),
             public_base_url: None,
             associated_project: None,
             db_pid: None,

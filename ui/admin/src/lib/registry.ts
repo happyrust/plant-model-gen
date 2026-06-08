@@ -8,7 +8,7 @@ import type {
 
 function resolveBackendOrigin(): string {
   if (typeof window === 'undefined' || !window.location.origin) {
-    return 'http://127.0.0.1:3100'
+    return ''
   }
   return window.location.origin
 }
@@ -19,8 +19,15 @@ function resolveFrontendOrigin(backendUrl: string): string {
     parsed.port = '5173'
     return parsed.toString().replace(/\/$/, '')
   } catch {
-    return 'http://127.0.0.1:5173'
+    return ''
   }
+}
+
+function resolveBrowserIpHost(): string {
+  if (typeof window === 'undefined') return ''
+  const host = window.location.hostname.trim().toLowerCase()
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return ''
+  return window.location.hostname
 }
 
 export function createDefaultRegistryConfig(
@@ -40,7 +47,7 @@ export function createDefaultRegistryConfig(
     module: 'DESI',
     db_type: 'surrealdb',
     surreal_ns: 1516,
-    db_ip: 'localhost',
+    db_ip: resolveBrowserIpHost(),
     db_port: '8020',
     db_user: 'root',
     db_password: 'root',

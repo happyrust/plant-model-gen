@@ -72,11 +72,19 @@ export function buildViewerUrl(
     runtimeBase?.source === 'local_ip' && site.viewer_port
       ? withViewerPort(runtimeBase.url, site.viewer_port)
       : runtimeBase?.url
+  const browserHost = typeof window !== 'undefined' ? window.location.hostname : ''
+  const browserHostIsIp =
+    browserHost
+    && browserHost !== 'localhost'
+    && browserHost !== '127.0.0.1'
+    && browserHost !== '::1'
 
   const base =
     normalizeViewerBaseUrl(site.viewer_url)
     || normalizeViewerBaseUrl(runtimeUrl)
-    || (site.viewer_port ? `http://127.0.0.1:${site.viewer_port}` : null)
+    || (site.viewer_port && browserHostIsIp
+      ? normalizeViewerBaseUrl(`${window.location.protocol}//${window.location.hostname}:${site.viewer_port}`)
+      : null)
 
   if (!base) return null
   return buildStandaloneViewerUrl(base, site)

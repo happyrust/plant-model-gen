@@ -375,8 +375,14 @@ pub async fn start_database_with_progress(
             }
         }
 
-        // 尝试连接数据库 - 使用本地地址进行测试
-        if test_tcp_connection(&format!("127.0.0.1:{}", port)).await {
+        // 尝试连接数据库 - 使用真实 IP 地址进行测试
+        if test_tcp_connection(&format!(
+            "{}:{}",
+            super::get_local_ip_via_udp().unwrap_or_default(),
+            port
+        ))
+        .await
+        {
             // 更新进度：95% - 验证功能
             {
                 let mut mgr = manager.write().await;
@@ -441,8 +447,12 @@ async fn check_port_in_use(_ip: &str, port: u16) -> bool {
             use std::time::Duration;
             use tokio::net::TcpStream;
 
-            // 尝试连接 127.0.0.1 和 0.0.0.0
-            for addr in &[format!("127.0.0.1:{}", port), format!("0.0.0.0:{}", port)] {
+            let access_addr = format!(
+                "{}:{}",
+                super::get_local_ip_via_udp().unwrap_or_default(),
+                port
+            );
+            for addr in &[access_addr] {
                 if let Ok(Ok(_)) =
                     tokio::time::timeout(Duration::from_millis(100), TcpStream::connect(addr)).await
                 {

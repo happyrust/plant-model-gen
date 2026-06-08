@@ -160,7 +160,7 @@ impl ConfigManager {
         db_option.mdb_name = "ALL".to_string();
         db_option.module = "DESI".to_string();
 
-        db_option.surreal_ip = "127.0.0.1".to_string();
+        db_option.surreal_ip = String::new();
         db_option.surreal_port = 8009;
         db_option.surreal_user = "root".to_string();
         db_option.surreal_password = "root".to_string();

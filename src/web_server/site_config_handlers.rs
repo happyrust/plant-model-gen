@@ -70,14 +70,7 @@ pub struct SiteConfig {
 pub async fn get_server_ip(
     _state: State<crate::web_server::AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 使用UdpSocket连接到外部地址，获取本地IP
-    let local_ip = match super::get_local_ip_via_udp() {
-        Ok(ip) => ip,
-        Err(_) => {
-            // 如果失败，返回127.0.0.1作为fallback
-            "127.0.0.1".to_string()
-        }
-    };
+    let local_ip = super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
     Ok(Json(json!({
         "status": "success",
@@ -638,7 +631,9 @@ pub async fn validate_site_config(
     }
 
     // 验证 IP 格式
-    if config.ip.parse::<std::net::IpAddr>().is_err() && config.ip != "localhost" {
+    if config.ip.parse::<std::net::IpAddr>().is_err()
+        || super::is_loopback_or_unspecified_host(&config.ip)
+    {
         errors.push(format!("无效的 IP 地址: {}", config.ip));
     }
 

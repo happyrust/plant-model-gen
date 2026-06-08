@@ -60,6 +60,12 @@ let previewTimer: ReturnType<typeof setTimeout> | null = null
 let previewRequestSeq = 0
 const DEFAULT_DB_PORT = 8020
 const DEFAULT_WEB_PORT = 8080
+function defaultAccessHost(): string {
+  if (typeof window === 'undefined') return ''
+  const host = window.location.hostname.trim().toLowerCase()
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return ''
+  return window.location.hostname
+}
 
 // D4 / Sprint D · 修 G12：端口冲突前端预检
 //
@@ -169,7 +175,7 @@ const form = ref<CreateManagedSiteRequest>({
   runtime_db_mode: 'ws',
   db_port: DEFAULT_DB_PORT,
   web_port: DEFAULT_WEB_PORT,
-  bind_host: '127.0.0.1',
+  bind_host: defaultAccessHost(),
   public_base_url: '',
   associated_project: '',
   db_user: '',
@@ -327,7 +333,7 @@ function applySitePreset(preset: ManagedSiteFormPreset) {
     runtime_db_mode: presetForm.runtime_db_mode ?? 'ws',
     db_port: presetForm.db_port ?? DEFAULT_DB_PORT,
     web_port: presetForm.web_port ?? DEFAULT_WEB_PORT,
-    bind_host: presetForm.bind_host ?? '127.0.0.1',
+    bind_host: presetForm.bind_host ?? defaultAccessHost(),
     public_base_url: presetForm.public_base_url ?? '',
     associated_project: presetForm.associated_project ?? '',
     db_user: presetForm.db_user ?? '',
@@ -419,7 +425,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         runtime_db_mode: s.runtime_db_mode ?? 'ws',
         db_port: s.db_port,
         web_port: s.web_port,
-        bind_host: s.bind_host || '127.0.0.1',
+        bind_host: s.bind_host || defaultAccessHost(),
         public_base_url: s.public_base_url || '',
         associated_project: s.associated_project || '',
         db_user: '',
@@ -464,7 +470,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       runtime_db_mode: 'ws',
       db_port: DEFAULT_DB_PORT,
       web_port: DEFAULT_WEB_PORT,
-      bind_host: '127.0.0.1',
+      bind_host: defaultAccessHost(),
       public_base_url: '',
       associated_project: '',
       db_user: '',
@@ -525,8 +531,12 @@ const previewPayload = computed<PreviewManagedSiteParsePlanRequest | null>(() =>
   }
   const previewWebPort = form.value.web_port || DEFAULT_WEB_PORT
   const parseDbTypes = normalizeParseDbTypes(form.value.parse_db_types ?? [])
+  const projectsPayload = buildProjectsPayload()
+  const siteNameTrimmed = siteName.value.trim()
   return {
     site_id: props.siteId ?? undefined,
+    site_name: siteNameTrimmed || undefined,
+    projects: projectsPayload,
     project_name: projectName,
     project_path: projectPath,
     manual_db_nums: parseManualDbNumsInput(manualDbNumsStr.value),
@@ -964,8 +974,8 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">绑定地址</label>
-                <input v-model="form.bind_host" type="text" placeholder="127.0.0.1" :class="inputClass" />
-                <p class="text-xs text-muted-foreground">默认只监听本机，避免把管理数据库直接暴露到外网</p>
+                <input v-model="form.bind_host" type="text" placeholder="例如 192.168.1.10" :class="inputClass" />
+                <p class="text-xs text-muted-foreground">请填写服务器真实 IP，站点和数据库访问都会使用该地址</p>
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">对外访问地址 <span class="text-muted-foreground">(可选)</span></label>

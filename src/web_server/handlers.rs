@@ -1275,14 +1275,14 @@ pub async fn api_projects_demo() -> Result<Json<serde_json::Value>, StatusCode> 
                     "demo",
                     "dev",
                     "Running",
-                    "http://localhost:9000",
+                    "http://192.168.1.10:9000",
                     "v1.0.0",
                     "alice",
                     now,
                     "staging-app",
                     "staging",
                     "Deploying",
-                    "http://localhost:9100",
+                    "http://192.168.1.10:9100",
                     "v1.2.3",
                     "bob"
                 ],
@@ -1316,7 +1316,7 @@ pub async fn api_projects_demo() -> Result<Json<serde_json::Value>, StatusCode> 
             "demo",
             "dev",
             "Running",
-            "http://localhost:9000",
+            "http://192.168.1.10:9000",
             "v1.0.0",
             "alice"
         ),
@@ -1324,7 +1324,7 @@ pub async fn api_projects_demo() -> Result<Json<serde_json::Value>, StatusCode> 
             "staging-app",
             "staging",
             "Deploying",
-            "http://localhost:9100",
+            "http://192.168.1.10:9100",
             "v1.2.3",
             "bob"
         )
@@ -2457,8 +2457,12 @@ fn disk_resource_for_path(path: &StdPath) -> serde_json::Value {
 async fn probe_viewer_health() -> serde_json::Value {
     let viewer_index = StdPath::new("viewer/index.html");
     let static_present = viewer_index.exists();
-    let viewer_url = crate::web_server::web_listen::get_web_listen()
-        .map(|(_, port)| format!("http://127.0.0.1:{port}/viewer/"));
+    let viewer_url = crate::web_server::web_listen::get_web_listen().map(|(_, port)| {
+        format!(
+            "http://{}:{port}/viewer/",
+            super::get_local_ip_via_udp().unwrap_or_default()
+        )
+    });
 
     let mut http_ok = None;
     let mut http_status = None;
@@ -2765,10 +2769,10 @@ fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> Strin
         let _ = parsed.set_port(Some(5173));
         return parsed.to_string();
     }
-    let host = if bind_host.trim().is_empty() || bind_host == "0.0.0.0" {
-        "127.0.0.1"
+    let host = if super::is_loopback_or_unspecified_host(bind_host) {
+        super::get_local_ip_via_udp().unwrap_or_default()
     } else {
-        bind_host
+        bind_host.to_string()
     };
     format!("http://{}:5173", host)
 }
@@ -2963,7 +2967,13 @@ pub async fn api_import_deployment_site_from_dboption(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string())
         })
-        .unwrap_or_else(|| format!("http://127.0.0.1:{}", bind_port));
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}:{}",
+                super::get_local_ip_via_udp().unwrap_or_default(),
+                bind_port
+            )
+        });
     let frontend_url = req
         .frontend_url
         .clone()
@@ -4025,9 +4035,8 @@ pub async fn start_surreal_server(
         }
     }
 
-    // SurrealDB 2.x 不接受 "localhost"，必须使用 IP 地址
-    if ip == "localhost" {
-        ip = "127.0.0.1".to_string();
+    if super::is_loopback_or_unspecified_host(&ip) {
+        ip = super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
     let bind_addr = format!("{}:{}", ip, port);
 
@@ -4058,17 +4067,21 @@ async fn start_surreal_process_improved(
     pass: &str,
     project: &str,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 统一监听到 0.0.0.0
+    // 统一监听到真实 IP，避免生成 loopback 访问地址
     let port_for_bind = bind_addr
         .split(':')
         .last()
         .unwrap_or("8000")
         .parse::<u16>()
         .unwrap_or(8000);
-    let final_bind_addr = format!("0.0.0.0:{}", port_for_bind);
+    let final_bind_addr = format!(
+        "{}:{}",
+        super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+        port_for_bind
+    );
 
     println!("🔧 准备启动 SurrealDB...");
-    println!("   地址: {} (统一绑定 0.0.0.0)", final_bind_addr);
+    println!("   地址: {} (真实 IP 访问)", final_bind_addr);
     println!("   用户: {}", user);
     println!("   项目: {}", project);
 
@@ -4201,13 +4214,18 @@ async fn start_surreal_process_improved(
                     }
                     Ok(None) => {
                         // 进程仍在运行，检查端口是否可连接
-                        let loopback_addr = format!("127.0.0.1:{}", port);
+                        let access_addr = format!(
+                            "{}:{}",
+                            super::get_local_ip_via_udp()
+                                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+                            port
+                        );
                         println!(
                             "⏳ 进程运行中，检查端口 {} 连接性... (尝试 {}/{})",
-                            loopback_addr, attempts, max_attempts
+                            access_addr, attempts, max_attempts
                         );
-                        if test_tcp_connection(&loopback_addr).await {
-                            println!("✅ 端口 {} 已响应", loopback_addr);
+                        if test_tcp_connection(&access_addr).await {
+                            println!("✅ 端口 {} 已响应", access_addr);
                             // 进一步测试数据库功能
                             tokio::time::sleep(StdDuration::from_millis(1000)).await; // 给数据库更多初始化时间
                             let (db_functional, error_msg) = test_database_functionality().await;
@@ -4241,11 +4259,15 @@ async fn start_surreal_process_improved(
             }
 
             // 超时但进程可能仍在启动
-            let loopback_addr = format!("127.0.0.1:{}", port);
-            if test_tcp_connection(&loopback_addr).await {
+            let access_addr = format!(
+                "{}:{}",
+                super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?,
+                port
+            );
+            if test_tcp_connection(&access_addr).await {
                 Ok(Json(json!({
                     "success": true,
-                    "message": format!("SurrealDB 启动中: {} (端口已监听)", loopback_addr),
+                    "message": format!("SurrealDB 启动中: {} (端口已监听)", access_addr),
                     "hint": "数据库可能仍在初始化，请稍后检查功能状态"
                 })))
             } else {
@@ -4293,9 +4315,8 @@ pub async fn stop_surreal_server(
             port = u16::try_from(p).unwrap_or(port);
         }
     }
-    // SurrealDB 2.x 不接受 "localhost"，必须使用 IP 地址
-    if ip == "localhost" {
-        ip = "127.0.0.1".to_string();
+    if super::is_loopback_or_unspecified_host(&ip) {
+        ip = super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
     let bind_addr = format!("{}:{}", ip, port);
 
@@ -4520,9 +4541,8 @@ pub async fn restart_surreal_server(
         }
     }
 
-    // SurrealDB 2.x 不接受 "localhost"，必须使用 IP 地址
-    if ip == "localhost" {
-        ip = "127.0.0.1".to_string();
+    if super::is_loopback_or_unspecified_host(&ip) {
+        ip = super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
     let bind_addr = format!("{}:{}", ip, port);
 
@@ -4556,9 +4576,8 @@ pub async fn get_surreal_status(
 
     let opt = get_db_option();
     let ip_raw = q.ip.unwrap_or(opt.surreal_ip.clone());
-    // SurrealDB 2.x 不接受 "localhost"，必须使用 IP 地址
-    let ip = if ip_raw == "localhost" {
-        "127.0.0.1".to_string()
+    let ip = if super::is_loopback_or_unspecified_host(&ip_raw) {
+        super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     } else {
         ip_raw
     };
@@ -7603,10 +7622,9 @@ pub async fn check_database_connection(
 
     // 基于查询参数 + 默认配置拼装被测配置
     let default_cfg = get_db_config_from_options();
-    // SurrealDB 2.x 推荐将 localhost 规范成 127.0.0.1
     let ip_raw = q.ip.unwrap_or(default_cfg.ip);
-    let ip = if ip_raw == "localhost" {
-        "127.0.0.1".to_string()
+    let ip = if super::is_loopback_or_unspecified_host(&ip_raw) {
+        super::get_local_ip_via_udp().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     } else {
         ip_raw
     };

@@ -121,6 +121,14 @@ pub fn create_admin_routes() -> Router {
         .layer(middleware::from_fn(admin_auth_middleware))
 }
 
+fn site_access_host(site: &ManagedProjectSite) -> Result<String, String> {
+    if !crate::web_server::is_loopback_or_unspecified_host(&site.bind_host) {
+        return Ok(site.bind_host.trim().to_string());
+    }
+    crate::web_server::get_local_ip_via_udp()
+        .map_err(|err| format!("无法推断站点真实访问 IP: {err}"))
+}
+
 #[derive(Debug, Serialize)]
 struct QuickExitResponse {
     script_path: String,
@@ -208,8 +216,8 @@ fn resolve_stop_script_path() -> Option<std::path::PathBuf> {
 /// 从环境变量解析后按需发布给前端。
 #[derive(Debug, Serialize, Default)]
 pub struct AdminAppConfig {
-    /// Viewer 三维看图页面的基础 URL，形如 `https://viewer.example.com` 或
-    /// `http://localhost:3101`。未显式配置时默认推断为 `http://<本机 IPv4>`。
+    /// Viewer 三维看图页面的基础 URL，形如 `http://<本机 IPv4>:3101`。
+    /// 未显式配置时默认推断为 `http://<本机 IPv4>`。
     ///
     /// 来源：`AIOS_VIEWER_BASE_URL` 环境变量（优先级 1）；未设置时用本机 IPv4
     /// 拼出默认入口。默认本机 IP 不代表 Nginx 已接管 80 端口，前端需要结合
@@ -672,7 +680,8 @@ async fn connect_site_data_browser_db(
             site.site_id, site.status
         ));
     }
-    let address = format!("127.0.0.1:{}", site.db_port);
+    let db_host = site_access_host(&site)?;
+    let address = format!("{}:{}", db_host, site.db_port);
     let db = Surreal::new::<Ws>(address.as_str())
         .await
         .map_err(|err| format!("连接站点数据库 {address} 失败: {err}"))?;
@@ -776,9 +785,13 @@ pub async fn get_site_data_browser_connection(
         return admin_response::managed_error(err);
     }
 
+    let endpoint_host = match site_access_host(&site) {
+        Ok(host) => host,
+        Err(err) => return admin_response::managed_error(err),
+    };
     let response = DataBrowserConnectionResponse {
         site: data_browser_site_context(&site),
-        endpoint: format!("ws://127.0.0.1:{}/rpc", site.db_port),
+        endpoint: format!("ws://{}:{}/rpc", endpoint_host, site.db_port),
         namespace: site.project_code.to_string(),
         database,
         mode: mode.as_str().to_string(),
@@ -788,7 +801,7 @@ pub async fn get_site_data_browser_connection(
             role: mode.role().to_string(),
             can_write: mode.can_write(),
         },
-        local_only: true,
+        local_only: false,
     };
     admin_response::ok("获取站点数据浏览器连接上下文成功", response)
 }

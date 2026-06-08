@@ -133,7 +133,7 @@ async function handleSubmit() {
             <div class="grid grid-cols-2 gap-4">
               <div class="space-y-2">
                 <label class="text-sm font-medium">MQTT 主机</label>
-                <input v-model="form.mqtt_host" type="text" placeholder="127.0.0.1" :class="inputClass" />
+                <input v-model="form.mqtt_host" type="text" placeholder="例如 192.168.1.10" :class="inputClass" />
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">MQTT 端口</label>

@@ -92,9 +92,10 @@ async fn main() -> anyhow::Result<()> {
                     .split_once(':')
                     .unwrap_or(("0.0.0.0", "8020"));
                 let conn_ip = if bind_ip == "0.0.0.0" {
-                    "127.0.0.1"
+                    aios_database::web_server::get_local_ip_via_udp()
+                        .unwrap_or_else(|_| bind_ip.to_string())
                 } else {
-                    bind_ip
+                    bind_ip.to_string()
                 };
                 unsafe {
                     std::env::set_var("SURREAL_CONN_MODE", "ws");
@@ -120,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("🚀 正在启动 AIOS Web UI 服务器...");
-    println!("📱 访问地址: http://localhost:{}", port);
+    let access_host =
+        aios_database::web_server::get_local_ip_via_udp().unwrap_or_else(|_| "0.0.0.0".to_string());
+    println!("📱 访问地址: http://{}:{}", access_host, port);
 
     start_web_server_with_config(port, Some(config_path)).await?;
 

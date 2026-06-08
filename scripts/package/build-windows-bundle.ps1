@@ -313,6 +313,7 @@ function Update-PackageDbOption([string]$Path) {
         "__root__.surreal_user" = '"root"'
         "__root__.surreal_password" = '"root"'
         "web_server.port" = "3100"
+        "web_server.bind_host" = '"0.0.0.0"'
         "web_server.auto_start_surreal" = "true"
         "web_server.surreal_bin" = '"bin/surreal/surreal.exe"'
         "web_server.surreal_data_path" = '"runtime/surrealdb"'
@@ -331,7 +332,7 @@ function Update-PackageDbOption([string]$Path) {
     $sectionOrder = @("__root__", "web_server", "surrealdb", "surrealkv")
     $keysBySection = @{
         "__root__" = @("meshes_path", "surreal_script_dir", "surreal_ip", "surreal_port", "surreal_user", "surreal_password")
-        "web_server" = @("port", "auto_start_surreal", "surreal_bin", "surreal_data_path", "surreal_bind", "surreal_user", "surreal_password")
+        "web_server" = @("port", "bind_host", "auto_start_surreal", "surreal_bin", "surreal_data_path", "surreal_bind", "surreal_user", "surreal_password")
         "surrealdb" = @("mode", "ip", "port", "user", "password", "path")
         "surrealkv" = @("mode", "path")
     }

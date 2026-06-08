@@ -1,0 +1,131 @@
+<mxfile host="app.diagrams.net" agent="cursor" version="24.0.0">
+  <diagram id="data-parse-save-flow" name="数据解析保存流程">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1300" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- ===================== Lane backgrounds ===================== -->
+        <mxCell id="laneA" value="① 控制面 / 触发（web_server 进程）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#EAF2FD;strokeColor=#6c8ebf;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=12;spacingTop=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="40" width="1240" height="160" as="geometry" />
+        </mxCell>
+        <mxCell id="laneB" value="② Sidecar 进程（aios-database serve · src/parse_sidecar.rs · Bearer token 鉴权）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#EAF6E9;strokeColor=#82b366;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=12;spacingTop=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="220" width="1240" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="laneC" value="③ 主管线 CLI：aios-database -c &lt;config&gt;（DbOption.toml 驱动 · 真正的解析+生成+保存）" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFF3E6;strokeColor=#d79b00;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=12;spacingTop=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="410" width="1240" height="290" as="geometry" />
+        </mxCell>
+        <mxCell id="laneD" value="④ 存储后端 / 产物" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#F3EEF8;strokeColor=#9673a6;verticalAlign=top;align=left;fontStyle=1;fontSize=14;spacingLeft=12;spacingTop=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="720" width="1240" height="160" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== Band A ===================== -->
+        <mxCell id="A1" value="用户在 Admin UI 触发&#10;解析 / 部署 / 快测" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="60" y="100" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="A2" value="web_server&#10;admin_handlers · admin_task_handlers&#10;managed_project_sites" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="360" y="100" width="260" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="A3" value="parse_sidecar_client&#10;ensure_sidecar() → spawn sidecar&#10;HTTP/WS 代理调用" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="680" y="100" width="260" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== Band B ===================== -->
+        <mxCell id="B1" value="POST /projects/scan&#10;扫描工程目录 · 读 60B 文件头&#10;parse_file_basic_info · dbnum 冲突检测" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="290" width="270" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="B2" value="POST /parse/preview-plan&#10;生成解析计划&#10;Full/Bootstrap/RebuildSystem/&#10;FastReparse/Selective" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="360" y="290" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="B3" value="POST /db-index/rebuild&#10;预扫 ref0 依赖 → DbIndexStore&#10;(spawn_blocking 两阶段)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="640" y="290" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="B4" value="POST /jobs/submit-cli&#10;派生 CLI 子进程 + WS /events&#10;进度/日志/产物事件流" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#b9dcb4;strokeColor=#82b366;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="920" y="290" width="280" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== Band C (snake: C0→C1→C2→C3→C4→C5→C6) ===================== -->
+        <mxCell id="C0" value="加载 DbOption.toml&#10;save_db / total_sync / gen_model&#10;gen_mesh / export_parquet" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="60" y="460" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C1" value="解析 PDMS .db&#10;PdmsIO parse_file_with_chunk&#10;versioned_db::sync_pdms" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="350" y="460" width="250" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C2" value="save_db? 保存 PE&#10;save_pes / save_pe_relates&#10;(→ SurrealDB)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="640" y="460" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C3" value="构建索引树 gen_index_tree&#10;tree_index_manager (rkyv 文件)&#10;+ db_meta_info.json (ref0→dbnum)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="920" y="460" width="280" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C4" value="模型生成 gen_all_geos_data&#10;PRIM/CATE/LOOP 几何 · mesh&#10;manifold 布尔运算" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="920" y="585" width="280" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C5" value="写实例/几何/变换/包围盒&#10;inst_relate · geo_relate · trans · aabb&#10;pdms_inst_surreal / model_writer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="640" y="585" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="C6" value="导出 Parquet&#10;export_dbnum_instances_parquet&#10;(从 SurrealDB 读 → 多表 Parquet)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="350" y="585" width="250" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== Band D ===================== -->
+        <mxCell id="D1" value="SurrealDB&#10;PE · inst/geo relate&#10;trans · aabb" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;shape=cylinder3;boundedLbl=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="760" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="D2" value="索引树文件 (rkyv)&#10;+ db_meta_info.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;shape=cylinder3;boundedLbl=1;" vertex="1" parent="1">
+          <mxGeometry x="280" y="760" width="180" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="D3" value="RocksDB KV&#10;(可选 mem-kv-save)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;shape=cylinder3;boundedLbl=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="760" width="170" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="D4" value="SQLite&#10;RTree 空间索引&#10;+ db_index 依赖" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;shape=cylinder3;boundedLbl=1;" vertex="1" parent="1">
+          <mxGeometry x="710" y="760" width="190" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="D5" value="Parquet 文件组&#10;instances/geo_instances/transforms/&#10;aabb/ptsets/tubings + manifest.json&#10;→ 前端直接查询" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5c4e3;strokeColor=#9673a6;fontSize=11;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="940" y="755" width="280" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- ===================== Edges ===================== -->
+        <!-- Band A chain -->
+        <mxCell id="eA1A2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#4d6fa8;" edge="1" parent="1" source="A1" target="A2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eA2A3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#4d6fa8;" edge="1" parent="1" source="A2" target="A3"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- A3 -> sidecar endpoints (HTTP) -->
+        <mxCell id="eA3B1" value="HTTP" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#5a8f54;fontSize=10;" edge="1" parent="1" source="A3" target="B1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eA3B2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#5a8f54;" edge="1" parent="1" source="A3" target="B2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eA3B3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#5a8f54;" edge="1" parent="1" source="A3" target="B3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eA3B4" value="submit" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#5a8f54;fontSize=10;" edge="1" parent="1" source="A3" target="B4"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- WS events feedback -->
+        <mxCell id="eB4A3" value="WS 事件流（进度/日志/产物）" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=open;dashed=1;strokeColor=#999999;fontSize=10;" edge="1" parent="1" source="B4" target="A3"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- submit-cli spawns the -c pipeline -->
+        <mxCell id="eB4C0" value="spawn aios-database -c &lt;config&gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;fontSize=10;fontStyle=1;" edge="1" parent="1" source="B4" target="C0"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- Band C snake chain -->
+        <mxCell id="eC0C1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;" edge="1" parent="1" source="C0" target="C1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC1C2" value="解析完成的 PE" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;fontSize=10;" edge="1" parent="1" source="C1" target="C2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC2C3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;" edge="1" parent="1" source="C2" target="C3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC3C4" value="gen_model?" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;fontSize=10;" edge="1" parent="1" source="C3" target="C4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC4C5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;" edge="1" parent="1" source="C4" target="C5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC5C6" value="export_parquet?" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#cf8b00;fontSize=10;" edge="1" parent="1" source="C5" target="C6"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- C -> storage -->
+        <mxCell id="eC2D1" value="写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C2" target="D1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC3D2" value="写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C3" target="D2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC5D1" value="写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C5" target="D1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC5D3" value="可选写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C5" target="D3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC4D4" value="空间索引" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;dashed=1;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C4" target="D4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC6D1" value="读 SurrealDB" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;startArrow=block;endArrow=none;dashed=1;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C6" target="D1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eC6D5" value="写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#8a64a8;fontSize=10;" edge="1" parent="1" source="C6" target="D5"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- B3 -> SQLite db_index -->
+        <mxCell id="eB3D4" value="db_index 写" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;endArrow=block;strokeColor=#8a64a8;fontSize=10;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="B3" target="D4"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- legend -->
+        <mxCell id="legend" value="图例：实线箭头 = 写/正向流　虚线箭头 = 读/可选/反馈　圆柱 = 持久化存储&#10;说明：①②④ 为常驻进程；③ 为每次解析任务派生的一次性 CLI 子进程（job 完成后自关闭）。&#10;真正的『解析 + 保存』发生在 ③ —— save_db 控制是否落 SurrealDB；gen_model / export_parquet 控制是否生成几何与导出列存。" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#666666;align=left;verticalAlign=middle;fontSize=11;spacingLeft=12;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="20" y="895" width="1240" height="70" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

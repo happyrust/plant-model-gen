@@ -1134,6 +1134,10 @@ pub async fn start_web_server_with_config(
         .route("/api/space/tray-span", post(handlers::api_space_tray_span))
         // SQLite RTree 空间索引：AABB 粗筛查询（供前端按需加载/最近点测量使用）
         .route(
+            "/api/sqlite-spatial/nearby",
+            get(sqlite_spatial_api::api_sqlite_spatial_nearby),
+        )
+        .route(
             "/api/sqlite-spatial/query",
             get(sqlite_spatial_api::api_sqlite_spatial_query),
         )

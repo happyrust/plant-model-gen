@@ -3,7 +3,7 @@
 //! 目标：为 plant3d-web 提供“管道 MBD 标注”所需的结构化数据（段/尺寸/焊缝/坡度）。
 //! 说明：本接口采用“后端提供语义点位 + 前端做屏幕布局/避让”的分层方式，便于渐进式对齐 MBD(PML)。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Mutex;
 
@@ -20,7 +20,7 @@ use axum::{
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MbdPipeSource {
     Db,
@@ -101,6 +101,18 @@ pub struct MbdPipeQuery {
     /// Phase 8: V2 直算开关。true 时走 `build_mbd_v2_pipe_data_direct`，
     /// 从 SurrealDB 直接构建 V2 数据而不经过 V1 generate_mbd_data。默认 false。
     pub v2_direct: bool,
+    /// V2-only 尺寸语义选择。支持逗号分隔：
+    /// `segment,chain,port,cut_tubi,overall`，也接受 `cut-tubi`。
+    #[serde(
+        rename = "dimension-kind",
+        alias = "dimension_kind",
+        alias = "dimension-kinds",
+        alias = "dimension_kinds"
+    )]
+    pub dimension_kind: Option<String>,
+    /// V2 layout 意图。当前仅支持后端 V2 layout；`direct`/`v2_direct` 可显式走直算。
+    #[serde(rename = "layout", alias = "layout_intent")]
+    pub layout: Option<String>,
 }
 
 impl Default for MbdPipeQuery {
@@ -131,6 +143,8 @@ impl Default for MbdPipeQuery {
             include_bends: None,
             bend_mode: MbdBendMode::default(),
             v2_direct: false,
+            dimension_kind: None,
+            layout: None,
         }
     }
 }
@@ -249,6 +263,291 @@ impl MbdPipeQuery {
             bend_mode: self.bend_mode,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MbdV2DimensionKind {
+    Segment,
+    Chain,
+    Overall,
+    Port,
+    CutTubi,
+}
+
+impl MbdV2DimensionKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Segment => "segment",
+            Self::Chain => "chain",
+            Self::Overall => "overall",
+            Self::Port => "port",
+            Self::CutTubi => "cut_tubi",
+        }
+    }
+
+    fn supported_keys() -> &'static [&'static str] {
+        &["segment", "chain", "overall", "port", "cut_tubi"]
+    }
+
+    fn all() -> BTreeSet<Self> {
+        [
+            Self::Segment,
+            Self::Chain,
+            Self::Overall,
+            Self::Port,
+            Self::CutTubi,
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    fn parse(raw: &str) -> Result<Self, String> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "segment" | "segments" => Ok(Self::Segment),
+            "chain" | "chains" => Ok(Self::Chain),
+            "overall" => Ok(Self::Overall),
+            "port" | "ports" => Ok(Self::Port),
+            "cut_tubi" | "cut_tubis" => Ok(Self::CutTubi),
+            other => Err(format!(
+                "unsupported dimension-kind '{other}'; supported values are {}",
+                Self::supported_keys().join(", ")
+            )),
+        }
+    }
+
+    fn from_linear_sub_kind(sub_kind: aios_core::mbd::v2::LinearDimSubKind) -> Self {
+        match sub_kind {
+            aios_core::mbd::v2::LinearDimSubKind::Segment => Self::Segment,
+            aios_core::mbd::v2::LinearDimSubKind::Chain => Self::Chain,
+            aios_core::mbd::v2::LinearDimSubKind::Overall => Self::Overall,
+            aios_core::mbd::v2::LinearDimSubKind::Port => Self::Port,
+            aios_core::mbd::v2::LinearDimSubKind::CutTubi => Self::CutTubi,
+        }
+    }
+
+    fn apply_to_query(kinds: &BTreeSet<Self>, query: &mut MbdPipeQuery) {
+        query.include_dims = Some(kinds.contains(&Self::Segment));
+        query.include_chain_dims = Some(kinds.contains(&Self::Chain));
+        query.include_overall_dim = Some(kinds.contains(&Self::Overall));
+        query.include_port_dims = Some(kinds.contains(&Self::Port));
+        query.include_cut_tubis = Some(kinds.contains(&Self::CutTubi));
+    }
+
+    fn from_query_flags(query: &MbdPipeQuery) -> BTreeSet<Self> {
+        let mut out = BTreeSet::new();
+        if query.include_dims.unwrap_or(false) {
+            out.insert(Self::Segment);
+        }
+        if query.include_chain_dims.unwrap_or(false) {
+            out.insert(Self::Chain);
+        }
+        if query.include_overall_dim.unwrap_or(false) {
+            out.insert(Self::Overall);
+        }
+        if query.include_port_dims.unwrap_or(false) {
+            out.insert(Self::Port);
+        }
+        if query.include_cut_tubis.unwrap_or(false) {
+            out.insert(Self::CutTubi);
+        }
+        out
+    }
+}
+
+fn parse_mbd_v2_dimension_kinds(raw: &str) -> Result<BTreeSet<MbdV2DimensionKind>, String> {
+    let mut out = BTreeSet::new();
+    let mut saw_token = false;
+    for token in raw
+        .split(|c: char| c == ',' || c == ';' || c == '|')
+        .flat_map(|part| part.split_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        saw_token = true;
+        let normalized = token.to_ascii_lowercase().replace('-', "_");
+        if normalized == "all" {
+            out.extend(MbdV2DimensionKind::all());
+        } else {
+            out.insert(MbdV2DimensionKind::parse(token)?);
+        }
+    }
+    if !saw_token {
+        return Err(format!(
+            "dimension-kind cannot be empty; supported values are {}",
+            MbdV2DimensionKind::supported_keys().join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MbdV2LayoutIntent {
+    Backend,
+    BackendDirect,
+}
+
+impl MbdV2LayoutIntent {
+    fn resolve(raw: Option<&str>, v2_direct: bool) -> Result<Self, String> {
+        let parsed = match raw.map(str::trim).filter(|value| !value.is_empty()) {
+            None => None,
+            Some(value) => {
+                let normalized = value.to_ascii_lowercase().replace('-', "_");
+                Some(match normalized.as_str() {
+                    "backend" | "backend_v2" | "layout_first" | "v2" => Self::Backend,
+                    "direct" | "v2_direct" | "backend_direct" | "backend_v2_direct" => {
+                        Self::BackendDirect
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported layout '{other}'; /api/mbd/v2/pipe supports backend, backend_v2, layout_first, direct, and v2_direct"
+                        ));
+                    }
+                })
+            }
+        };
+        Ok(if v2_direct {
+            Self::BackendDirect
+        } else {
+            parsed.unwrap_or(Self::Backend)
+        })
+    }
+
+    fn intent_key(self) -> &'static str {
+        match self {
+            Self::Backend => "layout_first",
+            Self::BackendDirect => "v2_direct",
+        }
+    }
+
+    fn layout_source(self) -> &'static str {
+        match self {
+            Self::Backend => "backend_v2_layout",
+            Self::BackendDirect => "backend_v2_direct_layout",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MbdV2RequestPlan {
+    query: MbdPipeQuery,
+    requested_dimension_kinds: Option<Vec<String>>,
+    effective_dimension_kinds: BTreeSet<MbdV2DimensionKind>,
+    dimension_kind_source: &'static str,
+    layout_intent: MbdV2LayoutIntent,
+    layout_source: &'static str,
+}
+
+impl MbdV2RequestPlan {
+    fn effective_dimension_kind_keys(&self) -> Vec<&'static str> {
+        let mut keys = self
+            .effective_dimension_kinds
+            .iter()
+            .map(|kind| kind.key())
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn response_metadata(
+        &self,
+        input_refno: impl Into<String>,
+        effective_branch_refno: impl Into<String>,
+    ) -> MbdV2ResponseContractMetadata {
+        MbdV2ResponseContractMetadata {
+            input_refno: input_refno.into(),
+            effective_branch_refno: effective_branch_refno.into(),
+            layout_intent: self.layout_intent.intent_key().to_string(),
+            layout_source: self.layout_source.to_string(),
+            dimension_kind_source: self.dimension_kind_source.to_string(),
+            requested_dimension_kinds: self.requested_dimension_kinds.clone(),
+            effective_dimension_kinds: self
+                .effective_dimension_kind_keys()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            v2_direct: self.query.v2_direct,
+        }
+    }
+}
+
+fn has_legacy_dimension_flags(query: &MbdPipeQuery) -> bool {
+    query.include_dims.is_some()
+        || query.include_chain_dims.is_some()
+        || query.include_overall_dim.is_some()
+        || query.include_port_dims.is_some()
+        || query.include_cut_tubis.is_some()
+}
+
+fn resolve_mbd_v2_request_plan(query: MbdPipeQuery) -> Result<MbdV2RequestPlan, String> {
+    if let Some(mode) = query.mode
+        && mode != MbdPipeMode::LayoutFirst
+    {
+        let mode_key = match mode {
+            MbdPipeMode::LayoutFirst => "layout_first",
+            MbdPipeMode::Construction => "construction",
+            MbdPipeMode::Inspection => "inspection",
+        };
+        return Err(format!(
+            "unsupported V2 mode '{mode_key}'; /api/mbd/v2/pipe requires mode=layout_first or an omitted mode"
+        ));
+    }
+
+    let explicit_dimension_kinds = match query.dimension_kind.as_deref() {
+        Some(raw) => Some(parse_mbd_v2_dimension_kinds(raw)?),
+        None => None,
+    };
+    let legacy_dimension_flags = has_legacy_dimension_flags(&query);
+    let layout_intent = MbdV2LayoutIntent::resolve(query.layout.as_deref(), query.v2_direct)?;
+
+    let mut query = query;
+    if let Some(kinds) = explicit_dimension_kinds.as_ref() {
+        MbdV2DimensionKind::apply_to_query(kinds, &mut query);
+    }
+    let mut query = mbd_v2_layout_query(query);
+    if let Some(kinds) = explicit_dimension_kinds.as_ref() {
+        // Keep dimension-kind authoritative even after layout defaults are filled.
+        MbdV2DimensionKind::apply_to_query(kinds, &mut query);
+    }
+    if matches!(layout_intent, MbdV2LayoutIntent::BackendDirect) {
+        query.v2_direct = true;
+    }
+
+    let effective_dimension_kinds = MbdV2DimensionKind::from_query_flags(&query);
+    let requested_dimension_kinds = explicit_dimension_kinds.as_ref().map(|kinds| {
+        kinds
+            .iter()
+            .map(|kind| kind.key().to_string())
+            .collect::<Vec<_>>()
+    });
+    let dimension_kind_source = if explicit_dimension_kinds.is_some() {
+        "dimension-kind"
+    } else if legacy_dimension_flags {
+        "include-flags"
+    } else {
+        "default_layout_first"
+    };
+
+    Ok(MbdV2RequestPlan {
+        query,
+        requested_dimension_kinds,
+        effective_dimension_kinds,
+        dimension_kind_source,
+        layout_intent,
+        layout_source: layout_intent.layout_source(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct MbdV2ResponseContractMetadata {
+    input_refno: String,
+    effective_branch_refno: String,
+    layout_intent: String,
+    layout_source: String,
+    dimension_kind_source: String,
+    requested_dimension_kinds: Option<Vec<String>>,
+    effective_dimension_kinds: Vec<String>,
+    v2_direct: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -518,6 +817,126 @@ fn json_utf8<T: Serialize>(value: T) -> Response {
     res
 }
 
+fn mbd_v2_success_response_value(
+    data: aios_core::mbd::v2::MbdV2PipeData,
+    metadata: &MbdV2ResponseContractMetadata,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(aios_core::mbd::v2::MbdV2Response {
+        success: true,
+        error_message: None,
+        data: Some(data),
+    })
+    .unwrap_or_else(|e| {
+        serde_json::json!({
+            "success": false,
+            "error_message": format!("V2 response serialization failed: {e}"),
+            "data": null
+        })
+    });
+
+    if let Some(data_obj) = value
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        data_obj.insert(
+            "effective_branch_refno".to_string(),
+            serde_json::json!(metadata.effective_branch_refno.clone()),
+        );
+
+        if let Some(meta_obj) = data_obj
+            .get_mut("meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meta_obj.insert(
+                "layout_source".to_string(),
+                serde_json::json!(metadata.layout_source.clone()),
+            );
+            meta_obj.insert(
+                "layout_intent".to_string(),
+                serde_json::json!(metadata.layout_intent.clone()),
+            );
+            meta_obj.insert(
+                "branch_identity".to_string(),
+                serde_json::json!({
+                    "input_refno": metadata.input_refno.clone(),
+                    "effective_branch_refno": metadata.effective_branch_refno.clone(),
+                    "canonical_branch_refno": metadata.effective_branch_refno.clone(),
+                }),
+            );
+            meta_obj.insert(
+                "dimension_kind_request".to_string(),
+                serde_json::json!({
+                    "source": metadata.dimension_kind_source.clone(),
+                    "requested": metadata.requested_dimension_kinds.clone(),
+                    "effective": metadata.effective_dimension_kinds.clone(),
+                }),
+            );
+            meta_obj.insert(
+                "v2_direct".to_string(),
+                serde_json::json!(metadata.v2_direct),
+            );
+        }
+    }
+
+    value
+}
+
+fn mbd_v2_success_response(
+    data: aios_core::mbd::v2::MbdV2PipeData,
+    metadata: &MbdV2ResponseContractMetadata,
+) -> Response {
+    json_utf8(mbd_v2_success_response_value(data, metadata))
+}
+
+fn filter_mbd_v2_dimension_primitives(
+    data: &mut aios_core::mbd::v2::MbdV2PipeData,
+    requested_kinds: &BTreeSet<MbdV2DimensionKind>,
+) {
+    use aios_core::mbd::v2::MbdPrimitive;
+
+    data.primitives.retain(|prim| match prim {
+        MbdPrimitive::LinearDim(dim) => {
+            requested_kinds.contains(&MbdV2DimensionKind::from_linear_sub_kind(dim.sub_kind))
+        }
+        _ => true,
+    });
+    recompute_mbd_v2_dimension_meta(data);
+}
+
+fn recompute_mbd_v2_dimension_meta(data: &mut aios_core::mbd::v2::MbdV2PipeData) {
+    use aios_core::mbd::v2::MbdPrimitive;
+
+    let mut dims_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut visible_dims_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut suppressed_dims_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut welds_count = 0u32;
+
+    for prim in &data.primitives {
+        match prim {
+            MbdPrimitive::LinearDim(dim) => {
+                let key = MbdV2DimensionKind::from_linear_sub_kind(dim.sub_kind)
+                    .key()
+                    .to_string();
+                *dims_by_kind.entry(key.clone()).or_default() += 1;
+                if dim.common.visible {
+                    *visible_dims_by_kind.entry(key).or_default() += 1;
+                } else {
+                    *suppressed_dims_by_kind.entry(key).or_default() += 1;
+                }
+            }
+            MbdPrimitive::WeldMark(_) => welds_count += 1,
+            _ => {}
+        }
+    }
+
+    data.meta.segments_count = dims_by_kind.get("segment").copied().unwrap_or_default();
+    data.meta.welds_count = welds_count;
+    data.meta.dims_by_kind = dims_by_kind;
+    data.meta.visible_dims_by_kind = visible_dims_by_kind;
+    data.meta.suppressed_dims_by_kind = suppressed_dims_by_kind;
+    data.meta.dims_count_basis = "emitted".to_string();
+}
+
 async fn ensure_mbd_surreal_context() -> anyhow::Result<()> {
     let db_option = aios_core::get_db_option();
     if aios_core::use_ns_db_compat(
@@ -573,9 +992,7 @@ async fn get_mbd_pipe_v2(
     Path(refno): Path<String>,
     Query(query): Query<MbdPipeQuery>,
 ) -> impl IntoResponse {
-    use aios_core::mbd::v2::{
-        MbdV2PipelineContext, MbdV2Response, build_mbd_v2_pipe_data, build_mbd_v2_pipe_data_direct,
-    };
+    use aios_core::mbd::v2::{MbdV2PipelineContext, MbdV2Response, build_mbd_v2_pipe_data};
 
     let input_refno_enum = match refno.parse::<RefnoEnum>() {
         Ok(v) => v,
@@ -593,12 +1010,37 @@ async fn get_mbd_pipe_v2(
         Err(_) => input_refno_enum.clone(),
     };
 
-    if query.v2_direct {
-        return get_mbd_pipe_v2_direct(input_refno_enum, branch_refno).await;
+    let plan = match resolve_mbd_v2_request_plan(query) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_utf8(MbdV2Response {
+                success: false,
+                error_message: Some(e),
+                data: None,
+            });
+        }
+    };
+    let response_metadata =
+        plan.response_metadata(input_refno_enum.to_string(), branch_refno.to_string());
+
+    if plan.query.v2_direct {
+        let mut v2_data =
+            match get_mbd_pipe_v2_direct_data(input_refno_enum.clone(), branch_refno.clone()).await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return json_utf8(MbdV2Response {
+                        success: false,
+                        error_message: Some(format!("V2 直算查询失败: {e}")),
+                        data: None,
+                    });
+                }
+            };
+        filter_mbd_v2_dimension_primitives(&mut v2_data, &plan.effective_dimension_kinds);
+        return mbd_v2_success_response(v2_data, &response_metadata);
     }
 
-    let v2_query = mbd_v2_layout_query(query);
-    let mut data = match generate_mbd_data(branch_refno.clone(), &v2_query).await {
+    let mut data = match generate_mbd_data(branch_refno.clone(), &plan.query).await {
         Ok(v) => v,
         Err(e) => {
             return json_utf8(MbdV2Response {
@@ -627,36 +1069,26 @@ async fn get_mbd_pipe_v2(
         branch_attrs: branch_attrs_to_mbd_v2_map(&data.branch_attrs),
         ..MbdV2PipelineContext::production_defaults()
     };
-    let v2_data = build_mbd_v2_pipe_data(layout, &ctx);
+    let mut v2_data = build_mbd_v2_pipe_data(layout, &ctx);
+    filter_mbd_v2_dimension_primitives(&mut v2_data, &plan.effective_dimension_kinds);
 
-    json_utf8(MbdV2Response {
-        success: true,
-        error_message: None,
-        data: Some(v2_data),
-    })
+    mbd_v2_success_response(v2_data, &response_metadata)
 }
 
 /// V2 直算路径（Phase 8）：从 SurrealDB 直接构建 V2 数据，不经过 V1 generate_mbd_data。
 ///
 /// 当前是 scaffold，复用 `fetch_tubi_segments_from_surreal_with_debug` 获取管段数据，
 /// 转换为 `BranchQueryResult` 后调用 `build_mbd_v2_pipe_data_direct`。
-async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: RefnoEnum) -> Response {
+async fn get_mbd_pipe_v2_direct_data(
+    input_refno_enum: RefnoEnum,
+    branch_refno: RefnoEnum,
+) -> anyhow::Result<aios_core::mbd::v2::MbdV2PipeData> {
     use aios_core::mbd::v2::{
-        BranchMember, BranchQueryResult, MbdV2PipelineContext, MbdV2Response,
-        build_mbd_v2_pipe_data_direct,
+        BranchMember, BranchQueryResult, MbdV2PipelineContext, build_mbd_v2_pipe_data_direct,
     };
 
     let (segments, _debug) =
-        match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
-            Ok(v) => v,
-            Err(e) => {
-                return json_utf8(MbdV2Response {
-                    success: false,
-                    error_message: Some(format!("V2 直算查询失败: {e}")),
-                    data: None,
-                });
-            }
-        };
+        fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
 
     let members: Vec<BranchMember> = segments
         .iter()
@@ -703,13 +1135,7 @@ async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: Refno
         ..MbdV2PipelineContext::production_defaults()
     };
 
-    let v2_data = build_mbd_v2_pipe_data_direct(&qr, &ctx);
-
-    json_utf8(MbdV2Response {
-        success: true,
-        error_message: None,
-        data: Some(v2_data),
-    })
+    Ok(build_mbd_v2_pipe_data_direct(&qr, &ctx))
 }
 
 fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
@@ -720,19 +1146,19 @@ fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
     // PML isoDim 的 mainDim 会跳过 TUBI 本体，只按 Head/Tail/管件/焊口等关键点生成
     // 链式尺寸；这里的 `include_dims=true` 会把每段 tubi 几何长度也作为普通尺寸输出，
     // 与链式尺寸和切管长度重复，真实页面会叠成一团。
-    query.include_dims = Some(false);
-    query.include_chain_dims = Some(true);
+    query.include_dims.get_or_insert(false);
+    query.include_chain_dims.get_or_insert(true);
     // 当前 LayoutResult 只能表达单条直线尺寸；折线 BRAN 的 overall 是路径总长，
     // 不能用“首尾直连”的一条 linear_dim 表达，先关闭，避免显示 43135 但几何跨度很短。
-    query.include_overall_dim = Some(false);
-    query.include_port_dims = Some(true);
-    query.include_welds = Some(true);
-    query.include_slopes = Some(true);
-    query.include_bends = Some(true);
-    query.include_cut_tubis = Some(true);
-    query.include_fittings = Some(true);
-    query.include_tags = Some(true);
-    query.include_layout_hints = Some(true);
+    query.include_overall_dim.get_or_insert(false);
+    query.include_port_dims.get_or_insert(true);
+    query.include_welds.get_or_insert(true);
+    query.include_slopes.get_or_insert(true);
+    query.include_bends.get_or_insert(true);
+    query.include_cut_tubis.get_or_insert(true);
+    query.include_fittings.get_or_insert(true);
+    query.include_tags.get_or_insert(true);
+    query.include_layout_hints.get_or_insert(true);
     query.include_branch_attrs = true;
     query.include_weld_nouns = true;
     query
@@ -3524,6 +3950,133 @@ mod tests {
         assert!(resolved.include_fittings);
         assert!(resolved.include_tags);
         assert!(resolved.include_layout_hints);
+    }
+
+    #[test]
+    fn test_mbd_v2_dimension_kind_query_overrides_dimension_flags() {
+        let plan = resolve_mbd_v2_request_plan(MbdPipeQuery {
+            dimension_kind: Some("segment,chain".to_string()),
+            include_port_dims: Some(true),
+            include_cut_tubis: Some(true),
+            ..Default::default()
+        })
+        .expect("valid V2 dimension-kind plan");
+
+        assert_eq!(plan.layout_source, "backend_v2_layout");
+        assert_eq!(plan.dimension_kind_source, "dimension-kind");
+        assert_eq!(
+            plan.effective_dimension_kind_keys(),
+            vec!["chain", "segment"]
+        );
+        assert_eq!(plan.query.mode, Some(MbdPipeMode::LayoutFirst));
+        assert_eq!(plan.query.include_dims, Some(true));
+        assert_eq!(plan.query.include_chain_dims, Some(true));
+        assert_eq!(plan.query.include_port_dims, Some(false));
+        assert_eq!(plan.query.include_cut_tubis, Some(false));
+        assert_eq!(plan.query.include_overall_dim, Some(false));
+    }
+
+    #[test]
+    fn test_mbd_v2_invalid_dimension_kind_is_reported() {
+        let err = resolve_mbd_v2_request_plan(MbdPipeQuery {
+            dimension_kind: Some("segment,banana".to_string()),
+            ..Default::default()
+        })
+        .expect_err("invalid dimension-kind should fail the V2 request plan");
+
+        assert!(err.contains("unsupported dimension-kind"));
+        assert!(err.contains("banana"));
+    }
+
+    #[test]
+    fn test_mbd_v2_non_layout_first_mode_is_reported() {
+        let err = resolve_mbd_v2_request_plan(MbdPipeQuery {
+            mode: Some(MbdPipeMode::Inspection),
+            ..Default::default()
+        })
+        .expect_err("V2 endpoint should reject non-layout-first modes");
+
+        assert!(err.contains("unsupported V2 mode"));
+        assert!(err.contains("inspection"));
+        assert!(err.contains("mode=layout_first"));
+    }
+
+    #[test]
+    fn test_mbd_v2_layout_query_honors_explicit_include_flags() {
+        let query = mbd_v2_layout_query(MbdPipeQuery {
+            include_dims: Some(true),
+            include_port_dims: Some(false),
+            include_cut_tubis: Some(false),
+            ..Default::default()
+        });
+
+        assert_eq!(query.mode, Some(MbdPipeMode::LayoutFirst));
+        assert_eq!(query.source, MbdPipeSource::Db);
+        assert_eq!(query.include_dims, Some(true));
+        assert_eq!(query.include_chain_dims, Some(true));
+        assert_eq!(query.include_port_dims, Some(false));
+        assert_eq!(query.include_cut_tubis, Some(false));
+        assert_eq!(query.include_overall_dim, Some(false));
+    }
+
+    #[test]
+    fn test_mbd_v2_success_response_metadata_is_v2_only_and_explicit() {
+        let data = aios_core::mbd::v2::MbdV2PipeData {
+            version: "v2".to_string(),
+            input_refno: "24381_145018".to_string(),
+            branch_refno: "24381_145018".to_string(),
+            primitives: Vec::new(),
+            meta: aios_core::mbd::v2::MbdV2Meta::default(),
+            issues: Vec::new(),
+        };
+        let metadata = MbdV2ResponseContractMetadata {
+            input_refno: "24381_145018".to_string(),
+            effective_branch_refno: "24381_145018".to_string(),
+            layout_intent: "layout_first".to_string(),
+            layout_source: "backend_v2_layout".to_string(),
+            dimension_kind_source: "dimension-kind".to_string(),
+            requested_dimension_kinds: Some(vec!["chain".to_string()]),
+            effective_dimension_kinds: vec!["chain".to_string()],
+            v2_direct: false,
+        };
+
+        let value = mbd_v2_success_response_value(data, &metadata);
+        let data = value
+            .get("data")
+            .and_then(Value::as_object)
+            .expect("V2 data object");
+        let meta = data
+            .get("meta")
+            .and_then(Value::as_object)
+            .expect("V2 metadata object");
+
+        assert_eq!(data.get("version").and_then(Value::as_str), Some("v2"));
+        assert!(data.get("primitives").is_some());
+        assert!(data.get("issues").is_some());
+        assert!(data.get("dims").is_none());
+        assert!(data.get("segments").is_none());
+        assert!(data.get("layout_result").is_none());
+        assert_eq!(
+            data.get("effective_branch_refno").and_then(Value::as_str),
+            Some("24381_145018")
+        );
+        assert_eq!(
+            meta.get("layout_source").and_then(Value::as_str),
+            Some("backend_v2_layout")
+        );
+        assert_eq!(
+            meta.get("branch_identity")
+                .and_then(|v| v.get("input_refno"))
+                .and_then(Value::as_str),
+            Some("24381_145018")
+        );
+        assert_eq!(
+            meta.get("dimension_kind_request")
+                .and_then(|v| v.get("effective"))
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["chain"])
+        );
     }
 
     #[test]

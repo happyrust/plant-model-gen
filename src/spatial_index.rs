@@ -61,7 +61,7 @@ impl SqliteSpatialIndex {
     }
 
     pub fn get_stats(&self) -> anyhow::Result<SpatialIndexStats> {
-        let conn = Connection::open(self.inner.path())?;
+        let conn = self.inner.open_read_connection()?;
         let total: i64 = conn.query_row("SELECT COUNT(1) FROM aabb_index", [], |row| row.get(0))?;
         Ok(SpatialIndexStats {
             total_elements: usize::try_from(total.max(0)).unwrap_or(0),
@@ -70,7 +70,7 @@ impl SqliteSpatialIndex {
     }
 
     pub fn get_aabb(&self, refno: RefU64) -> anyhow::Result<Option<Aabb>> {
-        let conn = Connection::open(self.inner.path())?;
+        let conn = self.inner.open_read_connection()?;
         let mut stmt = conn.prepare(
             "SELECT min_x, max_x, min_y, max_y, min_z, max_z FROM aabb_index WHERE id = ?1",
         )?;
@@ -106,7 +106,7 @@ impl SqliteSpatialIndex {
     }
 
     pub fn get_noun(&self, refno: RefU64) -> anyhow::Result<Option<String>> {
-        let conn = Connection::open(self.inner.path())?;
+        let conn = self.inner.open_read_connection()?;
         let noun: Option<String> = conn
             .query_row(
                 "SELECT noun FROM items WHERE id = ?1",

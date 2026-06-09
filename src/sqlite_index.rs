@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "sqlite-index")]
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OpenFlags, Result, params};
 
 // Minimal SQLite-based AABB index using the SQLite RTree virtual table.
 // This module is feature-gated behind `sqlite-index` and can be integrated
@@ -24,6 +24,19 @@ impl SqliteAabbIndex {
         Self::configure(&conn)?;
         drop(conn);
         Ok(this)
+    }
+
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        drop(conn);
+        Ok(SqliteAabbIndex {
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn open_read_connection(&self) -> Result<Connection> {
+        Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
     }
 
     fn configure(conn: &Connection) -> Result<()> {
@@ -92,7 +105,7 @@ impl SqliteAabbIndex {
         minz: f64,
         maxz: f64,
     ) -> Result<Vec<i64>> {
-        let conn = Connection::open(&self.path)?;
+        let conn = self.open_read_connection()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM aabb_index \
              WHERE min_x <= ?2 AND max_x >= ?1 \
@@ -109,9 +122,38 @@ impl SqliteAabbIndex {
         Ok(ids)
     }
 
+    pub fn query_intersect_limited(
+        &self,
+        minx: f64,
+        maxx: f64,
+        miny: f64,
+        maxy: f64,
+        minz: f64,
+        maxz: f64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let conn = self.open_read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM aabb_index \
+             WHERE min_x <= ?2 AND max_x >= ?1 \
+               AND min_y <= ?4 AND max_y >= ?3 \
+               AND min_z <= ?6 AND max_z >= ?5 \
+             ORDER BY id \
+             LIMIT ?7",
+        )?;
+        let rows = stmt.query_map((minx, maxx, miny, maxy, minz, maxz, limit as i64), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        let mut ids = Vec::new();
+        for r in rows {
+            ids.push(r?);
+        }
+        Ok(ids)
+    }
+
     // Optional: range query on X for scanning.
     pub fn query_range_x(&self, minx: f64, maxx: f64) -> Result<Vec<i64>> {
-        let conn = Connection::open(&self.path)?;
+        let conn = self.open_read_connection()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM aabb_index \
              WHERE min_x <= ?2 AND max_x >= ?1",
@@ -126,7 +168,7 @@ impl SqliteAabbIndex {
 
     // Query all AABBs: returns all (id, min_x, max_x, min_y, max_y, min_z, max_z) tuples
     pub fn query_all_aabbs(&self) -> Result<Vec<(i64, f64, f64, f64, f64, f64, f64)>> {
-        let conn = Connection::open(&self.path)?;
+        let conn = self.open_read_connection()?;
         let mut stmt =
             conn.prepare("SELECT id, min_x, max_x, min_y, max_y, min_z, max_z FROM aabb_index")?;
         let rows = stmt.query_map([], |row| {
@@ -1555,6 +1597,34 @@ mod tests {
         assert!(ids.contains(&1) && ids.contains(&2) && !ids.contains(&3));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn query_intersect_limited_caps_results_deterministically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("limited.sqlite");
+        let idx = SqliteAabbIndex::open(&path).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_many(vec![
+            (3, 0.0, 10.0, 0.0, 5.0, -5.0, 5.0),
+            (1, 0.0, 10.0, 0.0, 5.0, -5.0, 5.0),
+            (2, 0.0, 10.0, 0.0, 5.0, -5.0, 5.0),
+        ])
+        .unwrap();
+
+        let ids = idx
+            .query_intersect_limited(4.0, 6.0, 1.0, 3.0, -1.0, 1.0, 2)
+            .unwrap();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn open_existing_does_not_create_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing").join("spatial_index.sqlite");
+
+        assert!(SqliteAabbIndex::open_existing(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[cfg(feature = "parquet-export")]

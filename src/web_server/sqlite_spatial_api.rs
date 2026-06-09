@@ -19,10 +19,10 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use surrealdb::types::SurrealValue;
@@ -32,9 +32,10 @@ use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
 const DEFAULT_DISTANCE: f32 = 0.0;
 const DEFAULT_MAX_HITS: usize = 5000;
 const HARD_MAX_HITS: usize = 10_000;
+const HARD_MAX_PAGE: usize = 100_000;
 
 // ============================================================================
-// 全局惰性初始化索引（避免每次请求重新打开文件）
+// SQLite index path resolution and read-only opening helpers
 // ============================================================================
 
 struct CachedIndex {
@@ -56,11 +57,30 @@ fn test_guard() -> &'static Mutex<()> {
 
 fn get_cached_index() -> Result<CachedIndex, String> {
     let path = sqlite_index_path();
-    let idx =
-        SqliteAabbIndex::open(&path).map_err(|e| format!("open sqlite index failed: {}", e))?;
-    idx.init_schema()
-        .map_err(|e| format!("init sqlite schema failed: {}", e))?;
+    if !path.exists() {
+        return Err(format!(
+            "sqlite spatial index not found: {}",
+            path.display()
+        ));
+    }
+    if !path.is_file() {
+        return Err(format!(
+            "sqlite spatial index path is not a file: {}",
+            path.display()
+        ));
+    }
+    let idx = SqliteAabbIndex::open_existing(&path).map_err(|e| {
+        format!(
+            "open sqlite spatial index read-only failed at {}: {}",
+            path.display(),
+            e
+        )
+    })?;
     Ok(CachedIndex { idx, path })
+}
+
+fn open_sqlite_readonly(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
 // ============================================================================
@@ -200,7 +220,17 @@ pub struct SpatialNearbyResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_candidates: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_results: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_cap: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_cap: Option<usize>,
     pub error: Option<String>,
 }
 
@@ -241,6 +271,7 @@ struct NearbyQueryRequest {
     include_self: bool,
     page: usize,
     per_page: usize,
+    max_results: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -390,21 +421,6 @@ fn aabb_from_bbox_params(p: &SqliteSpatialQueryParams) -> Result<Aabb, String> {
     ))
 }
 
-fn aabb_dto_from_row(minx: f32, miny: f32, minz: f32, maxx: f32, maxy: f32, maxz: f32) -> AabbDto {
-    AabbDto {
-        min: Vec3Dto {
-            x: minx,
-            y: miny,
-            z: minz,
-        },
-        max: Vec3Dto {
-            x: maxx,
-            y: maxy,
-            z: maxz,
-        },
-    }
-}
-
 fn aabb_to_dto(aabb: &Aabb) -> AabbDto {
     AabbDto {
         min: Vec3Dto {
@@ -489,6 +505,27 @@ fn parse_positive_usize_param(
         )));
     }
     Ok(parsed)
+}
+
+fn parse_limited_usize_param(
+    value: Option<&str>,
+    name: &str,
+    default: usize,
+    hard_max: usize,
+) -> Result<usize, NearbyApiError> {
+    let parsed = parse_positive_usize_param(value, name, default)?;
+    Ok(parsed.min(hard_max))
+}
+
+fn parse_page_param(value: Option<&str>) -> Result<usize, NearbyApiError> {
+    let page = parse_positive_usize_param(value, "page", 1)?;
+    if page > HARD_MAX_PAGE {
+        return Err(NearbyApiError::bad_request(format!(
+            "invalid page: must be <= {}",
+            HARD_MAX_PAGE
+        )));
+    }
+    Ok(page)
 }
 
 fn parse_nearby_shape(shape: Option<&str>) -> Result<NearbyShape, NearbyApiError> {
@@ -612,23 +649,38 @@ fn parse_nearby_request(
     let shape = parse_nearby_shape(non_empty_param(&params.shape))?;
     let include_self =
         parse_nearby_bool(non_empty_param(&params.include_self), "include_self", false)?;
-    let page = parse_positive_usize_param(non_empty_param(&params.page), "page", 1)?;
-    let per_page_default = non_empty_param(&params.max_results)
+    let page = parse_page_param(non_empty_param(&params.page))?;
+    let explicit_per_page = non_empty_param(&params.per_page)
         .map(|_| {
-            parse_positive_usize_param(
+            parse_limited_usize_param(
+                non_empty_param(&params.per_page),
+                "per_page",
+                DEFAULT_MAX_HITS,
+                HARD_MAX_HITS,
+            )
+        })
+        .transpose()?;
+    let explicit_max_results = non_empty_param(&params.max_results)
+        .map(|_| {
+            parse_limited_usize_param(
                 non_empty_param(&params.max_results),
                 "max_results",
                 DEFAULT_MAX_HITS,
+                HARD_MAX_HITS,
             )
         })
-        .transpose()?
-        .unwrap_or(DEFAULT_MAX_HITS);
-    let per_page = parse_positive_usize_param(
-        non_empty_param(&params.per_page),
-        "per_page",
-        per_page_default,
-    )?
-    .min(HARD_MAX_HITS);
+        .transpose()?;
+    let max_results = explicit_max_results
+        .unwrap_or_else(|| {
+            explicit_per_page
+                .unwrap_or(DEFAULT_MAX_HITS)
+                .max(DEFAULT_MAX_HITS)
+        })
+        .min(HARD_MAX_HITS);
+    let per_page = explicit_per_page
+        .unwrap_or_else(|| explicit_max_results.unwrap_or(DEFAULT_MAX_HITS))
+        .min(max_results)
+        .min(HARD_MAX_HITS);
 
     Ok(NearbyQueryRequest {
         center,
@@ -639,6 +691,7 @@ fn parse_nearby_request(
         include_self,
         page,
         per_page,
+        max_results,
     })
 }
 
@@ -711,7 +764,12 @@ fn error_nearby_result(error: impl Into<String>) -> SpatialNearbyResult {
         page: None,
         per_page: None,
         has_more: None,
+        truncated: None,
         truncated_candidates: None,
+        truncated_results: None,
+        candidate_count: None,
+        candidate_cap: None,
+        result_cap: None,
         error: Some(error.into()),
     }
 }
@@ -720,12 +778,21 @@ fn nearby_error_response(error: NearbyApiError) -> Response {
     (error.status, Json(error_nearby_result(error.message))).into_response()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct NearbyQueryMetadata {
+    candidate_count: usize,
+    candidate_cap: usize,
+    truncated_candidates: bool,
+    truncated_results: bool,
+}
+
 fn success_nearby_result(
     request: &NearbyQueryRequest,
     center: &ResolvedNearbyCenter,
     query_bbox: AabbDto,
     results: Vec<SpatialQueryResultItem>,
     total_count: usize,
+    metadata: NearbyQueryMetadata,
 ) -> SpatialNearbyResult {
     let returned_count = results.len();
     let end = request
@@ -753,7 +820,12 @@ fn success_nearby_result(
         page: Some(request.page),
         per_page: Some(request.per_page),
         has_more: Some(has_more),
-        truncated_candidates: Some(false),
+        truncated: Some(has_more || metadata.truncated_candidates || metadata.truncated_results),
+        truncated_candidates: Some(metadata.truncated_candidates),
+        truncated_results: Some(metadata.truncated_results),
+        candidate_count: Some(metadata.candidate_count),
+        candidate_cap: Some(metadata.candidate_cap),
+        result_cap: Some(request.max_results),
         error: None,
     }
 }
@@ -1057,19 +1129,25 @@ fn do_nearby_query(
 
     let mut ids = cached
         .idx
-        .query_intersect(
+        .query_intersect_limited(
             query_aabb.mins.x as f64,
             query_aabb.maxs.x as f64,
             query_aabb.mins.y as f64,
             query_aabb.maxs.y as f64,
             query_aabb.mins.z as f64,
             query_aabb.maxs.z as f64,
+            HARD_MAX_HITS.saturating_add(1),
         )
         .map_err(|e| NearbyApiError::internal(format!("query_intersect failed: {}", e)))?;
     ids.sort_unstable();
     ids.dedup();
+    let truncated_candidates = ids.len() > HARD_MAX_HITS;
+    if truncated_candidates {
+        ids.truncate(HARD_MAX_HITS);
+    }
+    let candidate_count = ids.len();
 
-    let conn = Connection::open(&cached.path).map_err(|e| {
+    let conn = open_sqlite_readonly(&cached.path).map_err(|e| {
         NearbyApiError::service_unavailable(format!("open sqlite connection failed: {}", e))
     })?;
     let candidate_rows = query_nearby_candidate_rows(&conn, &ids)
@@ -1117,6 +1195,10 @@ fn do_nearby_query(
         (None, None) => a.refno.cmp(&b.refno),
     });
 
+    let truncated_results = results.len() > request.max_results;
+    if truncated_results {
+        results.truncate(request.max_results);
+    }
     let total_count = results.len();
     let offset = request
         .page
@@ -1138,6 +1220,12 @@ fn do_nearby_query(
         query_bbox_dto,
         page_results,
         total_count,
+        NearbyQueryMetadata {
+            candidate_count,
+            candidate_cap: HARD_MAX_HITS,
+            truncated_candidates,
+            truncated_results,
+        },
     ))
 }
 
@@ -1213,7 +1301,7 @@ async fn query_refno_visible_inst_ids_for_fallback(
     };
 
     let cached = get_cached_index()?;
-    let conn = Connection::open(&cached.path)
+    let conn = open_sqlite_readonly(&cached.path)
         .map_err(|e| format!("open sqlite connection failed: {}", e))?;
     if query_aabb_row(&conn, id)
         .map_err(|e| format!("query refno aabb failed: {}", e))?
@@ -1267,14 +1355,10 @@ fn aabb_from_row(minx: f32, miny: f32, minz: f32, maxx: f32, maxy: f32, maxz: f3
 }
 
 fn query_aabbs_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<Aabb>> {
-    let mut out = Vec::new();
-    for id in ids {
-        let Some((minx, miny, minz, maxx, maxy, maxz)) = query_aabb_row(conn, *id)? else {
-            continue;
-        };
-        out.push(aabb_from_row(minx, miny, minz, maxx, maxy, maxz));
-    }
-    Ok(out)
+    Ok(query_nearby_candidate_rows(conn, ids)?
+        .into_iter()
+        .map(|row| row.aabb)
+        .collect())
 }
 
 fn do_spatial_query(
@@ -1354,7 +1438,7 @@ fn do_spatial_query(
             return error_spatial_query_result("invalid refno format (expected dbnum_refno)", None);
         };
         // 查询该 refno 的 bbox（使用独立连接避免长期占用）
-        let conn = match Connection::open(&cached.path) {
+        let conn = match open_sqlite_readonly(&cached.path) {
             Ok(c) => c,
             Err(e) => {
                 return error_spatial_query_result(
@@ -1529,7 +1613,7 @@ fn query_by_target_aabbs(
     let query_bbox_dto = query_aabb.as_ref().map(aabb_to_dto);
 
     // 打开连接获取 noun 和 aabb 信息（使用 prepared statements 批量查询）
-    let conn = match Connection::open(&cached.path) {
+    let conn = match open_sqlite_readonly(&cached.path) {
         Ok(c) => c,
         Err(e) => {
             return error_spatial_query_result(
@@ -1539,95 +1623,54 @@ fn query_by_target_aabbs(
         }
     };
 
-    let mut stmt_item = match conn.prepare("SELECT noun, spec_value FROM items WHERE id = ?1") {
-        Ok(s) => s,
+    let candidate_rows = match query_nearby_candidate_rows(&conn, &ids) {
+        Ok(rows) => rows,
         Err(e) => {
             return error_spatial_query_result(
-                format!("prepare item stmt failed: {}", e),
-                query_bbox_dto.clone(),
-            );
-        }
-    };
-    let mut stmt_aabb = match conn
-        .prepare("SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1")
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return error_spatial_query_result(
-                format!("prepare aabb stmt failed: {}", e),
+                format!("query candidate rows failed: {}", e),
                 query_bbox_dto.clone(),
             );
         }
     };
 
-    let mut results: Vec<SpatialQueryResultItem> = Vec::with_capacity(ids.len().min(1024));
+    let mut results: Vec<SpatialQueryResultItem> =
+        Vec::with_capacity(candidate_rows.len().min(1024));
 
-    for id in ids {
+    for row in candidate_rows {
         // include_self 过滤
         if let Some(self_id) = self_id {
-            if id == self_id {
+            if row.id == self_id {
                 continue;
             }
         }
 
-        let item_row: Option<(String, i64)> = stmt_item
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1).unwrap_or(0))))
-            .optional()
-            .unwrap_or(None);
-        let (noun, spec_value) = item_row.unwrap_or_else(|| ("UNKNOWN".to_string(), 0));
-
         // noun 过滤
         if let Some(ref filter) = noun_filter {
-            if !filter.contains(&noun.to_uppercase()) {
+            if !filter.contains(&row.noun.to_uppercase()) {
                 continue;
             }
         }
 
         if let Some(ref filter) = spec_value_filter {
-            if !filter.contains(&spec_value) {
+            if !filter.contains(&row.spec_value) {
                 continue;
             }
         }
 
-        let aabb_row: Option<(f32, f32, f32, f32, f32, f32)> = stmt_aabb
-            .query_row([id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })
-            .optional()
-            .unwrap_or(None);
-
         // 计算候选 AABB 到目标 AABB/点的最小距离，避免长模型因中心点较远被误排除。
-        let distance = if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
-            let candidate_aabb = aabb_from_row(minx, miny, minz, maxx, maxy, maxz);
-            let min_distance = min_distance_to_targets(&candidate_aabb, &target_aabbs);
+        let min_distance = min_distance_to_targets(&row.aabb, &target_aabbs);
 
-            if is_sphere && min_distance > search_distance {
-                continue;
-            }
+        if is_sphere && min_distance > search_distance {
+            continue;
+        }
 
-            Some(min_distance)
-        } else {
-            None
-        };
-
-        let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| {
-            aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz)
-        });
-
-        let refno = i64_to_refno_str(id as i64);
+        let refno = i64_to_refno_str(row.id);
         results.push(SpatialQueryResultItem {
             refno,
-            noun,
-            spec_value,
-            aabb,
-            distance,
+            noun: row.noun,
+            spec_value: row.spec_value,
+            aabb: Some(aabb_to_dto(&row.aabb)),
+            distance: Some(min_distance),
         });
     }
 
@@ -1694,7 +1737,7 @@ fn do_spatial_stats() -> SpatialStatsResult {
     };
 
     // 查询总元素数
-    let conn = match Connection::open(&cached.path) {
+    let conn = match open_sqlite_readonly(&cached.path) {
         Ok(c) => c,
         Err(e) => {
             return SpatialStatsResult {
@@ -2139,6 +2182,155 @@ mod tests {
         assert_eq!(resp.per_page, Some(1));
         assert_eq!(resp.has_more, Some(false));
         assert_eq!(resp.results.as_ref().unwrap()[0].refno, "1_21");
+    }
+
+    #[test]
+    fn nearby_limit_params_are_validated_and_clamped() {
+        let mut params = nearby_params();
+        params.x = Some("0".to_string());
+        params.y = Some("0".to_string());
+        params.z = Some("0".to_string());
+        params.radius = Some("10".to_string());
+        params.max_results = Some("2".to_string());
+        let request = parse_nearby_request(&params).unwrap();
+        assert_eq!(request.per_page, 2);
+        assert_eq!(request.max_results, 2);
+
+        params.max_results = None;
+        params.per_page = Some("20000".to_string());
+        let request = parse_nearby_request(&params).unwrap();
+        assert_eq!(request.per_page, HARD_MAX_HITS);
+        assert_eq!(request.max_results, HARD_MAX_HITS);
+
+        params.per_page = Some("0".to_string());
+        assert!(
+            parse_nearby_request(&params)
+                .unwrap_err()
+                .message
+                .contains("per_page")
+        );
+
+        params.per_page = Some("1".to_string());
+        params.max_results = Some("0".to_string());
+        assert!(
+            parse_nearby_request(&params)
+                .unwrap_err()
+                .message
+                .contains("max_results")
+        );
+
+        params.max_results = None;
+        params.page = Some((HARD_MAX_PAGE + 1).to_string());
+        assert!(
+            parse_nearby_request(&params)
+                .unwrap_err()
+                .message
+                .contains("page")
+        );
+    }
+
+    #[test]
+    fn nearby_caps_results_and_reports_truncation_metadata() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values((1_u64..=5).map(|refno| {
+            (
+                ((1_u64 << 32) | refno) as i64,
+                "PIPE".to_string(),
+                1,
+                refno as f64,
+                refno as f64 + 0.5,
+                0.0,
+                0.5,
+                0.0,
+                0.5,
+            )
+        }))
+        .unwrap();
+
+        let mut params = nearby_params();
+        params.x = Some("0".to_string());
+        params.y = Some("0".to_string());
+        params.z = Some("0".to_string());
+        params.radius = Some("100".to_string());
+        params.max_results = Some("2".to_string());
+        let request = parse_nearby_request(&params).unwrap();
+
+        let resp = with_test_index(&db, || {
+            do_nearby_query(request, resolved_point(0.0, 0.0, 0.0)).unwrap()
+        });
+        assert!(resp.success);
+        assert_eq!(resp.returned_count, Some(2));
+        assert_eq!(resp.total_count, Some(2));
+        assert_eq!(resp.result_cap, Some(2));
+        assert_eq!(resp.candidate_count, Some(5));
+        assert_eq!(resp.candidate_cap, Some(HARD_MAX_HITS));
+        assert_eq!(resp.truncated_results, Some(true));
+        assert_eq!(resp.truncated_candidates, Some(false));
+        assert_eq!(resp.results.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn nearby_truncates_candidates_before_loading_rows() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values((1_u64..=(HARD_MAX_HITS as u64 + 1)).map(
+            |refno| {
+                (
+                    ((1_u64 << 32) | refno) as i64,
+                    "PIPE".to_string(),
+                    1,
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0,
+                )
+            },
+        ))
+        .unwrap();
+
+        let request = point_nearby_request(0, 0, 0, 10, Some("cube"));
+        let resp = with_test_index(&db, || {
+            do_nearby_query(request, resolved_point(0.0, 0.0, 0.0)).unwrap()
+        });
+        assert!(resp.success);
+        assert_eq!(resp.candidate_count, Some(HARD_MAX_HITS));
+        assert_eq!(resp.candidate_cap, Some(HARD_MAX_HITS));
+        assert_eq!(resp.truncated_candidates, Some(true));
+    }
+
+    #[test]
+    fn missing_index_path_returns_explicit_error_without_creating_file() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("missing").join("spatial_index.sqlite");
+
+        let err = with_test_index(&db, || {
+            do_nearby_query(
+                point_nearby_request(0, 0, 0, 10, None),
+                resolved_point(0.0, 0.0, 0.0),
+            )
+            .unwrap_err()
+        });
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.message.contains("not found"));
+        assert!(!db.exists());
+
+        let stats = with_test_index(&db, do_spatial_stats);
+        assert!(!stats.success);
+        assert!(
+            stats
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not found")
+        );
+        assert!(!db.exists());
     }
 
     #[test]

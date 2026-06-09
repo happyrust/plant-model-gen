@@ -352,6 +352,7 @@ pub async fn save_pes(
 
 #[cfg(all(test, feature = "surreal-save"))]
 #[tokio::test]
+#[ignore = "requires initialized SurrealDB test data and mutates shared test state"]
 async fn test_query_pe_with_children() -> anyhow::Result<()> {
     // 初始化 SurrealDB 连接
     let _ = aios_core::init_test_surreal().await;

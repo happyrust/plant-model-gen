@@ -2,6 +2,16 @@
 
 ## 2026-06-09
 
+### Fixed — 受管站点进程清理、配置 URL 与空间索引刷新
+
+> 受管站点 stop/delete 与 sidecar job 取消路径补齐进程树清理；站点配置与平台配置统一推导真实前端/API 地址；模型生成后在启用空间树时刷新 SQLite spatial index 并聚合中间节点 AABB。
+
+- `parse_sidecar.rs` / `parse_sidecar_client.rs` / `managed_project_sites.rs`：sidecar 与 CLI job 记录 PID/start token，取消或站点停止时按进程组/进程树终止，并清理站点级孤儿 sidecar；sidecar 启动时隔离继承的 Surreal 连接环境变量。
+- `config.rs` / `web_listen.rs` / `ui/admin/src/types/site.ts`：平台前端地址优先读取站点显式配置，缺省时从 web_server 监听配置推导真实可访问地址；站点身份接口补充 `api_base_url`。
+- `orchestrator.rs` / `room_model.rs` / `export_dbnum_instances_parquet.rs`：空间树生成后主动刷新 SQLite 空间索引，房间计算默认使用 Surreal 查询路径，并修正实例关系查询字段。
+- `resource/surreal/*.surql` 与 review workflow 脚本：函数定义改为 `DEFINE FUNCTION OVERWRITE`，修正 room code 关系查询和 Surreal CLI `--endpoint` 参数。
+- `scripts/package/*.bat` / `web_console`：Windows 端口清理只终止目标 `web_server.exe`，空间查询前端补齐 wall-distance 请求字段。
+
 ### Fixed — Quicktest Viewer 入口、离线 DuckDB 扩展与模型聚焦
 
 > 受管站点 Viewer 改为使用分配的前端端口和 Nginx 代理，不再依赖 `backend=` 查询参数；release Viewer 完整本地化 DuckDB Parquet 扩展，避免运行时访问公网 `extensions.duckdb.org`；前端模型聚焦忽略少量远端离群对象，避免全量 AABB 过大导致主体不可见。

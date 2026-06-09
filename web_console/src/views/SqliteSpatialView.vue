@@ -118,8 +118,10 @@ async function runFittingOffset() {
 
 async function runWallDistance() {
   await runAction(wallDistance, () => {
-    const payload: Record<string, unknown> = {
-      suppo_refno: wallDistance.suppoRefno.trim(),
+    const sourceRefno = wallDistance.suppoRefno.trim();
+    const payload: Parameters<typeof postWallDistance>[0] = {
+      source_refno: sourceRefno,
+      suppo_refno: sourceRefno,
     };
     if (wallDistance.suppoType?.trim()) payload.suppo_type = wallDistance.suppoType.trim();
     attachOptionalNumber(payload, 'search_radius', wallDistance.searchRadius);
@@ -128,7 +130,7 @@ async function runWallDistance() {
       .map((item) => item.trim())
       .filter(Boolean);
     if (targetNouns?.length) payload.target_nouns = targetNouns;
-    return postWallDistance(payload as Parameters<typeof postWallDistance>[0]);
+    return postWallDistance(payload);
   });
 }
 

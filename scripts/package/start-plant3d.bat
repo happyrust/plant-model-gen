@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 
 set "ADMIN_USER=admin"
 set "ADMIN_PASS=admin"
@@ -127,10 +127,9 @@ if "%REQUIRE_NGINX_EXPLICIT%"=="0" (
 set "ROOT=%~dp0"
 set "KILL_PORTS_BAT=%ROOT%kill-plant3d-ports.bat"
 if exist "%KILL_PORTS_BAT%" (
-    call "%KILL_PORTS_BAT%" %PORT% 10
+    call "%KILL_PORTS_BAT%" %PORT% 1
 ) else (
     call :kill_port_listeners %PORT%
-    call :kill_web_server_processes
 )
 goto after_port_cleanup
 
@@ -139,14 +138,16 @@ set "TARGET_PORT=%~1"
 if "%TARGET_PORT%"=="" exit /b 0
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":%TARGET_PORT% " ^| findstr "LISTENING"') do (
     if not "%%P"=="0" (
-        echo [kill-port] port %TARGET_PORT% PID=%%P
-        taskkill /F /PID %%P >nul 2>nul
+        set "IMAGE_NAME="
+        for /f "tokens=1" %%I in ('tasklist /FI "PID eq %%P" /NH 2^>nul') do set "IMAGE_NAME=%%I"
+        if /I "!IMAGE_NAME!"=="web_server.exe" (
+            echo [kill-port] port %TARGET_PORT% PID=%%P image=!IMAGE_NAME!
+            taskkill /F /PID %%P >nul 2>nul
+        ) else (
+            echo [skip-port] port %TARGET_PORT% PID=%%P image=!IMAGE_NAME!
+        )
     )
 )
-exit /b 0
-
-:kill_web_server_processes
-taskkill /F /IM web_server.exe >nul 2>nul
 exit /b 0
 
 :after_port_cleanup

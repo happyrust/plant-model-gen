@@ -1172,8 +1172,8 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
             r#"
             SELECT
                 in as refno,
-                out[0].cata_hash as cata_hash,
-                out[0].ptset as ptset
+                out.cata_hash as cata_hash,
+                out.ptset as ptset
             FROM [{pe_list}]->inst_relate
             WHERE out != NONE
             "#

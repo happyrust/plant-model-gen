@@ -13,12 +13,10 @@ DEFINE FIELD source ON type_node TYPE option<string>;
 
 DEFINE INDEX type_node_code_idx ON type_node FIELDS code UNIQUE;
 
-DEFINE TABLE type_edge SCHEMAFULL
+DEFINE TABLE type_edge TYPE RELATION IN type_node OUT type_node SCHEMAFULL
     PERMISSIONS
         FULL;
 
-DEFINE FIELD in ON type_edge TYPE record(type_node);
-DEFINE FIELD out ON type_edge TYPE record(type_node);
 DEFINE FIELD depth_hint ON type_edge TYPE option<int>;
 DEFINE FIELD source ON type_edge TYPE option<string>;
 DEFINE FIELD created_at ON type_edge TYPE option<datetime>;

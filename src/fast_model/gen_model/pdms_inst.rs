@@ -316,8 +316,10 @@ mod tests {
         ];
         let sqls = build_delete_tubi_relate_by_branch_refnos_sql(&refnos, 100);
         assert_eq!(sqls.len(), 1);
-        assert!(sqls[0].contains("tubi_relate:[pe:⟨24381_145569⟩, 0]..[pe:⟨24381_145569⟩, ..]"));
-        assert!(sqls[0].contains("tubi_relate:[pe:⟨24381_145570⟩, 0]..[pe:⟨24381_145570⟩, ..]"));
+        for refno in refnos {
+            let pe_key = refno.to_pe_key();
+            assert!(sqls[0].contains(&format!("tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]")));
+        }
     }
 }
 

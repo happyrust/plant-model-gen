@@ -1,8 +1,7 @@
 //定义一些工艺专业的公共函数
 
-remove function fn::bran_tubi_len;
 //首先查询所有 tubi 的长度 
-define function fn::bran_tubi_len($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::bran_tubi_len($pe:record) {
     return if $pe.noun != 'BRAN' {
         return 0;
     } else {
@@ -11,8 +10,7 @@ define function fn::bran_tubi_len($pe:record) {
 };
 
 //计算管道元件的长度
-remove function fn::elbo_len;
-define function fn::elbo_len($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::elbo_len($pe:record) {
     return if $pe.noun != 'ELBO' && $pe.noun != 'BEND' {
         return 0;
     } else {
@@ -21,8 +19,7 @@ define function fn::elbo_len($pe:record) {
     }
 };
 
-remove function fn::tee_len;
-define function fn::tee_len($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::tee_len($pe:record) {
     return if $pe.noun != 'TEE' {
         0
     } else {
@@ -30,8 +27,7 @@ define function fn::tee_len($pe:record) {
     }
 };
 
-remove function fn::bran_len;
-define function fn::bran_len($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::bran_len($pe:record) {
    //首先查询所有 tubi 的长度 
    let $tubi_len = fn::bran_tubi_len($pe);
    let $len = math::sum(select value fn::bran_comp_len(in) from $pe<-pe_owner);
@@ -39,8 +35,7 @@ define function fn::bran_len($pe:record) {
 };
 
 //计算管道元件的长度
-remove function fn::bran_comp_len;
-define function fn::bran_comp_len($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::bran_comp_len($pe:record) {
    return if $pe.noun == 'ELBO' || $pe.noun == 'BEND' {
        return fn::elbo_len($pe);
    } else if $pe.noun == 'TEE' {

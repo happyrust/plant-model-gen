@@ -2358,9 +2358,22 @@ async fn main() -> anyhow::Result<()> {
             let refno_str = s.replace('_', "/");
             RefnoEnum::from_str(&refno_str).ok()
         });
-        let dbnum_from_root = root_refno
-            .as_ref()
-            .and_then(|r| aios_database::data_interface::db_meta().get_dbnum_by_refno(*r));
+        let dbnum_from_root = if let Some(root) = root_refno.as_ref() {
+            let meta = aios_database::data_interface::db_meta();
+            match meta.ensure_loaded() {
+                Ok(()) => meta.get_dbnum_by_refno(*root),
+                Err(err) if dbnum_cli.is_none() => {
+                    eprintln!(
+                        "❌ 错误: --root-refno={} 需要从 db_meta_info.json 推导 dbnum，但元数据加载失败: {}。请显式传入 --dbnum。",
+                        root, err
+                    );
+                    std::process::exit(1);
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
@@ -2379,6 +2392,12 @@ async fn main() -> anyhow::Result<()> {
         let single_dbnum = match (dbnum_cli, dbnum_from_root) {
             (Some(n), _) => Some(n),
             (None, Some(n)) => Some(n),
+            (None, None) if root_refno.is_some() => {
+                eprintln!(
+                    "❌ 错误: 无法根据 --root-refno 推导 dbnum，请显式传入 --dbnum，避免误导出全量数据"
+                );
+                std::process::exit(1);
+            }
             (None, None) => None,
         };
 

@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::{
     process::Command,
     sync::{Mutex, mpsc},
@@ -27,11 +28,16 @@ const SIDECAR_HEALTH_ATTEMPTS: usize = 40;
 const SIDECAR_HEALTH_DELAY_MS: u64 = 100;
 const DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS: u64 = 10_000;
 const JOB_SIDECAR_SHUTDOWN_DELAY_ENV: &str = "ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS";
+const SIDECAR_KILL_GRACE_MS: u64 = 1500;
+const SURREAL_CONN_ENV_KEYS: &[&str] =
+    &["SURREAL_CONN_MODE", "SURREAL_CONN_IP", "SURREAL_CONN_PORT"];
 
 #[derive(Debug, Clone)]
 struct SidecarHandle {
     base_url: String,
     token: String,
+    pid: u32,
+    start_token: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -358,6 +364,74 @@ pub async fn forget_cli_job_sidecar(key: &str) {
     guard.remove(&cli_job_sidecar_key(key));
 }
 
+pub async fn shutdown_site_sidecars(site_id: &str) -> usize {
+    let site_key = format!("site:{site_id}");
+    let parse_key = cli_job_sidecar_key(&format!("parse:{site_id}"));
+    let generate_key = cli_job_sidecar_key(&format!("generate:{site_id}"));
+    let mut killed = shutdown_sidecars_by_keys(&[site_key.clone(), parse_key, generate_key]).await;
+    killed += shutdown_orphan_site_sidecars(&site_key).await;
+    killed
+}
+
+async fn shutdown_sidecars_by_keys(keys: &[String]) -> usize {
+    let handles = {
+        let mut guard = sidecars().lock().await;
+        keys.iter()
+            .filter_map(|key| guard.remove(key))
+            .collect::<Vec<_>>()
+    };
+    let mut killed = 0usize;
+    for handle in handles {
+        if kill_handle_process_tree(&handle).await {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+async fn shutdown_orphan_site_sidecars(site_key: &str) -> usize {
+    let handles = find_orphan_site_sidecars(site_key);
+    let mut killed = 0usize;
+    for handle in handles {
+        if kill_handle_process_tree(&handle).await {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+fn find_orphan_site_sidecars(site_key: &str) -> Vec<SidecarHandle> {
+    let system = System::new_all();
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            if !is_site_sidecar_command(process.cmd(), site_key) {
+                return None;
+            }
+            let pid = pid.as_u32();
+            Some(SidecarHandle {
+                base_url: String::new(),
+                token: String::new(),
+                pid,
+                start_token: process_start_token(pid),
+            })
+        })
+        .collect()
+}
+
+fn is_site_sidecar_command(cmd: &[std::ffi::OsString], site_key: &str) -> bool {
+    let args = cmd
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>();
+    let has_serve = args.iter().any(|arg| arg.as_ref() == "serve");
+    let has_site_key = args
+        .windows(2)
+        .any(|pair| pair[0].as_ref() == "--site-key" && pair[1].as_ref() == site_key);
+    has_serve && has_site_key
+}
+
 fn stable_key(value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -403,6 +477,9 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
         .arg(&token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for key in SURREAL_CONN_ENV_KEYS {
+        command.env_remove(key);
+    }
     if key.starts_with("job:") {
         command
             .arg("--shutdown-after-job")
@@ -410,13 +487,100 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
             .arg(job_sidecar_shutdown_delay_ms().to_string());
     }
 
-    let _child = command.spawn().context("启动 aios-database sidecar 失败")?;
+    isolate_sidecar_process_group(&mut command);
+    let child = command.spawn().context("启动 aios-database sidecar 失败")?;
+    let pid = child.id().unwrap_or_default();
     let handle = SidecarHandle {
         base_url: format!("http://{SIDECAR_HOST}:{port}"),
         token,
+        pid,
+        start_token: process_start_token(pid),
     };
     wait_for_sidecar_health(&handle).await?;
     Ok(handle)
+}
+
+fn isolate_sidecar_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000200);
+    }
+}
+
+fn process_start_token(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let target = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    system.process(target).map(|proc| proc.start_time())
+}
+
+fn same_sidecar_process(handle: &SidecarHandle) -> bool {
+    if handle.pid == 0 {
+        return false;
+    }
+    match (handle.start_token, process_start_token(handle.pid)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn killpg_group(pid: u32, sig: libc::c_int) -> bool {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid <= 0 {
+        return false;
+    }
+    unsafe { libc::killpg(pgid, sig) == 0 }
+}
+
+async fn kill_handle_process_tree(handle: &SidecarHandle) -> bool {
+    if !same_sidecar_process(handle) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if !killpg_group(handle.pid, libc::SIGTERM) {
+            unsafe {
+                libc::kill(handle.pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(SIDECAR_KILL_GRACE_MS)).await;
+        if same_sidecar_process(handle) {
+            if !killpg_group(handle.pid, libc::SIGKILL) {
+                unsafe {
+                    libc::kill(handle.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &handle.pid.to_string(), "/T"])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(SIDECAR_KILL_GRACE_MS)).await;
+        if same_sidecar_process(handle) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &handle.pid.to_string(), "/T", "/F"])
+                .output()
+                .await;
+        }
+    }
+    true
 }
 
 fn allocate_local_port() -> Result<u16> {

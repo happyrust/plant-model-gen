@@ -1,7 +1,6 @@
 //string::split(string::split(refno.SPRE.name?:'//:', '/')[2],':')[0]?:'' as code,
 // 编码
-remove function fn::code;
-define function fn::code($pe: record, $opt: option<number>){
+DEFINE FUNCTION OVERWRITE fn::code($pe: record, $opt: option<number>){
     return if $opt == none {
         string::split(string::split($pe.refno.SPRE.name?:'', '/')[2]?:'', ':')[0]?:''
     } else {
@@ -9,8 +8,7 @@ define function fn::code($pe: record, $opt: option<number>){
     };
 };
 
-remove function fn::normal_name;
-DEFINE FUNCTION fn::normal_name($name: string) {
+DEFINE FUNCTION OVERWRITE fn::normal_name($name: string) {
     return if string::starts_with($name, '/') ||  string::starts_with($name, ':') {
         string::slice($name, 1)
     } else {
@@ -20,8 +18,7 @@ DEFINE FUNCTION fn::normal_name($name: string) {
 
 
 // 返回 UDA 的某个属性，这里如果在 ATT_UDA 里如果没有找到，需要去查找默认值
-remove FUNCTION fn::get_uda_value;
-DEFINE FUNCTION fn::get_uda_value($pe:record, $uda_name:string) {
+DEFINE FUNCTION OVERWRITE fn::get_uda_value($pe:record, $uda_name:string) {
 
    let $a = SELECT VALUE (
                 SELECT VALUE object::values(v) FROM ONLY udas.* WHERE u.NAME ==  $uda_name LIMIT 1
@@ -36,8 +33,7 @@ DEFINE FUNCTION fn::get_uda_value($pe:record, $uda_name:string) {
 };
 
 //添加获取 panel 的长宽的方法
-remove function fn::pane_size;
-DEFINE FUNCTION fn::pane_size($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::pane_size($pe:record) {
     //活的下方的顶点，然后求出长宽
     let $ps =  (select value <-pe_owner[0].in<-pe_owner.in.refno.POS from only $pe limit 1);
     return if $ps==NONE || array::len($ps) != 4 {
@@ -49,16 +45,14 @@ DEFINE FUNCTION fn::pane_size($pe:record) {
 
 
 //将pe转换为refno
-remove function fn::pe_to_refno;
-define function fn::pe_to_refno($pe:record){
+DEFINE FUNCTION OVERWRITE fn::pe_to_refno($pe:record){
     return string::replace(record::id($pe), '_', '/');
 };
 
 // RETURN fn::normal_name("/exampleName");  -- 返回 "exampleName"
 // RETURN fn::normal_name(":anotherName");  -- 返回 "anotherName"
 // RETURN fn::normal_name("noPrefixName");  -- 返回 "noPrefixName"
-remove function fn::normal_name;
-DEFINE FUNCTION fn::normal_name($name: string) {
+DEFINE FUNCTION OVERWRITE fn::normal_name($name: string) {
     return if string::starts_with($name, '/') ||  string::starts_with($name, ':') {
         string::slice($name, 1)
     } else {
@@ -68,8 +62,7 @@ DEFINE FUNCTION fn::normal_name($name: string) {
 
 
 // 返回 UDA 的某个属性，这里如果在 ATT_UDA 里如果没有找到，需要去查找默认值
-remove FUNCTION fn::get_uda_value;
-DEFINE FUNCTION fn::get_uda_value($pe:record, $uda_name:string) {
+DEFINE FUNCTION OVERWRITE fn::get_uda_value($pe:record, $uda_name:string) {
 
    let $a = SELECT VALUE (
                 SELECT VALUE object::values(v) FROM ONLY udas.* WHERE u.NAME ==  $uda_name LIMIT 1
@@ -84,8 +77,7 @@ DEFINE FUNCTION fn::get_uda_value($pe:record, $uda_name:string) {
 };
 
 //添加获取 panel 的长宽的方法
-remove function fn::pane_size;
-DEFINE FUNCTION fn::pane_size($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::pane_size($pe:record) {
     //活的下方的顶点，然后求出长宽
     let $ps =  (select value <-pe_owner[0].in<-pe_owner.in.refno.POS from only $pe limit 1);
     return if $ps==NONE || array::len($ps) != 4 {
@@ -101,14 +93,12 @@ DEFINE FUNCTION fn::pane_size($pe:record) {
 -- return $code;
 
 // 判断上一个或下一个节点是否为 $type类型
-remove function fn::pre_or_next_b_type;
-DEFINE FUNCTION fn::pre_or_next_b_type($pe:record,$type:string){
+DEFINE FUNCTION OVERWRITE fn::pre_or_next_b_type($pe:record,$type:string){
     return
     select value fn::prev_pe($pe).noun == $type || fn::next_pe($pe) == $type from $pe
 };
 
-remove function fn::get_world_pos;
-DEFINE FUNCTION fn::get_world_pos($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::get_world_pos($pe:record) {
     let $noun = $pe.noun;
     return
     if $noun == 'EQUI' {
@@ -118,46 +108,38 @@ DEFINE FUNCTION fn::get_world_pos($pe:record) {
     }
 };
 
-remove function fn::refno;
-DEFINE FUNCTION fn::refno($pe: record){
+DEFINE FUNCTION OVERWRITE fn::refno($pe: record){
     return string::replace(record::id($pe), '_', '/');
 };
 
-remove function fn::type;
-DEFINE FUNCTION fn::type($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::type($pe:record) {
     return $pe.noun;
 };
 
 // 判断上一个或下一个节点是否为 $type类型
-remove function fn::prev_or_next_is_type;
-DEFINE FUNCTION fn::prev_or_next_is_type($pe:record,$type:string){
+DEFINE FUNCTION OVERWRITE fn::prev_or_next_is_type($pe:record,$type:string){
     return fn::pre_is_type($pe,$type) || fn::next_is_type($pe,$type);
 };
 
-remove function fn::pre_is_type;
-DEFINE FUNCTION fn::pre_is_type($pe:record, $type:string) {
+DEFINE FUNCTION OVERWRITE fn::pre_is_type($pe:record, $type:string) {
     return fn::prev_type($pe)==$type;
 };
 
 //判断cref的类型
-remove function fn::cref_is_type;
-DEFINE FUNCTION fn::cref_is_type($pe:record, $type:string) {
+DEFINE FUNCTION OVERWRITE fn::cref_is_type($pe:record, $type:string) {
     return $pe.refno.CREF.TYPE == $type;
 };
 
-remove function fn::next_is_type;
-DEFINE FUNCTION fn::next_is_type($pe:record,$type:string) {
+DEFINE FUNCTION OVERWRITE fn::next_is_type($pe:record,$type:string) {
     return fn::next_type($pe)==$type;
 };
 
 
-remove function fn::next_type;
-DEFINE FUNCTION fn::next_type($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::next_type($pe:record) {
     return fn::next_pe($pe).noun;
 };
 
-remove function fn::children;
-DEFINE FUNCTION fn::children($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::children($pe:record) {
     return (select value <-pe_owner.in from $pe)[0];;
 };
 
@@ -165,13 +147,11 @@ DEFINE FUNCTION fn::children($pe:record) {
 
 
 // 获取room
-remove function fn::get_room_number;
-DEFINE FUNCTION fn::get_room_number($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::get_room_number($pe:record) {
     return ($pe<-room_relate.room_num)[0];
 };
 
-remove function fn::vec3_distance;
-DEFINE FUNCTION fn::vec3_distance($x:array, $y:array) {
+DEFINE FUNCTION OVERWRITE fn::vec3_distance($x:array, $y:array) {
     return
     if array::len($x) < 3 || array::len($y) < 3 {
         0
@@ -180,18 +160,15 @@ DEFINE FUNCTION fn::vec3_distance($x:array, $y:array) {
     }
 };
 
-remove function fn::array_distance;
-DEFINE FUNCTION fn::array_distance($x: array<array>) {
+DEFINE FUNCTION OVERWRITE fn::array_distance($x: array<array>) {
     return vector::distance::euclidean($x[0], $x[1]);
 };
 
-remove function fn::b_pre_type;
-define function fn::b_pre_type($pe:record,$type:string) {
+DEFINE FUNCTION OVERWRITE fn::b_pre_type($pe:record,$type:string) {
     return fn::pre_is_type($pe,$type);
 };
 
-remove function fn::b_next_type;
-define function fn::b_next_type($pe:record,$type:string) {
+DEFINE FUNCTION OVERWRITE fn::b_next_type($pe:record,$type:string) {
     return fn::next_is_type($pe,$type);
 };
 
@@ -210,8 +187,7 @@ DEFINE FUNCTION fn::into_str($desp: float) {
     };
 };
 
-remove function fn::str_into_int;
-define function fn::str_into_int($input:string) {
+DEFINE FUNCTION OVERWRITE fn::str_into_int($input:string) {
     return if string::is_numeric($input) {
         <int>$input
     } else {

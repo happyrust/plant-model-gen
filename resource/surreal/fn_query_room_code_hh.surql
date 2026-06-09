@@ -1,5 +1,4 @@
-REMOVE FUNCTION fn::room_code;
-DEFINE FUNCTION fn::room_code($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::room_code($pe:record) {
     let $noun = $pe.refno.TYPE;
     let $uda_room = (select value v from type::record('ATT_UDA', record::id($pe)).udas where u.NAME='/ROOM');
     return

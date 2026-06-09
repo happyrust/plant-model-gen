@@ -499,7 +499,7 @@ fn evaluate_annotation_gate_decision(
         ));
     }
 
-    if summary.total == 0 {
+    if summary.total == 0 && matches!(intent, AnnotationCheckIntent::SubmitNext) {
         return Ok((true, "proceed", "无批注，直接放行".to_string()));
     }
 

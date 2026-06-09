@@ -1932,7 +1932,9 @@ impl RoomComputeOptions {
 }
 
 fn build_compute_options() -> RoomComputeOptions {
-    RoomComputeOptions::default().with_prebuilt_spatial_index()
+    RoomComputeOptions::default()
+        .with_prebuilt_spatial_index()
+        .with_surreal_query()
 }
 
 /// 地板 2D 回退判定的配置参数（从环境变量一次性读取，避免热路径重复读取）
@@ -5034,7 +5036,7 @@ mod tests {
         assert!(sql.contains("LET $ids = SELECT VALUE id FROM room_panel_relate"));
 
         assert!(sql.contains(&format!(
-            "out IN [{},{}]",
+            "in IN [{},{}]",
             room1.to_pe_key(),
             room2.to_pe_key()
         )));
@@ -5535,7 +5537,7 @@ mod tests {
     fn test_extract_aabb_key_points_count_and_basic_positions() {
         let aabb = Aabb::new(Point::new(0.0, 0.0, 0.0), Point::new(10.0, 20.0, 30.0));
 
-        let pts = extract_aabb_key_points(&aabb);
+        let pts = extract_aabb_key_points_full(&aabb);
 
         assert_eq!(pts.len(), 27);
 
@@ -6810,11 +6812,12 @@ mod regression_tests {
             "R101",
             "missing tree file",
         );
+        let normalized_message = message.replace('\\', "/");
 
         assert!(message.contains("dbnum=7997"));
         assert!(message.contains("room_refno=24383_83477"));
         assert!(message.contains("room_num=R101"));
-        assert!(message.contains("output/demo/scene_tree/7997.tree"));
+        assert!(normalized_message.contains("output/demo/scene_tree/7997.tree"));
         assert!(message.contains("[ROOM_TREE_INDEX_LOAD_FAILED]"));
     }
 
@@ -6826,11 +6829,12 @@ mod regression_tests {
             valid_room_refno("24383_83477"),
             "R101",
         );
+        let normalized_message = message.replace('\\', "/");
 
         assert!(message.contains("dbnum=7997"));
         assert!(message.contains("room_refno=24383_83477"));
         assert!(message.contains("room_num=R101"));
-        assert!(message.contains("output/demo/scene_tree/7997.tree"));
+        assert!(normalized_message.contains("output/demo/scene_tree/7997.tree"));
         assert!(message.contains("parse-db"));
         assert!(message.contains("[ROOM_TREE_INDEX_ROOM_MISSING]"));
     }

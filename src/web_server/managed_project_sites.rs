@@ -523,7 +523,11 @@ fn local_port_probe_host() -> String {
 
 fn local_port_in_use_any_host(port: u16) -> bool {
     let mut seen = HashSet::new();
-    for host in ["127.0.0.1".to_string(), "localhost".to_string(), local_port_probe_host()] {
+    for host in [
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        local_port_probe_host(),
+    ] {
         let host = host.trim();
         if host.is_empty() || !seen.insert(host.to_ascii_lowercase()) {
             continue;
@@ -1594,7 +1598,7 @@ fn build_site_config(
     let effective = effective_url.unwrap_or_else(|| local_url.clone().unwrap_or_default());
     let local = local_url.unwrap_or_default();
     set_toml_string(web_server, "frontend_url", effective.clone());
-    set_toml_string(web_server, "public_base_url", effective);
+    set_toml_string(web_server, "public_base_url", effective.clone());
     set_toml_string(web_server, "backend_url", local);
     set_toml_bool(web_server, "auto_start_surreal", false);
     set_toml_string(web_server, "surreal_bin", managed_surreal_bin_string());
@@ -1604,6 +1608,10 @@ fn build_site_config(
         "surreal_bind",
         format!("{}:{}", db_host, site.db_port),
     );
+
+    let model_center = ensure_table(table, "model_center");
+    set_toml_string(model_center, "frontend_base_url", effective);
+
     apply_site_db_mode_config(table, site, db_user, db_password, ManagedSiteDbMode::Ws);
 
     let surrealkv = ensure_table(table, "surrealkv");
@@ -8191,7 +8199,10 @@ async fn spawn_web_process(site: &ManagedProjectSite) -> Result<u32> {
         .arg("--config")
         .arg(config_no_ext)
         .env("WEB_SERVER_PORT", site.web_port.to_string())
-        .env("SURREAL_CONN_MODE", managed_db_mode_to_str(site.runtime_db_mode))
+        .env(
+            "SURREAL_CONN_MODE",
+            managed_db_mode_to_str(site.runtime_db_mode),
+        )
         .env("SURREAL_CONN_IP", db_host)
         .env("SURREAL_CONN_PORT", site.db_port.to_string())
         .current_dir(repo)
@@ -8482,7 +8493,8 @@ fn normalize_viewer_url_for_response(site: &mut ManagedProjectSite) {
     let Some(viewer_port) = site.viewer_port else {
         return;
     };
-    if is_legacy_viewer_url(viewer_url) || viewer_url_needs_managed_port(site, viewer_url, viewer_port)
+    if is_legacy_viewer_url(viewer_url)
+        || viewer_url_needs_managed_port(site, viewer_url, viewer_port)
     {
         site.viewer_url = Some(build_viewer_url(site, viewer_port));
     }

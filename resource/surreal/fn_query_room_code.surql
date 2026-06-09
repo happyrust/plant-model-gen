@@ -1,5 +1,4 @@
-REMOVE FUNCTION fn::room_code;
-DEFINE FUNCTION fn::room_code($pe:record) {
+DEFINE FUNCTION OVERWRITE fn::room_code($pe:record) {
     let $noun = $pe.refno.TYPE;
     let $id = return
     // First handle different entity types
@@ -14,7 +13,7 @@ DEFINE FUNCTION fn::room_code($pe:record) {
     };
 
     // Then check room relation
-    let $res = select * from only $pe<-room_relate limit 1;
+    let $res = select * from only $id<-room_relate limit 1;
     if ($res == none) {
         return none;
     };

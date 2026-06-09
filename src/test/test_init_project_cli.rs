@@ -37,7 +37,7 @@ fn test_resolve_target_dbnums_uses_all_discovered_dbnums_when_cli_missing() {
 #[test]
 fn test_resolve_target_dbnums_requires_discovered_dbnums() {
     let err = crate::init_project::resolve_target_dbnums(None, vec![]).unwrap_err();
-    assert!(err.to_string().contains("未发现任何 DESI dbnum"));
+    assert!(err.to_string().contains("没有任何 DESI dbnum"));
 }
 
 #[test]

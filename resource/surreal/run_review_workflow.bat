@@ -6,5 +6,5 @@ if not defined DATABASE_NAME set DATABASE_NAME=AvevaMarineSample
 REM namespace
 if not defined NAMESPACE set NAMESPACE=1516
 
-surreal import --conn %HTTP_ADDR% --namespace %NAMESPACE% --database %DATABASE_NAME% -u root -p root review_workflow.surql
+surreal import --endpoint %HTTP_ADDR% --namespace %NAMESPACE% --database %DATABASE_NAME% -u root -p root review_workflow.surql
 

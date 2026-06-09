@@ -120,7 +120,12 @@ mod tests {
         let port = find_free_port();
 
         // 启动一个子进程占用该端口
-        let mut child = std::process::Command::new("python3")
+        #[cfg(windows)]
+        let python = "python";
+        #[cfg(not(windows))]
+        let python = "python3";
+
+        let mut child = std::process::Command::new(python)
             .args([
                 "-c",
                 &format!(

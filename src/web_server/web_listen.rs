@@ -30,6 +30,10 @@ pub fn site_identity_json() -> serde_json::Value {
     let runtime = SITE_RUNTIME.get();
     let db_option = aios_core::get_db_option();
     let project_code = db_option.project_code.parse::<u32>().ok();
+    let backend_url = runtime.map(|v| v.backend_url.clone());
+    let api_base_url = backend_url
+        .as_deref()
+        .map(|url| format!("{}/api", url.trim_end_matches('/')));
 
     json!({
         "deployment_model": "one_web_server_per_site",
@@ -39,8 +43,9 @@ pub fn site_identity_json() -> serde_json::Value {
         "site_name": runtime.map(|v| v.site_name.clone()),
         "region": runtime.and_then(|v| v.region.clone()),
         "frontend_url": runtime.and_then(|v| v.frontend_url.clone()),
-        "backend_url": runtime.map(|v| v.backend_url.clone()),
+        "backend_url": backend_url,
         "public_base_url": runtime.map(|v| v.backend_url.clone()),
+        "api_base_url": api_base_url,
         "project_name": db_option.project_name,
         "project_code": project_code,
         "project_path": db_option.project_path,

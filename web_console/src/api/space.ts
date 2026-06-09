@@ -22,10 +22,12 @@ export type FittingRequest = {
 
 export type WallDistanceRequest = {
   dbnum?: number;
+  source_refno: string;
   suppo_refno: string;
   suppo_type?: string;
   search_radius?: number;
   target_nouns?: string[];
+  max_candidates?: number;
 };
 
 export type SteelRelativeRequest = {

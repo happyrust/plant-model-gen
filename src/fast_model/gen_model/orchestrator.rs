@@ -1590,9 +1590,51 @@ async fn process_index_tree_generation(
                     "[sqlite-index] 跳过生成后 SurrealDB 刷新：SQLite spatial index 将在 Parquet 导出成功后刷新"
                 );
             } else {
-                println!(
-                    "[sqlite-index] SQLite spatial index refresh skipped because parquet export is disabled"
-                );
+                let mut sqlite_dbnums: Vec<u32> =
+                    if let Some(nums) = db_option.inner.manual_db_nums.clone() {
+                        nums
+                    } else if db_meta().ensure_loaded().is_ok() {
+                        db_meta().get_dbnums_by_type(&db_option.inner.module)
+                    } else {
+                        aios_core::query_mdb_db_nums(None, aios_core::DBType::DESI).await?
+                    };
+                if let Some(exclude_nums) = &db_option.inner.exclude_db_nums {
+                    let exclude: HashSet<u32> = exclude_nums.iter().copied().collect();
+                    sqlite_dbnums.retain(|dbnum| !exclude.contains(dbnum));
+                }
+                sqlite_dbnums.sort_unstable();
+                sqlite_dbnums.dedup();
+
+                if sqlite_dbnums.is_empty() {
+                    println!("[sqlite-index] 跳过刷新：本轮未解析到可用 dbnum");
+                } else {
+                    println!(
+                        "[sqlite-index] 模型生成后刷新空间索引并聚合中间节点 AABB: dbnums={:?}",
+                        sqlite_dbnums
+                    );
+                    match crate::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb(
+                        Some(&sqlite_dbnums),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(count) if count > 0 => {
+                            println!("[sqlite-index] 空间索引刷新完成: inserted={count}")
+                        }
+                        Ok(_) => {
+                            return Err(anyhow::anyhow!(
+                                "gen_spatial_tree 已启用，但空间索引刷新结果为空: dbnums={sqlite_dbnums:?}"
+                            )
+                            .into());
+                        }
+                        Err(err) => {
+                            return Err(anyhow::anyhow!(
+                                "gen_spatial_tree 已启用，但空间索引刷新失败: {err:#}"
+                            )
+                            .into());
+                        }
+                    }
+                }
             }
         } else if db_option.inner.enable_sqlite_rtree {
             println!("[sqlite-index] 跳过刷新：gen_spatial_tree 未启用");

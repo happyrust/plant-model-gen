@@ -33,6 +33,7 @@ const REPARSE_REUSE_DB_TYPES: &[&str] = &["SYST"];
 const MANDATORY_PREPARSE_DB_TYPES: &[&str] = &["DICT", "GLOB", "GLB"];
 const SCAN_MAX_DEPTH: usize = 6;
 const SCAN_MAX_FILES: usize = 200_000;
+const CLI_JOB_KILL_GRACE_MS: u64 = 1500;
 
 #[derive(Debug, Clone)]
 pub struct ParseSidecarOptions {
@@ -812,7 +813,7 @@ async fn run_cli_job_with_cancel(
             }))
         }
         _ = &mut cancel_rx => {
-            let _ = child.kill().await;
+            kill_child_process_tree(&mut child).await;
             Ok(JobExecutionOutcome::Cancelled)
         }
     }
@@ -848,14 +849,81 @@ fn spawn_cli_child(payload: RunCliJobRequest) -> Result<Child> {
         .open(&stderr_path)
         .with_context(|| format!("打开 stderr 日志失败: {}", stderr_path.display()))?;
     let exe = std::env::current_exe().context("定位 aios-database 可执行文件失败")?;
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("-c")
         .arg(config_no_ext)
         .current_dir(cwd)
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("启动 CLI 作业失败")
+        .stderr(Stdio::from(stderr));
+    isolate_cli_job_process_group(&mut command);
+    command.spawn().context("启动 CLI 作业失败")
+}
+
+fn isolate_cli_job_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000200);
+    }
+}
+
+#[cfg(unix)]
+fn killpg_group(pid: u32, sig: libc::c_int) -> bool {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid <= 0 {
+        return false;
+    }
+    unsafe { libc::killpg(pgid, sig) == 0 }
+}
+
+async fn kill_child_process_tree(child: &mut Child) {
+    let Some(pid) = child.id() else {
+        let _ = child.kill().await;
+        return;
+    };
+    #[cfg(unix)]
+    {
+        if !killpg_group(pid, libc::SIGTERM) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(CLI_JOB_KILL_GRACE_MS)).await;
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                if !killpg_group(pid, libc::SIGKILL) {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+                let _ = child.wait().await;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .output()
+            .await;
+        tokio::time::sleep(Duration::from_millis(CLI_JOB_KILL_GRACE_MS)).await;
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            _ => {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output()
+                    .await;
+                let _ = child.wait().await;
+            }
+        }
+    }
 }
 
 fn authorize(state: &ParseSidecarState, headers: &HeaderMap) -> Result<(), Response> {
@@ -1684,7 +1752,7 @@ fn resolve_included_db_files(
     }
     for dbnum in manual_db_nums {
         let mut matched = None;
-        for root in primary_project_roots {
+        for root in project_roots {
             if let Some(file_name) = find_db_file_name_for_dbnum(root, *dbnum)? {
                 matched = Some(file_name);
                 break;

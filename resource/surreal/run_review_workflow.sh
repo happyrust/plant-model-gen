@@ -6,5 +6,5 @@ set -euo pipefail
 : "${DATABASE_NAME:=AvevaMarineSample}"
 : "${NAMESPACE:=1516}"
 
-surreal import --conn "$HTTP_ADDR" --namespace "$NAMESPACE" --database "$DATABASE_NAME" -u root -p root review_workflow.surql
+surreal import --endpoint "$HTTP_ADDR" --namespace "$NAMESPACE" --database "$DATABASE_NAME" -u root -p root review_workflow.surql
 

@@ -129,6 +129,7 @@ export interface ManagedRemoteDeployStatus {
   status: string
   current_step: string
   remote_entry_url?: string | null
+  remote_api_base_url?: string | null
   checked_at: string
   last_error?: string | null
   checks: ManagedSitePreflightCheck[]

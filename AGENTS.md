@@ -4,7 +4,7 @@ alwaysApply: true
 ---
 
 # Repository Guidelines
- 不要使用 test 或者编译任何 test,  任何时候，针对 web_server 都要使用运行起来，然后使用 post 去测试，而不是使用 test
+ 不要创建或运行基于 `cargo test` 的测试用例；不要使用 test 或者编译任何 test。任何时候，针对 web_server 都要运行服务后通过 HTTP/POST 去测试，而不是使用 test。
  针对 aios-database，使用 cli + json的方式去测试验证。
 
 ## 部署目标服务器 

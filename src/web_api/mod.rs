@@ -60,6 +60,8 @@ pub mod api_request_log;
 pub mod logs_api;
 #[cfg(feature = "web_server")]
 pub use logs_api::create_logs_api_routes;
+#[cfg(feature = "web_server")]
+pub mod server_runtime_log;
 
 #[cfg(feature = "web_server")]
 pub mod jwt_auth;

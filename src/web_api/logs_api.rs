@@ -93,6 +93,12 @@ fn log_type_catalog(admin: bool) -> Vec<LogTypeInfo> {
             filters: vec!["form_id", "task_id", "level", "q", "from_ms", "to_ms"],
             admin_only: true,
         });
+        types.push(LogTypeInfo {
+            id: "server.runtime".to_string(),
+            name: "进程运行日志".to_string(),
+            filters: vec!["level", "q", "from_ms", "to_ms"],
+            admin_only: true,
+        });
         for kind in SITE_FILE_KINDS {
             types.push(LogTypeInfo {
                 id: format!("site.file.{kind}"),
@@ -141,6 +147,7 @@ async fn get_logs(
     let result = match log_type.as_str() {
         "api.request" => query_api_request_logs(&query).await,
         "review.workflow" => query_workflow_logs(&query).await,
+        "server.runtime" => query_server_runtime_logs(&query),
         other => match other.strip_prefix("site.file.") {
             Some(kind) if SITE_FILE_KINDS.contains(&kind) => {
                 query_site_file_logs(kind, &query).await
@@ -359,6 +366,62 @@ fn workflow_row_to_entry(row: Value) -> LogEntry {
         },
         detail: row,
     }
+}
+
+// ─── adapter: server.runtime ─────────────────────────────────────────────────
+
+fn query_server_runtime_logs(query: &LogQuery) -> anyhow::Result<(Vec<LogEntry>, Option<String>)> {
+    let limit = effective_limit(query);
+    let offset = query
+        .cursor
+        .as_deref()
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(0);
+    let level_filter = query.level.clone().map(|l| l.to_lowercase());
+    let q_filter = query.q.clone();
+
+    let mut entries: Vec<crate::web_api::server_runtime_log::RuntimeLogEntry> =
+        crate::web_api::server_runtime_log::snapshot();
+    entries.reverse(); // newest-first
+
+    let filtered: Vec<LogEntry> = entries
+        .into_iter()
+        .filter(|e| match level_filter.as_deref() {
+            Some("error") => e.level == "error",
+            Some("warn") => e.level == "error" || e.level == "warn",
+            _ => true,
+        })
+        .filter(|e| {
+            q_filter
+                .as_deref()
+                .map(|q| e.message.contains(q) || e.target.contains(q))
+                .unwrap_or(true)
+        })
+        .filter(|e| query.from_ms.map(|from| e.ts_ms >= from).unwrap_or(true))
+        .filter(|e| query.to_ms.map(|to| e.ts_ms <= to).unwrap_or(true))
+        .skip(offset)
+        .take(limit)
+        .map(|e| LogEntry {
+            ts_ms: Some(e.ts_ms),
+            log_type: "server.runtime".to_string(),
+            level: e.level.to_string(),
+            summary: format!("[{}] {}", e.target, e.message),
+            detail: json!({ "target": e.target, "message": e.message }),
+            correlation: LogCorrelation {
+                form_id: None,
+                task_id: None,
+                site_id: None,
+                request_id: None,
+            },
+        })
+        .collect();
+
+    let next_cursor = if filtered.len() == limit {
+        Some((offset + filtered.len()).to_string())
+    } else {
+        None
+    };
+    Ok((filtered, next_cursor))
 }
 
 // ─── adapter: site.file.{kind} ───────────────────────────────────────────────

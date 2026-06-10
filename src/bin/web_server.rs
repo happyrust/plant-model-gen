@@ -32,8 +32,9 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("DB_OPTION_FILE", config_path);
     }
 
-    // 初始化日志，设置更详细的日志级别
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    // 初始化日志：Tee 包装 env_logger——控制台行为不变，同时把 info+ 记录写入
+    // 进程内 ring，供 /api/logs?type=server.runtime 查询（spec 005）。
+    aios_database::web_api::server_runtime_log::install_tee_env_logger("debug");
 
     // 读取配置文件（路径相对于当前工作目录）
     let config_file = format!("{}.toml", config_path);

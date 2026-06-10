@@ -147,6 +147,23 @@ use crate::web_api::{
 use handlers::*;
 use models::*;
 
+static SUL_DB_HEARTBEAT_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn spawn_sul_db_heartbeat_once() {
+    if SUL_DB_HEARTBEAT_STARTED.set(()).is_ok() {
+        let _heartbeat = aios_core::spawn_heartbeat(
+            &aios_core::SUL_DB,
+            aios_core::HEARTBEAT_INTERVAL_DEFAULT,
+            aios_core::HEARTBEAT_QUERY_TIMEOUT_DEFAULT,
+        );
+        println!(
+            "✅ SurrealDB heartbeat enabled: interval={}s timeout={}s",
+            aios_core::HEARTBEAT_INTERVAL_DEFAULT.as_secs(),
+            aios_core::HEARTBEAT_QUERY_TIMEOUT_DEFAULT.as_secs()
+        );
+    }
+}
+
 /// Web UI应用状态
 #[derive(Clone)]
 pub struct AppState {
@@ -396,6 +413,7 @@ pub async fn start_web_server_with_config(
         {
             Ok(_) => {
                 println!("✅ 数据库基础连接已就绪");
+                spawn_sul_db_heartbeat_once();
             }
             Err(e) if e.to_string().contains("Already connected") => {
                 println!("⚠️ 数据库基础连接已存在，沿用当前连接");
@@ -428,6 +446,9 @@ pub async fn start_web_server_with_config(
                     eprintln!("⚠️ 数据库初始化成功，但最终命名空间切换失败: {}", error);
                 }
                 println!("✅ 数据库连接初始化成功");
+                if db_option.effective_surrealdb().mode == aios_core::options::DbConnMode::Ws {
+                    spawn_sul_db_heartbeat_once();
+                }
                 let db_option_for_review = db_option_for_init.clone();
                 tokio::spawn(async move {
                     if let Err(error) =

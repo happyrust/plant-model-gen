@@ -68,4 +68,8 @@ pub fn create_platform_api_routes() -> Router {
             post(cache_preload::preload_cache),
         )
         .layer(middleware::from_fn(ensure_review_db_context))
+        // 接口 request/response 日志（spec 003，最外层以覆盖上下文失败的请求）
+        .layer(middleware::from_fn(
+            crate::web_api::api_request_log::api_request_log_layer,
+        ))
 }

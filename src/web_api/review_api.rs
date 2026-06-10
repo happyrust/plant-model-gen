@@ -1554,6 +1554,10 @@ pub fn create_review_api_routes() -> Router {
             review_auth_middleware,
         ))
         .layer(middleware::from_fn(ensure_review_db_context))
+        // 接口 request/response 日志（spec 003，最外层以覆盖鉴权/上下文失败的请求）
+        .layer(middleware::from_fn(
+            crate::web_api::api_request_log::api_request_log_layer,
+        ))
 }
 
 // ============================================================================

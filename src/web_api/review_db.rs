@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use once_cell::sync::OnceCell;
+use sha2::{Digest, Sha256};
 use std::future::{Future, IntoFuture};
 use std::time::Instant;
 use surrealdb::IndexedResults;
@@ -10,13 +10,52 @@ use tokio::time::{Duration, timeout};
 
 use aios_core::options::{DbConnMode, DbOption};
 
-static REVIEW_PRIMARY_DB: OnceCell<Surreal<Client>> = OnceCell::new();
+static REVIEW_PRIMARY_DB: tokio::sync::OnceCell<Surreal<Client>> =
+    tokio::sync::OnceCell::const_new();
+static REVIEW_SCHEMA_MIGRATIONS_READY: tokio::sync::OnceCell<()> =
+    tokio::sync::OnceCell::const_new();
 static REVIEW_QUERY_INDEXES_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 const REVIEW_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REVIEW_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_DDL_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SLOW_QUERY_WARN: Duration = Duration::from_millis(1000);
+
+struct ReviewSchemaMigration {
+    version: &'static str,
+    name: &'static str,
+    sql: &'static str,
+}
+
+const REVIEW_SCHEMA_MIGRATIONS: &[ReviewSchemaMigration] = &[
+    ReviewSchemaMigration {
+        version: "20260610_001",
+        name: "review_core_schema",
+        sql: include_str!(
+            "../../rs_surreal/review/migrations/20260610_001_review_core_schema.surql"
+        ),
+    },
+    ReviewSchemaMigration {
+        version: "20260610_002",
+        name: "api_request_log",
+        sql: include_str!("../../rs_surreal/review/migrations/20260610_002_api_request_log.surql"),
+    },
+];
+
+const REVIEW_SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
+    DEFINE TABLE IF NOT EXISTS review_schema_migrations SCHEMAFULL;
+    DEFINE FIELD OVERWRITE version ON review_schema_migrations TYPE string;
+    DEFINE FIELD OVERWRITE name ON review_schema_migrations TYPE string;
+    DEFINE FIELD OVERWRITE checksum ON review_schema_migrations TYPE string;
+    DEFINE FIELD OVERWRITE applied_at ON review_schema_migrations TYPE datetime DEFAULT time::now();
+    DEFINE INDEX IF NOT EXISTS idx_review_schema_migrations_version ON TABLE review_schema_migrations FIELDS version UNIQUE;
+"#;
+
+fn review_schema_migration_checksum(sql: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sql.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 async fn with_review_timeout<T, F>(
     operation: &'static str,
@@ -96,33 +135,30 @@ where
 }
 
 pub async fn init_review_primary_db(db_option: &DbOption) -> Result<()> {
-    if REVIEW_PRIMARY_DB.get().is_some() {
-        return Ok(());
-    }
-
     let db_option = db_option.clone();
-    let db = with_review_timeout(
-        "review.init_primary_db",
-        REVIEW_CONNECT_TIMEOUT,
-        async move { open_review_db_from_option(&db_option).await },
-    )
-    .await?;
-
-    let _ = REVIEW_PRIMARY_DB.set(db);
+    REVIEW_PRIMARY_DB
+        .get_or_try_init(|| async move {
+            with_review_timeout(
+                "review.init_primary_db",
+                REVIEW_CONNECT_TIMEOUT,
+                async move { open_review_db_from_option(&db_option).await },
+            )
+            .await
+        })
+        .await?;
     Ok(())
 }
 
-/// 为高并发/批量操作提供“独立连接”的 DB（不复用全局 `review_primary_db`）。
-///
-/// 说明：部分 Surreal WS 客户端在高并发下可能出现内部 channel 堵塞；这里按需新建连接以隔离请求。
+/// Return a per-request review DB session without opening a new WebSocket.
+pub async fn review_db_session() -> Result<Surreal<Client>> {
+    ensure_review_primary_db_context().await?;
+    Ok(review_primary_db().clone())
+}
+
+/// Compatibility wrapper for existing review code.
+/// The returned value is a cloned SurrealDB session, not a new physical connection.
 pub async fn fresh_review_db() -> Result<Surreal<Client>> {
-    let db_option = (*aios_core::get_db_option()).clone();
-    with_review_timeout(
-        "review.fresh_connection",
-        REVIEW_CONNECT_TIMEOUT,
-        async move { open_review_db_from_option(&db_option).await },
-    )
-    .await
+    review_db_session().await
 }
 
 async fn open_review_db_from_option(db_option: &DbOption) -> Result<Surreal<Client>> {
@@ -159,21 +195,6 @@ pub async fn ensure_review_primary_db_context() -> Result<()> {
     if REVIEW_PRIMARY_DB.get().is_none() {
         init_review_primary_db(&aios_core::get_db_option()).await?;
     }
-
-    let db_option = aios_core::get_db_option();
-    let ns = db_option.surreal_ns.clone();
-    let db = db_option.project_name.clone();
-    with_review_timeout(
-        "review.ensure_context",
-        REVIEW_CONNECT_TIMEOUT,
-        async move {
-            aios_core::use_ns_db_compat(review_primary_db(), &ns, &db)
-                .await
-                .map_err(anyhow::Error::from)
-        },
-    )
-    .await?;
-
     Ok(())
 }
 
@@ -183,31 +204,84 @@ pub fn review_primary_db() -> &'static Surreal<Client> {
         .expect("review_primary_db 尚未初始化")
 }
 
-async fn ensure_review_query_indexes_inner() -> Result<()> {
+async fn ensure_review_schema_migrations_inner() -> Result<()> {
     let db = fresh_review_db().await?;
     await_review_ddl(
-        "review.ensure_query_indexes",
-        db.query(
-            r#"
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_form_id ON TABLE review_tasks FIELDS form_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_requester_id ON TABLE review_tasks FIELDS requester_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_checker_id ON TABLE review_tasks FIELDS checker_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_reviewer_id ON TABLE review_tasks FIELDS reviewer_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_approver_id ON TABLE review_tasks FIELDS approver_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_current_node ON TABLE review_tasks FIELDS current_node;
-            DEFINE INDEX IF NOT EXISTS idx_review_tasks_status ON TABLE review_tasks FIELDS status;
-            DEFINE INDEX IF NOT EXISTS idx_review_records_form_id ON TABLE review_records FIELDS form_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_records_task_id ON TABLE review_records FIELDS task_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_comments_annotation_id ON TABLE review_comments FIELDS annotation_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_attachment_form_id ON TABLE review_attachment FIELDS form_id;
-            DEFINE INDEX IF NOT EXISTS idx_review_form_model_form_id ON TABLE review_form_model FIELDS form_id;
-            "#,
-        ),
+        "review.ensure_schema_migrations_table",
+        db.query(REVIEW_SCHEMA_MIGRATIONS_TABLE_SQL),
     )
     .await?
     .check()?;
+
+    for migration in REVIEW_SCHEMA_MIGRATIONS {
+        let checksum = review_schema_migration_checksum(migration.sql);
+        await_review_ddl(
+            "review.check_schema_migration",
+            db.query(
+                r#"
+                LET $existing = SELECT VALUE checksum FROM review_schema_migrations
+                    WHERE version = $version
+                    LIMIT 1;
+
+                IF array::len($existing) > 0 AND $existing[0] != $checksum {
+                    THROW "REVIEW_SCHEMA_MIGRATION_CHECKSUM_MISMATCH";
+                };
+                "#,
+            )
+            .bind(("version", migration.version.to_string()))
+            .bind(("checksum", checksum.clone())),
+        )
+        .await?
+        .check()?;
+
+        await_review_ddl("review.apply_schema_migration", db.query(migration.sql))
+            .await?
+            .check()?;
+
+        await_review_ddl(
+            "review.record_schema_migration",
+            db.query(
+                r#"
+                UPSERT type::record('review_schema_migrations', $version) CONTENT {
+                    version: $version,
+                    name: $name,
+                    checksum: $checksum,
+                    applied_at: time::now()
+                };
+                "#,
+            )
+            .bind(("version", migration.version.to_string()))
+            .bind(("name", migration.name.to_string()))
+            .bind(("checksum", checksum)),
+        )
+        .await?
+        .check()?;
+
+        tracing::info!(
+            "[REVIEW_DB.schema] migration 已确认 version={} name={}",
+            migration.version,
+            migration.name
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn ensure_review_schema_migrations() -> Result<()> {
+    REVIEW_SCHEMA_MIGRATIONS_READY
+        .get_or_try_init(|| async { ensure_review_schema_migrations_inner().await })
+        .await?;
+    Ok(())
+}
+
+pub fn review_schema_migrations_ready() -> bool {
+    REVIEW_SCHEMA_MIGRATIONS_READY.get().is_some()
+}
+
+async fn ensure_review_query_indexes_inner() -> Result<()> {
+    ensure_review_schema_migrations().await?;
     tracing::info!(
-        "[REVIEW_DB.schema] review 查询索引已确认（tasks/records/comments/attachments/form_model）"
+        "[REVIEW_DB.schema] review 查询索引已由 schema migration 确认（tasks/records/comments/attachments/form_model）"
     );
     Ok(())
 }
@@ -236,39 +310,9 @@ static REVIEW_WORKFLOW_HISTORY_SCHEMA_READY: tokio::sync::OnceCell<()> =
     tokio::sync::OnceCell::const_new();
 
 async fn ensure_review_workflow_history_schema_inner() -> Result<()> {
-    let db = fresh_review_db().await?;
-    await_review_ddl(
-        "review.ensure_workflow_history_schema",
-        db.query(
-            r#"
-        DEFINE TABLE OVERWRITE review_workflow_history SCHEMAFULL;
-        DEFINE FIELD OVERWRITE task_id ON review_workflow_history TYPE string;
-        DEFINE FIELD OVERWRITE node ON review_workflow_history TYPE string;
-        DEFINE FIELD OVERWRITE action ON review_workflow_history TYPE string;
-        DEFINE FIELD OVERWRITE operator_id ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE operator_name ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE timestamp ON review_workflow_history TYPE option<datetime> DEFAULT time::now();
-        DEFINE FIELD OVERWRITE comment ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE form_id ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE target_node ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE actor_id ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE actor_role ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE actor_name ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE source ON review_workflow_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE created_at ON review_workflow_history TYPE option<datetime>;
-        DEFINE INDEX OVERWRITE idx_workflow_task ON review_workflow_history FIELDS task_id;
-        DEFINE INDEX OVERWRITE idx_workflow_form ON review_workflow_history FIELDS form_id;
-
-        DEFINE FIELD OVERWRITE form_id ON review_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE source ON review_history TYPE option<string>;
-        DEFINE FIELD OVERWRITE created_at ON review_history TYPE option<datetime>;
-        "#,
-        ),
-    )
-    .await?
-    .check()?;
+    ensure_review_schema_migrations().await?;
     tracing::info!(
-        "[REVIEW_DB.schema] review_workflow_history / review_history schema 已升级到 RUS-244 形态（actor_id/source/target_node/form_id/created_at + 旧字段改为 option）"
+        "[REVIEW_DB.schema] review_workflow_history / review_history schema 已由 schema migration 确认（actor_id/source/target_node/form_id/created_at + 旧字段改为 option）"
     );
     Ok(())
 }
@@ -285,6 +329,7 @@ pub fn review_workflow_history_schema_ready() -> bool {
 }
 
 pub async fn warm_review_schema() -> Result<()> {
+    ensure_review_schema_migrations().await?;
     ensure_review_query_indexes().await?;
     ensure_review_workflow_history_schema().await?;
     Ok(())

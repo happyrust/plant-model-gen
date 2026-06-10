@@ -54,6 +54,12 @@ pub mod review_annotation_state;
 pub use review_annotation_state::create_annotation_state_routes;
 #[cfg(feature = "web_server")]
 pub mod review_db;
+#[cfg(feature = "web_server")]
+pub mod api_request_log;
+#[cfg(feature = "web_server")]
+pub mod logs_api;
+#[cfg(feature = "web_server")]
+pub use logs_api::create_logs_api_routes;
 
 #[cfg(feature = "web_server")]
 pub mod jwt_auth;
@@ -85,6 +91,7 @@ pub fn assemble_stateless_web_api_routes() -> axum::Router {
         .merge(create_jwt_auth_routes())
         .merge(create_review_api_routes())
         .merge(create_annotation_state_routes())
+        .merge(create_logs_api_routes())
         .merge(create_scene_tree_routes())
         .merge(create_mbd_pipe_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())
@@ -170,6 +177,9 @@ pub fn stateless_web_api_route_paths() -> Vec<&'static str> {
         "GET    /api/users",
         "GET    /api/users/me",
         "GET    /api/users/reviewers",
+        // logs_api（spec 003-review-log-viewer）
+        "GET    /api/logs/types",
+        "GET    /api/logs",
         // scene_tree_api
         "POST   /api/scene-tree/init",
         "POST   /api/scene-tree/init/{dbnum}",

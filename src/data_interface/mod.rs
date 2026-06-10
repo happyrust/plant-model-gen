@@ -13,6 +13,9 @@ pub mod db_meta_manager;
 #[cfg(feature = "sqlite-index")]
 pub mod db_index;
 
+/// 元件库（CATA）按需解析 — refno 级引用闭包的基础原语（spec 002）。
+pub mod cata_closure;
+
 pub mod increment_manager;
 
 pub mod increment_record;

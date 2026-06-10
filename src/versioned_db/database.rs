@@ -1177,6 +1177,10 @@ where
     let selected_file_names = selected_db_file_names(db_option);
     let selected_dbnums = selected_dbnums(db_option);
     let force_include = is_parse_sys && is_total_sync && selected_file_names.is_empty();
+    // CATA 闭包部分解析过滤器（spec 002 T006b）：默认 Off=None=整库解析；
+    // AIOS_CATA_CLOSURE_MODE=manifest 时从 cata_closure.json 加载，缺失即整库回退。
+    let cata_filter =
+        crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
 
     for (file_idx, path) in children_files.into_iter().enumerate() {
@@ -1367,6 +1371,13 @@ where
             .iter()
             .map(|entry| *entry.key())
             .collect();
+        // CATA 闭包部分解析（spec 002 T006b）：manifest 命中则裁剪 refno 全集，否则整库回退。
+        let all_refnos = crate::data_interface::cata_closure::apply_sync_filter(
+            cata_filter.as_ref(),
+            &db_type,
+            dbnum,
+            all_refnos,
+        );
         let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
 
         let db_basic = Arc::new(db_basic);
@@ -1510,9 +1521,14 @@ where
             }
         }
         let output_dir = db_meta_info::get_project_tree_dir(&project_name);
+        // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
+        // CATA 闭包部分解析时 tree_nodes 只覆盖闭包子集，db_meta 的 ref0->dbnum 映射不能缩水。
         let mut ref0s = BTreeSet::new();
-        for refno in tree_nodes.keys() {
-            ref0s.insert(refno.get_0());
+        for entry in db_basic.refno_table_map.iter() {
+            let ref0 = entry.key().get_0();
+            if ref0 != 0 && ref0 != 0x8000_0001 {
+                ref0s.insert(ref0);
+            }
         }
 
         let header_hex_60 = (|| -> Option<String> {
@@ -1900,6 +1916,10 @@ pub async fn sync_total_async_threaded(
     let selected_file_names = selected_db_file_names(db_option);
     let selected_dbnums = selected_dbnums(db_option);
     let force_include = is_parse_sys && is_total_sync && selected_file_names.is_empty();
+    // CATA 闭包部分解析过滤器（spec 002 T006b）：默认 Off=None=整库解析；
+    // AIOS_CATA_CLOSURE_MODE=manifest 时从 cata_closure.json 加载，缺失即整库回退。
+    let cata_filter =
+        crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
 
     let sender_clone = sender.clone();
     let children_files_len = children_files.len();
@@ -2057,6 +2077,13 @@ pub async fn sync_total_async_threaded(
                     );
                     continue;
                 }
+                // CATA 闭包部分解析（spec 002 T006b）：manifest 命中则裁剪 refno 全集，否则整库回退。
+                let all_refnos = crate::data_interface::cata_closure::apply_sync_filter(
+                    cata_filter.as_ref(),
+                    &db_type,
+                    dbnum,
+                    all_refnos,
+                );
                 let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
 
                 let db_basic = Arc::new(db_basic);
@@ -2244,11 +2271,15 @@ pub async fn sync_total_async_threaded(
                 // 该文件用于：refno(ref_0) -> dbnum 的快速映射，以及记录 db 文件头的关键信息以便排查。
                 let db_meta_stage_start = Instant::now();
                 {
+                    // ref_0 为 RefU64 高 32 位（注意：ref_0 并非 dbnum）。
+                    // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
+                    // CATA 闭包部分解析时 tree_nodes 只覆盖闭包子集，db_meta 的 ref0->dbnum 映射不能缩水。
                     let mut ref0s = BTreeSet::new();
-                    for refno in tree_nodes.keys() {
-                        // ref_0 为 RefU64 高 32 位（注意：ref_0 并非 dbnum）。
-                        let ref0 = ((refno.0 >> 32) & 0xFFFF_FFFF) as u32;
-                        ref0s.insert(ref0);
+                    for entry in db_basic.refno_table_map.iter() {
+                        let ref0 = entry.key().get_0();
+                        if ref0 != 0 && ref0 != 0x8000_0001 {
+                            ref0s.insert(ref0);
+                        }
                     }
 
                     let header_hex_60 = (|| -> Option<String> {
@@ -2594,6 +2625,18 @@ pub async fn parse_single_db_file(
         anyhow::bail!("文件 {} 中没有找到任何 refno", file_name);
     }
 
+    // CATA 闭包部分解析（spec 002 T006b）：与 sync 流水线同一开关/回退语义。
+    let cata_filter = crate::data_interface::cata_closure::load_sync_filter(
+        project_name,
+        std::slice::from_ref(&db_type),
+    );
+    let all_refnos = crate::data_interface::cata_closure::apply_sync_filter(
+        cata_filter.as_ref(),
+        &db_type,
+        target_dbnum,
+        all_refnos,
+    );
+
     println!("📊 找到 {} 个 refno，开始解析...", all_refnos.len());
 
     let db_basic = Arc::new(db_basic);
@@ -2681,8 +2724,15 @@ pub async fn parse_single_db_file(
     let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
     // 收集 ref0s 并更新 db_meta_info.json
+    // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
+    // CATA 闭包部分解析时 tree_nodes 只覆盖闭包子集，db_meta 的 ref0->dbnum 映射不能缩水。
     let db_meta_stage_start = Instant::now();
-    let ref0s: std::collections::BTreeSet<u32> = tree_nodes.keys().map(|r| r.get_0()).collect();
+    let ref0s: std::collections::BTreeSet<u32> = db_basic
+        .refno_table_map
+        .iter()
+        .map(|entry| entry.key().get_0())
+        .filter(|&ref0| ref0 != 0 && ref0 != 0x8000_0001)
+        .collect();
 
     let file_path_buf = PathBuf::from(file_path);
 

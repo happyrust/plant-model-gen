@@ -84,10 +84,13 @@ fn open_db_session(project: &str, path: &Path) -> Result<DbSession> {
 }
 
 /// 用已打开会话解析一批 refno（复用页缓存，不重开文件 / 不重建索引）。
+///
+/// `attmap_sink`：可选保留完整属性表（T007 惰性兜底落库需要；闭包发现 pass 传 `None` 省内存）。
 async fn parse_refnos_with_session(
     io: &mut PdmsIO,
     index_map: &HashMap<RefU64, Vec<u64>>,
     refnos: &[RefU64],
+    mut attmap_sink: Option<&mut HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)>>,
 ) -> Result<HashMap<RefU64, ParsedCataEle>> {
     let mut out = HashMap::with_capacity(refnos.len());
     for &refno in refnos {
@@ -107,6 +110,9 @@ async fn parse_refnos_with_session(
                     .copied()
                     .filter(|r| is_valid_ref0(r.get_0()))
                     .collect();
+                if let Some(sink) = attmap_sink.as_deref_mut() {
+                    sink.insert(refno, (ele.att_map().clone(), children.clone()));
+                }
                 out.insert(
                     refno,
                     ParsedCataEle {
@@ -146,7 +152,7 @@ pub async fn parse_db_refnos(
         return Ok(HashMap::new());
     }
     let mut session = open_db_session(project, path)?;
-    parse_refnos_with_session(&mut session.io, &session.index_map, refnos).await
+    parse_refnos_with_session(&mut session.io, &session.index_map, refnos, None).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,6 +223,10 @@ pub struct CataClosureResolver<'a, L: CataDbLocator> {
     frontier: Vec<RefU64>,
     /// 每个 dbnum 的打开会话缓存（复用页缓存，逼近 core.dll db1 页缓存）。
     sessions: HashMap<u32, DbSession>,
+    /// 是否保留完整属性表（T007 惰性兜底落库用；闭包发现 pass 默认关省内存）。
+    retain_attmaps: bool,
+    /// `retain_attmaps` 开启时收集：refno -> (完整属性表, children)。
+    attmaps: HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)>,
 }
 
 impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
@@ -227,7 +237,20 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
             visited: HashSet::new(),
             frontier: Vec::new(),
             sessions: HashMap::new(),
+            retain_attmaps: false,
+            attmaps: HashMap::new(),
         }
+    }
+
+    /// 开启属性表保留（小闭包惰性兜底场景；大闭包慎用，内存随 visited 线性增长）。
+    pub fn with_retain_attmaps(mut self, retain: bool) -> Self {
+        self.retain_attmaps = retain;
+        self
+    }
+
+    /// 取走保留的属性表（`retain_attmaps` 开启时在 `resolve()` 后调用）。
+    pub fn take_attmaps(&mut self) -> HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)> {
+        std::mem::take(&mut self.attmaps)
     }
 
     /// 播种：把从 DESI 收集到的出向引用（`outbound_refs_of` 的结果）作为闭包起点。
@@ -320,9 +343,18 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                     .sessions
                     .get_mut(&dbnum)
                     .expect("session just ensured");
-                let parsed =
-                    parse_refnos_with_session(&mut session.io, &session.index_map, &to_parse)
-                        .await?;
+                let attmap_sink = if self.retain_attmaps {
+                    Some(&mut self.attmaps)
+                } else {
+                    None
+                };
+                let parsed = parse_refnos_with_session(
+                    &mut session.io,
+                    &session.index_map,
+                    &to_parse,
+                    attmap_sink,
+                )
+                .await?;
 
                 let mut next: Vec<RefU64> = Vec::new();
                 for r in &to_parse {
@@ -626,6 +658,225 @@ pub async fn run_cata_closure_pass_for_roots(
         out_path.display()
     );
     Ok(total)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T007: 运行期惰性兜底（命中未解析的 CATA refno → 即时小闭包 → 落库 → manifest 增量）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 内存版 db 定位器：从 `db_index.sqlite` 一次性全量加载。
+///
+/// rusqlite `Connection` 非 `Sync`，直接把 `DbIndexStore` 当 locator 会让
+/// `resolve()`（跨 await 持有 `&L`）的 Future 失去 `Send`；索引表量级很小
+/// （每库个位数 ref0），全量载入内存换 `Send` 是稳赚的取舍。
+pub struct InMemoryDbLocator {
+    ref0_to_dbnum: HashMap<u32, u32>,
+    files: HashMap<u32, InMemoryDbFile>,
+}
+
+struct InMemoryDbFile {
+    db_type: String,
+    project: String,
+    path: PathBuf,
+}
+
+impl InMemoryDbLocator {
+    /// 从 `db_index.sqlite` 全量加载（同步 IO，建议放 `spawn_blocking`）。
+    #[cfg(feature = "sqlite-index")]
+    pub fn load_from_index(path: &Path) -> Result<Self> {
+        let store = crate::data_interface::db_index::DbIndexStore::open(path)?;
+        let ref0_to_dbnum: HashMap<u32, u32> = store.all_ref0_owners().into_iter().collect();
+        let files: HashMap<u32, InMemoryDbFile> = store
+            .all_db_files()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.dbnum,
+                    InMemoryDbFile {
+                        db_type: r.db_type,
+                        project: r.project,
+                        path: PathBuf::from(r.file_path),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            ref0_to_dbnum,
+            files,
+        })
+    }
+
+    /// 某 dbnum 所属工程名（manifest 增量按工程分目录落盘用）。
+    pub fn project_of(&self, dbnum: u32) -> Option<String> {
+        self.files.get(&dbnum).map(|f| f.project.clone())
+    }
+}
+
+impl CataDbLocator for InMemoryDbLocator {
+    fn dbnum_of_ref0(&self, ref0: u32) -> Option<u32> {
+        self.ref0_to_dbnum.get(&ref0).copied()
+    }
+
+    fn db_type_of(&self, dbnum: u32) -> Option<String> {
+        self.files.get(&dbnum).map(|f| f.db_type.clone())
+    }
+
+    fn file_of(&self, dbnum: u32) -> Option<(String, PathBuf)> {
+        self.files
+            .get(&dbnum)
+            .map(|f| (f.project.clone(), f.path.clone()))
+    }
+}
+
+/// 惰性兜底结果统计。
+#[derive(Debug, Default, Clone)]
+pub struct LazyFallbackOutcome {
+    /// 成功解析并落库的 CATA refno 数（含闭包扩展出的关联元素）。
+    pub parsed: usize,
+    /// 闭包过程中无法定位/解析的引用数。
+    pub missing: usize,
+}
+
+/// 惰性兜底全局互斥：并发 miss 串行化，避免重复建索引/重复解析同一批元素
+/// （落库用 INSERT IGNORE，重复执行幂等）。
+#[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+static LAZY_CATA_FALLBACK_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// T007 运行期惰性兜底：对未解析的 CATA refno 跑**小闭包**并即时落库。
+///
+/// 流程：seeds → [`InMemoryDbLocator`]（db_index.sqlite）→ [`CataClosureResolver`]
+/// （保留属性表）→ `INSERT IGNORE` 写 `pe` + `ATT_{noun}` + `ATT_UDA` → 闭包结果
+/// merge 进各工程 `cata_closure.json`（增量 delta，Q8）。
+///
+/// 调用方约定：命中"pe 缺失"再调用（如 `get_named_attmap` 失败路径），成功后重试原查询；
+/// cache-miss 统计由调用方记录（`cache_miss_report` 在 gen_model 层）。
+#[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackOutcome> {
+    use aios_core::project_primary_db;
+
+    if seeds.is_empty() {
+        return Ok(LazyFallbackOutcome::default());
+    }
+    let _guard = LAZY_CATA_FALLBACK_LOCK.lock().await;
+
+    // 1. 定位器：db_index.sqlite 全量载入内存（保持 Future Send）。
+    let site_project = aios_core::get_db_option().project_name.clone();
+    let index_path = crate::versioned_db::db_meta_info::get_project_tree_dir(&site_project)
+        .join(crate::data_interface::db_index::DB_INDEX_FILE_NAME);
+    if !index_path.exists() {
+        anyhow::bail!(
+            "[cata_closure] 惰性兜底需要 db_index.sqlite（未找到: {}），请先执行预扫描",
+            index_path.display()
+        );
+    }
+    let locator = {
+        let path = index_path.clone();
+        tokio::task::spawn_blocking(move || InMemoryDbLocator::load_from_index(&path)).await??
+    };
+
+    // 2. 小闭包（保留属性表与 children）。
+    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::default())
+        .with_retain_attmaps(true);
+    resolver.seed(seeds.iter().copied());
+    let delta = resolver.resolve().await?;
+    let retained = resolver.take_attmaps();
+
+    // 3. 落库：pe（带 children/refno 链接）+ ATT_{noun} + ATT_UDA，全部 INSERT IGNORE 幂等。
+    const INSERT_CHUNK: usize = 500;
+    let mut parsed = 0usize;
+    for (dbnum, refs) in &delta.by_dbnum {
+        let mut pe_jsons: Vec<String> = Vec::new();
+        let mut att_by_table: HashMap<String, Vec<String>> = HashMap::new();
+        let mut uda_jsons: Vec<String> = Vec::new();
+
+        for refno in refs {
+            let Some((att, children)) = retained.get(refno) else {
+                continue;
+            };
+            // pe 行（与 versioned_db::pe::save_pes 同构：gen_sur_json + children 注入）。
+            let pe_data = att.pe(*dbnum as i32);
+            let mut json = pe_data.gen_sur_json(Some(refno.to_pe_key()));
+            let children_links = if children.is_empty() {
+                String::new()
+            } else {
+                children
+                    .iter()
+                    .map(|c| c.to_pe_key())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if json.ends_with('}') {
+                json.pop();
+                let needs_comma = json.ends_with('}') || json.contains(':');
+                let sep = if needs_comma { ", " } else { "" };
+                json.push_str(&format!("{}children: [{}]}}", sep, children_links));
+            }
+            pe_jsons.push(json);
+
+            // ATT_{noun} / ATT_UDA 行。
+            let table = att.get_type_str().to_string();
+            if !table.is_empty() {
+                if let Some(att_json) = att.gen_sur_json() {
+                    att_by_table.entry(table).or_default().push(att_json);
+                }
+                if let Some(uda_json) = att.gen_sur_json_uda(&[]) {
+                    uda_jsons.push(aios_core::helper::normalize_sql_string(&uda_json));
+                }
+            }
+            parsed += 1;
+        }
+
+        for chunk in pe_jsons.chunks(INSERT_CHUNK) {
+            let sql = format!("INSERT IGNORE INTO pe [{}]", chunk.join(","));
+            project_primary_db().query(&sql).await?;
+        }
+        for (table, jsons) in att_by_table {
+            for chunk in jsons.chunks(INSERT_CHUNK) {
+                let sql = format!("INSERT IGNORE INTO {} [{}]", table, chunk.join(","));
+                project_primary_db().query(&sql).await?;
+            }
+        }
+        for chunk in uda_jsons.chunks(INSERT_CHUNK) {
+            let sql = format!("INSERT IGNORE INTO ATT_UDA [{}]", chunk.join(","));
+            project_primary_db().query(&sql).await?;
+        }
+    }
+
+    // 4. manifest 增量 merge（按 dbnum 所属工程分别落盘，与 sync 读取口径一致）。
+    let mut delta_by_project: HashMap<String, CataClosureManifest> = HashMap::new();
+    for (dbnum, refs) in &delta.by_dbnum {
+        let project = locator
+            .project_of(*dbnum)
+            .unwrap_or_else(|| site_project.clone());
+        delta_by_project
+            .entry(project)
+            .or_default()
+            .by_dbnum
+            .insert(*dbnum, refs.clone());
+    }
+    for (project, project_delta) in delta_by_project {
+        let manifest_path = default_manifest_path(&project);
+        let mut base = if manifest_path.exists() {
+            CataClosureManifest::load_json(&manifest_path).unwrap_or_default()
+        } else {
+            CataClosureManifest::default()
+        };
+        base.merge_from(&project_delta);
+        base.save_json(&manifest_path)?;
+    }
+
+    log::info!(
+        "[cata_closure] 惰性兜底完成: seeds={} parsed={} missing={} rounds={}",
+        seeds.len(),
+        parsed,
+        delta.missing,
+        delta.rounds
+    );
+    Ok(LazyFallbackOutcome {
+        parsed,
+        missing: delta.missing,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

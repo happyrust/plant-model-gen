@@ -75,6 +75,57 @@ fn insert_iparam_kv(context: &mut CataContext, idx1: usize, v: &str) {
     context.insert(format!("IPARM{}", idx1), v.to_string());
 }
 
+/// 命中未解析 CATA refno 时的惰性兜底（spec 002 T007）。
+///
+/// 仅在 `AIOS_CATA_CLOSURE_MODE=manifest`（部分解析模式）下生效：记 cache-miss →
+/// [`crate::data_interface::cata_closure::ensure_cata_refnos_parsed`] 小闭包解析落库 →
+/// 返回是否值得重试原查询。整库解析模式下 miss 即真缺数据，不兜底。
+#[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+async fn try_lazy_cata_fallback(cata_refno: RefnoEnum, stage: &'static str) -> bool {
+    use crate::data_interface::cata_closure::{
+        CataClosureSyncMode, cata_closure_sync_mode, ensure_cata_refnos_parsed,
+    };
+
+    if cata_closure_sync_mode() != CataClosureSyncMode::Manifest {
+        return false;
+    }
+    super::cache_miss_report::with_global_report(|report| {
+        report.record_refno_miss(stage, "cata_refno_unparsed_lazy_fallback", cata_refno, None);
+    });
+    match ensure_cata_refnos_parsed(&[cata_refno.refno()]).await {
+        Ok(outcome) if outcome.parsed > 0 => {
+            log::info!(
+                "[cata_closure] 惰性兜底成功({stage}): {} 解析落库 {} 个元素（missing={}），重试原查询",
+                cata_refno,
+                outcome.parsed,
+                outcome.missing
+            );
+            true
+        }
+        Ok(outcome) => {
+            log::warn!(
+                "[cata_closure] 惰性兜底未解析到元素({stage}): {}（missing={}）",
+                cata_refno,
+                outcome.missing
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[cata_closure] 惰性兜底失败({stage}): {}: {}",
+                cata_refno,
+                e
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(all(feature = "sqlite-index", feature = "surreal-save")))]
+async fn try_lazy_cata_fallback(_cata_refno: RefnoEnum, _stage: &'static str) -> bool {
+    false
+}
+
 ///收集SCOM的信息, 暂时慎用缓存
 pub async fn get_or_create_scom_info(cata_refno: RefnoEnum) -> anyhow::Result<ScomInfo> {
     // P5 优化：禁用 debug 模式下的缓存清除，避免重复查询相同 SCOM
@@ -88,7 +139,17 @@ pub async fn get_or_create_scom_info(cata_refno: RefnoEnum) -> anyhow::Result<Sc
     let scom_info = if let Some(info) = SCOM_INFO_MAP.get(&cata_refno) {
         info.value().clone()
     } else {
-        let attr_map = aios_core::get_named_attmap(cata_refno).await?;
+        // 命中未解析（部分解析模式下 pe 缺失）→ 惰性兜底小闭包后重试一次（spec 002 T007）。
+        let attr_map = match aios_core::get_named_attmap(cata_refno).await {
+            Ok(attr_map) => attr_map,
+            Err(first_err) => {
+                if try_lazy_cata_fallback(cata_refno, "get_or_create_scom_info").await {
+                    aios_core::get_named_attmap(cata_refno).await?
+                } else {
+                    return Err(first_err);
+                }
+            }
+        };
         let type_noun = attr_map.get_type_str();
         let ptref_name = match type_noun {
             "SPRF" => "PSTR",

@@ -52,9 +52,18 @@
 
 ## 正确性安全网
 
-- [ ] **T007 运行期惰性兜底**
-  - `ensure_cata_refno_parsed(refno)`：命中未解析 → 即时 `parse_db_refnos` 小闭包 → 存 pe → 记 `cache_miss_report`。
-  - 接入 `resolve.rs`（`get_or_create_scom_info` / `resolve_desi_comp` 命中未解析路径）。
+- [x] **T007 运行期惰性兜底（已完成）**
+  - `cata_closure.rs::ensure_cata_refnos_parsed(seeds)`：小闭包（`CataClosureResolver` +
+    `with_retain_attmaps` 保留属性表/children）→ `INSERT IGNORE` 落 `pe`（含 children/refno
+    链接，与 `save_pes` 同构）+ `ATT_{noun}` + `ATT_UDA` → 闭包结果按工程 merge 进
+    `cata_closure.json`（增量 delta，Q8）。全局互斥防并发重复解析；幂等。
+  - 定位器：新增 `InMemoryDbLocator`（`db_index.sqlite` 全量载入内存，避免跨 await 持有
+    rusqlite 连接破坏 Future Send）；`DbIndexStore` 增 `all_ref0_owners`/`all_db_files`。
+  - 接入 `resolve.rs::get_or_create_scom_info`：`get_named_attmap` 失败 → 记
+    `cache_miss_report`（stage=get_or_create_scom_info, kind=cata_refno_unparsed_lazy_fallback）
+    → 兜底 → 重试一次。`resolve_desi_comp` / `resolve_axis_params` 的 SCOM 路径经由同一入口覆盖。
+  - 门控：仅 `AIOS_CATA_CLOSURE_MODE=manifest` 时生效（整库模式 miss = 真缺数据，不兜底）；
+    feature 门 `sqlite-index + surreal-save`，未启用时退化为 no-op。
 - [ ] **T008 离线校验模式**
   - `verify_cata_closure(dbnums)`：整库解析 vs 按需闭包，diff 生成结果（inst_relate / 几何 hash），写 `output/<project>/cata_closure_verify.json`。
   - 接 CI/灰度门禁。

@@ -283,6 +283,49 @@ impl DbIndexStore {
         out
     }
 
+    /// 全量导出 `ref0 -> dbnum` 映射（内存定位器用；行数 = Σ每库 ref0 数，量级小）。
+    pub fn all_ref0_owners(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let Ok(mut stmt) = self.conn.prepare("SELECT ref0, dbnum FROM ref0_owner") else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
+        }) {
+            for r in rows.flatten() {
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// 全量导出 db 文件记录（内存定位器用）。
+    pub fn all_db_files(&self) -> Vec<DbFileRecord> {
+        let mut out = Vec::new();
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT dbnum, db_type, file_name, file_path, project, latest_sesno, fingerprint
+             FROM db_file_index",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok(DbFileRecord {
+                dbnum: row.get(0)?,
+                db_type: row.get(1)?,
+                file_name: row.get(2)?,
+                file_path: row.get(3)?,
+                project: row.get(4)?,
+                latest_sesno: row.get(5)?,
+                fingerprint: row.get(6)?,
+            })
+        }) {
+            for r in rows.flatten() {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// 取某 dbnum 的文件记录。
     pub fn file_by_dbnum(&self, dbnum: u32) -> Option<DbFileRecord> {
         self.conn

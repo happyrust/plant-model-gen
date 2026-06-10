@@ -97,7 +97,8 @@ fn log_type_catalog(admin: bool) -> Vec<LogTypeInfo> {
             types.push(LogTypeInfo {
                 id: format!("site.file.{kind}"),
                 name: format!("站点日志·{kind}"),
-                filters: vec!["site_id", "level", "q"],
+                // site_id 可选：缺省为当前站点（spec 004）。
+                filters: vec!["site_id?", "level", "q"],
                 admin_only: true,
             });
         }
@@ -366,19 +367,37 @@ async fn query_site_file_logs(
     kind: &str,
     query: &LogQuery,
 ) -> anyhow::Result<(Vec<LogEntry>, Option<String>)> {
-    let Some(site_id) = query.site_id.clone().filter(|s| !s.is_empty()) else {
-        anyhow::bail!("site.file.* 类型必须携带 site_id 参数");
+    // spec 004:site_id 缺省时兜底为当前站点（one-web-server-per-site 进程内已知）。
+    let explicit_site = query.site_id.clone().filter(|s| !s.is_empty());
+    let implicit = explicit_site.is_none();
+    let site_id = match explicit_site {
+        Some(explicit) => explicit,
+        None => crate::web_server::web_listen::current_site_id().ok_or_else(|| {
+            anyhow::anyhow!("site.file.* 未传 site_id 且当前进程无站点身份，请显式指定 site_id")
+        })?,
     };
     let limit = effective_limit(query);
     let kind_owned = kind.to_string();
 
     // tail 会整文件读入，放 spawn_blocking 防大文件阻塞 runtime。
-    let tail = tokio::task::spawn_blocking({
+    let tail_result = tokio::task::spawn_blocking({
         let site_id = site_id.clone();
         let kind = kind_owned.clone();
         move || crate::web_server::managed_project_sites::tail_log(&site_id, &kind, 2000)
     })
-    .await??;
+    .await?;
+    let tail = match tail_result {
+        Ok(tail) => tail,
+        // 隐式兜底的当前站点可能不是 managed 站点（如手工启动的 dev 实例）——
+        // 此时按"无日志"返回空列表；显式 site_id 查不到仍然报错。
+        Err(error) if implicit => {
+            log::info!(
+                "[logs_api] 当前站点 {site_id} 非 managed 站点（{error}），site.file.{kind_owned} 返回空列表"
+            );
+            return Ok((Vec::new(), None));
+        }
+        Err(error) => return Err(error),
+    };
 
     let level_filter = query.level.clone().map(|l| l.to_lowercase());
     let q_filter = query.q.clone();

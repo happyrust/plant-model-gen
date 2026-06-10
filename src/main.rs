@@ -916,6 +916,24 @@ async fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("gen-cata-closure")
+                .about(
+                    "前置 CATA 闭包 pass：扫描工程根下全部 DESI 库 → refno 级引用闭包 → 写 <output>/<项目>/scene_tree/cata_closure.json（解析时配合 AIOS_CATA_CLOSURE_MODE=manifest 启用 CATA 部分解析）",
+                )
+                .arg(
+                    Arg::new("rescan-index")
+                        .long("rescan-index")
+                        .help("先按指纹（mtime/size）增量刷新 db_index.sqlite（缺失时总会自动全量预扫描）")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("out")
+                        .long("out")
+                        .help("覆盖 manifest 输出路径（默认 <output>/<项目>/scene_tree/cata_closure.json）")
+                        .value_name("PATH"),
+                ),
+        )
+        .subcommand(
             Command::new("serve")
                 .about("启动 aios-database 解析域 sidecar HTTP/WS 服务")
                 .arg(
@@ -2622,6 +2640,41 @@ async fn main() -> anyhow::Result<()> {
         {
             let _ = no_scan;
             anyhow::bail!("scan-db-index 需要 sqlite-index feature（默认/web_server 构建已含）");
+        }
+    }
+
+    // ========== 处理 gen-cata-closure 子命令 ==========
+    if let Some(closure_matches) = matches.subcommand_matches("gen-cata-closure") {
+        let rescan_index = closure_matches.get_flag("rescan-index");
+        let out_override = closure_matches
+            .get_one::<String>("out")
+            .map(std::path::PathBuf::from);
+        #[cfg(feature = "sqlite-index")]
+        {
+            // 前置闭包 pass（spec 002 Q8）：独立于 sync，产出 cata_closure.json 供解析消费。
+            let manifest =
+                aios_database::data_interface::cata_closure::run_cata_closure_pass_from_config(
+                    rescan_index,
+                    out_override,
+                )
+                .await?;
+            println!(
+                "✅ gen-cata-closure 完成: {} 个 CATA 库 / seeds={} / visited={} / missing={} / rounds={}",
+                manifest.by_dbnum.len(),
+                manifest.seed_count,
+                manifest.visited_count,
+                manifest.missing,
+                manifest.rounds
+            );
+            println!(
+                "💡 解析时设置 AIOS_CATA_CLOSURE_MODE=manifest 启用 CATA 部分解析（manifest 缺失/未覆盖时自动整库回退）"
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "sqlite-index"))]
+        {
+            let _ = (rescan_index, out_override);
+            anyhow::bail!("gen-cata-closure 需要 sqlite-index feature（默认/web_server 构建已含）");
         }
     }
 

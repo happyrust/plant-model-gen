@@ -660,6 +660,47 @@ pub async fn run_cata_closure_pass_for_roots(
     Ok(total)
 }
 
+/// CLI 完整入口：从 `DB_OPTION_FILE` 配置派生工程根，跑前置闭包 pass 并写 manifest
+/// （`gen-cata-closure` 子命令即薄包装本函数）。
+///
+/// 流程：
+/// 1. `db_index.sqlite` 缺失 → 自动全量预扫描（等价 `scan-db-index`）；
+///    已存在且 `rescan_index=true` → 按指纹（mtime/size）增量刷新；
+/// 2. [`run_cata_closure_pass_for_roots`]：扫描工程根下全部 DESI 库 → 逐库闭包 → merge；
+/// 3. 原子写 `out_override`（缺省 [`default_manifest_path`]）。
+#[cfg(feature = "sqlite-index")]
+pub async fn run_cata_closure_pass_from_config(
+    rescan_index: bool,
+    out_override: Option<PathBuf>,
+) -> Result<CataClosureManifest> {
+    use crate::data_interface::db_index;
+
+    let db_option = db_index::load_db_option_from_env()?;
+    let project_name = db_option.project_name.clone();
+    let roots = db_index::derive_project_roots(&db_option)?;
+
+    let index_path = db_index::default_index_path(&project_name);
+    if !index_path.exists() {
+        log::info!(
+            "[cata_closure] db_index.sqlite 不存在（{}），先执行全量预扫描",
+            index_path.display()
+        );
+        db_index::rebuild_from_config(true).await?;
+    } else if rescan_index {
+        db_index::rebuild_from_config(false).await?;
+    }
+    if !index_path.exists() {
+        anyhow::bail!(
+            "[cata_closure] 预扫描后仍未找到 db_index.sqlite: {}",
+            index_path.display()
+        );
+    }
+
+    let out_path = out_override.unwrap_or_else(|| default_manifest_path(&project_name));
+    let store = db_index::DbIndexStore::open(&index_path)?;
+    run_cata_closure_pass_for_roots(&store, &roots, CataClosureConfig::default(), &out_path).await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // T007: 运行期惰性兜底（命中未解析的 CATA refno → 即时小闭包 → 落库 → manifest 增量）
 // ─────────────────────────────────────────────────────────────────────────────

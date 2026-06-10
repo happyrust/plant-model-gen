@@ -717,23 +717,21 @@ pub async fn collect_design_outbound_for_dbnums(
     out
 }
 
-/// CLI 入口：从 `DB_OPTION_FILE` 配置派生工程根，做 index-only 全量/增量预扫 +
-/// 设计库精确依赖边，写入 `output/<project>/scene_tree/db_index.sqlite`。
-///
-/// `force=true` 全量重扫；`force=false` 按指纹增量。
-pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
-    use aios_core::options::DbOption;
-
+/// 从 `DB_OPTION_FILE` 环境变量（缺省 `db_options/DbOption`）加载 CLI 配置。
+pub fn load_db_option_from_env() -> anyhow::Result<aios_core::options::DbOption> {
     let config_name =
         std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
     let config_path = format!("{}.toml", config_name);
     let content = std::fs::read_to_string(&config_path)
         .map_err(|e| anyhow::anyhow!("读取配置 {} 失败: {}", config_path, e))?;
-    let db_option: DbOption = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("解析配置 {} 失败: {}", config_path, e))?;
-    let project_name = db_option.project_name.clone();
+    toml::from_str(&content).map_err(|e| anyhow::anyhow!("解析配置 {} 失败: {}", config_path, e))
+}
 
-    // 派生 (project_name, root) 列表。
+/// 从配置派生 `(project_name, root)` 工程根列表（预扫描 / 闭包 pass 口径一致）。
+pub fn derive_project_roots(
+    db_option: &aios_core::options::DbOption,
+) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let project_name = db_option.project_name.clone();
     let mut roots: Vec<(String, PathBuf)> = Vec::new();
     for p in &db_option.included_projects {
         if let Some(path) = db_option.get_project_path(p) {
@@ -757,11 +755,25 @@ pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
             project_name
         );
     }
+    Ok(roots)
+}
 
-    let out_path = PathBuf::from("output")
-        .join(&project_name)
-        .join("scene_tree")
-        .join(DB_INDEX_FILE_NAME);
+/// CLI 口径的 `db_index.sqlite` 落盘路径：`<output_root>/<project>/scene_tree/db_index.sqlite`
+/// （与 `db_meta_info.json` / `cata_closure.json` 同目录，读写口径同源）。
+pub fn default_index_path(project_name: &str) -> PathBuf {
+    crate::versioned_db::db_meta_info::get_project_tree_dir(project_name).join(DB_INDEX_FILE_NAME)
+}
+
+/// CLI 入口：从 `DB_OPTION_FILE` 配置派生工程根，做 index-only 全量/增量预扫 +
+/// 设计库精确依赖边，写入 [`default_index_path`]。
+///
+/// `force=true` 全量重扫；`force=false` 按指纹增量。
+pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
+    let db_option = load_db_option_from_env()?;
+    let project_name = db_option.project_name.clone();
+    let roots = derive_project_roots(&db_option)?;
+
+    let out_path = default_index_path(&project_name);
 
     // Phase 1（同步）：index-only 归属扫描；在 await 前释放连接以保持 Send。
     let report = {

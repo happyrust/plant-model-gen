@@ -49,6 +49,15 @@
   - `DEFAULT_DATA_SYNC_DB_TYPES` 保持 `["DESI","CATA"]` 不变：部分解析靠 refno 裁剪实现，
     CATA 仍需进解析循环以产出 .tree/db_meta。
   - 冷构建验证：`cargo check --lib --no-default-features --features review` 绿（2026-06-10）。
+- [x] **T006c CLI 用户入口 `gen-cata-closure`（已完成）**
+  - `main.rs` 新增子命令 `gen-cata-closure`（`--rescan-index` / `--out <PATH>`），薄包装
+    `cata_closure::run_cata_closure_pass_from_config`：db_index.sqlite 缺失自动全量预扫
+    （等价 `scan-db-index`）→ `run_cata_closure_pass_for_roots` → 写默认 manifest 路径。
+  - 配套重构：`db_index.rs` 抽出 `load_db_option_from_env` / `derive_project_roots` /
+    `default_index_path`（`rebuild_from_config` 改用之；index 落盘路径从硬编码 `output/`
+    对齐到 `get_project_tree_dir`，与 manifest / T007 惰性兜底读取口径同源）。
+  - 完整用户流程：`aios-database -c <cfg> gen-cata-closure` → 设
+    `AIOS_CATA_CLOSURE_MODE=manifest` 跑解析。
 
 ## 正确性安全网
 

@@ -6237,12 +6237,22 @@ async fn gen_cata_geos_inner(
 
             let t_query = Instant::now();
 
-            if let Err(e) = model_primary_db().query(sql).await {
-                debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
+            // 注意：连接级错误才会落到 Err；语句级错误（如 RELATE 内函数抛错）
+            // 藏在 Response 里，必须 check()，否则写入失败被静默吞掉。
+            match model_primary_db().query(sql).await {
+                Err(e) => {
+                    debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
 
-                // 保持原来的 unwrap 语义
+                    // 保持原来的 unwrap 语义
 
-                panic!("写入 tubi_relate 失败: {}", e);
+                    panic!("写入 tubi_relate 失败: {}", e);
+                }
+                Ok(response) => {
+                    if let Err(e) = response.check() {
+                        eprintln!("[BRAN_TUBI] tubi_relate 语句执行失败（数据未写入）: {}", e);
+                        panic!("写入 tubi_relate 失败（语句级错误）: {}", e);
+                    }
+                }
             }
 
             tubi_query_time = t_query.elapsed().as_millis();

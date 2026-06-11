@@ -16,7 +16,17 @@ static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 /// 此函数用 `OnceCell` 保证只执行一次。
 pub async fn ensure_surreal_init() -> anyhow::Result<()> {
     SURREAL_INIT
-        .get_or_try_init(|| async { aios_core::init_surreal().await })
+        .get_or_try_init(|| async {
+            aios_core::init_surreal().await?;
+            // ses 表仅在 sync_history=true 的解析流程中被填充；普通站点没有该表时，
+            // tubi_relate 写入 SQL 里的 `dt=fn::ses_date(...)` 会因
+            // "The table 'ses' does not exist" 整条 RELATE 失败（且历史上被静默吞掉）。
+            // 这里无条件确保空表存在：空表上 fn::ses_date 安全返回 none。
+            let _ = model_primary_db()
+                .query("DEFINE TABLE IF NOT EXISTS ses SCHEMALESS;")
+                .await;
+            anyhow::Ok(())
+        })
         .await?;
     Ok(())
 }

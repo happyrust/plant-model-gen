@@ -123,7 +123,12 @@ fn insert_cata_hash_refno(
     if is_bran_or_hang(meta.noun) {
         return;
     }
-    if !is_cate_noun(meta.noun) {
+    // 带有效 cata_hash 的元素必然是元件引用件（cal_cata_hash 基于 SPRE/CATR 计算成功），
+    // 直接入组 —— 否则 BRAN 子管件（ELBO/VALV/OLET/ATTA 等，不在 USE_CATE_NOUN_NAMES
+    // 白名单内）会被整体滤掉，导致 BRAN 管线 unique_cata=0、管件实例从不生成。
+    // 无有效 hash 的退化路径（refno key）仍按 CATE noun 白名单收口，避免容器节点混入。
+    let has_valid_hash = meta.cata_hash.is_some_and(|hash| hash != 0);
+    if !has_valid_hash && !is_cate_noun(meta.noun) {
         return;
     }
     let refno = RefnoEnum::from(meta.refno);
@@ -224,8 +229,17 @@ pub async fn build_cata_hash_map_from_tree(
 
     let merged_map: DashMap<String, CataHashRefnoKV> = DashMap::new();
     for (dbnum, group_refnos) in dbnum_groups {
-        let Ok(map) = build_cata_hash_map_from_tree_by_dbnum(dbnum, &group_refnos).await else {
-            continue;
+        let map = match build_cata_hash_map_from_tree_by_dbnum(dbnum, &group_refnos).await {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!(
+                    "[build_cata_hash_map] dbnum={} 加载 tree/构建 cata_hash 失败（跳过该组 {} 个 refno）: {}",
+                    dbnum,
+                    group_refnos.len(),
+                    e
+                );
+                continue;
+            }
         };
         for entry in map.into_iter() {
             let (cata_hash, kv) = entry;

@@ -1,5 +1,5 @@
 //! Platform configuration (embed URL / frontend base).
-use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use crate::shared::net_util::{is_loopback_or_unspecified_host, local_ip_or_loopback};
 
 /// 平台前端配置
 #[derive(Clone, Debug)]
@@ -64,77 +64,8 @@ fn access_host_from_bind_host(bind_host: &str) -> String {
     if !is_loopback_or_unspecified_host(trimmed) {
         return trimmed.to_string();
     }
-
-    get_local_ip_via_udp().unwrap_or_else(|err| {
-        tracing::warn!("无法推断本机真实 IPv4: {err}");
-        "0.0.0.0".to_string()
-    })
-}
-
-fn is_loopback_or_unspecified_host(host: &str) -> bool {
-    let normalized = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "" | "0.0.0.0" | "::" | "127.0.0.1" | "localhost" | "::1"
-    ) {
-        return true;
-    }
-    normalized
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback() || ip.is_unspecified())
-        .unwrap_or(false)
-}
-
-fn get_local_ip_via_udp() -> Result<String, std::io::Error> {
-    fn host_from_url_or_host(value: &str) -> Option<&str> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let without_scheme = trimmed
-            .strip_prefix("http://")
-            .or_else(|| trimmed.strip_prefix("https://"))
-            .unwrap_or(trimmed);
-        without_scheme
-            .split('/')
-            .next()
-            .and_then(|host_port| host_port.split(':').next())
-            .map(str::trim)
-            .filter(|host| !host.is_empty())
-    }
-
-    for key in [
-        "AIOS_PUBLIC_HOST",
-        "AIOS_LOCAL_IP",
-        "AIOS_VIEWER_HOST",
-        "AIOS_VIEWER_BASE_URL",
-    ] {
-        let Ok(value) = std::env::var(key) else {
-            continue;
-        };
-        let Some(host) = host_from_url_or_host(&value) else {
-            continue;
-        };
-        if let Ok(IpAddr::V4(ipv4)) = host.parse::<IpAddr>() {
-            if !ipv4.is_unspecified() && !ipv4.is_loopback() {
-                return Ok(ipv4.to_string());
-            }
-        }
-    }
-
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80))?;
-    match socket.local_addr()?.ip() {
-        IpAddr::V4(ipv4) if !ipv4.is_unspecified() && !ipv4.is_loopback() => Ok(ipv4.to_string()),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "无法推断本机真实 IPv4，请设置 AIOS_PUBLIC_HOST 或 AIOS_LOCAL_IP",
-        )),
-    }
+    // 失败回退 127.0.0.1（specs/004：展示型地址禁止 0.0.0.0 / 空串）。
+    local_ip_or_loopback()
 }
 
 fn url_host(host: &str) -> String {

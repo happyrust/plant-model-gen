@@ -2457,12 +2457,8 @@ fn disk_resource_for_path(path: &StdPath) -> serde_json::Value {
 async fn probe_viewer_health() -> serde_json::Value {
     let viewer_index = StdPath::new("viewer/index.html");
     let static_present = viewer_index.exists();
-    let viewer_url = crate::web_server::web_listen::get_web_listen().map(|(_, port)| {
-        format!(
-            "http://{}:{port}/viewer/",
-            super::get_local_ip_via_udp().unwrap_or_default()
-        )
-    });
+    let viewer_url = crate::web_server::web_listen::get_web_listen()
+        .map(|(_, port)| format!("http://{}:{port}/viewer/", super::local_ip_or_loopback()));
 
     let mut http_ok = None;
     let mut http_status = None;
@@ -2770,7 +2766,7 @@ fn derive_frontend_url_from_backend(backend_url: &str, bind_host: &str) -> Strin
         return parsed.to_string();
     }
     let host = if super::is_loopback_or_unspecified_host(bind_host) {
-        super::get_local_ip_via_udp().unwrap_or_default()
+        super::local_ip_or_loopback()
     } else {
         bind_host.to_string()
     };
@@ -2967,13 +2963,7 @@ pub async fn api_import_deployment_site_from_dboption(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string())
         })
-        .unwrap_or_else(|| {
-            format!(
-                "http://{}:{}",
-                super::get_local_ip_via_udp().unwrap_or_default(),
-                bind_port
-            )
-        });
+        .unwrap_or_else(|| format!("http://{}:{}", super::local_ip_or_loopback(), bind_port));
     let frontend_url = req
         .frontend_url
         .clone()

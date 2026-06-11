@@ -481,7 +481,7 @@ pub async fn get_wizard_templates(
             module: "DESI".to_string(),
             db_type: "surrealdb".to_string(),
             surreal_ns: 1516,
-            db_ip: super::get_local_ip_via_udp().unwrap_or_default(),
+            db_ip: super::local_ip_or_loopback(),
             db_port: "8009".to_string(),
             db_user: "root".to_string(),
             db_password: "root".to_string(),

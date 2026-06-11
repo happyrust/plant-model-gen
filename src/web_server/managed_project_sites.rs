@@ -9,7 +9,7 @@
 //! - 新增 `path_size_bytes` 的 TTL 缓存；递归扫描限制深度并跳过隐藏/符号链接。
 //! - `open_db` 使用进程内共享连接 + 一次性 schema 升级；pid 存在性检查改用 `libc::kill(pid,0)`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -502,10 +502,8 @@ fn normalize_host(host: Option<String>) -> String {
 }
 
 fn default_access_host() -> String {
-    super::get_local_ip_via_udp().unwrap_or_else(|err| {
-        tracing::warn!("无法推断本机真实 IPv4: {err}");
-        "0.0.0.0".to_string()
-    })
+    // 回退 127.0.0.1 而非 0.0.0.0：后者拼进展示 URL 在多数环境不可访问（specs/004）。
+    super::local_ip_or_loopback()
 }
 
 fn access_host_from_bind_host(bind_host: &str) -> String {
@@ -1042,6 +1040,7 @@ fn validate_and_canonicalize_projects(projects: &[SiteProject]) -> Result<Vec<Si
             role: p.role,
             is_primary: p.is_primary,
             sort_order: p.sort_order,
+            dbnums: normalize_manual_db_nums(p.dbnums.clone()),
         });
     }
     if design_count == 0 {
@@ -1053,13 +1052,34 @@ fn validate_and_canonicalize_projects(projects: &[SiteProject]) -> Result<Vec<Si
     Ok(out)
 }
 
-/// dbnum 冲突预检由 parse sidecar 负责。
+/// create/update 保存前的 dbnum 冲突预检（specs/004，W-1 收口）。
 ///
-/// `web_server` 不再扫描工程目录或读取 DB 文件头；这里只保留调用点的
-/// 配置级占位，避免控制面重新获得 E3D 数据读取职责。
+/// 基于请求透传的 `SiteProject.dbnums` 快照（来源 sidecar 扫描）做本地查重，
+/// 冲突定义与 sidecar 扫描一致：同一 dbnum 落在站点内多个工程。`web_server`
+/// 仍不扫描工程目录、不读 DB 文件头；未携带 dbnums 的工程（旧数据 / 手填路径）
+/// 跳过校验，渐进收紧。
 fn precheck_dbnum_conflicts(projects: &[SiteProject]) -> Result<()> {
-    let _ = projects;
-    Ok(())
+    let mut owners: BTreeMap<u32, Vec<&str>> = BTreeMap::new();
+    for project in projects {
+        // 工程内先去重：update 路径的 projects 可能未经规范化，
+        // 单工程重复 dbnum 不构成跨工程冲突。
+        let unique: BTreeSet<u32> = project.dbnums.iter().copied().collect();
+        for dbnum in unique {
+            owners.entry(dbnum).or_default().push(project.name.as_str());
+        }
+    }
+    let conflicts: Vec<String> = owners
+        .into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(dbnum, names)| format!("dbnum {} 同时属于工程 [{}]", dbnum, names.join(", ")))
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "站点内 dbnum 冲突：{}。请调整工程的 db 归属或拆分站点后再保存。",
+        conflicts.join("；")
+    )
 }
 
 pub fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
@@ -3275,6 +3295,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
             role: ProjectRole::Design,
             is_primary: true,
             sort_order: 0,
+            dbnums: Vec::new(),
         }]
     } else {
         validate_and_canonicalize_projects(&req.projects)?
@@ -3987,6 +4008,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             role: ProjectRole::Design,
             is_primary: true,
             sort_order: 0,
+            dbnums: Vec::new(),
         }];
     }
     if !req.manual_db_files.is_empty() {

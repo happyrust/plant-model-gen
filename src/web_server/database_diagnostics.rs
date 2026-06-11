@@ -341,6 +341,6 @@ fn generate_recommendations(result: &mut DatabaseDiagnosticResult) {
     result.add_recommendation("查看详细日志: tail -f surreal.log".to_string());
     result.add_recommendation(format!(
         "手动测试连接: surreal sql --conn ws://{}:8009 --user root --pass root",
-        super::get_local_ip_via_udp().unwrap_or_default()
+        super::local_ip_or_loopback()
     ));
 }

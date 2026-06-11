@@ -281,7 +281,7 @@ impl Default for DatabaseConfig {
             module: "DESI".to_string(),
             db_type: "surrealdb".to_string(),
             surreal_ns: 1516,
-            db_ip: super::get_local_ip_via_udp().unwrap_or_default(),
+            db_ip: super::local_ip_or_loopback(),
             db_port: "8020".to_string(), // 修改为与 DbOption.toml 一致的端口
             db_user: "root".to_string(),
             db_password: "root".to_string(),
@@ -905,6 +905,10 @@ pub struct SiteProject {
     /// 排序
     #[serde(default)]
     pub sort_order: u32,
+    /// 该工程下发现的 dbnum（来自 sidecar 扫描结果透传；为空表示无快照，
+    /// `precheck_dbnum_conflicts` 跳过该工程，渐进收紧。specs/004）
+    #[serde(default)]
+    pub dbnums: Vec<u32>,
 }
 
 /// 工程扫描候选项（Phase 3 扫描 API 返回的单个候选工程）
@@ -940,7 +944,9 @@ pub struct ScanProjectsResult {
     pub root: String,
     /// 候选工程
     pub projects: Vec<ScannedProject>,
-    /// dbnum 冲突标注（仅提示，不阻塞返回；保存时由 precheck_dbnum_conflicts 兜底）
+    /// dbnum 冲突标注（仅提示，不阻塞返回；create/update 保存时由
+    /// `precheck_dbnum_conflicts` 基于请求透传的 `SiteProject.dbnums` 快照兜底，
+    /// 未透传 dbnums 的工程跳过校验）
     pub conflicts: Vec<ScannedDbnumConflict>,
     /// 是否存在冲突
     pub has_conflict: bool,

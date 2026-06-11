@@ -264,6 +264,7 @@ async function runScan() {
         role: candidate.role,
         is_primary: false,
         sort_order: projects.value.length,
+        dbnums: candidate.dbnums ?? [],
       })
     }
     ensureSinglePrimary()
@@ -297,6 +298,8 @@ function buildProjectsPayload(): SiteProject[] | undefined {
     role: p.role,
     is_primary: p.is_primary,
     sort_order: idx,
+    // 透传扫描得到的 dbnums，后端保存时据此做冲突预检（缺省跳过）
+    dbnums: p.dbnums ?? [],
   }))
 }
 

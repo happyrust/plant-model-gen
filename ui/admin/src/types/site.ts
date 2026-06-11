@@ -22,6 +22,8 @@ export interface SiteProject {
   role: ProjectRole
   is_primary: boolean
   sort_order: number
+  /** 该工程下发现的 dbnum（扫描结果透传；后端保存时据此做冲突预检，缺省跳过） */
+  dbnums?: number[]
 }
 
 /** Phase 3 扫描 API 返回的候选工程 */

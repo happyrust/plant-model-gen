@@ -2,6 +2,15 @@
 
 ## 2026-06-11
 
+### Fixed — 审核修复批次 specs/006~008:admin 任务恢复、sidecar 生命周期、站点输入校验
+
+> 2026-06-10 增量审核（`docs/code-review-2026-06-10/INCREMENTAL_REVIEW.md`）的三项修复落地。
+
+- admin 任务崩溃恢复(spec 006):启动期(建表后、路由可用前)将残留 Pending/Running 任务统一置 Failed + error="admin 重启中断",补 updated_at/completed_at,恢复条数写启动日志,失败仅告警不阻塞启动;解除"崩溃后站点被单飞检查永久锁死"(cancel 空壳、delete 拒非终态、retry 仅认 Failed 四路全堵),恢复后任务可直接 retry 重新提交。
+- sidecar 单飞拉起与空闲自关闭(spec 007):`ensure_sidecar` per-key 单飞锁(双重检查复用,不串行化跨 key 拉起),健康检查移出注册表锁消除锁内 HTTP 等待;serve 新增 `--idle-shutdown-ms`,authorize 成功即重置空闲计时、events WS 按连接计数视为活跃、存在非终态 job 不关闭,看门狗复用既有 oneshot 通道优雅退出;非 job sidecar 默认 15 分钟空闲自关(`ADMIN_SIDECAR_IDLE_SHUTDOWN_MS` 可调,0 禁用),兜底 admin 崩溃后 `process_group(0)` 隔离导致的永久孤儿;job sidecar 行为不变。
+- 站点 dbnum 输入预检 + 本机 IP 工具收敛(spec 008):`SiteProject` 新增 serde-default `dbnums`(扫描结果经 SiteDrawer 透传),`precheck_dbnum_conflicts` 实装"同一 dbnum 落站点内多个工程即拒绝保存"(与 sidecar 扫描同语义,工程内去重防误报,缺省跳过渐进收紧);`get_local_ip_via_udp`/`is_loopback_or_unspecified_host` 收敛为 `src/shared/net_util.rs` 唯一实现,删除 platform_api 整份复制,新增 `local_ip_or_loopback()` 统一失败回退(127.0.0.1 + warn),替换 11 处空串/0.0.0.0 回退,消灭 `http://:port` 与 `http://0.0.0.0:port` 损坏地址。
+- 验证:nightly cargo fmt + rust-analyzer/vue-tsc 零错;`rg` 确认 IP 函数全仓单一定义;ui/admin 全量 build 受阻于预存幽灵依赖(`data-browser-surreal.ts` 引用未声明的 `surrealdb`,与本批无关);运行时验收(kill -9 恢复/并发单飞/idle 重拉/冲突 409)待环境。
+
 ### Added — 校审日志体系 specs/003~005:采集、统一查询、站点可见性与进程内日志
 
 > 校审页日志抽屉四类日志全链路:接口 request/response 采集落库、统一查询契约、站点文件日志默认当前站点、web_server 进程内运行日志环形缓冲。配套前端 plant3d-web LogDrawer(flag 门控)。

@@ -92,7 +92,7 @@ fn runtime_access_host(bind_host: &str) -> String {
         .trim_start_matches('[')
         .trim_end_matches(']');
     if super::is_loopback_or_unspecified_host(trimmed) {
-        super::get_local_ip_via_udp().unwrap_or_default()
+        super::local_ip_or_loopback()
     } else {
         trimmed.to_string()
     }

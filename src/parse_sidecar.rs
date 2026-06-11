@@ -5,7 +5,10 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,6 +37,8 @@ const MANDATORY_PREPARSE_DB_TYPES: &[&str] = &["DICT", "GLOB", "GLB"];
 const SCAN_MAX_DEPTH: usize = 6;
 const SCAN_MAX_FILES: usize = 200_000;
 const CLI_JOB_KILL_GRACE_MS: u64 = 1500;
+const IDLE_WATCHDOG_TICK_MS: u64 = 30_000;
+const JOB_TERMINAL_STATUSES: &[&str] = &["succeeded", "failed", "cancelled"];
 
 #[derive(Debug, Clone)]
 pub struct ParseSidecarOptions {
@@ -44,6 +49,8 @@ pub struct ParseSidecarOptions {
     pub token: Option<String>,
     pub shutdown_after_job: bool,
     pub shutdown_delay_ms: u64,
+    /// 空闲多少毫秒后自关闭；0 表示禁用（specs/003-sidecar-singleflight-idle）。
+    pub idle_shutdown_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -53,10 +60,29 @@ struct ParseSidecarState {
     token: Option<String>,
     shutdown_after_job: bool,
     shutdown_delay_ms: u64,
+    idle_shutdown_ms: u64,
+    /// 进程启动时刻，配合 `last_activity_ms` 计算空闲时长。
+    started_at: Instant,
+    /// 最近一次授权请求距 `started_at` 的毫秒数（原子更新，无锁读）。
+    last_activity_ms: Arc<AtomicU64>,
+    /// 当前打开的 events WebSocket 连接数；>0 视为活跃，不触发 idle 关闭。
+    active_ws: Arc<AtomicUsize>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     events_tx: broadcast::Sender<Value>,
     jobs: Arc<Mutex<BTreeMap<String, SidecarJobRecord>>>,
     job_cancels: Arc<Mutex<BTreeMap<String, oneshot::Sender<()>>>>,
+}
+
+impl ParseSidecarState {
+    fn touch_activity(&self) {
+        let elapsed = self.started_at.elapsed().as_millis() as u64;
+        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    fn idle_elapsed_ms(&self) -> u64 {
+        let now = self.started_at.elapsed().as_millis() as u64;
+        now.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -272,11 +298,18 @@ pub async fn run_parse_sidecar(options: ParseSidecarOptions) -> Result<()> {
         token: options.token,
         shutdown_after_job: options.shutdown_after_job,
         shutdown_delay_ms: options.shutdown_delay_ms,
+        idle_shutdown_ms: options.idle_shutdown_ms,
+        started_at: Instant::now(),
+        last_activity_ms: Arc::new(AtomicU64::new(0)),
+        active_ws: Arc::new(AtomicUsize::new(0)),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         events_tx,
         jobs: Arc::new(Mutex::new(BTreeMap::new())),
         job_cancels: Arc::new(Mutex::new(BTreeMap::new())),
     };
+    if state.idle_shutdown_ms > 0 {
+        tokio::spawn(idle_shutdown_watchdog(state.clone()));
+    }
     let bind_host = options.bind_host;
     let http_port = options.http_port;
     let app = Router::new()
@@ -547,6 +580,7 @@ async fn events(
     authorize(&state, &headers)?;
     Ok(ws
         .on_upgrade(|mut socket| async move {
+            state.active_ws.fetch_add(1, Ordering::Relaxed);
             let mut rx = state.events_tx.subscribe();
             let _ = socket
                 .send(axum::extract::ws::Message::Text(
@@ -574,6 +608,9 @@ async fn events(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            state.active_ws.fetch_sub(1, Ordering::Relaxed);
+            // 断连即视为一次活动，给调用方留出重连/收尾窗口，避免立刻判定空闲。
+            state.touch_activity();
         })
         .into_response())
 }
@@ -714,6 +751,40 @@ async fn run_submitted_cli_job(
         }
     }
     schedule_shutdown_after_job(&state).await;
+}
+
+/// 空闲看门狗：无授权请求、无打开的 WS、无非终态 job 持续超过阈值时优雅自关闭。
+///
+/// 兜底 admin 崩溃/重启后 `process_group(0)` 隔离导致的 sidecar 孤儿
+/// （specs/003-sidecar-singleflight-idle）；下一次 `ensure_sidecar` 会按需重新拉起。
+async fn idle_shutdown_watchdog(state: ParseSidecarState) {
+    let tick = Duration::from_millis(IDLE_WATCHDOG_TICK_MS.min(state.idle_shutdown_ms.max(1)));
+    loop {
+        tokio::time::sleep(tick).await;
+        if state.active_ws.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        if state.idle_elapsed_ms() < state.idle_shutdown_ms {
+            continue;
+        }
+        let has_live_job = {
+            let jobs = state.jobs.lock().await;
+            jobs.values()
+                .any(|record| !JOB_TERMINAL_STATUSES.contains(&record.status.as_str()))
+        };
+        if has_live_job {
+            continue;
+        }
+        let Some(tx) = state.shutdown_tx.lock().await.take() else {
+            return;
+        };
+        println!(
+            "📴 aios-database sidecar {} idle for {}ms, shutting down",
+            state.site_key, state.idle_shutdown_ms
+        );
+        let _ = tx.send(());
+        return;
+    }
 }
 
 async fn schedule_shutdown_after_job(state: &ParseSidecarState) {
@@ -927,7 +998,9 @@ async fn kill_child_process_tree(child: &mut Child) {
 }
 
 fn authorize(state: &ParseSidecarState, headers: &HeaderMap) -> Result<(), Response> {
+    // 所有路由都经过此函数，授权成功即视为一次活动，统一重置 idle 计时。
     let Some(expected) = state.token.as_deref().filter(|value| !value.is_empty()) else {
+        state.touch_activity();
         return Ok(());
     };
     let actual = headers
@@ -936,6 +1009,7 @@ fn authorize(state: &ParseSidecarState, headers: &HeaderMap) -> Result<(), Respo
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default();
     if actual == expected {
+        state.touch_activity();
         Ok(())
     } else {
         Err(structured_error(

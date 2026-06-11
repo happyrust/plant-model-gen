@@ -966,6 +966,14 @@ async fn main() -> anyhow::Result<()> {
                         .default_value("1000")
                         .value_parser(clap::value_parser!(u64))
                         .value_name("MS"),
+                )
+                .arg(
+                    Arg::new("idle-shutdown-ms")
+                        .long("idle-shutdown-ms")
+                        .help("无授权请求/WS/运行中 job 持续该毫秒数后自关闭；0 禁用")
+                        .default_value("0")
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("MS"),
                 ),
         )
         // ========== pe_transform 刷新命令 ==========
@@ -1135,6 +1143,10 @@ async fn main() -> anyhow::Result<()> {
                 .get_one::<u64>("shutdown-delay-ms")
                 .copied()
                 .unwrap_or(1000);
+            let idle_shutdown_ms = serve_matches
+                .get_one::<u64>("idle-shutdown-ms")
+                .copied()
+                .unwrap_or(0);
             return aios_database::parse_sidecar::run_parse_sidecar(
                 aios_database::parse_sidecar::ParseSidecarOptions {
                     site_key,
@@ -1144,6 +1156,7 @@ async fn main() -> anyhow::Result<()> {
                     token,
                     shutdown_after_job,
                     shutdown_delay_ms,
+                    idle_shutdown_ms,
                 },
             )
             .await;

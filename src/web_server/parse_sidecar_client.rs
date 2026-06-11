@@ -3,7 +3,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -28,6 +28,8 @@ const SIDECAR_HEALTH_ATTEMPTS: usize = 40;
 const SIDECAR_HEALTH_DELAY_MS: u64 = 100;
 const DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS: u64 = 10_000;
 const JOB_SIDECAR_SHUTDOWN_DELAY_ENV: &str = "ADMIN_SIDECAR_JOB_SHUTDOWN_DELAY_MS";
+const DEFAULT_SIDECAR_IDLE_SHUTDOWN_MS: u64 = 900_000;
+const SIDECAR_IDLE_SHUTDOWN_ENV: &str = "ADMIN_SIDECAR_IDLE_SHUTDOWN_MS";
 const SIDECAR_KILL_GRACE_MS: u64 = 1500;
 const SURREAL_CONN_ENV_KEYS: &[&str] =
     &["SURREAL_CONN_MODE", "SURREAL_CONN_IP", "SURREAL_CONN_PORT"];
@@ -94,6 +96,25 @@ fn job_sidecar_shutdown_delay_ms() -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_JOB_SIDECAR_SHUTDOWN_DELAY_MS)
+}
+
+/// 非 job sidecar 的空闲自关闭阈值；env 可调，显式设 0 禁用
+/// （specs/003-sidecar-singleflight-idle）。
+fn sidecar_idle_shutdown_ms() -> u64 {
+    std::env::var(SIDECAR_IDLE_SHUTDOWN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SIDECAR_IDLE_SHUTDOWN_MS)
+}
+
+/// 每个 sidecar key 一把 spawn 锁，保证同 key 并发 ensure 只 spawn 一个进程，
+/// 同时不串行化不同 key 的拉起（健康等待可达数秒）。
+///
+/// 锁条目一旦创建就不移除：key 集合有限（site:/scan:/resolve:/preview:/db-index:
+/// 的稳定 hash），而提前 remove 会让两个调用方各持不同锁实例，破坏单飞语义。
+fn spawn_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub async fn preview_parse_plan(
@@ -440,19 +461,41 @@ fn stable_key(value: &str) -> String {
 }
 
 async fn ensure_sidecar(key: &str) -> Result<SidecarHandle> {
-    {
-        let guard = sidecars().lock().await;
-        if let Some(handle) = guard.get(key) {
-            if sidecar_healthy(handle).await {
-                return Ok(handle.clone());
-            }
-        }
+    // 快路径：已有健康 handle 直接复用。
+    if let Some(handle) = healthy_registered_sidecar(key).await {
+        return Ok(handle);
+    }
+
+    // 慢路径单飞：同 key 并发只允许一个调用方 spawn，其余等待后复用。
+    let key_lock = {
+        let mut locks = spawn_locks().lock().await;
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _spawn_guard = key_lock.lock().await;
+
+    // double-check：等锁期间可能已有并发方完成 spawn。
+    if let Some(handle) = healthy_registered_sidecar(key).await {
+        return Ok(handle);
     }
 
     let handle = spawn_sidecar(key).await?;
     let mut guard = sidecars().lock().await;
     guard.insert(key.to_string(), handle.clone());
     Ok(handle)
+}
+
+async fn healthy_registered_sidecar(key: &str) -> Option<SidecarHandle> {
+    let handle = {
+        let guard = sidecars().lock().await;
+        guard.get(key).cloned()
+    };
+    match handle {
+        Some(handle) if sidecar_healthy(&handle).await => Some(handle),
+        _ => None,
+    }
 }
 
 async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
@@ -485,6 +528,11 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
             .arg("--shutdown-after-job")
             .arg("--shutdown-delay-ms")
             .arg(job_sidecar_shutdown_delay_ms().to_string());
+    } else {
+        let idle_ms = sidecar_idle_shutdown_ms();
+        if idle_ms > 0 {
+            command.arg("--idle-shutdown-ms").arg(idle_ms.to_string());
+        }
     }
 
     isolate_sidecar_process_group(&mut command);

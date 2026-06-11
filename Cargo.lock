@@ -3671,10 +3671,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "e3d_io"
-version = "0.1.0"
-
-[[package]]
 name = "earcutr"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8490,7 +8486,6 @@ dependencies = [
  "dashmap 7.0.0-rc2",
  "deku",
  "derivative",
- "e3d_io",
  "fern",
  "flume",
  "futures",

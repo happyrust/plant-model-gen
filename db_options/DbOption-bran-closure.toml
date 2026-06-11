@@ -1,0 +1,142 @@
+# 按需解析验证：BRAN 24381_145018（AvevaMarineSample, MDB /ALL, dbnum 7997）
+# 用法：
+#   1) aios-database -c db_options/DbOption-bran-closure gen-cata-closure --seed-refnos 24381_145018
+#   2) $env:AIOS_CATA_CLOSURE_MODE="manifest"; aios-database -c db_options/DbOption-bran-closure
+admin_allowed_project_roots = ["D:/AVEVA/Projects"]
+admin_enable_quick_deploy_test = false
+apply_boolean_operation = false
+att_chunk = 200
+batch_insert_sql_cnt = 100
+boolean_pipeline_mode = "db_legacy"
+build_cate_relate = false
+debug_print_world_transform = false
+debug_refno_types = []
+defer_db_write = false
+enable_index = false
+enable_log = true
+enable_sqlite_rtree = false
+export_json = false
+export_parquet = false
+export_parquet_after_gen = false
+file_server_host = "http://localhost:8082/assets/archives"
+gen_history_model = false
+gen_mesh = false
+gen_model = false
+gen_model_batch_size = 16
+gen_spatial_tree = false
+gen_tree_only = false
+# 按需最小解析集：SYST + DICT（必解析）+ DESI 7997（BRAN 所在库）
+# + CATA 5054（闭包 manifest 唯一覆盖的元件库；其余 CATA 对该 BRAN 无依赖，不解析）
+included_db_files = [
+    "ams251047_0001",
+    "ams5054_0001",
+    "ams5100_0001",
+    "ams5101_0001",
+    "ams7997_0001",
+    "amssys",
+]
+included_projects = ["AvevaMarineSample"]
+incr_sync = false
+index_tree_batch_size = 200
+index_tree_debug_limit_per_target_type = 0
+index_tree_max_concurrent_targets = 6
+ip = "127.0.0.1"
+load_spatial_tree = false
+location = "sjz"
+location_dbs = []
+manual_db_nums = [7997]
+mdb_name = "ALL"
+mesh_tol_ratio = 3.0
+meshes_path = "./assets/meshes"
+module = "DESI"
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+need_sync_refno_basic = false
+only_rebuild_pdms_element = false
+only_sync_sys = false
+only_update_dbinfo = false
+password = ""
+pe_chunk = 300
+port = "3306"
+project_code = "1"
+# 与磁盘工程名一致（scene_tree/db_meta/cata_closure/生成期口径全部同源）
+project_name = "AvevaMarineSample"
+project_path = "D:/AVEVA/Projects/E3D2.1"
+puhua_database_ip = ""
+puhua_database_password = ""
+puhua_database_user = ""
+rebuild_ssc_tree = false
+remote_file_server_hosts = []
+replace_dbs = false
+replace_mesh = false
+reset_mdb_project = false
+room_key_word = ["-RM"]
+save_db = true
+save_spatial_tree_to_db = false
+sql_threads_number = 50
+surreal_ip = "127.0.0.1"
+surreal_ns = "1"
+surreal_password = "root"
+surreal_port = 8031
+surreal_script_dir = "../rs-core/resource/surreal"
+surreal_user = "root"
+sync_chunk_size = 100000
+sync_graph_db = true
+sync_history = false
+sync_live = false
+sync_tidb = false
+sync_versioned = false
+total_sync = true
+user = "root"
+
+[mesh_precision]
+default_lod = "L1"
+
+[mesh_precision.lod_profiles.L1]
+mesh_tol_ratio = 3.0
+neg_multiplier = 0.3
+polyhedron_fixed_tol = 0.01
+radial_segments = 48
+sphere_subdiv = 32
+sweep_multiplier = 0.1
+
+[mesh_precision.lod_profiles.L1.csg_settings]
+cap_segments = 1
+error_tolerance = 0.002
+height_segments = 3
+max_height_segments = 6
+max_radial_segments = 60
+min_height_segments = 2
+min_radial_segments = 16
+non_scalable_factor = 0.7
+radial_segments = 32
+target_segment_length = 80.0
+
+[model_center]
+base_url = "http://localhost:3000"
+frontend_base_url = ""
+timeout_seconds = 30
+token_secret = "your-shared-secret-key"
+
+[platform_auth]
+debug_token = ""
+enabled = true
+
+[review_auth]
+debug_project_id = "debug-project"
+debug_role = "sj"
+debug_user_id = "debug-user"
+enabled = false
+
+[surrealdb]
+ip = "127.0.0.1"
+mode = "ws"
+password = "root"
+path = "runtime/bran-closure/surreal.db"
+port = 8031
+user = "root"
+
+[surrealkv]
+enabled = false
+mode = "file"
+path = "runtime/bran-closure/surreal.db.kv"

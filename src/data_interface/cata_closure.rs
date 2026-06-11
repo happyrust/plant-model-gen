@@ -32,6 +32,8 @@ pub struct ParsedCataEle {
     pub owner: RefU64,
     /// noun 的 `db1_hash`。
     pub noun: u32,
+    /// noun 名（大写，来自属性表类型；未知时为空串）。
+    pub noun_name: String,
     /// 该元素所有出向 `RefU64` 引用（闭包的横向边）。
     pub outbound: Vec<RefU64>,
     /// 该元素的成员/子节点（容器子树的纵向边；来自 `EleData::children`）。
@@ -113,12 +115,14 @@ async fn parse_refnos_with_session(
                 if let Some(sink) = attmap_sink.as_deref_mut() {
                     sink.insert(refno, (ele.att_map().clone(), children.clone()));
                 }
+                let noun_name = ele.att_map().get_type_str().trim().to_uppercase();
                 out.insert(
                     refno,
                     ParsedCataEle {
                         refno: ele.refno,
                         owner: ele.owner,
                         noun: ele.noun,
+                        noun_name,
                         outbound,
                         children,
                     },
@@ -183,6 +187,13 @@ pub struct CataClosureConfig {
     pub cata_db_types: HashSet<String>,
     /// 防御性轮数上限。
     pub max_rounds: usize,
+    /// 容器子树展开白名单（noun 名，大写）。
+    ///
+    /// - `None`：全部展开（项目级 pass 口径，Q5：SELE/SPEC 到达即纳入全部 SPCO 子树）。
+    /// - `Some(set)`：仅展开集合内名词的 children —— refno 级按需闭包 / 运行期惰性
+    ///   小闭包用，避免经 owner 链到达 SPEC/SELE 后整个规格世界被子树展开拉爆
+    ///   （28 个种子 → 百万级 visited 的发散场景）。
+    pub container_subtree_nouns: Option<HashSet<String>>,
 }
 
 impl Default for CataClosureConfig {
@@ -194,6 +205,25 @@ impl Default for CataClosureConfig {
             follow_children: true,
             cata_db_types,
             max_rounds: 64,
+            container_subtree_nouns: None,
+        }
+    }
+}
+
+impl CataClosureConfig {
+    /// 精确模式（refno 级按需 / 惰性小闭包）：children 仅对几何与点集容器展开
+    /// （GMSE/NGMS/PTSE/PSTR/SPRO/DTSE），不展开 SPEC/SELE 等规格容器。
+    ///
+    /// 生成期 spec 口径选择若命中闭包外 SPCO，由 T007 惰性兜底即时补齐
+    /// （与 core.dll `DGOTO` 惰性导航同构）。
+    pub fn precise() -> Self {
+        let container: HashSet<String> = ["GMSE", "NGMS", "PTSE", "PSTR", "SPRO", "DTSE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        Self {
+            container_subtree_nouns: Some(container),
+            ..Self::default()
         }
     }
 }
@@ -266,6 +296,7 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
         let include_owner = self.cfg.include_owner_chain;
         let follow_children = self.cfg.follow_children;
         let max_rounds = self.cfg.max_rounds;
+        let container_allow = self.cfg.container_subtree_nouns.clone();
         let cata_types: HashSet<String> = self
             .cfg
             .cata_db_types
@@ -369,7 +400,13 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                                 next.push(ele.owner);
                             }
                             if follow_children {
-                                next.extend(ele.children.iter().copied());
+                                let expand_children = match &container_allow {
+                                    None => true,
+                                    Some(allow) => allow.contains(&ele.noun_name),
+                                };
+                                if expand_children {
+                                    next.extend(ele.children.iter().copied());
+                                }
                             }
                         }
                         None => {
@@ -660,24 +697,16 @@ pub async fn run_cata_closure_pass_for_roots(
     Ok(total)
 }
 
-/// CLI 完整入口：从 `DB_OPTION_FILE` 配置派生工程根，跑前置闭包 pass 并写 manifest
-/// （`gen-cata-closure` 子命令即薄包装本函数）。
-///
-/// 流程：
-/// 1. `db_index.sqlite` 缺失 → 自动全量预扫描（等价 `scan-db-index`）；
-///    已存在且 `rescan_index=true` → 按指纹（mtime/size）增量刷新；
-/// 2. [`run_cata_closure_pass_for_roots`]：扫描工程根下全部 DESI 库 → 逐库闭包 → merge；
-/// 3. 原子写 `out_override`（缺省 [`default_manifest_path`]）。
+/// 共用前置：从 `DB_OPTION_FILE` 配置加载 DbOption，并确保 `db_index.sqlite` 就绪
+/// （缺失自动全量预扫；存在且 `rescan_index=true` 时按指纹增量刷新）。
 #[cfg(feature = "sqlite-index")]
-pub async fn run_cata_closure_pass_from_config(
+async fn prepare_index_from_config(
     rescan_index: bool,
-    out_override: Option<PathBuf>,
-) -> Result<CataClosureManifest> {
+) -> Result<(aios_core::options::DbOption, PathBuf)> {
     use crate::data_interface::db_index;
 
     let db_option = db_index::load_db_option_from_env()?;
     let project_name = db_option.project_name.clone();
-    let roots = db_index::derive_project_roots(&db_option)?;
 
     let index_path = db_index::default_index_path(&project_name);
     if !index_path.exists() {
@@ -695,10 +724,211 @@ pub async fn run_cata_closure_pass_from_config(
             index_path.display()
         );
     }
+    Ok((db_option, index_path))
+}
+
+/// CLI 完整入口：从 `DB_OPTION_FILE` 配置派生工程根，跑前置闭包 pass 并写 manifest
+/// （`gen-cata-closure` 子命令即薄包装本函数）。
+///
+/// 流程：
+/// 1. `db_index.sqlite` 缺失 → 自动全量预扫描（等价 `scan-db-index`）；
+///    已存在且 `rescan_index=true` → 按指纹（mtime/size）增量刷新；
+/// 2. [`run_cata_closure_pass_for_roots`]：扫描工程根下全部 DESI 库 → 逐库闭包 → merge；
+/// 3. 原子写 `out_override`（缺省 [`default_manifest_path`]）。
+#[cfg(feature = "sqlite-index")]
+pub async fn run_cata_closure_pass_from_config(
+    rescan_index: bool,
+    out_override: Option<PathBuf>,
+) -> Result<CataClosureManifest> {
+    use crate::data_interface::db_index;
+
+    let (db_option, index_path) = prepare_index_from_config(rescan_index).await?;
+    let project_name = db_option.project_name.clone();
+    let roots = db_index::derive_project_roots(&db_option)?;
 
     let out_path = out_override.unwrap_or_else(|| default_manifest_path(&project_name));
     let store = db_index::DbIndexStore::open(&index_path)?;
     run_cata_closure_pass_for_roots(&store, &roots, CataClosureConfig::default(), &out_path).await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// refno 级按需入口（如：单个 BRAN）— 设计子树部分解析播种 + CATA 闭包
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 设计侧子树出向引用收集（按需播种）。
+///
+/// 给定设计元素根 refno（如 BRAN / PIPE / ZONE），在其所属 DESI 库内沿
+/// `children` 做子树 BFS（`parse_db_refnos` 部分解析，**不整库解析**），
+/// 收集子树内全部元素的出向 `RefU64` 作为后续 CATA 闭包种子。
+///
+/// 返回 `(种子集合, 子树元素数)`。跨库 children（如有）由 locator 定位后同样纳入。
+#[cfg(feature = "sqlite-index")]
+pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
+    locator: &L,
+    roots: &[RefU64],
+) -> Result<(Vec<RefU64>, usize)> {
+    let mut sessions: HashMap<u32, DbSession> = HashMap::new();
+    let mut visited: HashSet<RefU64> = HashSet::new();
+    let mut seeds: HashSet<RefU64> = HashSet::new();
+    let mut frontier: Vec<RefU64> = roots.iter().copied().filter(|r| is_valid_ref0(r.get_0())).collect();
+    let mut parsed_count = 0usize;
+
+    while !frontier.is_empty() {
+        let mut by_db: HashMap<u32, Vec<RefU64>> = HashMap::new();
+        for r in frontier.drain(..) {
+            if !visited.insert(r) {
+                continue;
+            }
+            match locator.dbnum_of_ref0(r.get_0()) {
+                Some(dbnum) => by_db.entry(dbnum).or_default().push(r),
+                None => {
+                    log::warn!("[cata_closure] 设计子树 BFS：ref0 {} 无 dbnum 映射，跳过", r.get_0());
+                }
+            }
+        }
+        for (dbnum, refs) in by_db {
+            if !sessions.contains_key(&dbnum) {
+                let Some((project, path)) = locator.file_of(dbnum) else {
+                    log::warn!("[cata_closure] 设计子树 BFS：dbnum {} 无文件映射，跳过", dbnum);
+                    continue;
+                };
+                match open_db_session(&project, &path) {
+                    Ok(s) => {
+                        sessions.insert(dbnum, s);
+                    }
+                    Err(e) => {
+                        log::warn!("[cata_closure] 打开设计库失败 dbnum={}: {}", dbnum, e);
+                        continue;
+                    }
+                }
+            }
+            let session = sessions.get_mut(&dbnum).expect("session 已插入");
+            let parsed =
+                parse_refnos_with_session(&mut session.io, &session.index_map, &refs, None).await?;
+            parsed_count += parsed.len();
+            for ele in parsed.values() {
+                seeds.extend(ele.outbound.iter().copied());
+                frontier.extend(ele.children.iter().copied());
+            }
+        }
+    }
+    Ok((seeds.into_iter().collect(), parsed_count))
+}
+
+/// refno 级按需闭包 pass：以给定设计元素（如单个 BRAN）的子树出向引用为种子，
+/// 跑 CATA 闭包并原子写 manifest。
+#[cfg(feature = "sqlite-index")]
+pub async fn run_cata_closure_pass_for_refnos(
+    index: &crate::data_interface::db_index::DbIndexStore,
+    seed_roots: &[RefU64],
+    cfg: CataClosureConfig,
+    out_path: &Path,
+) -> Result<CataClosureManifest> {
+    let (seeds, subtree_count) = collect_design_subtree_outbound(index, seed_roots).await?;
+    log::info!(
+        "[cata_closure] 设计子树元素 {} 个 → 收集种子 {} 个",
+        subtree_count,
+        seeds.len()
+    );
+    let seed_count = seeds.len();
+    let mut resolver = CataClosureResolver::new(index, cfg);
+    resolver.seed(seeds);
+    let mut manifest = resolver.resolve().await?;
+    manifest.seed_count = seed_count;
+    manifest.save_json(out_path)?;
+    log::info!(
+        "[cata_closure] refno 级闭包 pass 完成: {} 个 CATA 库 / visited={} / missing={} → {}",
+        manifest.by_dbnum.len(),
+        manifest.visited_count,
+        manifest.missing,
+        out_path.display()
+    );
+    Ok(manifest)
+}
+
+/// CLI 入口（refno 级）：`gen-cata-closure --seed-refnos 24381_145018[,...]`。
+///
+/// 与 [`run_cata_closure_pass_from_config`] 同源准备 db_index，但跳过工程级 DESI
+/// 全量扫描，只解析种子设计元素的子树并做闭包 —— 即"给定 BRAN 参考号，
+/// 按需解析其全部依赖数据"的解析期入口。
+///
+/// 落盘口径：`--out` 给定时写单文件；缺省时按 dbnum 所属**工程名**分组 merge 进各
+/// `output/<工程>/scene_tree/cata_closure.json`（与 sync `load_sync_filter` 的读取
+/// 口径同源 —— sync 按解析循环的工程名找 manifest，而非配置 `project_name`；
+/// 与 T007 惰性兜底的 merge 行为一致，多次调用为增量并集）。
+#[cfg(feature = "sqlite-index")]
+pub async fn run_cata_closure_pass_for_refno_strs_from_config(
+    rescan_index: bool,
+    seed_refno_strs: &[String],
+    out_override: Option<PathBuf>,
+) -> Result<CataClosureManifest> {
+    let seed_roots: Vec<RefU64> = seed_refno_strs
+        .iter()
+        .filter_map(|s| s.trim().parse::<RefU64>().ok())
+        .filter(|r| is_valid_ref0(r.get_0()))
+        .collect();
+    anyhow::ensure!(
+        !seed_roots.is_empty(),
+        "--seed-refnos 未解析出有效 refno（期望形如 24381_145018，逗号分隔）"
+    );
+
+    let (db_option, index_path) = prepare_index_from_config(rescan_index).await?;
+
+    // InMemoryDbLocator：既作闭包定位器，又提供 dbnum→工程名（落盘分组用）。
+    let locator = {
+        let path = index_path.clone();
+        tokio::task::spawn_blocking(move || InMemoryDbLocator::load_from_index(&path)).await??
+    };
+
+    let (seeds, subtree_count) = collect_design_subtree_outbound(&locator, &seed_roots).await?;
+    log::info!(
+        "[cata_closure] 设计子树元素 {} 个 → 收集种子 {} 个",
+        subtree_count,
+        seeds.len()
+    );
+    let seed_count = seeds.len();
+    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::precise());
+    resolver.seed(seeds);
+    let mut manifest = resolver.resolve().await?;
+    manifest.seed_count = seed_count;
+
+    match out_override {
+        Some(out) => {
+            manifest.save_json(&out)?;
+            println!("📄 manifest → {}", out.display());
+        }
+        None => {
+            // 按 dbnum 所属工程分组，merge 进各工程默认 manifest（增量并集）。
+            let mut by_project: HashMap<String, CataClosureManifest> = HashMap::new();
+            for (dbnum, refs) in &manifest.by_dbnum {
+                let project = locator
+                    .project_of(*dbnum)
+                    .unwrap_or_else(|| db_option.project_name.clone());
+                by_project
+                    .entry(project)
+                    .or_default()
+                    .by_dbnum
+                    .insert(*dbnum, refs.clone());
+            }
+            for (project, delta) in by_project {
+                let path = default_manifest_path(&project);
+                let mut merged = if path.exists() {
+                    CataClosureManifest::load_json(&path).unwrap_or_default()
+                } else {
+                    CataClosureManifest::default()
+                };
+                merged.merge_from(&delta);
+                merged.save_json(&path)?;
+                println!(
+                    "📄 manifest（工程 {}）merge {} 个库 → {}",
+                    project,
+                    delta.by_dbnum.len(),
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -816,8 +1046,8 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
         tokio::task::spawn_blocking(move || InMemoryDbLocator::load_from_index(&path)).await??
     };
 
-    // 2. 小闭包（保留属性表与 children）。
-    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::default())
+    // 2. 小闭包（保留属性表与 children；精确模式防 SPEC 子树发散）。
+    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::precise())
         .with_retain_attmaps(true);
     resolver.seed(seeds.iter().copied());
     let delta = resolver.resolve().await?;

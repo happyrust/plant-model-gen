@@ -927,6 +927,14 @@ async fn main() -> anyhow::Result<()> {
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("seed-refnos")
+                        .long("seed-refnos")
+                        .help("按需模式：仅以这些设计元素（如 BRAN refno，形如 24381_145018，逗号分隔）的子树出向引用为种子做闭包；省略则扫描工程根下全部 DESI 库")
+                        .value_name("REFNOS")
+                        .value_delimiter(',')
+                        .num_args(1..),
+                )
+                .arg(
                     Arg::new("out")
                         .long("out")
                         .help("覆盖 manifest 输出路径（默认 <output>/<项目>/scene_tree/cata_closure.json）")
@@ -2649,15 +2657,27 @@ async fn main() -> anyhow::Result<()> {
         let out_override = closure_matches
             .get_one::<String>("out")
             .map(std::path::PathBuf::from);
+        let seed_refno_strs: Option<Vec<String>> = closure_matches
+            .get_many::<String>("seed-refnos")
+            .map(|vals| vals.cloned().collect());
         #[cfg(feature = "sqlite-index")]
         {
             // 前置闭包 pass（spec 002 Q8）：独立于 sync，产出 cata_closure.json 供解析消费。
-            let manifest =
+            let manifest = if let Some(seed_strs) = seed_refno_strs {
+                // 按需模式：仅以指定设计元素（如单个 BRAN）子树播种。
+                aios_database::data_interface::cata_closure::run_cata_closure_pass_for_refno_strs_from_config(
+                    rescan_index,
+                    &seed_strs,
+                    out_override,
+                )
+                .await?
+            } else {
                 aios_database::data_interface::cata_closure::run_cata_closure_pass_from_config(
                     rescan_index,
                     out_override,
                 )
-                .await?;
+                .await?
+            };
             println!(
                 "✅ gen-cata-closure 完成: {} 个 CATA 库 / seeds={} / visited={} / missing={} / rounds={}",
                 manifest.by_dbnum.len(),
@@ -2673,7 +2693,7 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "sqlite-index"))]
         {
-            let _ = (rescan_index, out_override);
+            let _ = (rescan_index, out_override, seed_refno_strs);
             anyhow::bail!("gen-cata-closure 需要 sqlite-index feature（默认/web_server 构建已含）");
         }
     }

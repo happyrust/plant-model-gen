@@ -1772,6 +1772,11 @@ pub async fn run_generate_model(
     db_option_ext: &DbOptionExt,
 ) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
     println!("\n🔧 --debug-model：开始增量生成几何体数据...");
+    println!(
+        "   ⚠️  增量语义：不清理既有模型关系（inst_relate/geo_relate/tubi_relate）。\n\
+         若元件几何算法/参数已变更（同 refno 重新生成），旧 geo 关系会与新结果叠加，\n\
+         请改用 --regen-model（先 pre_cleanup 再重建，幂等）。"
+    );
 
     // 方案 B（CLI 第一阶段）：mesh 状态以本地 glb + aabb_cache.rkyv 为准。
     let _mesh_state_guard = ScopedEnvVar::set("MESH_STATE_SOURCE", "file");

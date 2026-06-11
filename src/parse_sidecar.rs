@@ -49,7 +49,7 @@ pub struct ParseSidecarOptions {
     pub token: Option<String>,
     pub shutdown_after_job: bool,
     pub shutdown_delay_ms: u64,
-    /// 空闲多少毫秒后自关闭；0 表示禁用（specs/003-sidecar-singleflight-idle）。
+    /// 空闲多少毫秒后自关闭；0 表示禁用（specs/007-sidecar-singleflight-idle）。
     pub idle_shutdown_ms: u64,
 }
 
@@ -756,7 +756,7 @@ async fn run_submitted_cli_job(
 /// 空闲看门狗：无授权请求、无打开的 WS、无非终态 job 持续超过阈值时优雅自关闭。
 ///
 /// 兜底 admin 崩溃/重启后 `process_group(0)` 隔离导致的 sidecar 孤儿
-/// （specs/003-sidecar-singleflight-idle）；下一次 `ensure_sidecar` 会按需重新拉起。
+/// （specs/007-sidecar-singleflight-idle）；下一次 `ensure_sidecar` 会按需重新拉起。
 async fn idle_shutdown_watchdog(state: ParseSidecarState) {
     let tick = Duration::from_millis(IDLE_WATCHDOG_TICK_MS.min(state.idle_shutdown_ms.max(1)));
     loop {

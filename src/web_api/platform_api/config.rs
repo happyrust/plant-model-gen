@@ -64,7 +64,7 @@ fn access_host_from_bind_host(bind_host: &str) -> String {
     if !is_loopback_or_unspecified_host(trimmed) {
         return trimmed.to_string();
     }
-    // 失败回退 127.0.0.1（specs/004：展示型地址禁止 0.0.0.0 / 空串）。
+    // 失败回退 127.0.0.1（specs/008：展示型地址禁止 0.0.0.0 / 空串）。
     local_ip_or_loopback()
 }
 

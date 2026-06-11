@@ -70,7 +70,7 @@ pub mod web_listen; // 当前进程 HTTP 监听与站点身份（一 web_server 
 pub mod wizard_handlers;
 pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
 
-// 唯一实现在 crate::shared::net_util（specs/004）；此处再导出维持既有调用路径。
+// 唯一实现在 crate::shared::net_util（specs/008）；此处再导出维持既有调用路径。
 pub use crate::shared::net_util::{
     get_local_ip_via_udp, is_loopback_or_unspecified_host, local_ip_or_loopback,
 };

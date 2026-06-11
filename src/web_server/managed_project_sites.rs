@@ -502,7 +502,7 @@ fn normalize_host(host: Option<String>) -> String {
 }
 
 fn default_access_host() -> String {
-    // 回退 127.0.0.1 而非 0.0.0.0：后者拼进展示 URL 在多数环境不可访问（specs/004）。
+    // 回退 127.0.0.1 而非 0.0.0.0：后者拼进展示 URL 在多数环境不可访问（specs/008）。
     super::local_ip_or_loopback()
 }
 
@@ -1052,7 +1052,7 @@ fn validate_and_canonicalize_projects(projects: &[SiteProject]) -> Result<Vec<Si
     Ok(out)
 }
 
-/// create/update 保存前的 dbnum 冲突预检（specs/004，W-1 收口）。
+/// create/update 保存前的 dbnum 冲突预检（specs/008，W-1 收口）。
 ///
 /// 基于请求透传的 `SiteProject.dbnums` 快照（来源 sidecar 扫描）做本地查重，
 /// 冲突定义与 sidecar 扫描一致：同一 dbnum 落在站点内多个工程。`web_server`

@@ -99,7 +99,7 @@ fn job_sidecar_shutdown_delay_ms() -> u64 {
 }
 
 /// 非 job sidecar 的空闲自关闭阈值；env 可调，显式设 0 禁用
-/// （specs/003-sidecar-singleflight-idle）。
+/// （specs/007-sidecar-singleflight-idle）。
 fn sidecar_idle_shutdown_ms() -> u64 {
     std::env::var(SIDECAR_IDLE_SHUTDOWN_ENV)
         .ok()

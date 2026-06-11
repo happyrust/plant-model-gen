@@ -906,7 +906,7 @@ pub struct SiteProject {
     #[serde(default)]
     pub sort_order: u32,
     /// 该工程下发现的 dbnum（来自 sidecar 扫描结果透传；为空表示无快照，
-    /// `precheck_dbnum_conflicts` 跳过该工程，渐进收紧。specs/004）
+    /// `precheck_dbnum_conflicts` 跳过该工程，渐进收紧。specs/008）
     #[serde(default)]
     pub dbnums: Vec<u32>,
 }

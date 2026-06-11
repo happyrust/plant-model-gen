@@ -1,6 +1,6 @@
 //! 本机网络地址推断工具。
 //!
-//! `web_server` 与 `web_api` 共用的唯一实现（specs/004-site-input-validation-net-util，
+//! `web_server` 与 `web_api` 共用的唯一实现（specs/008-site-input-validation-net-util，
 //! 消除 NEW-2 双份漂移）。展示型 URL 的失败回退统一用 [`local_ip_or_loopback`]，
 //! 禁止再以空串或 `0.0.0.0` 拼接用户可见地址。
 

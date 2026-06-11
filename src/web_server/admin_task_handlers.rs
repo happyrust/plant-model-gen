@@ -98,7 +98,7 @@ pub fn cleanup_old_tasks() {
 /// admin 崩溃/硬重启后这些行永远不会再被推进，却会命中
 /// `create_and_dispatch_site_task` 的同站点单飞检查；而 cancel 是空壳、delete
 /// 拒绝非终态、retry 仅认 Failed，站点会被永久锁死。置 Failed 后既解除单飞
-/// 阻塞，又能直接走 retry 重新提交（specs/002-admin-task-recovery）。
+/// 阻塞，又能直接走 retry 重新提交（specs/006-admin-task-recovery）。
 fn recover_stale_tasks_on_startup() -> Result<usize, Box<dyn std::error::Error>> {
     let conn = open_deployment_sites_sqlite()?;
     let now = chrono::Utc::now().to_rfc3339();

@@ -93,6 +93,26 @@ pub fn cleanup_old_tasks() {
     }
 }
 
+/// 启动代恢复：把上一个进程残留的 Pending/Running 任务统一置为 Failed。
+///
+/// admin 崩溃/硬重启后这些行永远不会再被推进，却会命中
+/// `create_and_dispatch_site_task` 的同站点单飞检查；而 cancel 是空壳、delete
+/// 拒绝非终态、retry 仅认 Failed，站点会被永久锁死。置 Failed 后既解除单飞
+/// 阻塞，又能直接走 retry 重新提交（specs/002-admin-task-recovery）。
+fn recover_stale_tasks_on_startup() -> Result<usize, Box<dyn std::error::Error>> {
+    let conn = open_deployment_sites_sqlite()?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let recovered = conn.execute(
+        &format!(
+            "UPDATE {TABLE_NAME}
+             SET status = 'Failed', error = 'admin 重启中断', updated_at = ?1, completed_at = ?1
+             WHERE status IN ('Pending', 'Running')"
+        ),
+        rusqlite::params![now],
+    )?;
+    Ok(recovered)
+}
+
 pub fn insert_task(task: TaskInfo) {
     let site_id = task.site_id.clone();
     let _ = save_task(&task, site_id.as_deref());
@@ -147,6 +167,12 @@ pub fn create_and_dispatch_site_task(
 pub fn create_admin_task_routes() -> Router {
     if let Err(e) = ensure_admin_tasks_table() {
         eprintln!("⚠️ Failed to init admin_tasks table: {e}");
+    }
+    match recover_stale_tasks_on_startup() {
+        Ok(recovered) => {
+            eprintln!("🔁 启动恢复：{recovered} 条残留 Pending/Running 任务已置为 Failed");
+        }
+        Err(e) => eprintln!("⚠️ 启动恢复残留任务失败（不阻塞启动）: {e}"),
     }
 
     Router::new()

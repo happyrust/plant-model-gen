@@ -16,6 +16,10 @@ pub mod db_index;
 /// 元件库（CATA）按需解析 — refno 级引用闭包的基础原语（spec 002）。
 pub mod cata_closure;
 
+/// T008 离线校验：按需闭包站点 vs 全量基准站点的生成结果一致性对比（spec 002）。
+#[cfg(feature = "surreal-save")]
+pub mod cata_closure_verify;
+
 pub mod increment_manager;
 
 pub mod increment_record;

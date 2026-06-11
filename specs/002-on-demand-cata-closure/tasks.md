@@ -73,9 +73,17 @@
     → 兜底 → 重试一次。`resolve_desi_comp` / `resolve_axis_params` 的 SCOM 路径经由同一入口覆盖。
   - 门控：仅 `AIOS_CATA_CLOSURE_MODE=manifest` 时生效（整库模式 miss = 真缺数据，不兜底）；
     feature 门 `sqlite-index + surreal-save`，未启用时退化为 no-op。
-- [ ] **T008 离线校验模式**
-  - `verify_cata_closure(dbnums)`：整库解析 vs 按需闭包，diff 生成结果（inst_relate / 几何 hash），写 `output/<project>/cata_closure_verify.json`。
-  - 接 CI/灰度门禁。
+- [x] **T008 离线校验模式（已完成，实现为跨站点对比）**
+  - CLI `verify-cata-closure --refnos <设计根> --baseline-*`：当前 `-c` 配置=按需站点，
+    基准站点（整库解析）走 **HTTP `/sql`** 直连（基准服务端版本不受控，如 3.1.0-alpha
+    与 SDK fork WS 握手挂起；HTTP 文本接口无此问题）。
+  - 校验项：① 设计子树成员 pe 完整性 ② 几何指纹逐 refno 一致（按需 `inst_relate`
+    vs 基准 `inst_relate`，缺失回退解析期 `ele_reuse_relate`；BRAN/HANG 根自身走
+    tubi_relate 不生成实例，已排除）③ TUBI 段数（基准缺数据时跳过并标注）
+    ④ manifest 覆盖 dbnum 的两库 pe 数（裁剪率报告）。
+  - 报告 `output/<project>/cata_closure_verify.json`；未通过以非零码退出 → 可接 CI 门禁。
+  - 实测（BRAN 24381_145018，按需 8031 vs 全量 e2e 3202）：members 18/18、
+    hash 17/17、裁剪率 172/327860，✅ 通过。
 
 ## IDA 交叉验证
 

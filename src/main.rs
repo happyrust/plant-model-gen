@@ -942,6 +942,38 @@ async fn main() -> anyhow::Result<()> {
                 ),
         )
         .subcommand(
+            Command::new("verify-cata-closure")
+                .about(
+                    "T008 离线校验：当前 -c 配置=按需站点，对比基准站点（整库解析）的生成结果（成员/几何指纹/TUBI/裁剪率），写 <output>/<项目>/cata_closure_verify.json，失败以非零码退出",
+                )
+                .arg(
+                    Arg::new("refnos")
+                        .long("refnos")
+                        .help("校验的设计根 refno（如 BRAN，逗号分隔）")
+                        .value_name("REFNOS")
+                        .value_delimiter(',')
+                        .num_args(1..)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("baseline-endpoint")
+                        .long("baseline-endpoint")
+                        .help("基准站点 SurrealDB 地址（host:port，可带 ws:// 前缀）")
+                        .value_name("ADDR")
+                        .required(true),
+                )
+                .arg(Arg::new("baseline-ns").long("baseline-ns").value_name("NS").required(true))
+                .arg(Arg::new("baseline-db").long("baseline-db").value_name("DB").required(true))
+                .arg(Arg::new("baseline-user").long("baseline-user").value_name("USER").required(true))
+                .arg(Arg::new("baseline-pass").long("baseline-pass").value_name("PASS").required(true))
+                .arg(
+                    Arg::new("out")
+                        .long("out")
+                        .help("覆盖报告输出路径（默认 <output>/<项目>/cata_closure_verify.json）")
+                        .value_name("PATH"),
+                ),
+        )
+        .subcommand(
             Command::new("serve")
                 .about("启动 aios-database 解析域 sidecar HTTP/WS 服务")
                 .arg(
@@ -2695,6 +2727,78 @@ async fn main() -> anyhow::Result<()> {
         {
             let _ = (rescan_index, out_override, seed_refno_strs);
             anyhow::bail!("gen-cata-closure 需要 sqlite-index feature（默认/web_server 构建已含）");
+        }
+    }
+
+    // ========== 处理 verify-cata-closure 子命令（T008 离线校验）==========
+    if let Some(verify_matches) = matches.subcommand_matches("verify-cata-closure") {
+        #[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+        {
+            use aios_database::data_interface::cata_closure_verify::{
+                BaselineEndpoint, run_verify_from_cli,
+            };
+            let refnos: Vec<String> = verify_matches
+                .get_many::<String>("refnos")
+                .map(|v| v.cloned().collect())
+                .unwrap_or_default();
+            let baseline_ep = BaselineEndpoint {
+                address: verify_matches
+                    .get_one::<String>("baseline-endpoint")
+                    .cloned()
+                    .unwrap_or_default(),
+                ns: verify_matches
+                    .get_one::<String>("baseline-ns")
+                    .cloned()
+                    .unwrap_or_default(),
+                db: verify_matches
+                    .get_one::<String>("baseline-db")
+                    .cloned()
+                    .unwrap_or_default(),
+                user: verify_matches
+                    .get_one::<String>("baseline-user")
+                    .cloned()
+                    .unwrap_or_default(),
+                pass: verify_matches
+                    .get_one::<String>("baseline-pass")
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+            let out_override = verify_matches
+                .get_one::<String>("out")
+                .map(std::path::PathBuf::from);
+            let report = run_verify_from_cli(&refnos, &baseline_ep, out_override).await?;
+            println!(
+                "📋 verify-cata-closure: members={}（missing={}）/ hash {}:{}/{}（mismatch={}）/ tubi ondemand={} baseline={}{}",
+                report.member_total,
+                report.member_missing.len(),
+                report.hash_baseline_source,
+                report.hash_matched,
+                report.hash_checked,
+                report.hash_mismatched.len(),
+                report.tubi_ondemand,
+                report.tubi_baseline,
+                if report.tubi_baseline_missing {
+                    "（基准缺 tubi 数据，该项跳过）"
+                } else {
+                    ""
+                }
+            );
+            for item in &report.cata_pe_counts {
+                println!(
+                    "   - CATA dbnum {}: 按需 {} / 基准 {} pe",
+                    item.dbnum, item.ondemand, item.baseline
+                );
+            }
+            if report.passed {
+                println!("✅ 校验通过");
+                return Ok(());
+            }
+            anyhow::bail!("校验未通过（missing={}, mismatch={}）", report.member_missing.len(), report.hash_mismatched.len());
+        }
+        #[cfg(not(all(feature = "sqlite-index", feature = "surreal-save")))]
+        {
+            let _ = verify_matches;
+            anyhow::bail!("verify-cata-closure 需要 sqlite-index + surreal-save feature");
         }
     }
 

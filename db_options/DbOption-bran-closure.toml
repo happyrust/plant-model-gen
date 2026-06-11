@@ -26,9 +26,10 @@ gen_model_batch_size = 16
 gen_spatial_tree = false
 gen_tree_only = false
 # 按需最小解析集：SYST + DICT（必解析）+ DESI 7997（BRAN 所在库）
-# + CATA 5054（闭包 manifest 唯一覆盖的元件库；其余 CATA 对该 BRAN 无依赖，不解析）
+# + CATA 5054（BRAN 闭包）+ CATA 5052（FITT 生成对比样本闭包）
 included_db_files = [
     "ams251047_0001",
+    "ams5052_0001",
     "ams5054_0001",
     "ams5100_0001",
     "ams5101_0001",

@@ -436,6 +436,14 @@ fn export_export_data_to_obj_grouped(
     writeln!(out, "# Tubings: {}", export_data.tubings.len())?;
     writeln!(out, "# Total instances: {}", export_data.total_instances)?;
     writeln!(out)?;
+    // 兼容性：部分查看器（如 F3D 3.x 的格式探测）要求首个数据关键字不能是 `g`，
+    // 否则整个文件被判为 unknown format。先写一行 `o` 作为根对象即可规避
+    // （`o` 打头 + 后续任意位置 `g` 均被接受）。
+    let root_name = Path::new(output_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("aios_export");
+    writeln!(out, "o {}", sanitize_obj_group_name(root_name))?;
 
     let mesh_cache = GltfMeshCache::new();
     let mut vertex_base: usize = 1; // OBJ 使用 1-based index

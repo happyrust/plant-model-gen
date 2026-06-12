@@ -71,6 +71,25 @@ thread 'main' panicked at src\fast_model\gen_model\cata_model.rs:6253:25:
 - 不做存量站点的批量 DB 迁移；存量站点在下一次进程初始化加载
   common.surql 时自然获得空表。
 
+## Relationship to spec 006（实施期间的并行修复）
+
+本 spec 实施同晚（2026-06-12 22:38 提交 `e0b91c59`），spec 006 在
+`orchestrator.rs::gen_all_geos_data` 入口显式调用了 `ensure_surreal_init()`
+（内含同一条 DEFINE），从 **Rust 生成主流程**侧消除了本缺陷的触发路径，
+并重建/替换了 release 包二进制（22:35）。
+
+两道防线职责划分：
+
+- **spec 006（Rust 层）**：生成主流程入口必经 `ensure_surreal_init()`，
+  覆盖生成管线自身。
+- **spec 008（schema 层，本 spec）**：`common.surql` 内置
+  `DEFINE TABLE IF NOT EXISTS ses;`，覆盖**所有**加载该脚本的进程
+  （web_server 主进程、解析 sidecar、CLI、查询路径），且对已发布包可
+  仅替换资源文件热修，不依赖二进制重建。
+
+T003 的 A/B 冒烟（干净 3.2.0-nightly 内存库，无任何 Rust 侧调用）独立证明
+schema 层防线自身成立；T005 端到端复跑验证的是双防线叠加后的整体行为。
+
 ## Known Issues（记录，不在本 spec 内处理）
 
 - SurrealDB 3.1 与 3.2.0-nightly 对"查询不存在的表"的行为不一致：

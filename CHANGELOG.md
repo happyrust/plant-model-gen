@@ -2,6 +2,17 @@
 
 ## 2026-06-12
 
+### Fixed — ses 表缺失导致 tubi_relate 写入崩溃：schema 层第二道防线（spec 008）
+
+> release 包站点 `quicktest-250160-8080`（捆绑 SurrealDB 3.2.0-nightly）模型生成在 BRAN_TUBI 阶段 panic：`The table 'ses' does not exist`（`cata_model.rs:6253`，exit_code=101）。根因：`tubi_relate` RELATE SQL 携带 `dt=fn::ses_date(...)`，该函数查 `ses` 表，而 quick deploy 站点（sync_history 关闭）从不创建它；3.2.0-nightly 对缺表查询抛语句级错误（3.1 容忍返回 none），叠加语句级错误 fail-loud 后以崩溃显形。
+
+- `resource/surreal/common.surql`：在 `fn::ses_data` / `fn::ses_date` 定义前增加 `DEFINE TABLE IF NOT EXISTS ses SCHEMALESS;`——所有加载该脚本的进程（web_server / 解析 sidecar / CLI / 查询路径）初始化即保证空表存在，空表上两函数安全返回 none；对已发布 release 包可仅替换资源文件热修，无需重编二进制。
+- 与 spec 006 的关系：同晚 `e0b91c59` 已在 `orchestrator.rs::gen_all_geos_data` 入口显式调用 `ensure_surreal_init()`（Rust 层防线，覆盖生成主流程）；本 spec 为 schema 层防线，二者互为冗余、职责互补。
+- A/B 冒烟（干净 3.2.0-nightly 内存库，HTTP /sql 整文件执行）：未修复版 `fn::ses_date` 精确复现 `The table 'ses' does not exist`；修复版返回 NONE 无错误。
+- 端到端：热修包内 `common.surql`（SHA256 与仓库一致）后复跑 250160 生成，`tubings.parquet` 16 行、站点库 `tubi_relate count=16`、sidecar `job_done exit_code=0`（复跑时二进制已含 spec 006 修复，双防线叠加）；7997 站点（3.1 路径）重放修复版脚本无新增失败、`tubi_relate 4950 行`完好。
+- 已知事项：SurrealDB 3.1 与 3.2.0-nightly 对"查询不存在的表"行为不一致（容忍 vs 报错），release 包与开发机版本不同会出现"只在包里复现"的故障；`common.surql` 中 `inst_relate_aabb` 等三组 DEFINE 无 `IF NOT EXISTS`，对在线库重放历来报 already exists（加载器容忍，未在本 spec 处理）。
+- `specs/008-ses-table-tubi-relate-guard/`：spec/plan/tasks 三件套（grill-me 四项决策：schema 层落点 / 三项验收 / 版本差异仅记录 / 保留 dt 语义），验收实测已回填。
+
 ### Fixed — PDMS refno B-tree 索引枚举漏读（spec 007）
 
 > `aps250160_0001` release 解析曾出现 `db_type is DESI` 但 `All refnos count: 2`，导致单 DESI 驱动的 CATA 闭包和后续模型生成明显缩水。根因在 `parse_pdms_db` 的 index page 读取与 internal page 遍历，不使用 scan fallback。

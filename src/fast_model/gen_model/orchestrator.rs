@@ -838,6 +838,16 @@ pub async fn gen_all_geos_data(
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
     perf.mark("init");
 
+    // 生成入口显式确保 surreal 辅助 schema 就绪（含 ses 空表兜底）。
+    // 此前 ensure_surreal_init 只在 rkyv 构建等旁路被动触发：全新空库站点若
+    // 首批 BRAN_TUBI tubi_relate 写入先于任何旁路调用，`dt=fn::ses_date(...)`
+    // 会因 "The table 'ses' does not exist" 语句级失败直接 panic（250160 实测）。
+    if db_option.use_surrealdb {
+        crate::fast_model::utils::ensure_surreal_init()
+            .await
+            .map_err(IndexTreeError::Other)?;
+    }
+
     // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
     // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
@@ -1347,6 +1357,8 @@ async fn process_index_tree_generation(
         carriers
     };
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
+    // spec 004：生成阶段 mesh 计数（批量屏障汇总点，一次性记录）。
+    crate::perf_metrics::add_generate_counters(total_mesh_new_generated, total_mesh_cache_hits);
     println!(
         "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",
         completed_batches,
@@ -1355,6 +1367,26 @@ async fn process_index_tree_generation(
         total_mesh_new_generated,
         missing_neg_carriers.len()
     );
+    // spec 006 T302：收尾安全网——所有 writer 退出后全量 INSERT IGNORE 补写 aabb/vec3，
+    // 兜住增量写（T301）覆盖不到的跨运行状态漂移；失败只告警不阻断流程。
+    if std::env::var_os("AIOS_SKIP_FINAL_AABB_SWEEP").is_some() {
+        println!("[gen_model] final_sweep skipped: AIOS_SKIP_FINAL_AABB_SWEEP 已设置");
+    } else {
+        let sweep_start = Instant::now();
+        match base_model_writer
+            .finalize_mesh_entities(&mesh_aabb_map, &mesh_pts_map)
+            .await
+        {
+            Ok(report) => println!(
+                "[gen_model] final_sweep aabb={} pts={} status={:?} elapsed_ms={}",
+                mesh_aabb_map.len(),
+                mesh_pts_map.len(),
+                report.status,
+                sweep_start.elapsed().as_millis()
+            ),
+            Err(err) => log::error!("[gen_model] final_sweep 失败（不阻断流程）: {err}"),
+        }
+    }
     let mut bool_tasks = insert_report.bool_tasks;
     println!(
         "✅ [2/5] 实例数据入库完成, 用时 {}ms",
@@ -1457,6 +1489,8 @@ async fn process_index_tree_generation(
                         report.skipped,
                         report.skipped_reason
                     );
+                    // spec 004：生成阶段布尔任务计数。
+                    crate::perf_metrics::add_boolean_counters(report.success, report.failed);
                 }
                 Err(e) => {
                     eprintln!("[gen_model] IndexTree 布尔运算失败: {}", e);
@@ -1643,6 +1677,19 @@ async fn process_index_tree_generation(
 
     // model_cache close 已移除（foyer-cache-cleanup）
     perf.end_current();
+
+    // spec 004：生成阶段分段耗时（直接来自 PerfTimer 分段记录）。
+    {
+        let stage_ms: Vec<(String, u64)> = perf
+            .stages()
+            .iter()
+            .filter_map(|s| {
+                s.ended_at
+                    .map(|end| (s.name.clone(), end.duration_since(s.started_at).as_millis() as u64))
+            })
+            .collect();
+        crate::perf_metrics::record_generate_stage_ms(&stage_ms);
+    }
 
     // 输出性能摘要到控制台
     perf.print_summary();

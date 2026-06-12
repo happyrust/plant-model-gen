@@ -17,7 +17,16 @@ static INST_RELATE_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 pub async fn ensure_surreal_init() -> anyhow::Result<()> {
     SURREAL_INIT
         .get_or_try_init(|| async {
-            aios_core::init_surreal().await?;
+            // spec 006 加固：run_app 入口已完成 init 时（不经过本 OnceCell），
+            // 这里若再次 connect+signin 会与流水线在飞请求竞争 WS router 死锁
+            // （实测 gen_cata_geos worker 预取触发 rkyv 构建时 2/3 概率挂死）。
+            // 先用轻量探针判断连接是否已就绪，就绪则跳过重复 init。
+            let already_live = model_primary_db().query("RETURN 1;").await.is_ok();
+            if already_live {
+                println!("[ensure_surreal_init] 连接已就绪，跳过重复 init_surreal");
+            } else {
+                aios_core::init_surreal().await?;
+            }
             // ses 表仅在 sync_history=true 的解析流程中被填充；普通站点没有该表时，
             // tubi_relate 写入 SQL 里的 `dt=fn::ses_date(...)` 会因
             // "The table 'ses' does not exist" 整条 RELATE 失败（且历史上被静默吞掉）。

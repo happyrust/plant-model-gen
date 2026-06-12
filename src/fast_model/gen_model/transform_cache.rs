@@ -348,6 +348,15 @@ fn transform_from_dmat4(m: glam::DMat4) -> Option<Transform> {
     transform_from_matrix_cols(&m.to_cols_array())
 }
 
+/// spec 006 T304：rkyv 构建失败负缓存。
+/// 同 dbnum 构建失败后，本次运行内不再重复整套构建
+/// （collect_refnos + 批量查询 + 逐 refno 回退），直接快速失败走 DB 路径。
+/// 基线日志显示同库 1 秒内重试 6+ 次并刷错误日志。
+fn failed_build_dbnums() -> &'static DashSet<u32> {
+    static FAILED: OnceLock<DashSet<u32>> = OnceLock::new();
+    FAILED.get_or_init(DashSet::new)
+}
+
 async fn ensure_dbnum_loaded(
     db_option: Option<&DbOptionExt>,
     dbnum: u32,
@@ -361,6 +370,10 @@ async fn ensure_dbnum_loaded(
         return Ok(());
     }
 
+    if allow_build && failed_build_dbnums().contains(&dbnum) {
+        anyhow::bail!("transform rkyv 此前构建失败（本次运行内不再重试）: dbnum={dbnum}");
+    }
+
     let lock = dbnum_load_lock(dbnum);
     let _guard = lock.lock().await;
 
@@ -369,7 +382,16 @@ async fn ensure_dbnum_loaded(
     }
 
     let loaded = if allow_build {
-        Some(transform_rkyv_cache::load_or_build_dbnum_cache(db_option, dbnum).await?)
+        if failed_build_dbnums().contains(&dbnum) {
+            anyhow::bail!("transform rkyv 此前构建失败（本次运行内不再重试）: dbnum={dbnum}");
+        }
+        match transform_rkyv_cache::load_or_build_dbnum_cache(db_option, dbnum).await {
+            Ok(loaded) => Some(loaded),
+            Err(err) => {
+                failed_build_dbnums().insert(dbnum);
+                return Err(err);
+            }
+        }
     } else {
         transform_rkyv_cache::load_dbnum_cache_if_fresh(db_option, dbnum)?
     };

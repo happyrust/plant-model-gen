@@ -211,6 +211,22 @@ pub trait ModelWriterBackend: Send + Sync {
         request: BooleanBridgeRequest,
     ) -> anyhow::Result<BooleanBridgeReport>;
 
+    /// spec 006 T302：收尾安全网。sink 全部完成后调用一次，把全局
+    /// aabb/pts map 全量 `INSERT IGNORE` 补写，兜住增量写覆盖不到的
+    /// 跨运行状态漂移（mesh 文件在、DB 行不在）。默认 no-op。
+    async fn finalize_mesh_entities(
+        &self,
+        mesh_aabb_map: &DashMap<String, Aabb>,
+        mesh_pts_map: &DashMap<u64, String>,
+    ) -> anyhow::Result<ModelWriterStageReport> {
+        let _ = (mesh_aabb_map, mesh_pts_map);
+        Ok(ModelWriterStageReport::skipped(
+            "final_sweep",
+            "backend default no-op",
+            0,
+        ))
+    }
+
     /// Called once after all writer stages finish.
     async fn finalize(&self) -> anyhow::Result<ModelWriterFinishReport> {
         Ok(ModelWriterFinishReport {
@@ -301,9 +317,28 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
             ));
         }
 
+        // spec 006 T301：每批只写本批 delta（由 mesh_results 的 aabb_hash/pts_hashes 还原），
+        // 不再全量重写整个全局 map（O(N²) 回归根因，基线每批固定 ~5.5s）。
+        // 历史行与跨运行状态漂移由收尾 finalize_mesh_entities 全量补写兜底。
+        let delta_aabb: DashMap<String, Aabb> = DashMap::new();
+        let delta_pts: DashMap<u64, String> = DashMap::new();
+        for mesh_result in mesh_results.values() {
+            if let Some(aabb_hash) = mesh_result.aabb_hash {
+                let key = aabb_hash.to_string();
+                if let Some(value) = mesh_aabb_map.get(&key) {
+                    delta_aabb.insert(key, *value.value());
+                }
+            }
+            for pts_hash in &mesh_result.pts_hashes {
+                if let Some(value) = mesh_pts_map.get(pts_hash) {
+                    delta_pts.insert(*pts_hash, value.value().clone());
+                }
+            }
+        }
+
         // Preserve existing ordering: persist aabb/pts entities before inst_geo references them.
-        save_pts_to_surreal(mesh_pts_map).await;
-        save_aabb_to_surreal(mesh_aabb_map).await;
+        save_pts_to_surreal(&delta_pts).await;
+        save_aabb_to_surreal(&delta_aabb).await;
 
         let mut update_sql = String::new();
         for (geo_hash, mesh_result) in mesh_results {
@@ -364,6 +399,29 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         Ok(ModelWriterStageReport::executed(
             "inst_relate_aabb",
             row_count,
+        ))
+    }
+
+    /// spec 006 T302：全量补写 aabb/vec3（INSERT IGNORE 幂等，一次性 ~秒级）。
+    async fn finalize_mesh_entities(
+        &self,
+        mesh_aabb_map: &DashMap<String, Aabb>,
+        mesh_pts_map: &DashMap<u64, String>,
+    ) -> anyhow::Result<ModelWriterStageReport> {
+        if crate::fast_model::gen_model::mesh_state::use_file_mesh_state() {
+            crate::fast_model::gen_model::mesh_state::flush_aabb_cache();
+            return Ok(ModelWriterStageReport::skipped(
+                "final_sweep",
+                "file mesh state active; flushed aabb cache",
+                0,
+            ));
+        }
+
+        save_pts_to_surreal(mesh_pts_map).await;
+        save_aabb_to_surreal(mesh_aabb_map).await;
+        Ok(ModelWriterStageReport::executed(
+            "final_sweep",
+            mesh_aabb_map.len() + mesh_pts_map.len(),
         ))
     }
 

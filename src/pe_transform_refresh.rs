@@ -19,6 +19,32 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
     refresh_pe_transform_for_dbnums(dbnums, &db_option).await
 }
 
+/// spec 006 T303：探测 pe_transform 表是否已覆盖指定 dbnum。
+///
+/// 以「该 dbnum 的任一根节点（SITE/WORL）在 pe_transform 中存在行」为覆盖标志：
+/// 刷新流程从根节点 BFS 写入，根节点行是刷新产物的最早部分。
+/// 表缺失 / 查询失败时返回 Err，由调用方按未覆盖处理。
+pub async fn pe_transform_covers_dbnum(dbnum: u32) -> Result<bool> {
+    let roots = query_root_refnos(dbnum)
+        .await
+        .with_context(|| format!("探测 pe_transform 覆盖时查询 dbnum {} 根节点失败", dbnum))?;
+    if roots.is_empty() {
+        return Ok(false);
+    }
+
+    let ids = roots
+        .iter()
+        .map(|r| r.to_table_key("pe_transform"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT VALUE record::id(id) FROM [{ids}];");
+    let rows: Vec<Value> = aios_core::model_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .with_context(|| format!("探测 pe_transform 覆盖失败: dbnum={dbnum}"))?;
+    Ok(!rows.is_empty())
+}
+
 pub async fn refresh_pe_transform_for_dbnums(
     dbnums: &[u32],
     db_option: &DbOptionExt,

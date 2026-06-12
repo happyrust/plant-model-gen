@@ -1,0 +1,340 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="980" viewBox="0 0 1400 980">
+<style>text { font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", "Microsoft JhengHei", SimHei, sans-serif; } .small { font-size: 12px; }</style>
+<defs>
+<marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#2563eb"/></marker>
+<marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#16a34a"/></marker>
+<marker id="arrow-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#ea580c"/></marker>
+<marker id="arrow-purple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#9333ea"/></marker>
+<marker id="arrow-red" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#dc2626"/></marker>
+<marker id="arrow-gray" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#6b7280"/></marker>
+</defs>
+<rect width="1400" height="980" fill="#ffffff"/>
+<text x="700.0" y="36" text-anchor="middle" fill="#111827" font-size="22" font-weight="700">
+  <tspan x="700.0" dy="0">7997 Release 模型生成写入流水线架构与提速方案</tspan>
+</text>
+<text x="700.0" y="64" text-anchor="middle" fill="#6b7280" font-size="13" font-weight="400">
+  <tspan x="700.0" dy="0">当前瓶颈：生产与 mesh 阶段很快，SurrealDB base 写入和 inst_relate_aabb DELETE+INSERT 慢，导致 join 队列背压。</tspan>
+</text>
+<rect x="40" y="95" width="1320" height="360" rx="18" fill="#f9fafb" stroke="#e5e7eb"/>
+<text x="700" y="125" text-anchor="middle" fill="#111827" font-size="16" font-weight="700">
+  <tspan x="700" dy="0">当前架构：逐批写入，背压集中在写库侧</tspan>
+</text>
+<rect x="40" y="500" width="1320" height="340" rx="18" fill="#f9fafb" stroke="#e5e7eb"/>
+<text x="700" y="530" text-anchor="middle" fill="#111827" font-size="16" font-weight="700">
+  <tspan x="700" dy="0">推荐架构：两阶段批量写入，先稳定再提速</tspan>
+</text>
+<g id="cfg">
+<rect x="70" y="160" width="170" height="88" rx="12" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.6"/>
+<circle cx="94" cy="184" r="13" fill="#ffffff" stroke="#fed7aa" stroke-width="1"/>
+<text x="94" y="189" text-anchor="middle" fill="#ea580c" font-size="14" font-weight="700">
+  <tspan x="94" dy="0">I</tspan>
+</text>
+<text x="165.0" y="188" text-anchor="middle" fill="#ea580c" font-size="14" font-weight="700">
+  <tspan x="165.0" dy="0">配置与输入</tspan>
+</text>
+<text x="155.0" y="218" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="155.0" dy="0">DbOption-generate</tspan>
+  <tspan x="155.0" dy="15">ams7997_0001</tspan>
+</text>
+</g>
+<g id="prod">
+<rect x="285" y="145" width="190" height="118" rx="12" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.6"/>
+<circle cx="309" cy="169" r="13" fill="#ffffff" stroke="#bfdbfe" stroke-width="1"/>
+<text x="309" y="174" text-anchor="middle" fill="#2563eb" font-size="14" font-weight="700">
+  <tspan x="309" dy="0">P</tspan>
+</text>
+<text x="390.0" y="173" text-anchor="middle" fill="#2563eb" font-size="14" font-weight="700">
+  <tspan x="390.0" dy="0">IndexTree 生产者</tspan>
+</text>
+<text x="380.0" y="203" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="380.0" dy="0">CATA / LOOP / PRIM</tspan>
+  <tspan x="380.0" dy="15">concurrency=6</tspan>
+  <tspan x="380.0" dy="15">batch_size=200</tspan>
+</text>
+</g>
+<g id="sink">
+<rect x="520" y="160" width="160" height="88" rx="12" fill="#ffffff" stroke="#d1d5db" stroke-width="1.6"/>
+<circle cx="544" cy="184" r="13" fill="#ffffff" stroke="#d1d5db" stroke-width="1"/>
+<text x="544" y="189" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="544" dy="0">S</tspan>
+</text>
+<text x="610.0" y="188" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="610.0" dy="0">Batch Sink</tspan>
+</text>
+<text x="600.0" y="218" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="600.0" dy="0">复制 batch 到</tspan>
+  <tspan x="600.0" dy="15">base 与 mesh 队列</tspan>
+</text>
+</g>
+<g id="base">
+<rect x="730" y="125" width="220" height="120" rx="12" fill="#fef2f2" stroke="#fecaca" stroke-width="1.6"/>
+<circle cx="754" cy="149" r="13" fill="#ffffff" stroke="#fecaca" stroke-width="1"/>
+<text x="754" y="154" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="754" dy="0">B</tspan>
+</text>
+<text x="850.0" y="153" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="850.0" dy="0">Base Writer</tspan>
+</text>
+<text x="840.0" y="183" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="840.0" dy="0">8 workers</tspan>
+  <tspan x="840.0" dy="15">inst_info / inst_geo</tspan>
+  <tspan x="840.0" dy="15">inst_relate 写 SurrealDB</tspan>
+</text>
+</g>
+<g id="mesh">
+<rect x="730" y="285" width="220" height="105" rx="12" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.6"/>
+<circle cx="754" cy="309" r="13" fill="#ffffff" stroke="#bbf7d0" stroke-width="1"/>
+<text x="754" y="314" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="754" dy="0">M</tspan>
+</text>
+<text x="850.0" y="313" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="850.0" dy="0">Mesh Stage</tspan>
+</text>
+<text x="840.0" y="343" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="840.0" dy="0">4 workers</tspan>
+  <tspan x="840.0" dy="15">mesh 通常毫秒级</tspan>
+</text>
+</g>
+<g id="join">
+<rect x="1010" y="185" width="160" height="100" rx="12" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.6"/>
+<circle cx="1034" cy="209" r="13" fill="#ffffff" stroke="#e9d5ff" stroke-width="1"/>
+<text x="1034" y="214" text-anchor="middle" fill="#9333ea" font-size="14" font-weight="700">
+  <tspan x="1034" dy="0">J</tspan>
+</text>
+<text x="1100.0" y="213" text-anchor="middle" fill="#9333ea" font-size="14" font-weight="700">
+  <tspan x="1100.0" dy="0">Joiner</tspan>
+</text>
+<text x="1090.0" y="243" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="1090.0" dy="0">等待 base_result</tspan>
+  <tspan x="1090.0" dy="15">+ mesh_output</tspan>
+</text>
+</g>
+<g id="aabb">
+<rect x="1210" y="145" width="130" height="145" rx="12" fill="#fef2f2" stroke="#fecaca" stroke-width="1.6"/>
+<circle cx="1234" cy="169" r="13" fill="#ffffff" stroke="#fecaca" stroke-width="1"/>
+<text x="1234" y="174" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="1234" dy="0">A</tspan>
+</text>
+<text x="1285.0" y="173" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="1285.0" dy="0">AABB Writer</tspan>
+</text>
+<text x="1275.0" y="203" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="1275.0" dy="0">2 workers</tspan>
+  <tspan x="1275.0" dy="15">mesh persist</tspan>
+  <tspan x="1275.0" dy="15">inst_relate_aabb</tspan>
+  <tspan x="1275.0" dy="15">DELETE + INSERT</tspan>
+</text>
+</g>
+<g id="db">
+<rect x="1035" y="335" width="260" height="75" rx="12" fill="#fef2f2" stroke="#fecaca" stroke-width="1.6"/>
+<circle cx="1059" cy="359" r="13" fill="#ffffff" stroke="#fecaca" stroke-width="1"/>
+<text x="1059" y="364" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="1059" dy="0">D</tspan>
+</text>
+<text x="1175.0" y="363" text-anchor="middle" fill="#dc2626" font-size="14" font-weight="700">
+  <tspan x="1175.0" dy="0">SurrealDB</tspan>
+</text>
+<text x="1165.0" y="393" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="1165.0" dy="0">事务冲突 / already exists / retry 耗尽风险</tspan>
+</text>
+</g>
+<path id="a1" d="M 240,204 L 285,204" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<rect x="229" y="182" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="285" y="198" text-anchor="middle" fill="#2563eb" font-size="11" font-weight="600">
+  <tspan x="285" dy="0">输入</tspan>
+</text>
+<path id="a2" d="M 475,204 L 520,204" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<rect x="464" y="182" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="520" y="198" text-anchor="middle" fill="#2563eb" font-size="11" font-weight="600">
+  <tspan x="520" dy="0">batch</tspan>
+</text>
+<path id="a3" d="M 680,190 L 730,185" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<rect x="674" y="163" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="730" y="179" text-anchor="middle" fill="#2563eb" font-size="11" font-weight="600">
+  <tspan x="730" dy="0">base queue</tspan>
+</text>
+<path id="a4" d="M 680,225 L 705,225 L 705,335 L 730,335" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+<rect x="649" y="313" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="705" y="329" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">
+  <tspan x="705" dy="0">mesh queue</tspan>
+</text>
+<path id="a5" d="M 950,185 L 1010,215" fill="none" stroke="#ea580c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+<rect x="954" y="193" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1010" y="209" text-anchor="middle" fill="#ea580c" font-size="11" font-weight="600">
+  <tspan x="1010" dy="0">base_result</tspan>
+</text>
+<path id="a6" d="M 950,335 L 980,335 L 980,255 L 1010,255" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+<rect x="924" y="233" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="980" y="249" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">
+  <tspan x="980" dy="0">mesh_output</tspan>
+</text>
+<path id="a7" d="M 1170,235 L 1210,215" fill="none" stroke="#9333ea" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<rect x="1154" y="193" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1210" y="209" text-anchor="middle" fill="#9333ea" font-size="11" font-weight="600">
+  <tspan x="1210" dy="0">joined</tspan>
+</text>
+<path id="a8" d="M 1275,290 L 1275,335 L 1165,335" fill="none" stroke="#dc2626" stroke-width="2" marker-end="url(#arrow-red)"/>
+<rect x="1219" y="313" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1275" y="329" text-anchor="middle" fill="#dc2626" font-size="11" font-weight="600">
+  <tspan x="1275" dy="0">事务写入</tspan>
+</text>
+<path id="a9" d="M 840,245 L 840,335 L 1035,365" fill="none" stroke="#dc2626" stroke-width="2" marker-end="url(#arrow-red)"/>
+<rect x="784" y="313" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="840" y="329" text-anchor="middle" fill="#dc2626" font-size="11" font-weight="600">
+  <tspan x="840" dy="0">高并发写库</tspan>
+</text>
+<rect x="515" y="415" width="365" height="55" rx="10" fill="#fef2f2" stroke="#fecaca" stroke-width="1.4"/>
+<text x="697" y="438" text-anchor="middle" fill="#dc2626" font-size="12" font-weight="600">
+  <tspan x="697" dy="0">观测信号：pending_mesh_outputs 长期贴近 108；base_write_ms / inst_aabb_ms 到几十秒；producer send_wait_ms 秒级</tspan>
+</text>
+<g id="phase0">
+<rect x="70" y="585" width="190" height="105" rx="12" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.6"/>
+<circle cx="94" cy="609" r="13" fill="#ffffff" stroke="#bfdbfe" stroke-width="1"/>
+<text x="94" y="614" text-anchor="middle" fill="#2563eb" font-size="14" font-weight="700">
+  <tspan x="94" dy="0">0</tspan>
+</text>
+<text x="175.0" y="613" text-anchor="middle" fill="#2563eb" font-size="14" font-weight="700">
+  <tspan x="175.0" dy="0">Phase 0 基线</tspan>
+</text>
+<text x="165.0" y="643" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="165.0" dy="0">perf-summary.json</tspan>
+  <tspan x="165.0" dy="15">耗时 / p95 / max</tspan>
+  <tspan x="165.0" dy="15">错误计数</tspan>
+</text>
+</g>
+<g id="phase1">
+<rect x="300" y="585" width="210" height="105" rx="12" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.6"/>
+<circle cx="324" cy="609" r="13" fill="#ffffff" stroke="#bbf7d0" stroke-width="1"/>
+<text x="324" y="614" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="324" dy="0">1</tspan>
+</text>
+<text x="415.0" y="613" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="415.0" dy="0">Phase 1 稳定配置</tspan>
+</text>
+<text x="405.0" y="643" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="405.0" dy="0">降低上游并发</tspan>
+  <tspan x="405.0" dy="15">限制队列容量</tspan>
+  <tspan x="405.0" dy="15">先跑通 release</tspan>
+</text>
+</g>
+<g id="acc">
+<rect x="560" y="560" width="250" height="140" rx="12" fill="#faf5ff" stroke="#e9d5ff" stroke-width="1.6"/>
+<circle cx="584" cy="584" r="13" fill="#ffffff" stroke="#e9d5ff" stroke-width="1"/>
+<text x="584" y="589" text-anchor="middle" fill="#9333ea" font-size="14" font-weight="700">
+  <tspan x="584" dy="0">Q</tspan>
+</text>
+<text x="695.0" y="588" text-anchor="middle" fill="#9333ea" font-size="14" font-weight="700">
+  <tspan x="695.0" dy="0">InstRelateAabbAccumulator</tspan>
+</text>
+<text x="685.0" y="618" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="685.0" dy="0">生成阶段只收集 rows</tspan>
+  <tspan x="685.0" dy="15">last-wins 去重</tspan>
+  <tspan x="685.0" dy="15">必要时 spill 到 spool</tspan>
+</text>
+</g>
+<g id="bulk">
+<rect x="860" y="560" width="225" height="140" rx="12" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.6"/>
+<circle cx="884" cy="584" r="13" fill="#ffffff" stroke="#fed7aa" stroke-width="1"/>
+<text x="884" y="589" text-anchor="middle" fill="#ea580c" font-size="14" font-weight="700">
+  <tspan x="884" dy="0">F</tspan>
+</text>
+<text x="982.5" y="588" text-anchor="middle" fill="#ea580c" font-size="14" font-weight="700">
+  <tspan x="982.5" dy="0">Bulk Flush</tspan>
+</text>
+<text x="972.5" y="618" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="972.5" dy="0">按 touched ids 统一 DELETE</tspan>
+  <tspan x="972.5" dy="15">大块 INSERT</tspan>
+  <tspan x="972.5" dy="15">串行或低并发事务</tspan>
+</text>
+</g>
+<g id="export">
+<rect x="1135" y="575" width="190" height="110" rx="12" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1.6"/>
+<circle cx="1159" cy="599" r="13" fill="#ffffff" stroke="#bbf7d0" stroke-width="1"/>
+<text x="1159" y="604" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="1159" dy="0">V</tspan>
+</text>
+<text x="1240.0" y="603" text-anchor="middle" fill="#16a34a" font-size="14" font-weight="700">
+  <tspan x="1240.0" dy="0">Parquet 验收</tspan>
+</text>
+<text x="1230.0" y="633" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="1230.0" dy="0">manifest / instances</tspan>
+  <tspan x="1230.0" dy="15">geo / trans / aabb</tspan>
+  <tspan x="1230.0" dy="15">全部非空</tspan>
+</text>
+</g>
+<path id="b1" d="M 260,637 L 300,637" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<rect x="244" y="615" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="300" y="631" text-anchor="middle" fill="#2563eb" font-size="11" font-weight="600">
+  <tspan x="300" dy="0">量化</tspan>
+</text>
+<path id="b2" d="M 510,637 L 560,637" fill="none" stroke="#16a34a" stroke-width="2" marker-end="url(#arrow-green)"/>
+<rect x="504" y="615" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="560" y="631" text-anchor="middle" fill="#16a34a" font-size="11" font-weight="600">
+  <tspan x="560" dy="0">稳定后</tspan>
+</text>
+<path id="b3" d="M 810,637 L 860,637" fill="none" stroke="#9333ea" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<rect x="804" y="615" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="860" y="631" text-anchor="middle" fill="#9333ea" font-size="11" font-weight="600">
+  <tspan x="860" dy="0">dedupe</tspan>
+</text>
+<path id="b4" d="M 1085,637 L 1135,637" fill="none" stroke="#ea580c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+<rect x="1079" y="615" width="112" height="22" rx="6" fill="#ffffff" opacity="0.96"/>
+<text x="1135" y="631" text-anchor="middle" fill="#ea580c" font-size="11" font-weight="600">
+  <tspan x="1135" dy="0">产物</tspan>
+</text>
+<g id="benefit1">
+<rect x="210" y="750" width="260" height="62" rx="12" fill="#ffffff" stroke="#d1d5db" stroke-width="1.6"/>
+<text x="340.0" y="778" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="340.0" dy="0">收益 1</tspan>
+</text>
+<text x="340.0" y="808" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="340.0" dy="0">减少小事务与重试</tspan>
+</text>
+</g>
+<g id="benefit2">
+<rect x="520" y="750" width="260" height="62" rx="12" fill="#ffffff" stroke="#d1d5db" stroke-width="1.6"/>
+<text x="650.0" y="778" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="650.0" dy="0">收益 2</tspan>
+</text>
+<text x="650.0" y="808" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="650.0" dy="0">解除 join 队列长期满载</tspan>
+</text>
+</g>
+<g id="benefit3">
+<rect x="830" y="750" width="260" height="62" rx="12" fill="#ffffff" stroke="#d1d5db" stroke-width="1.6"/>
+<text x="960.0" y="778" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="960.0" dy="0">收益 3</tspan>
+</text>
+<text x="960.0" y="808" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="960.0" dy="0">release 两次连续成功</tspan>
+</text>
+</g>
+<g id="benefit4">
+<rect x="1140" y="750" width="190" height="62" rx="12" fill="#ffffff" stroke="#d1d5db" stroke-width="1.6"/>
+<text x="1235.0" y="778" text-anchor="middle" fill="#111827" font-size="14" font-weight="700">
+  <tspan x="1235.0" dy="0">目标</tspan>
+</text>
+<text x="1235.0" y="808" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="1235.0" dy="0">总耗时降低 &gt;= 30%</tspan>
+</text>
+</g>
+<rect x="60" y="880" width="640" height="62" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
+<text x="90" y="905" text-anchor="start" fill="#111827" font-size="13" font-weight="700">
+  <tspan x="90" dy="0">图例</tspan>
+</text>
+<line x1="145" y1="902" x2="190" y2="902" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+<text x="245" y="906" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="245" dy="0">主数据流</tspan>
+</text>
+<line x1="310" y1="902" x2="355" y2="902" stroke="#dc2626" stroke-width="2" marker-end="url(#arrow-red)"/>
+<text x="410" y="906" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="410" dy="0">瓶颈写入</tspan>
+</text>
+<line x1="475" y1="902" x2="520" y2="902" stroke="#9333ea" stroke-width="2" marker-end="url(#arrow-purple)"/>
+<text x="575" y="906" text-anchor="middle" fill="#6b7280" font-size="12" font-weight="400">
+  <tspan x="575" dy="0">重构路径</tspan>
+</text>
+<text x="700" y="955" text-anchor="middle" fill="#6b7280" font-size="11" font-weight="400">
+  <tspan x="700" dy="0">文件：specs/004-model-generation-write-pipeline-performance/model-generation-write-pipeline-architecture.svg</tspan>
+</text>
+</svg>

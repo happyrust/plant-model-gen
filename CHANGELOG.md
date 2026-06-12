@@ -2,6 +2,47 @@
 
 ## 2026-06-12
 
+### Fixed — PDMS refno B-tree 索引枚举漏读（spec 007）
+
+> `aps250160_0001` release 解析曾出现 `db_type is DESI` 但 `All refnos count: 2`，导致单 DESI 驱动的 CATA 闭包和后续模型生成明显缩水。根因在 `parse_pdms_db` 的 index page 读取与 internal page 遍历，不使用 scan fallback。
+
+- `pdms-io-fork/crates/parse_pdms_db/src/refno_index.rs`：index page entry 改为按页容量读到 `ref0 == 0`，不再用 `offset+0x10` 截断；internal page 遍历包含 start marker child；single lookup fallback 与 full enumeration 共享遍历语义。
+- 新增 synthetic 测试覆盖 entry count、start marker child、duplicate refno latest-wins；`cargo test refno_index --lib` 通过。
+- 真实文件验证：`aps250160_0001` index refnos 从 2 恢复到 2748；`aps7351_0001` 从 8 恢复到 3345855 且与 scan 完全一致。
+- release 包最小验证：替换 `Plant3D-AIOS-win-x64/release/bin/aios-database.exe` 后复跑 `quicktest-250160-8081` 的 `DbOption-parse`，日志 `parse-refno-index-20260612-210130.log` 显示 `aps250160_0001 All refnos count: 2748`，CATA closure manifest 非空并覆盖 `250193` 的 16 个 refno。
+- 7997 closure 验证：复跑 `quicktest-7997-8080` 的 `gen-cata-closure --rescan-index`，日志 `cata-closure-refno-index-20260612-210727.log` 显示 `ams7997_0001 All refnos count: 157260`，manifest 覆盖 8 个 CATA 库、15040 个 refno；完整生成/Parquet 重跑另行验收。
+
+### Fixed — 模型生成 O(N²) 写入回归：aabb/vec3 每批增量写 + 收尾补写（spec 006）
+
+> spec 005 落地后 7997 生成仍需 127 分钟，实测 99.9% 墙钟耗在 `inst_aabb` writer：`persist_mesh_results` 每批把全局累积的 `mesh_aabb_map`/`mesh_pts_map`（最终 37k+ 行）全量 `INSERT IGNORE` 重写一遍（每批固定 ~5.5s 与行数无关 × 2,415 批 ÷ 2 workers ≈ 126 分钟，7696cf04 引入）。现改为每批只写本批 delta，收尾一次性全量补写兜底。
+
+- `model_writer.rs`：`persist_mesh_results` 由本批 `mesh_results` 的 `aabb_hash`/`pts_hashes` 还原 delta，只写本批新增行；trait 新增 `finalize_mesh_entities` 收尾安全网（默认 no-op，Surreal 后端全量 `INSERT IGNORE` 补写，兜住「mesh 文件在、DB 行不在」的跨运行漂移）。
+- `orchestrator.rs`：批量屏障后调用收尾补写，打印 `[gen_model] final_sweep aabb=N pts=M elapsed_ms=T`；`AIOS_SKIP_FINAL_AABB_SWEEP=1` 可关（跳过亦打印原因）；失败仅告警不阻断。
+- `precheck_coordinator.rs` + `pe_transform_refresh.rs`：precheck 真实探测 `pe_transform` 表对目标 dbnum 的覆盖（根节点行存在性，新增 `pe_transform_covers_dbnum`），未覆盖则生成前刷新——消除生成期 `The table 'pe_transform' does not exist` 刷屏与 transform 全程回退 DB（基线 CATE 阶段 `get_world_transform`=14s）。
+- `transform_cache.rs`：rkyv 构建失败负缓存，同 dbnum 本次运行内不再重复整套构建（基线同库 1 秒内重试 6+ 次）。
+- `utils.rs`：`ensure_surreal_init` 增加连接存活探针——run_app 入口已完成 init 时跳过重复 connect+signin（验收中实测：CATE worker 预取触发 rkyv 构建时对已繁忙连接重复 init 会与在飞请求竞争 WS router 导致客户端死锁，2/3 复现）。
+- `orchestrator.rs`：`gen_all_geos_data` 入口显式调用 `ensure_surreal_init`（含 ses 空表兜底 DEFINE）——此前该兜底只在 rkyv 构建等旁路被动触发，全新空库站点首批 BRAN_TUBI `tubi_relate` 写入（`dt=fn::ses_date(...)`）先于旁路调用时直接 `The table 'ses' does not exist` panic（quicktest-250160-8080 部署实测复现，修复后重跑 job_done 退出 0）。
+- `specs/006-incremental-aabb-pts-persistence/`：spec/plan/tasks 三件套（grill-me 三项决策：新开 spec 006、收尾补写安全网、验收线总耗时<20min + inst_aabb_ms p50<200ms）；spec 004 Decisions 加 Q5 注记剩余瓶颈归属。
+- **验收实测（2026-06-12 22:08，quicktest-7997-8080 同配置重跑）**：`categorize_and_inst_relate` 126.1min → **2.28min（98.2% 降幅）**；`inst_aabb_ms` p50 5,519ms → **31ms**、累计 15,117s → 136s；final_sweep 一次 3.9s；零 pe_transform 报错、零 `already exists`/`Cannot COMMIT`；aabb.parquet 37,802 行 ≥ 基线；端到端 ≈ 8.6min。详见 spec 006 T308/T309。
+
+### Added — 站点部署性能统计：任务级四阶段指标采集 + API + UI（spec 004-site-deploy-perf-stats）
+
+> 站点部署此前只有 `last_parse_duration_ms` 和日志文本，解析了多少元素/几个库、生成了多少实例/网格/布尔、各阶段耗时无法在 admin UI 查看。现按「sidecar 落产物文件 → web_server 入库 → REST API → UI Tab」链路补齐任务级（每次 parse / generate 一条）结构化指标。
+
+- `src/perf_metrics.rs`（新增）：`TaskMetricsCollector` 全局聚合器，env `AIOS_TASK_METRICS_PATH` 注入产物路径（未注入全程 no-op）；schema_version=1，闭包/解析/生成/导出四阶段结构；每次记录原子落盘（tmp+rename），进程中断也保留已完成阶段；闭包 job 与解析 job 两个进程共用产物文件，启动时 merge-on-load 合并阶段。
+- sidecar 接线：`main.rs` gen-cata-closure 收尾记闭包指标（seed/visited/rounds/missing/covered_dbnums/耗时）；`cata_closure.rs` `apply_sync_filter` 记每库 mode（full|partial|skipped）与文件全量元素数；`database.rs` 两条 sync 路径 + `parse_single_db_file` 记每库解析元素数与耗时、收尾记 failed_sql 错误数；`orchestrator.rs` 批量屏障点记 mesh 新建/缓存命中、布尔桥记 success/failed、PerfTimer 分段耗时直出；`lib.rs` 生成收尾以 Surreal 计数落 inst_relate/inst_info/inst_relate_aabb/tubi_relate，导出收尾 walk parquet 目录统计文件数与字节数。
+- `src/web_server/site_task_metrics.rs`（新增）：派发 parse/generate sidecar job 时注入指标 env；job 完成钩子读产物 → admin SQLite `site_task_metrics` 入库（task_id UNIQUE upsert，产物缺失只告警不阻塞）；每站点按 `started_at` 保留最近 50 条；`GET /api/admin/sites/{id}/metrics?limit=`（含同类型上一条 delta：耗时/元素数/inst_relate/闭包 visited）与 `GET .../metrics/{task_id}` 两个端点，挂 admin 鉴权层内。
+- `ui/admin`：站点详情新增「性能统计」Tab（URL `?tab=metrics` 持久化）——四阶段卡片（闭包 visited/seeds/轮次、解析元素数/库数/错误、生成 inst_relate/mesh 新建+命中/布尔、导出 parquet 文件数/体积）+ 历史任务表（类型 badge/耗时/关键数量/较上次 delta 箭头/状态，行点击展开 stages JSON 明细）+ 空态引导；`types/site.ts` 增 `SiteTaskMetrics*` 类型、`api/sites.ts` 增 `metrics()`；admin 静态产物重建。
+- 验证：`cargo check` 双 bin 绿；`scripts/guard/web_server_parse_boundary_guard.ps1` PASS（web_server 仅消费 sidecar 产物文件，不解析日志/不读 E3D）。
+
+### Changed — 模型写入管线幂等化：统一 INSERT IGNORE，部署零旧数据检查（spec 005）
+
+> 站点首次部署是空库写入，但旧写入管线多处「写入前先检查/删除旧数据」：`inst_relate_aabb` 逐 chunk DELETE+INSERT 成对替换、`inst_relate` 写入前无条件图遍历扫描删除、`tubi_info` 写入前批量预查已存在 id——部署场景全是白跑，且成对语句本身是 `already exists`/`Cannot COMMIT` 的事故源。现统一为幂等 `INSERT IGNORE`：写入层零 DELETE 零预查，旧数据清理唯一权威归 `--regen-model` 入口的 `pre_cleanup_for_regen`。
+
+- `pdms_inst.rs`：`inst_relate_aabb` 三条路径（`save_instance_data_with_report` / `save_inst_relate_aabb_rows` / `save_instance_data_to_sql_file`）DELETE+INSERT → `INSERT IGNORE`（同批次 id 去重保留）；删除写入前无条件 `delete_inst_relate_by_in` 调用与函数；`inst_relate` / `geo_relate` / `neg_relate` / `ngmr_relate` / `tubi_info` 写入统一补 `IGNORE`；`save_tubi_info_batch` 删除 existing 预查（返回值改为提交条数）；清理两处「DELETE+INSERT 必须偶数事务块」过时注释。
+- `specs/005-idempotent-write-pipeline/`：spec/plan/tasks 三件套（grill-me 五项决策：新开 spec、清理权威契约、删 tubi 预查、三场景验收、性能仅观测）；spec 004 Q4「两阶段写入」决策注记被取代。
+- 验证：`cargo check` 绿；三场景实测（空库部署 / 不清理重跑 / regen）见 spec 005 T209–T211。
+
 ### Added — 「按需解析 CATA」独立开关（与全量解析显式区分）
 
 > 新增站点级开关 `cata_partial_parse`（默认开启），与「自动解析依赖库」组合：两者都开 = 闭包 manifest 部分解析（被引用条目解析、零引用库整库跳过）；仅依赖库开 = 关联 CATA 库整库全量解析（解析日志明示「📦 CATA 按需解析已关闭」）。便于按需/全量两种模式对照与回退。

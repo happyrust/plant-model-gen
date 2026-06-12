@@ -196,15 +196,17 @@ async fn check_tree_files(
     Ok(())
 }
 
-/// 检查 model_cache transform_cache 是否存在（不要求全量命中）。
+/// 检查 transform_cache 与 SurrealDB pe_transform 表覆盖。
 ///
-/// 约定：precheck 只做“存在性检查”，miss 由后续模型生成阶段按需计算并回写。
+/// spec 006 T303：precheck 真实探测 pe_transform 对目标 dbnum 的覆盖，
+/// 未覆盖则在生成前同步刷新——否则生成期 transform rkyv 构建失败，
+/// 全程回退 DB 逐条查询（基线 CATE 阶段 get_world_transform=14s + 错误刷屏）。
 async fn check_pe_transform(
-    _db_option: &DbOptionExt,
+    db_option: &DbOptionExt,
     dbnums: &[u32],
     stats: &mut PrecheckStats,
 ) -> Result<()> {
-    println!("[precheck] 🔄 检查 transform_cache（model cache）...");
+    println!("[precheck] 🔄 检查 transform_cache 与 pe_transform 覆盖...");
 
     if dbnums.is_empty() {
         println!("[precheck] ⚠️  没有需要检查的数据库");
@@ -216,7 +218,39 @@ async fn check_pe_transform(
 
     // transform_cache 已改为纯内存，无需磁盘目录
     crate::fast_model::transform_cache::init_global_transform_cache();
-    println!("[precheck] ✅ transform_cache 已初始化（纯内存）");
+
+    let mut uncovered: Vec<u32> = Vec::new();
+    for &dbnum in dbnums {
+        match crate::pe_transform_refresh::pe_transform_covers_dbnum(dbnum).await {
+            Ok(true) => {}
+            Ok(false) => uncovered.push(dbnum),
+            Err(err) => {
+                println!(
+                    "[precheck] ⚠️  探测 pe_transform 覆盖失败（按未覆盖处理）: dbnum={dbnum} err={err}"
+                );
+                uncovered.push(dbnum);
+            }
+        }
+    }
+
+    if uncovered.is_empty() {
+        println!(
+            "[precheck] ✅ pe_transform 覆盖完好（{} 个 dbnum），transform_cache 已初始化",
+            dbnums.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "[precheck] 🔄 pe_transform 未覆盖 dbnums={:?}，生成前刷新...",
+        uncovered
+    );
+    let refreshed =
+        crate::pe_transform_refresh::refresh_pe_transform_for_dbnums(&uncovered, db_option)
+            .await
+            .with_context(|| format!("precheck 刷新 pe_transform 失败: dbnums={uncovered:?}"))?;
+    stats.pe_transform_refreshed = refreshed;
+    println!("[precheck] ✅ pe_transform 刷新完成: {} 个节点", refreshed);
     Ok(())
 }
 

@@ -234,6 +234,23 @@ loc 2013286704/2064 leaf=pg377 elem_pg=32353 words=576 byte_off=66260096 (file=9
   「loc 指向文件外哨兵/失效页」豁免。若后续需要显式删除语义，可把 `loc.pgno > 文件总页数`
   识别为 tombstone 并输出诊断计数。
 
+### 站点部署端到端验收（2026-06-12，T008 收口）
+
+`quicktest-250160-8080` 重建站点全链路（解析 → CATA closure → 生成 → 部署验证）结果，
+见 `runtime/admin_sites/quicktest-250160-8080/deploy-validation.json`（22:26:45）：
+
+- `blocking_count = 0`；解析日志 `aps250160_0001 All refnos count: 2748`（修复前为 2）。
+- Parquet 全部非空：`instances.parquet rows=808`、`geo_instances rows=808`、
+  `transforms rows=854`、`aabb rows=824`，HTTP 访问 200。
+- `visible-insts API` 返回 963 个可见实例（修复前 TreeIndex 仅 2 节点、产物近空）。
+- mesh GLB 可匹配且 HTTP 200；Parquet 抽样引用一致性 pass。
+- 7997：`cata-closure-refno-index-20260612-210727.log` 显示 `ams7997_0001 All refnos count: 157260`，
+  manifest 覆盖 8 个 CATA 库 / 15040 refno，不再因 index 漏读为空。
+- 唯一 warning：`subtree-refnos API` 的 `resolve_dbnum_for_refno failed`——与 refno 索引无关的
+  API 解析问题，按 T009 约定另行立项，不混入本 spec。
+
+**Acceptance Criteria 全部达成，spec 007 关闭。**
+
 ```json
 {
   "db_file": "aps7351_0001",

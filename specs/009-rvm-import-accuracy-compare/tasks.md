@@ -129,6 +129,24 @@
 (全局基准平移、AABB 尺寸差)均定位为对拍链路自身问题,
 **未发现生成端缺陷**。
 
+**bbox 修复实施与缩放根因(2026-06-13 04:10 续)**:
+
+1. 导入端已改为 mesh 化自算 AABB + 退化盒落 NULL
+   (`rvm_import.rs::compute_payload_aabb`);
+2. 深挖发现真根因:**RVM PRIM 矩阵旋转部分按米制存储(列长≈0.001),
+   原语参数与平移为毫米**——直接相乘把几何坍缩成准点(所有成员的
+   rvm-rs bbox_world 全部如此,先前各成员 90~320mm"尺寸差"实为
+   gen 盒尺寸 vs 准点)。`rvm_obj_export.rs::parse_transform` 已加
+   缩放检测归一(列长 ∈[5e-4,2e-3] 时旋转列 ×1000);
+3. 修复后**尺寸差收敛到 0~27mm**(FLANGE 0~13.6、REDU 0~26、
+   FLAN2/3/4 12.5),**形状级一致性得证**;TEE/ELBO/VALVE 残差
+   54~358mm 与中心定位分裂(FLANGE 组与其余成员呈两组不同基准平移)
+   暴露 rvm-rs **层级变换组合**问题(导入 walk 只累加 group.translation,
+   未组合 CNTB 旋转;不同 PRIM 矩阵单位也不一致)——属上游
+   `rvm-rs`(D:/work/plant-code/rvmparser/rvm-rs)工作项,另行处理;
+4. L3 中心定位对比在 rvm-rs 层级矩阵修复前不可判;
+   尺寸(形状)级与成员/类型级结论维持:**生成端无缺陷**。
+
 - 站点 surreal(8022)在线,基于 2026-06-12 22:30 成功生成的数据
   (tubi_relate=16)。
 - 重导入样本(带解析)→ `--compare-rvm` → 分析差异:

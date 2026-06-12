@@ -459,26 +459,74 @@ impl RelationBuilder {
         self.stats.geometry_records += 1;
         let geo_hash = stable_geo_hash(self.dbnum, group_path, geometry_index, geometry);
         let final_bbox = translate_bbox(geometry.bbox_world, world_translation);
+        let geometry_blob = encode_geometry_blob(
+            geometry,
+            group_path,
+            geometry_index,
+            world_translation,
+            final_bbox,
+        )?;
+
+        // spec 009:rvm-rs 的 bbox_world 对部分带 transform 的原语退化为点
+        // (VALVE 12 原语实测全为零尺寸盒)。优先用原语参数 mesh 化后的精确
+        // 包围盒,mesh 不可用时回退 rvm-rs bbox。
+        let computed = compute_payload_aabb(&geometry_blob);
+        let (min_v, max_v) = match computed {
+            Some(b) => (Some([b[0], b[1], b[2]]), Some([b[3], b[4], b[5]])),
+            // mesh 化失败或退化(零矩阵坍缩)时落 NULL——
+            // rvm-rs 的 bbox_world 在同样的零矩阵下也是点,不可回退采信。
+            None => (None, None),
+        };
+
         self.inst_geos.push(InstGeoRecord {
             hash: geo_hash,
-            geometry: encode_geometry_blob(
-                geometry,
-                group_path,
-                geometry_index,
-                world_translation,
-                final_bbox,
-            )?,
-            aabb_min_x: final_bbox.is_valid().then_some(final_bbox.min.x as f64),
-            aabb_min_y: final_bbox.is_valid().then_some(final_bbox.min.y as f64),
-            aabb_min_z: final_bbox.is_valid().then_some(final_bbox.min.z as f64),
-            aabb_max_x: final_bbox.is_valid().then_some(final_bbox.max.x as f64),
-            aabb_max_y: final_bbox.is_valid().then_some(final_bbox.max.y as f64),
-            aabb_max_z: final_bbox.is_valid().then_some(final_bbox.max.z as f64),
+            geometry: geometry_blob,
+            aabb_min_x: min_v.map(|v| v[0]),
+            aabb_min_y: min_v.map(|v| v[1]),
+            aabb_min_z: min_v.map(|v| v[2]),
+            aabb_max_x: max_v.map(|v| v[0]),
+            aabb_max_y: max_v.map(|v| v[1]),
+            aabb_max_z: max_v.map(|v| v[2]),
             meshed: false,
         });
         self.geo_relates.push((inst_id, geo_hash));
         Ok(())
     }
+}
+
+/// 用原语参数 mesh 化(已应用 transform)后取顶点精确 AABB。
+///
+/// 退化检测:rvm-rs 对部分原语解析出的 transform.matrix3 为全零矩阵
+/// (VALVE 2013286704_483 的 12 个原语实测),顶点会坍缩成一个点——
+/// 这种退化盒不可用于对拍,返回 None(调用方落 NULL,compare 跳过并可识别)。
+fn compute_payload_aabb(geometry_blob: &[u8]) -> Option<[f64; 6]> {
+    let payload: serde_json::Value = serde_json::from_slice(geometry_blob).ok()?;
+    let mesh = crate::rvm_obj_export::mesh_from_payload(&payload).ok()??;
+    if mesh.vertices.is_empty() {
+        return None;
+    }
+    let mut bbox = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for v in &mesh.vertices {
+        bbox[0] = bbox[0].min(v.x as f64);
+        bbox[1] = bbox[1].min(v.y as f64);
+        bbox[2] = bbox[2].min(v.z as f64);
+        bbox[3] = bbox[3].max(v.x as f64);
+        bbox[4] = bbox[4].max(v.y as f64);
+        bbox[5] = bbox[5].max(v.z as f64);
+    }
+    if !bbox.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    // 三轴全部退化(< 0.01mm)视为零矩阵坍缩,弃用。
+    let degenerate = (0..3).all(|i| (bbox[i + 3] - bbox[i]).abs() < 0.01);
+    (!degenerate).then_some(bbox)
 }
 
 fn sanitize_name(raw: &str, fallback: String) -> String {

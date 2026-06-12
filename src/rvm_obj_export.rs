@@ -106,7 +106,10 @@ pub fn export_rvm_obj_from_relation_store(
     })
 }
 
-fn mesh_from_payload(payload: &Value) -> Result<Option<PlantMesh>> {
+/// 从 inst_geo payload 构建已应用 transform 的世界坐标 mesh。
+/// spec 009:除 OBJ 导出外,也被导入端用于自算精确 AABB
+/// (rvm-rs 的 bbox_world 对部分带 transform 的原语退化为点)。
+pub(crate) fn mesh_from_payload(payload: &Value) -> Result<Option<PlantMesh>> {
     let kind = payload
         .get("kind")
         .and_then(Value::as_str)
@@ -501,7 +504,7 @@ fn parse_transform(payload: &Value) -> Result<DMat4> {
         return Err(anyhow!("transform 数组长度无效"));
     }
 
-    let m = matrix
+    let mut m = matrix
         .iter()
         .map(value_to_f64)
         .collect::<Result<Vec<_>>>()?;
@@ -509,6 +512,19 @@ fn parse_transform(payload: &Value) -> Result<DMat4> {
         .iter()
         .map(value_to_f64)
         .collect::<Result<Vec<_>>>()?;
+
+    // spec 009:RVM 的 PRIM 矩阵旋转部分按米制存储(列长 ≈ 0.001),而原语
+    // 参数与平移是毫米——直接相乘会把几何坍缩成准点(VALVE 实测 12 原语
+    // bbox 全退化)。检测到米制缩放时把旋转列归一回毫米。
+    let col_len = |c: usize| -> f64 {
+        (m[c * 3] * m[c * 3] + m[c * 3 + 1] * m[c * 3 + 1] + m[c * 3 + 2] * m[c * 3 + 2]).sqrt()
+    };
+    let avg_scale = (col_len(0) + col_len(1) + col_len(2)) / 3.0;
+    if avg_scale > 5e-4 && avg_scale < 2e-3 {
+        for v in m.iter_mut() {
+            *v *= 1000.0;
+        }
+    }
 
     Ok(DMat4::from_cols_array(&[
         m[0], m[1], m[2], 0.0, m[3], m[4], m[5], 0.0, m[6], m[7], m[8], 0.0, t[0], t[1], t[2], 1.0,

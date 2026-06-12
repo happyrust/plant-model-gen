@@ -321,6 +321,30 @@ mod tests {
             assert!(sqls[0].contains(&format!("tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]")));
         }
     }
+
+    #[test]
+    fn dedupe_inst_relate_aabb_rows_keeps_last_row_for_duplicate_id() {
+        let rows = vec![
+            "{id: inst_relate_aabb:⟨1⟩, aabb_id: aabb:⟨old⟩}".to_string(),
+            "{id: inst_relate_aabb:⟨2⟩, aabb_id: aabb:⟨other⟩}".to_string(),
+            "{id: inst_relate_aabb:⟨1⟩, aabb_id: aabb:⟨new⟩}".to_string(),
+        ];
+        let ids = vec![
+            "inst_relate_aabb:⟨1⟩".to_string(),
+            "inst_relate_aabb:⟨2⟩".to_string(),
+            "inst_relate_aabb:⟨1⟩".to_string(),
+        ];
+
+        let (deduped_rows, deduped_ids) = dedupe_inst_relate_aabb_rows(&rows, &ids);
+
+        assert_eq!(
+            deduped_ids,
+            vec!["inst_relate_aabb:⟨1⟩", "inst_relate_aabb:⟨2⟩"]
+        );
+        assert_eq!(deduped_rows.len(), 2);
+        assert!(deduped_rows[0].contains("aabb:⟨new⟩"));
+        assert!(deduped_rows[1].contains("aabb:⟨other⟩"));
+    }
 }
 
 /// replace_exist=true 时，删除本次将要重建的 inst_geo 记录（按 geo_hash 点删）。
@@ -759,7 +783,9 @@ pub async fn save_instance_data_with_report(
     // 单条 INSERT 里拼接的记录数，过大容易触发 SurrealDB 事务取消/超时；取小一点更稳。
     const CHUNK_SIZE: usize = 100;
     // SurrealDB 在高并发/大事务时容易出现 session 丢失、匿名访问等错误；这里优先保证稳定性。
-    const MAX_TX_STATEMENTS: usize = 5;
+    // 必须为偶数：inst_relate_aabb 走 DELETE+INSERT 成对语句，奇数上限会把配对
+    // 拆进两个并发事务，重跑时 INSERT 先于配对 DELETE 执行 → "already exists" 中断。
+    const MAX_TX_STATEMENTS: usize = 4;
     // 本地 SurrealDB 在并发事务较高时更容易出现 “Transaction conflict: Resource busy”，
     // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
     const MAX_CONCURRENT_TX: usize = 2;
@@ -1424,32 +1450,33 @@ FROM neg_relate WHERE out = {} AND pe = {}",
     {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
 
-        // 统一把积累的 chunks + 剩余 buffer 一次性落库
-        let mut total = 0usize;
-        macro_rules! flush_pairs {
-            ($rows:expr, $ids:expr) => {{
-                let n = ($ids).len().min(($rows).len());
-                if n > 0 {
-                    for idx in (0..n).step_by(CHUNK_SIZE) {
-                        let end = (idx + CHUNK_SIZE).min(n);
-                        let delete_stmt = format!("DELETE [{}];", ($ids)[idx..end].join(","));
-                        let insert_stmt = format!(
-                            "INSERT INTO inst_relate_aabb [{}];",
-                            ($rows)[idx..end].join(",")
-                        );
-                        inst_aabb_batcher.push(delete_stmt).await?;
-                        inst_aabb_batcher.push(insert_stmt).await?;
-                    }
-                    total += n;
-                }
-                anyhow::Result::<()>::Ok(())
-            }};
+        // 统一把积累的 chunks + 剩余 buffer 一次性落库；同一 refno 可能在
+        // 多个批次中被重新聚合，写入前按目标 id 去重，避免单个 INSERT 内自冲突。
+        let raw_total = inst_relate_aabb_chunks
+            .iter()
+            .map(|(rows, _)| rows.len())
+            .sum::<usize>()
+            + inst_relate_aabb_buffer.len();
+        let mut all_rows: Vec<String> = Vec::with_capacity(raw_total);
+        let mut all_ids: Vec<String> = Vec::with_capacity(raw_total);
+        for (rows, ids) in &inst_relate_aabb_chunks {
+            all_rows.extend(rows.iter().cloned());
+            all_ids.extend(ids.iter().cloned());
         }
+        all_rows.extend(inst_relate_aabb_buffer.iter().cloned());
+        all_ids.extend(inst_relate_aabb_ids.iter().cloned());
+        let (deduped_rows, deduped_ids) = dedupe_inst_relate_aabb_rows(&all_rows, &all_ids);
+        let total = deduped_rows.len();
 
-        for (rows, ins) in &inst_relate_aabb_chunks {
-            flush_pairs!(rows, ins)?;
+        for (rows, ids) in deduped_rows
+            .chunks(CHUNK_SIZE)
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
+        {
+            let delete_stmt = format!("DELETE [{}];", ids.join(","));
+            let insert_stmt = format!("INSERT INTO inst_relate_aabb [{}];", rows.join(","));
+            inst_aabb_batcher.push(delete_stmt).await?;
+            inst_aabb_batcher.push(insert_stmt).await?;
         }
-        flush_pairs!(&inst_relate_aabb_buffer, &inst_relate_aabb_ids)?;
 
         debug_model_debug!(
             "save_instance_data_optimize flushing inst_relate_aabb after aabb insert: {}",
@@ -1758,7 +1785,31 @@ pub fn build_inst_relate_aabb_rows(
         }
     }
 
+    let (inst_relate_aabb_rows, inst_relate_aabb_ids) =
+        dedupe_inst_relate_aabb_rows(&inst_relate_aabb_rows, &inst_relate_aabb_ids);
+
     Ok((aabb_map, inst_relate_aabb_rows, inst_relate_aabb_ids))
+}
+
+fn dedupe_inst_relate_aabb_rows(rows: &[String], ids: &[String]) -> (Vec<String>, Vec<String>) {
+    debug_assert_eq!(rows.len(), ids.len());
+
+    let mut index_by_id: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
+    let mut deduped_rows: Vec<String> = Vec::with_capacity(rows.len());
+    let mut deduped_ids: Vec<String> = Vec::with_capacity(ids.len());
+
+    for (row, id) in rows.iter().zip(ids.iter()) {
+        if let Some(&idx) = index_by_id.get(id.as_str()) {
+            deduped_rows[idx] = row.clone();
+            deduped_ids[idx] = id.clone();
+        } else {
+            index_by_id.insert(id.as_str(), deduped_rows.len());
+            deduped_rows.push(row.clone());
+            deduped_ids.push(id.clone());
+        }
+    }
+
+    (deduped_rows, deduped_ids)
 }
 
 pub async fn save_inst_relate_aabb_rows(
@@ -1777,7 +1828,8 @@ pub async fn save_inst_relate_aabb_rows(
     );
 
     const CHUNK_SIZE: usize = 100;
-    const MAX_TX_STATEMENTS: usize = 5;
+    // 必须为偶数：DELETE+INSERT 成对语句不允许被拆进两个并发事务（见 save_instance_data_with_report）。
+    const MAX_TX_STATEMENTS: usize = 4;
     const MAX_CONCURRENT_TX: usize = 2;
 
     if !aabb_map.is_empty() {
@@ -1803,9 +1855,11 @@ pub async fn save_inst_relate_aabb_rows(
 
     if !inst_relate_aabb_rows.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        for (rows, ids) in inst_relate_aabb_rows
+        let (deduped_rows, deduped_ids) =
+            dedupe_inst_relate_aabb_rows(inst_relate_aabb_rows, inst_relate_aabb_ids);
+        for (rows, ids) in deduped_rows
             .chunks(CHUNK_SIZE)
-            .zip(inst_relate_aabb_ids.chunks(CHUNK_SIZE))
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
         {
             let delete_stmt = format!("DELETE [{}];", ids.join(","));
             let insert_stmt = format!("INSERT INTO inst_relate_aabb [{}];", rows.join(","));
@@ -3076,9 +3130,11 @@ pub async fn save_instance_data_to_sql_file(
 
     // inst_relate_aabb
     if !inst_relate_aabb_buffer.is_empty() {
-        for (rows, ids) in inst_relate_aabb_buffer
+        let (deduped_rows, deduped_ids) =
+            dedupe_inst_relate_aabb_rows(&inst_relate_aabb_buffer, &inst_relate_aabb_ids);
+        for (rows, ids) in deduped_rows
             .chunks(CHUNK_SIZE)
-            .zip(inst_relate_aabb_ids.chunks(CHUNK_SIZE))
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
         {
             writer.write_statement(&format!("DELETE [{}]", ids.join(",")))?;
             writer.write_statement(&format!(

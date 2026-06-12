@@ -40,12 +40,17 @@ fn is_refno_assoc_index_enabled() -> bool {
 const MAX_FAILED_SQL_DUMPS_PER_RUN: usize = 20;
 static FAILED_SQL_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// 本次运行的 failed_sql 转储计数（spec 004 任务指标采集用）。
+pub fn failed_sql_dump_count() -> usize {
+    FAILED_SQL_DUMP_COUNT.load(Ordering::Relaxed)
+}
+
 fn infer_failed_sql_stage(query: &str) -> &'static str {
     if query.contains("INSERT IGNORE INTO inst_relate_aabb") {
         "inst_relate_aabb"
-    } else if query.contains("INSERT RELATION INTO inst_relate [") {
+    } else if query.contains("INTO inst_relate [") {
         "inst_relate"
-    } else if query.contains("INSERT RELATION INTO geo_relate [") {
+    } else if query.contains("INTO geo_relate [") {
         "geo_relate"
     } else if query.contains("INSERT IGNORE INTO inst_geo") {
         "inst_geo"
@@ -57,9 +62,9 @@ fn infer_failed_sql_stage(query: &str) -> &'static str {
         "trans"
     } else if query.contains("INSERT IGNORE INTO vec3") {
         "vec3"
-    } else if query.contains("INSERT INTO tubi_info") {
+    } else if query.contains("INTO tubi_info") {
         "tubi_info"
-    } else if query.contains("INSERT RELATION INTO neg_relate [") {
+    } else if query.contains("INTO neg_relate [") {
         "neg_relate"
     } else {
         "transaction_batch"
@@ -162,15 +167,6 @@ pub async fn save_tubi_info_batch_with_replace(
     }
 
     Ok(written)
-}
-
-/// replace_exist=true 时，仅删除 inst_relate（按 in=pe），避免级联误删 inst_info/inst_geo，
-/// 以支持“inst_relate 重建 + inst_info/ptset 复用”的工作流。
-async fn delete_inst_relate_by_in(refnos: &[RefnoEnum], chunk_size: usize) -> anyhow::Result<()> {
-    for sql in build_delete_inst_relate_by_in_sql(refnos, chunk_size, None) {
-        model_query_response(&sql).await?;
-    }
-    Ok(())
 }
 
 async fn delete_inst_relate_by_in_with_dbnum(
@@ -783,8 +779,6 @@ pub async fn save_instance_data_with_report(
     // 单条 INSERT 里拼接的记录数，过大容易触发 SurrealDB 事务取消/超时；取小一点更稳。
     const CHUNK_SIZE: usize = 100;
     // SurrealDB 在高并发/大事务时容易出现 session 丢失、匿名访问等错误；这里优先保证稳定性。
-    // 必须为偶数：inst_relate_aabb 走 DELETE+INSERT 成对语句，奇数上限会把配对
-    // 拆进两个并发事务，重跑时 INSERT 先于配对 DELETE 执行 → "already exists" 中断。
     const MAX_TX_STATEMENTS: usize = 4;
     // 本地 SurrealDB 在并发事务较高时更容易出现 “Transaction conflict: Resource busy”，
     // 这里降低并发以提升整体成功率（结合 TransactionBatcher 内部重试）。
@@ -834,9 +828,9 @@ pub async fn save_instance_data_with_report(
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut transform_map: HashMap<u64, String> = HashMap::new();
     let inst_refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
-    if !inst_refnos.is_empty() {
-        delete_inst_relate_by_in(&inst_refnos, CHUNK_SIZE).await?;
-    }
+    // 写入前不再逐批扫描删除 inst_relate：首次部署为空库，重生成场景的旧
+    // 关系清理统一由入口 pre_cleanup_for_regen 完成（写入用 INSERT RELATION
+    // IGNORE 幂等），避免空库部署时每批 refnos 白跑一次图遍历 DELETE。
     let inst_dbnum_map = query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await;
     let inst_relate_precomputed = InstRelatePrecomputed::build(&inst_refnos).await;
     if let Entry::Vacant(entry) = transform_map.entry(0) {
@@ -955,7 +949,7 @@ pub async fn save_instance_data_with_report(
 
             if geo_relate_buffer.len() >= CHUNK_SIZE {
                 let statement = format!(
-                    "INSERT RELATION INTO geo_relate [{}];",
+                    "INSERT RELATION IGNORE INTO geo_relate [{}];",
                     geo_relate_buffer.join(",")
                 );
                 geo_batcher.push(statement).await?;
@@ -979,7 +973,7 @@ pub async fn save_instance_data_with_report(
 
     if !geo_relate_buffer.is_empty() {
         let statement = format!(
-            "INSERT RELATION INTO geo_relate [{}];",
+            "INSERT RELATION IGNORE INTO geo_relate [{}];",
             geo_relate_buffer.join(",")
         );
         geo_batcher.push(statement).await?;
@@ -1109,7 +1103,7 @@ pub async fn save_instance_data_with_report(
                         if neg_buffer.len() >= CHUNK_SIZE {
                             let statement = if replace_exist {
                                 format!(
-                                    "INSERT RELATION INTO neg_relate [{}];",
+                                    "INSERT RELATION IGNORE INTO neg_relate [{}];",
                                     neg_buffer.join(",")
                                 )
                             } else {
@@ -1129,7 +1123,7 @@ pub async fn save_instance_data_with_report(
         if !neg_buffer.is_empty() {
             let statement = if replace_exist {
                 format!(
-                    "INSERT RELATION INTO neg_relate [{}];",
+                    "INSERT RELATION IGNORE INTO neg_relate [{}];",
                     neg_buffer.join(",")
                 )
             } else {
@@ -1212,7 +1206,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             let statement = if replace_exist {
                                 format!(
-                                    "INSERT RELATION INTO ngmr_relate [{}];",
+                                    "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
                                     ngmr_buffer.join(",")
                                 )
                             } else {
@@ -1232,7 +1226,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         if !ngmr_buffer.is_empty() {
             let statement = if replace_exist {
                 format!(
-                    "INSERT RELATION INTO ngmr_relate [{}];",
+                    "INSERT RELATION IGNORE INTO ngmr_relate [{}];",
                     ngmr_buffer.join(",")
                 )
             } else {
@@ -1337,7 +1331,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         inst_relate_buffer.push(relate_sql);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
             let statement = format!(
-                "INSERT RELATION INTO inst_relate [{}];",
+                "INSERT RELATION IGNORE INTO inst_relate [{}];",
                 inst_relate_buffer.join(",")
             );
             inst_relate_batcher.push(statement).await?;
@@ -1355,7 +1349,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
 
     if !inst_relate_buffer.is_empty() {
         let statement = format!(
-            "INSERT RELATION INTO inst_relate [{}];",
+            "INSERT RELATION IGNORE INTO inst_relate [{}];",
             inst_relate_buffer.join(",")
         );
         inst_relate_batcher.push(statement).await?;
@@ -1465,16 +1459,16 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         }
         all_rows.extend(inst_relate_aabb_buffer.iter().cloned());
         all_ids.extend(inst_relate_aabb_ids.iter().cloned());
-        let (deduped_rows, deduped_ids) = dedupe_inst_relate_aabb_rows(&all_rows, &all_ids);
+        let (deduped_rows, _deduped_ids) = dedupe_inst_relate_aabb_rows(&all_rows, &all_ids);
         let total = deduped_rows.len();
 
-        for (rows, ids) in deduped_rows
-            .chunks(CHUNK_SIZE)
-            .zip(deduped_ids.chunks(CHUNK_SIZE))
-        {
-            let delete_stmt = format!("DELETE [{}];", ids.join(","));
-            let insert_stmt = format!("INSERT INTO inst_relate_aabb [{}];", rows.join(","));
-            inst_aabb_batcher.push(delete_stmt).await?;
+        // 旧数据由重生成入口整体清理（pre_cleanup），首次部署为空库；
+        // 写入统一 INSERT IGNORE 幂等，不再逐 chunk DELETE+INSERT 替换。
+        for rows in deduped_rows.chunks(CHUNK_SIZE) {
+            let insert_stmt = format!(
+                "INSERT IGNORE INTO inst_relate_aabb [{}];",
+                rows.join(",")
+            );
             inst_aabb_batcher.push(insert_stmt).await?;
         }
 
@@ -1828,7 +1822,6 @@ pub async fn save_inst_relate_aabb_rows(
     );
 
     const CHUNK_SIZE: usize = 100;
-    // 必须为偶数：DELETE+INSERT 成对语句不允许被拆进两个并发事务（见 save_instance_data_with_report）。
     const MAX_TX_STATEMENTS: usize = 4;
     const MAX_CONCURRENT_TX: usize = 2;
 
@@ -1855,15 +1848,14 @@ pub async fn save_inst_relate_aabb_rows(
 
     if !inst_relate_aabb_rows.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        let (deduped_rows, deduped_ids) =
+        let (deduped_rows, _deduped_ids) =
             dedupe_inst_relate_aabb_rows(inst_relate_aabb_rows, inst_relate_aabb_ids);
-        for (rows, ids) in deduped_rows
-            .chunks(CHUNK_SIZE)
-            .zip(deduped_ids.chunks(CHUNK_SIZE))
-        {
-            let delete_stmt = format!("DELETE [{}];", ids.join(","));
-            let insert_stmt = format!("INSERT INTO inst_relate_aabb [{}];", rows.join(","));
-            inst_aabb_batcher.push(delete_stmt).await?;
+        // 同上：写入统一 INSERT IGNORE，旧数据由入口整体清理，不做逐行替换。
+        for rows in deduped_rows.chunks(CHUNK_SIZE) {
+            let insert_stmt = format!(
+                "INSERT IGNORE INTO inst_relate_aabb [{}];",
+                rows.join(",")
+            );
             inst_aabb_batcher.push(insert_stmt).await?;
         }
         inst_aabb_batcher.finish().await?;
@@ -2091,15 +2083,17 @@ fn build_transaction_block(statements: &[String]) -> String {
     block
 }
 
-/// 增量保存 tubi_info 数据到数据库
+/// 批量保存 tubi_info 数据到数据库（INSERT IGNORE 幂等）。
 ///
-/// 仅写入尚不存在的 tubi_info 记录，返回新增记录数量。
+/// spec 005（grill-me Q3）：不再预查已存在 id——IGNORE 本身就是幂等闸，
+/// 预查在部署场景是纯白跑的批量查询。返回值为提交条数（非精确新增数，
+/// 仅 debug 日志消费）。
 ///
 /// # 参数
 /// - `tubi_info_map`: 组合键 ID -> TubiInfoData 的映射
 ///
 /// # 返回
-/// - `Ok(usize)`: 新增的记录数量
+/// - `Ok(usize)`: 提交的记录数量
 pub async fn save_tubi_info_batch(
     tubi_info_map: &DashMap<String, TubiInfoData>,
 ) -> anyhow::Result<usize> {
@@ -2109,71 +2103,24 @@ pub async fn save_tubi_info_batch(
 
     const CHUNK_SIZE: usize = 200;
 
-    // 1. 查询已存在的 tubi_info ID
-    let ids: Vec<String> = tubi_info_map.iter().map(|e| e.key().clone()).collect();
-    let existing = query_existing_tubi_info_ids(&ids).await?;
+    let entries: Vec<_> = tubi_info_map.iter().collect();
+    debug_model_debug!("save_tubi_info_batch: total={}", entries.len());
 
-    debug_model_debug!(
-        "save_tubi_info_batch: total={}, existing={}, to_insert={}",
-        ids.len(),
-        existing.len(),
-        ids.len() - existing.len()
-    );
-
-    // 2. 过滤出需要新建的
-    let new_entries: Vec<_> = tubi_info_map
-        .iter()
-        .filter(|e| !existing.contains(e.key()))
-        .collect();
-
-    if new_entries.is_empty() {
-        return Ok(0);
-    }
-
-    // 3. 批量 INSERT
-    let mut inserted = 0;
-    for chunk in new_entries.chunks(CHUNK_SIZE) {
+    let mut submitted = 0;
+    for chunk in entries.chunks(CHUNK_SIZE) {
         let values: Vec<String> = chunk.iter().map(|e| e.value().to_surreal_json()).collect();
 
-        let sql = format!("INSERT INTO tubi_info [{}];", values.join(","));
+        let sql = format!("INSERT IGNORE INTO tubi_info [{}];", values.join(","));
         model_query_response(&sql).await?;
-        inserted += chunk.len();
+        submitted += chunk.len();
 
         debug_model_debug!(
-            "save_tubi_info_batch: inserted chunk of {} records",
+            "save_tubi_info_batch: submitted chunk of {} records",
             chunk.len()
         );
     }
 
-    Ok(inserted)
-}
-
-/// 查询已存在的 tubi_info ID 列表
-async fn query_existing_tubi_info_ids(ids: &[String]) -> anyhow::Result<HashSet<String>> {
-    if ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    // 分批查询以避免 SQL 过长
-    const BATCH_SIZE: usize = 500;
-    let mut existing = HashSet::new();
-
-    for chunk in ids.chunks(BATCH_SIZE) {
-        let id_list: String = chunk
-            .iter()
-            .map(|id| format!("tubi_info:⟨{}⟩", id))
-            .join(",");
-
-        let sql = format!("SELECT VALUE record::id(id) FROM [{}];", id_list);
-
-        let result: Vec<String> = model_primary_db()
-            .query_take(&sql, 0)
-            .await
-            .unwrap_or_default();
-        existing.extend(result);
-    }
-
-    Ok(existing)
+    Ok(submitted)
 }
 
 /// 补建跨阶段缺失的 neg_relate
@@ -3128,17 +3075,14 @@ pub async fn save_instance_data_to_sql_file(
         }
     }
 
-    // inst_relate_aabb
+    // inst_relate_aabb：与 DB 直写路径同口径，统一 INSERT IGNORE 幂等，
+    // 旧数据由入口整体清理（pre_cleanup_for_regen / replace_exist DELETE 块）。
     if !inst_relate_aabb_buffer.is_empty() {
-        let (deduped_rows, deduped_ids) =
+        let (deduped_rows, _deduped_ids) =
             dedupe_inst_relate_aabb_rows(&inst_relate_aabb_buffer, &inst_relate_aabb_ids);
-        for (rows, ids) in deduped_rows
-            .chunks(CHUNK_SIZE)
-            .zip(deduped_ids.chunks(CHUNK_SIZE))
-        {
-            writer.write_statement(&format!("DELETE [{}]", ids.join(",")))?;
+        for rows in deduped_rows.chunks(CHUNK_SIZE) {
             writer.write_statement(&format!(
-                "INSERT INTO inst_relate_aabb [{}]",
+                "INSERT IGNORE INTO inst_relate_aabb [{}]",
                 rows.join(",")
             ))?;
         }

@@ -47,6 +47,7 @@ import type {
   ManagedSiteProcessResource,
   ManagedSiteRiskLevel,
   ManagedSiteRuntimeStatus,
+  SiteTaskMetrics,
 } from '@/types/site'
 import type { TaskInfo, TaskStatus } from '@/types/task'
 
@@ -108,13 +109,14 @@ const remotePreflightLoading = ref(false)
 const remotePrepareLoading = ref(false)
 const remoteDeployLoading = ref(false)
 const reconcileLoading = ref(false)
-type DetailTab = 'overview' | 'deploy'
+type DetailTab = 'overview' | 'deploy' | 'metrics'
 
-// D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy`
+// D6 / Sprint D · 修 G16：tab 状态持久化到 URL `?tab=overview|deploy|metrics`
 //
 // 旧版 activeTab 仅保存在组件 ref，刷新页面回到「运行概览」；新版从 URL query
 // 取初值并双向同步，刷新 / 分享链接都能保留 tab 选择。
-const initialTab: DetailTab = route.query.tab === 'deploy' ? 'deploy' : 'overview'
+const initialTab: DetailTab =
+  route.query.tab === 'deploy' ? 'deploy' : route.query.tab === 'metrics' ? 'metrics' : 'overview'
 const activeTab = ref<DetailTab>(initialTab)
 const initialDeployTaskId = typeof route.query.task_id === 'string' ? route.query.task_id : ''
 const deployTaskId = ref(initialDeployTaskId)
@@ -133,7 +135,90 @@ watch(activeTab, (next) => {
   if (next === 'deploy' && !deployValidation.value && !deployValidationLoading.value) {
     void fetchDeployValidation()
   }
+  if (next === 'metrics' && metricsItems.value.length === 0 && !metricsLoading.value) {
+    void fetchMetrics()
+  }
 })
+
+// ─── spec 004：性能统计 Tab ───────────────────────────────────────────────────
+const metricsItems = ref<SiteTaskMetrics[]>([])
+const metricsLoading = ref(false)
+const metricsError = ref('')
+const expandedMetricsTask = ref('')
+
+async function fetchMetrics() {
+  metricsLoading.value = true
+  metricsError.value = ''
+  try {
+    const data = await sitesApi.metrics(siteId, 20)
+    metricsItems.value = data.items ?? []
+  } catch (err) {
+    metricsError.value = extractErrorMessage(err)
+  } finally {
+    metricsLoading.value = false
+  }
+}
+
+const latestMetrics = computed(() => metricsItems.value[0] ?? null)
+/** 最近一次含某阶段数据的任务的该阶段（parse 任务带 closure/parse，generate 任务带 generate/export）。 */
+function latestStage<T = Record<string, unknown>>(name: string): T | null {
+  for (const item of metricsItems.value) {
+    const stage = (item.stages as Record<string, unknown>)?.[name]
+    if (stage) return stage as T
+  }
+  return null
+}
+const metricsClosure = computed(() => latestStage<Record<string, number>>('closure'))
+const metricsParse = computed(() =>
+  latestStage<{ dbs?: Array<Record<string, unknown>>; total_elements?: number; error_count?: number; duration_ms?: number }>('parse'),
+)
+const metricsGenerate = computed(() => latestStage<Record<string, number>>('generate'))
+const metricsExport = computed(() => latestStage<Record<string, number>>('export'))
+
+function fmtDurationMs(ms: number | undefined | null): string {
+  const value = Number(ms ?? 0)
+  if (value <= 0) return '0s'
+  if (value < 1000) return `${value}ms`
+  if (value < 60_000) return `${(value / 1000).toFixed(1)}s`
+  const minutes = Math.floor(value / 60_000)
+  const seconds = Math.round((value % 60_000) / 1000)
+  return `${minutes}m${seconds.toString().padStart(2, '0')}s`
+}
+
+function fmtBytes(bytes: number | undefined | null): string {
+  const value = Number(bytes ?? 0)
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function fmtDelta(value: number | undefined): string {
+  if (value === undefined || value === 0) return ''
+  return value > 0 ? `+${value.toLocaleString()}` : value.toLocaleString()
+}
+
+function metricsTaskKeyNumber(item: SiteTaskMetrics): string {
+  const stages = item.stages as Record<string, Record<string, number> | undefined>
+  if (item.job_kind === 'generate') {
+    const inst = stages?.generate?.inst_relate
+    return inst !== undefined ? `inst ${inst.toLocaleString()}` : '—'
+  }
+  const elements = (stages?.parse as Record<string, number> | undefined)?.total_elements
+  return elements !== undefined ? `元素 ${elements.toLocaleString()}` : '—'
+}
+
+function toggleMetricsExpand(taskId: string) {
+  expandedMetricsTask.value = expandedMetricsTask.value === taskId ? '' : taskId
+}
+
+function metricsStagesPretty(item: SiteTaskMetrics): string {
+  try {
+    return JSON.stringify(item.stages, null, 2)
+  } catch {
+    return String(item.stages)
+  }
+}
 watch(() => route.query.task_id, (next) => {
   deployTaskId.value = typeof next === 'string' ? next : ''
   if (deployTaskId.value) {
@@ -1080,6 +1165,9 @@ onMounted(async () => {
       await fetchRemoteDeployStatus()
     }
   }
+  if (activeTab.value === 'metrics') {
+    await fetchMetrics()
+  }
   await scrollToLogsIfRequested()
   startPolling()
   startDeployTaskPolling()
@@ -1141,6 +1229,11 @@ onMounted(async () => {
         :class="activeTab === 'deploy' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'"
         @click="activeTab = 'deploy'"
       >部署进度</button>
+      <button
+        class="px-4 py-2 text-sm font-medium transition-colors border-b-2"
+        :class="activeTab === 'metrics' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'"
+        @click="activeTab = 'metrics'"
+      >性能统计</button>
     </div>
 
     <div v-if="activeTab === 'overview'" class="space-y-4">
@@ -1536,6 +1629,148 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+    </div>
+
+    <div v-else-if="activeTab === 'metrics'" class="space-y-4">
+      <div
+        v-if="metricsError"
+        class="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+      >
+        性能统计加载失败：{{ metricsError }}
+        <button class="ml-2 underline" @click="fetchMetrics">重试</button>
+      </div>
+
+      <div v-if="metricsLoading && metricsItems.length === 0" class="rounded-lg border border-border bg-card p-8 text-center text-sm text-muted-foreground">
+        加载性能统计...
+      </div>
+
+      <div v-else-if="metricsItems.length === 0" class="rounded-lg border border-dashed border-border bg-card p-10 text-center">
+        <p class="text-sm font-medium">暂无性能统计数据</p>
+        <p class="mt-2 text-xs text-muted-foreground">
+          完成一次解析或模型生成任务后，这里会展示闭包 / 解析 / 生成 / 导出四阶段的耗时与数量指标。
+        </p>
+      </div>
+
+      <template v-else>
+        <!-- 四阶段卡片（最近一次有该阶段数据的任务） -->
+        <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <div class="rounded-lg border border-border bg-card p-4">
+            <div class="text-xs font-medium text-muted-foreground">CATA 闭包</div>
+            <template v-if="metricsClosure">
+              <div class="mt-2 text-2xl font-semibold">{{ (metricsClosure.visited_count ?? 0).toLocaleString() }}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                visited · seeds {{ metricsClosure.seed_count ?? 0 }} · {{ metricsClosure.rounds ?? 0 }} 轮
+                · 缺失 {{ metricsClosure.missing_count ?? 0 }}
+              </div>
+              <div class="mt-1 text-xs text-muted-foreground">耗时 {{ fmtDurationMs(metricsClosure.duration_ms) }}</div>
+            </template>
+            <div v-else class="mt-2 text-sm text-muted-foreground">无数据</div>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <div class="text-xs font-medium text-muted-foreground">解析</div>
+            <template v-if="metricsParse">
+              <div class="mt-2 text-2xl font-semibold">{{ (metricsParse.total_elements ?? 0).toLocaleString() }}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                元素 · {{ (metricsParse.dbs ?? []).length }} 个库
+                · 错误 {{ metricsParse.error_count ?? 0 }}
+              </div>
+              <div class="mt-1 text-xs text-muted-foreground">耗时 {{ fmtDurationMs(metricsParse.duration_ms) }}</div>
+            </template>
+            <div v-else class="mt-2 text-sm text-muted-foreground">无数据</div>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <div class="text-xs font-medium text-muted-foreground">模型生成</div>
+            <template v-if="metricsGenerate">
+              <div class="mt-2 text-2xl font-semibold">{{ (metricsGenerate.inst_relate ?? 0).toLocaleString() }}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                inst_relate · mesh 新建 {{ (metricsGenerate.mesh_generated ?? 0).toLocaleString() }}
+                / 命中 {{ (metricsGenerate.mesh_cache_hit ?? 0).toLocaleString() }}
+                · 布尔 {{ metricsGenerate.boolean_success ?? 0 }}✓/{{ metricsGenerate.boolean_failed ?? 0 }}✗
+              </div>
+              <div class="mt-1 text-xs text-muted-foreground">耗时 {{ fmtDurationMs(metricsGenerate.duration_ms) }}</div>
+            </template>
+            <div v-else class="mt-2 text-sm text-muted-foreground">无数据</div>
+          </div>
+          <div class="rounded-lg border border-border bg-card p-4">
+            <div class="text-xs font-medium text-muted-foreground">导出</div>
+            <template v-if="metricsExport">
+              <div class="mt-2 text-2xl font-semibold">{{ (metricsExport.parquet_files ?? 0).toLocaleString() }}</div>
+              <div class="mt-1 text-xs text-muted-foreground">
+                parquet 文件 · {{ fmtBytes(metricsExport.parquet_bytes) }}
+                <template v-if="metricsExport.json_files"> · JSON {{ metricsExport.json_files }} 个</template>
+              </div>
+              <div class="mt-1 text-xs text-muted-foreground">耗时 {{ fmtDurationMs(metricsExport.duration_ms) }}</div>
+            </template>
+            <div v-else class="mt-2 text-sm text-muted-foreground">无数据</div>
+          </div>
+        </div>
+
+        <!-- 历史任务表 -->
+        <div class="rounded-lg border border-border bg-card">
+          <div class="flex items-center justify-between border-b border-border px-4 py-3">
+            <h3 class="text-sm font-medium">历史任务（最近 {{ metricsItems.length }} 条）</h3>
+            <button
+              class="inline-flex h-7 items-center rounded-md border border-input bg-transparent px-3 text-xs font-medium hover:bg-accent transition-colors"
+              :disabled="metricsLoading"
+              @click="fetchMetrics"
+            >{{ metricsLoading ? '刷新中...' : '刷新' }}</button>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-border text-left text-xs text-muted-foreground">
+                  <th class="px-4 py-2 font-medium">时间</th>
+                  <th class="px-4 py-2 font-medium">类型</th>
+                  <th class="px-4 py-2 font-medium">耗时</th>
+                  <th class="px-4 py-2 font-medium">关键数量</th>
+                  <th class="px-4 py-2 font-medium">较上次</th>
+                  <th class="px-4 py-2 font-medium">状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="item in metricsItems" :key="item.task_id">
+                  <tr
+                    class="border-b border-border/60 cursor-pointer hover:bg-accent/40 transition-colors"
+                    @click="toggleMetricsExpand(item.task_id)"
+                  >
+                    <td class="px-4 py-2 whitespace-nowrap">{{ formatDateTime(item.started_at) }}</td>
+                    <td class="px-4 py-2">
+                      <span
+                        class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                        :class="item.job_kind === 'generate' ? 'bg-violet-100 text-violet-800 dark:bg-violet-900 dark:text-violet-200' : 'bg-sky-100 text-sky-800 dark:bg-sky-900 dark:text-sky-200'"
+                      >{{ item.job_kind === 'generate' ? '模型生成' : '解析' }}</span>
+                    </td>
+                    <td class="px-4 py-2 whitespace-nowrap">{{ fmtDurationMs(item.duration_ms) }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap">{{ metricsTaskKeyNumber(item) }}</td>
+                    <td class="px-4 py-2 whitespace-nowrap text-xs">
+                      <template v-if="item.delta">
+                        <span :class="item.delta.duration_ms > 0 ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'">
+                          {{ item.delta.duration_ms > 0 ? '↑' : '↓' }}{{ fmtDurationMs(Math.abs(item.delta.duration_ms)) }}
+                        </span>
+                        <span v-if="fmtDelta(item.job_kind === 'generate' ? item.delta.inst_relate : item.delta.total_elements)" class="ml-2 text-muted-foreground">
+                          {{ fmtDelta(item.job_kind === 'generate' ? item.delta.inst_relate : item.delta.total_elements) }}
+                        </span>
+                      </template>
+                      <span v-else class="text-muted-foreground">—</span>
+                    </td>
+                    <td class="px-4 py-2">
+                      <span
+                        class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+                        :class="item.success ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'"
+                      >{{ item.success ? '成功' : '失败' }}</span>
+                    </td>
+                  </tr>
+                  <tr v-if="expandedMetricsTask === item.task_id" class="border-b border-border/60 bg-muted/30">
+                    <td colspan="6" class="px-4 py-3">
+                      <pre class="max-h-80 overflow-auto rounded-md bg-background p-3 font-mono text-xs leading-relaxed">{{ metricsStagesPretty(item) }}</pre>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
     </div>
 
     <div v-else-if="site" class="space-y-4">

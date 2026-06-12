@@ -1,83 +1,122 @@
 # SigMap Query Context
-Generated: 2026-06-08T18:27:52.174Z
+Generated: 2026-06-12T02:57:05.671Z
 
-## .trellis\scripts\add_session.py
+## .worktrees\pe-transform-backends\src\web_server\managed_project_sites.rs
 ```
-def get_latest_journal_info(dev_dir: Path) → tuple[Path | None, int, int]  # Get latest journal file info
-def get_current_session(index_file: Path) → int  # Get current session number from index
-def count_journal_files(dev_dir: Path, active_num: int) → str  # Count journal files and return table rows
-def create_new_journal_file(dev_dir: Path, num: int, developer: str, today: str, max_lines: int) → Path  # Create a new journal file
-def generate_session_content(session_num: int, title: str, commit: str, summary: str, extra_content: str, today: str, package: str | None, branch: str | None) → str  # Generate session content
-def update_index(index_file: Path, dev_dir: Path, title: str, commit: str, new_session: int, active_file: str, today: str, branch: str | None) → bool  # Update index
-def main() → int  # CLI entry point
-```
-
-## .cursor\skills\trellis-meta\references\customize-local\add-project-local-conventions.md
-```
-h1 Add Project-Local Conventions
-h2 Where To Put Things
-h2 Create A Project-Local Skill
-h1 Trellis Local
-h2 Local Scope
-h2 Custom Workflow Rules
-h2 Local Hook Changes
-h2 Local Agent Changes
-h2 Write To `.trellis/spec/`
-h2 Make The Current Task Use New Conventions
-h2 Do Not Store Project-Private Rules In `trellis-meta`
-code-fence text
-code-fence plain
-code-fence md
-code-fence bash
+pub struct RuntimeUpdate
+pub struct StopSiteResult
+pub struct TailLogResponse
+pub fn ensure_schema() → Result<()>
+pub fn get_site(site_id: &str) → Result<Option<ManagedProjec...
+pub fn list_sites() → Result<Vec<ManagedProjectSi...
+pub fn create_site(req: CreateManagedSiteRequest) → Result<ManagedProjectSite>
+pub fn preview_parse_plan(req: PreviewManagedSiteParsePlanRequest) → Result<ManagedSiteParsePlan>
+pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) → Result<ManagedProjectSite>
+pub fn update_runtime(site_id: &str, update: RuntimeUpdate) → Result<()>
+pub fn resource_summary() → Result<AdminResourceSummary>
+pub async fn start_site(site_id: String) → Result<()>
+pub async fn parse_site(site_id: String) → Result<()>
+pub async fn restart_site(site_id: &str) → Result<()>
+pub async fn stop_site(site_id: &str) → Result<StopSiteResult>
+pub fn delete_site(site_id: &str) → Result<bool>
+pub fn runtime_status(site_id: &str) → Result<ManagedSiteRuntimeSt...
+pub fn tail_log(site_id: &str, kind: &str, limit: usize) → Result<TailLogResponse>
+pub fn full_log_path(site_id: &str, kind: &str) → Result<PathBuf>
+pub fn logs(site_id: &str) → Result<ManagedSiteLogsRespo...
 ```
 
-## .cursor\skills\trellis-update-spec\SKILL.md
+## src\web_server\wizard_handlers.rs
 ```
-h1 Update Code-Spec - Capture Executable Contracts
-h2 Code-Spec First Rule (CRITICAL)
-h3 Mandatory Triggers
-h3 Mandatory Output (7 Sections)
-h2 When to Update Code-Specs
-h2 Spec Structure Overview
-h3 CRITICAL: Code-Spec vs Guide - Know the Difference
-h2 Update Process
-h3 Step 1: Identify What You Learned
-h3 Step 2: Classify the Update Type
-h3 Step 3: Read the Target Code-Spec
-h3 Step 4: Make the Update
-h3 Step 5: Update the Index (if needed)
-h2 Update Templates
-h3 Mandatory Template for Infra/Cross-Layer Work
-h2 Scenario: <name>
-h3 1. Scope / Trigger
-h3 2. Signatures
-h3 3. Contracts
-h3 4. Validation & Error Matrix
-```
-
-## .worktrees\model-persistence-trait\docs\development\model-writer-storage\01-current-surreal-write-contract.md
-```
-h1 Current SurrealDB Write Contract
-h2 Current behavior
-h2 Contract principles
-h2 Parity matrix
-h2 Backend parity requirements
+pub struct DatabaseFileInfo
+pub struct DatabaseFileScanRequest
+pub struct DatabaseFileScanResult
+pub struct BrowseDirectoryRequest
+pub struct DirectoryEntry
+pub struct BrowseDirectoryResponse
+pub async fn scan_directory(State(_state) → Result<Json<DirectoryScanRe...
+pub async fn list_projects(State(_state) → Result<Json<Vec<ProjectInfo...
+pub async fn create_wizard_task(State(state) → Result<Json<TaskInfo>, (Sta...
+pub async fn get_wizard_templates(State(_state) → Result<Json<Vec<TaskTemplat...
+pub async fn scan_database_files(State(_state) → Result<Json<DatabaseFileSca...
+pub fn open_deployment_sites_sqlite() → Result<rusqlite::Connection...
+pub fn persist_task_progress_to_sqlite(task: &TaskInfo) → Result<(), Box<dyn std::err...
+pub async fn browse_directory(Query(request) → Result<Json<BrowseDirectory...
+pub fn delete_deployment_site_from_sqlite(site_id: &str) → Result<(), Box<dyn std::err...
+pub fn load_wizard_config_by_task_id(task_id: &str) → Option<DataParsingWizardCon...
+pub fn restore_tasks_from_sqlite() → Vec<TaskInfo>
+pub fn load_deployment_sites_from_sqlite() → Result<Vec<serde_json::Valu...
+pub fn load_deployment_site_by_id_from_sqlite(site_id: &str,) → Result<Option<serde_json::V...
+pub fn update_deployment_site_health(site_id: &str, status: &str, timestamp: &str,) → Result<(), Box<dyn std::err...
 ```
 
-## .trellis\scripts\common\config.py
+## .worktrees\model-persistence-trait\src\cli_modes.rs
 ```
-def parse_simple_yaml(content: str) → dict  # Parse simple YAML with nested dict support (no dependencies)
-def get_session_commit_message(repo_root: Path | None) → str  # Get the commit message for auto-committing session records
-def get_max_journal_lines(repo_root: Path | None) → int  # Get the maximum lines per journal file
-def get_session_auto_commit(repo_root: Path | None) → bool
-def get_hooks(event: str, repo_root: Path | None) → list[str]  # Get hook commands for a lifecycle event
-def get_packages(repo_root: Path | None) → dict[str, dict] | None  # Get monorepo package declarations
-def get_default_package(repo_root: Path | None) → str | None  # Get the default package name from config
-def get_submodule_packages(repo_root: Path | None) → dict[str, str]  # Get packages that are git submodules
-def get_git_packages(repo_root: Path | None) → dict[str, str]  # Get packages that have their own independent git repository
-def is_monorepo(repo_root: Path | None) → bool  # Check if the project is configured as a monorepo (has packag
-def get_spec_base(package: str | None, repo_root: Path | None) → str  # Get the spec directory base path relative to
-def validate_package(package: str, repo_root: Path | None) → bool  # Check if a package name is valid in this project
-def resolve_package(task_package: str | None, repo_root: Path | None) → str | None  # Resolve package from inferred sources with validation
-def get_spec_scope(repo_root: Path | None) → list[str] | str | None  # Get session
+pub struct ExportConfig
+pub struct CanonicalParquetValidationReport
+pub struct RoomComputeCliConfig
+pub struct SpatialQueryVerifyResultItem
+pub struct SpatialQueryVerifySnapshot
+impl ExportConfig
+impl ExportConfig
+pub fn new(refnos_str: Vec<String>) → Self
+pub fn with_output_path(mut self, output_path: Option<String>) → Self
+pub fn with_filter_nouns(mut self, filter_nouns: Option<Vec<String>>) → Self
+pub fn with_include_descendants(mut self, include_descendants: bool) → Self
+pub fn with_unit_conversion(mut self, source_unit: &str, target_unit: &str) → Self
+pub fn with_verbose(mut self, verbose: bool) → Self
+pub fn with_regenerate_plant_mesh(mut self, regenerate_plant_mesh: bool) → Self
+pub fn with_run_all_dbnos(mut self, run_all_dbnos: bool) → Self
+impl RoomVerifySummary
+impl ScopedEnvVar
+impl ScopedEnvVar
+impl RoomComputeCliReport
+pub fn validate_canonical_parquet_writer_mode(output_dir: &Path, project_name: &str, dbnum: u32, batch_id: u64,) → Result<CanonicalParquetVali...
+```
+
+## src\web_server\handlers.rs
+```
+pub struct CreateBatchTaskRequest
+pub struct CreateTaskTemplateRequest
+pub struct SshOptions
+pub struct SurrealControlRequest
+pub struct SurrealTestRequest
+pub struct SqliteSpatialQuery
+pub struct DeploymentSiteBrowseQuery
+pub struct GetInstancesRequest
+pub struct ModelDataResponse
+pub struct SurrealStatusQuery
+pub struct TraySupportsDetectRequest
+pub struct SctnTestRequest
+pub struct DatabaseConnectionStatus
+pub struct DatabaseConnectionConfig
+pub struct StartupScript
+pub struct DbConnCheckQuery
+pub struct StartDatabaseRequest
+pub struct ExportRequest
+pub struct ExportResponse
+pub struct ExportStatusResponse
+```
+
+## .worktrees\model-persistence-trait\src\fast_model\gen_model\transform_cache.rs
+```
+pub struct TransformCacheManager
+impl TransformCacheManager
+pub fn new() → Self
+pub fn get_world_transform(&self, dbnum: u32, refno: RefnoEnum) → Option<Transform>
+pub fn get_local_transform(&self, dbnum: u32, refno: RefnoEnum) → Option<Transform>
+pub fn remove(&self, dbnum: u32, refno: RefnoEnum)
+pub fn insert_world_transform(&self, dbnum: u32, refno: RefnoEnum, world: Transform)
+pub fn insert_local_transform(&self, dbnum: u32, refno: RefnoEnum, local: Transform)
+pub fn is_dbnum_loaded(&self, dbnum: u32) → bool
+pub fn load_dbnum_snapshot(&self, dbnum: u32, snapshot: LoadedTransformDbnum)
+pub fn init_global_transform_cache()
+pub fn prime_global_transform_cache_from_pe_entries(entries: &[PeTransformEntry]) → usize
+pub fn clear_global_transform_cache() → usize
+pub fn clear_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) → usize
+pub fn pin_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) → usize
+pub fn release_global_transform_cache_for_refnos(refnos: &[RefnoEnum]) → usize
+pub async fn get_world_transform_cache_first(db_option: Option<&DbOptionExt>, refno: RefnoEnum,) → anyhow::Result<Option<Trans...
+pub async fn get_local_transform_cache_first(db_option: Option<&DbOptionExt>, refno: RefnoEnum,) → anyhow::Result<Option<Trans...
+pub async fn get_world_transforms_cache_only_batch(db_option: &DbOptionExt, refnos: &[RefnoEnum],) → anyhow::Result<HashMap<Refn...
+pub async fn get_local_transforms_cache_only_batch(db_option: &DbOptionExt, refnos: &[RefnoEnum],) → anyhow::Result<HashMap<Refn...
 ```

@@ -60,6 +60,7 @@ pub mod site_config_handlers;
 pub mod site_data_validation;
 pub mod site_metadata;
 pub mod site_registry;
+pub mod site_task_metrics; // 站点部署任务级性能指标（spec 004）
 pub mod sqlite_spatial_api;
 pub mod sse_handlers; // SSE 事件流处理器
 pub mod stream_generate; // 流式模型生成模块

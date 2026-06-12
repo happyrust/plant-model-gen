@@ -1182,6 +1182,8 @@ where
     let cata_filter =
         crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
+    // spec 004：解析阶段总耗时计时起点。
+    let sync_stage_started = Instant::now();
 
     for (file_idx, path) in children_files.into_iter().enumerate() {
         let total_files = total_files; // 仅为语义清晰
@@ -1584,6 +1586,14 @@ where
             tree_node_count: tree_nodes.len(),
         });
 
+        // spec 004：解析阶段每库指标（mode/total 已由 apply_sync_filter 记录）。
+        crate::perf_metrics::record_parse_db(
+            dbnum,
+            &db_type,
+            total_cnt as usize,
+            time.elapsed().as_millis() as u64,
+        );
+
         info!(
             "解析任务完成, 耗时: {} s, 总数量: {}",
             time.elapsed().as_secs_f32(),
@@ -1609,8 +1619,24 @@ where
         // 可在此加入错误处理或日志
     }
     validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
+    crate::perf_metrics::finish_parse_stage(
+        parse_failed_sql_count(),
+        sync_stage_started.elapsed().as_millis() as u64,
+    );
 
     Ok(())
+}
+
+/// spec 004：解析阶段错误计数（failed_sql 转储数；未编译 gen_model 时恒为 0）。
+fn parse_failed_sql_count() -> usize {
+    #[cfg(feature = "gen_model")]
+    {
+        crate::fast_model::gen_model::pdms_inst::failed_sql_dump_count()
+    }
+    #[cfg(not(feature = "gen_model"))]
+    {
+        0
+    }
 }
 
 //分成两部分，一部分先保存UDA 和 SYS 这些数据
@@ -1927,6 +1953,8 @@ pub async fn sync_total_async_threaded(
     // let progress_sender_clone = progress_sender.clone();
     let parse_handle = tokio::spawn(async move {
         let mut parsed_artifacts = Vec::new();
+        // spec 004：解析阶段总耗时计时起点。
+        let sync_stage_started = Instant::now();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
         // let mut db_info_sql = vec![];
         for path in children_files {
@@ -2343,6 +2371,14 @@ pub async fn sync_total_async_threaded(
                     tree_node_count: tree_nodes.len(),
                 });
 
+                // spec 004：解析阶段每库指标（mode/total 已由 apply_sync_filter 记录）。
+                crate::perf_metrics::record_parse_db(
+                    dbnum,
+                    &db_type,
+                    total_cnt as usize,
+                    time.elapsed().as_millis() as u64,
+                );
+
             info!(
                 "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
                 file_name,
@@ -2373,6 +2409,10 @@ pub async fn sync_total_async_threaded(
         //     project_primary_db().query(&db_info_sql).await.expect("save db_info failed");
         // }
         validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
+        crate::perf_metrics::finish_parse_stage(
+            parse_failed_sql_count(),
+            sync_stage_started.elapsed().as_millis() as u64,
+        );
         anyhow::Ok(())
     })
     .await
@@ -2800,6 +2840,18 @@ pub async fn parse_single_db_file(
         chunk_parse_ms,
         tree_export_ms,
         db_meta_update_ms
+    );
+
+    // spec 004：单库解析模式的指标记录（与多库 sync 同口径，元素数取 tree_nodes）。
+    crate::perf_metrics::record_parse_db(
+        target_dbnum,
+        &db_type,
+        tree_nodes.len(),
+        time.elapsed().as_millis() as u64,
+    );
+    crate::perf_metrics::finish_parse_stage(
+        parse_failed_sql_count(),
+        time.elapsed().as_millis() as u64,
     );
 
     Ok(())

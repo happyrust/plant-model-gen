@@ -532,3 +532,29 @@ export interface SiteStats {
   error: number
   pending_parse: number
 }
+
+/** spec 004：同类型上一次任务的关键指标差值。 */
+export interface SiteTaskMetricsDelta {
+  prev_task_id: string
+  duration_ms: number
+  total_elements: number
+  inst_relate: number
+  closure_visited: number
+}
+
+/** spec 004：站点任务级性能指标（一行 = 一次 parse / generate 任务）。 */
+export interface SiteTaskMetrics {
+  task_id: string
+  job_kind: 'parse' | 'generate' | string
+  started_at: string
+  finished_at?: string | null
+  duration_ms: number
+  success: boolean
+  /** 阶段明细（closure / parse / generate / export，阶段可缺省）。 */
+  stages: Record<string, unknown>
+  delta?: SiteTaskMetricsDelta
+}
+
+export interface SiteTaskMetricsList {
+  items: SiteTaskMetrics[]
+}

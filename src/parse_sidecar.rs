@@ -35,6 +35,10 @@ const SCAN_MAX_DEPTH: usize = 6;
 const SCAN_MAX_FILES: usize = 200_000;
 const CLI_JOB_KILL_GRACE_MS: u64 = 1500;
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone)]
 pub struct ParseSidecarOptions {
     pub site_key: String,
@@ -97,6 +101,8 @@ pub struct ParsePreviewRequest {
     pub force_rebuild_system_db: bool,
     #[serde(default)]
     pub auto_parse_related_dbnums: bool,
+    #[serde(default = "default_true")]
+    pub cata_partial_parse: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1104,6 +1110,7 @@ fn build_preview_plan(payload: ParsePreviewRequest) -> Result<ManagedSiteParsePl
         &parse_db_types,
         force_rebuild_system_db,
         payload.auto_parse_related_dbnums,
+        payload.cata_partial_parse,
     )?;
     let (entries, warnings) = build_parse_plan_facts(
         &project_roots,
@@ -1228,11 +1235,15 @@ async fn rebuild_db_index_request(
         Err(err) => bail!("db_index phase1 任务失败: {err}"),
     }
 
-    let outbound = if payload.manual_db_nums.is_empty() {
-        collect_design_outbound(&roots).await
-    } else {
-        Vec::new()
-    };
+    let target_dbnums = payload
+        .manual_db_nums
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut outbound = collect_design_outbound(&roots).await;
+    if !target_dbnums.is_empty() {
+        outbound.retain(|(src, _)| target_dbnums.contains(src));
+    }
     if !outbound.is_empty() {
         let index_p2 = index_path.clone();
         match task::spawn_blocking(move || -> Result<usize> {
@@ -1722,6 +1733,7 @@ fn resolve_included_db_files(
     parse_db_types: &[String],
     force_rebuild_system_db: bool,
     auto_parse_related_dbnums: bool,
+    cata_partial_parse: bool,
 ) -> Result<Vec<String>> {
     let mut file_names = Vec::new();
     let has_manual_targets = !manual_db_nums.is_empty();
@@ -1770,7 +1782,7 @@ fn resolve_included_db_files(
             matched.ok_or_else(|| anyhow!("项目路径下未找到 dbnum={} 对应的 db 文件", dbnum))?;
         file_names.push(file_name);
     }
-    if auto_parse_related_dbnums {
+    if auto_parse_related_dbnums && !cata_partial_parse {
         for root in project_roots {
             collect_db_file_names_for_types(root, &["CATA"], &mut file_names)?;
         }

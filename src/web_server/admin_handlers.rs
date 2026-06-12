@@ -118,6 +118,8 @@ pub fn create_admin_routes() -> Router {
             "/api/admin/sites/{id}/logs/{kind}/download",
             get(download_site_log),
         )
+        // 站点部署任务级性能指标（spec 004）
+        .merge(crate::web_server::site_task_metrics::create_site_metrics_routes())
         .layer(middleware::from_fn(admin_auth_middleware))
 }
 

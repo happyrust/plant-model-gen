@@ -147,6 +147,9 @@ pub mod init_project;
 pub mod pe_transform_refresh;
 pub mod pe_transform_store;
 
+/// 站点部署任务级性能指标采集（spec 004-site-deploy-perf-stats）。
+pub mod perf_metrics;
+
 #[cfg(feature = "gui")]
 pub mod gui;
 
@@ -357,6 +360,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         if let Err(e) = sync_pdms(&db_option).await {
             log::error!("同步PDMS数据失败: {}", e);
+            crate::perf_metrics::finalize_task_metrics(false);
             return Err(e);
         }
 
@@ -372,6 +376,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         // progress_sender.send(100)?;
 
+        crate::perf_metrics::finalize_task_metrics(true);
         return Ok(());
     }
 
@@ -401,7 +406,44 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
         let path: PathBuf = "assets/meshes".into();
 
-        gen_all_geos_data(vec![], &db_option_ext, None, None).await?;
+        let generate_started = Instant::now();
+        let gen_result = gen_all_geos_data(vec![], &db_option_ext, None, None).await;
+        let generate_ms = generate_started.elapsed().as_millis() as u64;
+        // spec 004：生成收尾统计——落库数量走 Surreal 计数（与验收口径一致），
+        // 错误数取 failed_sql 转储计数，cache miss 取全局报告快照。
+        {
+            async fn surreal_count(table: &str) -> usize {
+                let sql = format!("SELECT count() FROM {table} GROUP ALL;");
+                match crate::fast_model::model_store::model_query_take::<Vec<serde_json::Value>, _>(
+                    sql, 0,
+                )
+                .await
+                {
+                    Ok(rows) => rows
+                        .first()
+                        .and_then(|v| v.get("count"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                    Err(_) => 0,
+                }
+            }
+            let cache_miss = crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
+                .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
+                .unwrap_or(0);
+            crate::perf_metrics::finish_generate_stage(
+                surreal_count("inst_relate").await,
+                surreal_count("inst_info").await,
+                surreal_count("inst_relate_aabb").await,
+                surreal_count("tubi_relate").await,
+                crate::fast_model::gen_model::pdms_inst::failed_sql_dump_count(),
+                cache_miss,
+                generate_ms,
+            );
+        }
+        if let Err(e) = gen_result {
+            crate::perf_metrics::finalize_task_metrics(false);
+            return Err(e.into());
+        }
 
         // 模型生成完成后，若启用 export_parquet_after_gen：
         // - 指定 manual_db_nums 时按指定库导出；
@@ -484,6 +526,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
                 let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
                 let db_option = Arc::new(db_option_ext.inner.clone());
+                let export_started = Instant::now();
                 for dbnum in dbnums {
                     log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
                     let output_dir = base_output_dir.join(dbnum.to_string());
@@ -525,6 +568,39 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                         );
                     }
                 }
+
+                // spec 004：导出阶段统计——walk parquet 输出目录汇总文件数与字节数。
+                {
+                    let mut parquet_files = 0usize;
+                    let mut parquet_bytes = 0u64;
+                    let mut json_files = 0usize;
+                    let mut json_bytes = 0u64;
+                    for entry in walkdir::WalkDir::new(&base_output_dir)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file())
+                    {
+                        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        match entry.path().extension().and_then(|s| s.to_str()) {
+                            Some("parquet") => {
+                                parquet_files += 1;
+                                parquet_bytes += len;
+                            }
+                            Some("json") => {
+                                json_files += 1;
+                                json_bytes += len;
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::perf_metrics::record_export_stage(
+                        parquet_files,
+                        parquet_bytes,
+                        json_files,
+                        json_bytes,
+                        export_started.elapsed().as_millis() as u64,
+                    );
+                }
             }
             #[cfg(not(feature = "parquet-export"))]
             {
@@ -533,6 +609,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                 );
             }
         }
+        crate::perf_metrics::finalize_task_metrics(true);
     }
 
     // 房间计算已迁移至独立 CLI 子命令：`aios-database room compute`

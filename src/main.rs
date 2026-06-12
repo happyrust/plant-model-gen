@@ -1613,6 +1613,10 @@ async fn main() -> anyhow::Result<()> {
         aios_database::init_logging(true);
     }
 
+    // spec 004：任务级指标采集（web_server 派发 sidecar job 时注入产物路径 env；
+    // 未注入时为 no-op，不影响普通 CLI 使用）。
+    aios_database::perf_metrics::init_task_metrics_from_env();
+
     if let Some(("init-project", sub_matches)) = matches.subcommand() {
         let cli_dbnums = sub_matches
             .get_many::<u32>("dbnums")
@@ -2695,6 +2699,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "sqlite-index")]
         {
             // 前置闭包 pass（spec 002 Q8）：独立于 sync，产出 cata_closure.json 供解析消费。
+            let closure_started = std::time::Instant::now();
             let manifest = if let Some(seed_strs) = seed_refno_strs {
                 // 按需模式：仅以指定设计元素（如单个 BRAN）子树播种。
                 aios_database::data_interface::cata_closure::run_cata_closure_pass_for_refno_strs_from_config(
@@ -2721,6 +2726,21 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "💡 解析时设置 AIOS_CATA_CLOSURE_MODE=manifest 启用 CATA 部分解析（manifest 缺失/未覆盖时自动整库回退）"
             );
+            // spec 004：闭包阶段指标。
+            let covered: std::collections::BTreeMap<u32, usize> = manifest
+                .by_dbnum
+                .iter()
+                .map(|(dbnum, refs)| (*dbnum, refs.len()))
+                .collect();
+            aios_database::perf_metrics::record_closure_stage(
+                manifest.seed_count,
+                manifest.visited_count,
+                manifest.rounds,
+                manifest.missing,
+                &covered,
+                closure_started.elapsed().as_millis() as u64,
+            );
+            aios_database::perf_metrics::finalize_task_metrics(true);
             return Ok(());
         }
         #[cfg(not(feature = "sqlite-index"))]

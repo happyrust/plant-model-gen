@@ -258,6 +258,13 @@ DEFINE FUNCTION OVERWRITE fn::find_pe_by_datetime($pe: record, $dt: datetime){
 -- fn::latest_pe_sesno(pe:17496_171715, 880);
 -- fn::latest_pe_sesno(pe:17496_171715);
 
+-- ses（会话日期）表仅在 sync_history=true 的解析流程中被填充；
+-- quick deploy 站点没有该表时，fn::ses_data / fn::ses_date 在
+-- SurrealDB 3.2.0-nightly 下会抛 "The table 'ses' does not exist"，
+-- 连带 tubi_relate 等 RELATE 批量 SQL 整条失败（spec 008）。
+-- 这里无条件保证空表存在：空表上两个函数安全返回 none。
+DEFINE TABLE IF NOT EXISTS ses SCHEMALESS;
+
 -- 获取节点的会话数据
 DEFINE FUNCTION OVERWRITE fn::ses_data($pe: record){
     let $id = type::record('ses', [$pe.dbnum, $pe.sesno]);

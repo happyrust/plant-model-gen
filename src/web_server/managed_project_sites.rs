@@ -9,7 +9,7 @@
 //! - 新增 `path_size_bytes` 的 TTL 缓存；递归扫描限制深度并跳过隐藏/符号链接。
 //! - `open_db` 使用进程内共享连接 + 一次性 schema 升级；pid 存在性检查改用 `libc::kill(pid,0)`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -1353,6 +1353,115 @@ fn hydrate_parse_plan_from_manifest(site_id: &str, plan: &mut ManagedSiteParsePl
         .into_iter()
         .filter(|file| included.contains(file))
         .collect();
+}
+
+fn push_unique_file(files: &mut Vec<String>, file_name: String) {
+    if !files.iter().any(|existing| existing == &file_name) {
+        files.push(file_name);
+    }
+}
+
+fn parse_plan_fact_is_cata(entry: &ParsePlanFact) -> bool {
+    entry
+        .db_type
+        .as_deref()
+        .is_some_and(|db_type| db_type.eq_ignore_ascii_case("CATA"))
+}
+
+#[cfg(feature = "sqlite-index")]
+fn site_project_tree_dir(site: &ManagedProjectSite) -> PathBuf {
+    site_runtime_dir(&site.site_id)
+        .join("output")
+        .join(&site.project_name)
+        .join("scene_tree")
+}
+
+#[cfg(feature = "sqlite-index")]
+fn cata_manifest_path_for_site(site: &ManagedProjectSite) -> PathBuf {
+    site_project_tree_dir(site).join("cata_closure.json")
+}
+
+#[cfg(feature = "sqlite-index")]
+fn cata_index_path_for_site(site: &ManagedProjectSite) -> PathBuf {
+    site_project_tree_dir(site).join(crate::data_interface::db_index::DB_INDEX_FILE_NAME)
+}
+
+#[cfg(feature = "sqlite-index")]
+fn cata_db_file_from_site_index(site: &ManagedProjectSite, dbnum: u32) -> Option<(String, String)> {
+    let index_path = cata_index_path_for_site(site);
+    let store = crate::data_interface::db_index::DbIndexStore::open(&index_path).ok()?;
+    let record = store.file_by_dbnum(dbnum)?;
+    Some((record.file_name, record.db_type))
+}
+
+#[cfg(feature = "sqlite-index")]
+fn align_parse_plan_cata_with_manifest(
+    site: &ManagedProjectSite,
+    plan: &ManagedSiteParsePlan,
+    manifest: &crate::data_interface::cata_closure::CataClosureManifest,
+) -> ManagedSiteParsePlan {
+    let covered_cata_dbnums = manifest.by_dbnum.keys().copied().collect::<BTreeSet<_>>();
+    let entries_by_file = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.file_name.clone(), entry.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut aligned = plan.clone();
+    let mut included_db_files = Vec::new();
+    let mut entries = Vec::new();
+
+    for file_name in &plan.included_db_files {
+        let Some(entry) = entries_by_file.get(file_name) else {
+            push_unique_file(&mut included_db_files, file_name.clone());
+            continue;
+        };
+        if parse_plan_fact_is_cata(entry)
+            && !entry
+                .dbnum
+                .is_some_and(|dbnum| covered_cata_dbnums.contains(&dbnum))
+        {
+            continue;
+        }
+        push_unique_file(&mut included_db_files, file_name.clone());
+        entries.push(entry.clone());
+    }
+
+    for dbnum in covered_cata_dbnums {
+        if entries.iter().any(|entry| entry.dbnum == Some(dbnum)) {
+            continue;
+        }
+        match cata_db_file_from_site_index(site, dbnum) {
+            Some((file_name, db_type)) => {
+                push_unique_file(&mut included_db_files, file_name.clone());
+                entries.push(ParsePlanFact {
+                    file_name,
+                    dbnum: Some(dbnum),
+                    db_type: Some(db_type),
+                    source: "cata_closure_manifest".to_string(),
+                    priority: 35,
+                });
+            }
+            None => aligned.warnings.push(format!(
+                "CATA manifest 覆盖 dbnum={}，但 db_index 未找到对应 db 文件；未写入解析计划",
+                dbnum
+            )),
+        }
+    }
+
+    aligned.included_db_files = included_db_files;
+    aligned.auto_related_db_files = entries
+        .iter()
+        .filter(|entry| {
+            parse_plan_fact_is_cata(entry)
+                && matches!(
+                    entry.source.as_str(),
+                    "auto_related" | "cata_closure_manifest"
+                )
+        })
+        .map(|entry| entry.file_name.clone())
+        .collect();
+    aligned.entries = entries;
+    aligned
 }
 
 fn annotate_site_parse_plan(site: &mut ManagedProjectSite) {
@@ -8037,6 +8146,14 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         },
     )?;
 
+    // spec 004：本次解析任务的指标产物（闭包 job 与解析 job 共用同一产物文件，
+    // sidecar 侧 merge-on-load，两个进程的阶段数据合并在同一 task_id 下）。
+    let metrics_task_id = crate::web_server::site_task_metrics::new_metrics_task_id("parse");
+    let metrics_env: HashMap<String, String> =
+        crate::web_server::site_task_metrics::metrics_env(&site.site_id, &metrics_task_id, "parse")
+            .into_iter()
+            .collect();
+
     let cata_partial_enabled = site.auto_parse_related_dbnums && site.cata_partial_parse;
     if cata_partial_enabled {
         append_log_line(
@@ -8052,12 +8169,78 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             parse_log_path(&site.site_id),
             parse_log_path(&site.site_id),
             vec!["gen-cata-closure".to_string(), "--rescan-index".to_string()],
-            HashMap::new(),
+            metrics_env.clone(),
         )
         .await
         .map_err(|err| anyhow!("CATA 闭包 sidecar 作业失败: {}", err.message))?;
         if !closure_job.success {
+            crate::web_server::site_task_metrics::ingest_task_metrics(
+                &site.site_id,
+                &metrics_task_id,
+                false,
+            );
             bail!("CATA 闭包生成失败，退出码: {:?}", closure_job.exit_code);
+        }
+        #[cfg(feature = "sqlite-index")]
+        {
+            let manifest_path = cata_manifest_path_for_site(&site);
+            match crate::data_interface::cata_closure::CataClosureManifest::load_json(
+                &manifest_path,
+            ) {
+                Ok(manifest) => {
+                    let aligned_plan =
+                        align_parse_plan_cata_with_manifest(&site, &parse_plan, &manifest);
+                    let before_cata = parse_plan
+                        .entries
+                        .iter()
+                        .filter(|entry| parse_plan_fact_is_cata(entry))
+                        .count();
+                    let after_cata = aligned_plan
+                        .entries
+                        .iter()
+                        .filter(|entry| parse_plan_fact_is_cata(entry))
+                        .count();
+                    task::spawn_blocking({
+                        let site = site.clone();
+                        let db_user = db_user.clone();
+                        let db_password = db_password.clone();
+                        let aligned_plan = aligned_plan.clone();
+                        move || {
+                            write_site_files_with_parse_plan(
+                                &site,
+                                &db_user,
+                                &db_password,
+                                Some(&aligned_plan),
+                            )
+                        }
+                    })
+                    .await
+                    .context("CATA manifest 对齐解析配置失败 (join error)")??;
+                    let covered_dbnums = manifest
+                        .by_dbnum
+                        .keys()
+                        .map(|dbnum| dbnum.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    append_log_line(
+                        &parse_log_path(&site.site_id),
+                        &format!(
+                            "🧩 CATA manifest 对齐解析计划：CATA files {} -> {}, covered_dbnums=[{}]",
+                            before_cata, after_cata, covered_dbnums
+                        ),
+                    );
+                }
+                Err(err) => {
+                    append_log_line(
+                        &parse_log_path(&site.site_id),
+                        &format!(
+                            "⚠️ CATA manifest 读取失败，保留原解析计划（不收窄 CATA 文件）：{}: {}",
+                            manifest_path.display(),
+                            err
+                        ),
+                    );
+                }
+            }
         }
     } else if site.auto_parse_related_dbnums {
         append_log_line(
@@ -8066,7 +8249,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         );
     }
 
-    let mut parse_env = HashMap::new();
+    let mut parse_env = metrics_env;
     if cata_partial_enabled {
         parse_env.insert("AIOS_CATA_CLOSURE_MODE".to_string(), "manifest".to_string());
     }
@@ -8083,6 +8266,12 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     )
     .await
     .map_err(|err| anyhow!("aios-database sidecar 解析作业失败: {}", err.message))?;
+    // spec 004：解析任务指标入库（成功/失败都读取已落盘的阶段数据）。
+    crate::web_server::site_task_metrics::ingest_task_metrics(
+        &site.site_id,
+        &metrics_task_id,
+        job.success,
+    );
     let parse_finished_at = now_rfc3339();
     let parse_duration_ms = parse_started_instant.elapsed().as_millis() as u64;
     if job.success {
@@ -8167,6 +8356,15 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         },
     )?;
 
+    // spec 004：本次生成任务的指标产物。
+    let metrics_task_id = crate::web_server::site_task_metrics::new_metrics_task_id("generate");
+    let metrics_env: HashMap<String, String> = crate::web_server::site_task_metrics::metrics_env(
+        &site.site_id,
+        &metrics_task_id,
+        "generate",
+    )
+    .into_iter()
+    .collect();
     let job = run_sidecar_cli_job_with_site_events(
         &site.site_id,
         SidecarCliJobKind::Generate,
@@ -8176,10 +8374,16 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         generate_log_path(&site.site_id),
         generate_log_path(&site.site_id),
         Vec::new(),
-        HashMap::new(),
+        metrics_env,
     )
     .await
     .map_err(|err| anyhow!("aios-database sidecar 模型生成作业失败: {}", err.message))?;
+    // spec 004：生成任务指标入库。
+    crate::web_server::site_task_metrics::ingest_task_metrics(
+        &site.site_id,
+        &metrics_task_id,
+        job.success,
+    );
     if job.success {
         update_runtime(
             &site.site_id,

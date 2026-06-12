@@ -22,6 +22,7 @@ import type {
   PreviewManagedSiteParsePlanRequest,
   UpdateManagedSiteRequest,
   ScanProjectsResult,
+  SiteTaskMetricsList,
 } from '@/types/site'
 
 export type ManagedSiteLogKind = 'parse' | 'generate' | 'db' | 'web' | 'viewer'
@@ -178,6 +179,10 @@ export const sitesApi = {
    */
   tailLog: (id: string, kind: ManagedSiteLogKind, limit = 200) =>
     apiGet<TailLogResponse>(`/api/admin/sites/${id}/logs/${kind}?limit=${limit}`),
+
+  /** spec 004：站点任务级性能指标（最近 N 条，含同类型上一条 delta）。 */
+  metrics: (id: string, limit = 10) =>
+    apiGet<SiteTaskMetricsList>(`/api/admin/sites/${id}/metrics?limit=${limit}`),
 
   /**
    * D5 / Sprint D · 单类日志的全量下载链接

@@ -504,18 +504,10 @@ pub fn seed_refs_from_design_data(data: &parse_pdms_db::parse::PdmsDbData) -> Ve
     set.into_iter().collect()
 }
 
-async fn seed_refs_from_design_file(
-    project: &str,
-    desi_path: &Path,
-) -> Result<Vec<RefU64>> {
-    use parse_pdms_db::parse::{
-        parse_ele_data_with_info_sync, parse_file_db_basic_data,
-    };
+async fn seed_refs_from_design_file(project: &str, desi_path: &Path) -> Result<Vec<RefU64>> {
+    use parse_pdms_db::parse::{parse_ele_data_with_info_sync, parse_file_db_basic_data};
 
-    let file_name = desi_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file_name = desi_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let basic = parse_file_db_basic_data(&desi_path.to_path_buf(), file_name, project)?;
     if basic.refno_table_map.is_empty() {
         anyhow::bail!("DESI 库没有可解析的 refno: {}", desi_path.display());
@@ -603,8 +595,7 @@ pub fn cata_closure_sync_mode() -> CataClosureSyncMode {
 /// manifest 默认落盘路径：`output/<project>/scene_tree/cata_closure.json`
 /// （与 `db_index.sqlite` / `db_meta_info.json` 同目录，路径口径同源）。
 pub fn default_manifest_path(project_name: &str) -> PathBuf {
-    crate::versioned_db::db_meta_info::get_project_tree_dir(project_name)
-        .join("cata_closure.json")
+    crate::versioned_db::db_meta_info::get_project_tree_dir(project_name).join("cata_closure.json")
 }
 
 /// 判断 db_type 是否属于"元件库"类型（与 [`CataClosureConfig::default`] 的收口集合一致）。
@@ -694,21 +685,18 @@ pub fn apply_sync_filter(
                 filtered.len(),
                 before
             );
+            crate::perf_metrics::note_parse_db_mode(dbnum, "partial", before);
             filtered
         }
         None => {
             // manifest 已加载但该 CATA 库无任何被引用条目：闭包 pass 已确认目标
             // DESI 不依赖此库，按需语义下直接跳过（T007 运行期惰性兜底仍可补漏）。
-            log::warn!(
+            log::info!(
                 "[cata_closure] dbnum={} 不在 manifest 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
                 dbnum,
                 all_refnos.len()
             );
-            println!(
-                "[cata_closure] dbnum={} 不在 manifest 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
-                dbnum,
-                all_refnos.len()
-            );
+            crate::perf_metrics::note_parse_db_mode(dbnum, "skipped", all_refnos.len());
             Vec::new()
         }
     }
@@ -761,7 +749,11 @@ async fn run_cata_closure_pass_for_roots_filtered(
             let relative_path = path.strip_prefix(root).unwrap_or(path);
             if relative_path.components().any(|component| {
                 matches!(
-                    component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
+                    component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .as_str(),
                     "back" | "backup"
                 )
             }) {
@@ -918,7 +910,11 @@ pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
     let mut sessions: HashMap<u32, DbSession> = HashMap::new();
     let mut visited: HashSet<RefU64> = HashSet::new();
     let mut seeds: HashSet<RefU64> = HashSet::new();
-    let mut frontier: Vec<RefU64> = roots.iter().copied().filter(|r| is_valid_ref0(r.get_0())).collect();
+    let mut frontier: Vec<RefU64> = roots
+        .iter()
+        .copied()
+        .filter(|r| is_valid_ref0(r.get_0()))
+        .collect();
     let mut parsed_count = 0usize;
 
     while !frontier.is_empty() {
@@ -930,14 +926,20 @@ pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
             match locator.dbnum_of_ref0(r.get_0()) {
                 Some(dbnum) => by_db.entry(dbnum).or_default().push(r),
                 None => {
-                    log::warn!("[cata_closure] 设计子树 BFS：ref0 {} 无 dbnum 映射，跳过", r.get_0());
+                    log::warn!(
+                        "[cata_closure] 设计子树 BFS：ref0 {} 无 dbnum 映射，跳过",
+                        r.get_0()
+                    );
                 }
             }
         }
         for (dbnum, refs) in by_db {
             if !sessions.contains_key(&dbnum) {
                 let Some((project, path)) = locator.file_of(dbnum) else {
-                    log::warn!("[cata_closure] 设计子树 BFS：dbnum {} 无文件映射，跳过", dbnum);
+                    log::warn!(
+                        "[cata_closure] 设计子树 BFS：dbnum {} 无文件映射，跳过",
+                        dbnum
+                    );
                     continue;
                 };
                 match open_db_session(&project, &path) {
@@ -1194,8 +1196,8 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
     };
 
     // 2. 小闭包（保留属性表与 children；精确模式防 SPEC 子树发散）。
-    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::precise())
-        .with_retain_attmaps(true);
+    let mut resolver =
+        CataClosureResolver::new(&locator, CataClosureConfig::precise()).with_retain_attmaps(true);
     resolver.seed(seeds.iter().copied());
     let delta = resolver.resolve().await?;
     let retained = resolver.take_attmaps();

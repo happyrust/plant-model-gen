@@ -499,6 +499,20 @@ where
                 continue;
             }
             let path = entry.path();
+            if path
+                .strip_prefix(root)
+                .ok()
+                .into_iter()
+                .flat_map(|relative| relative.components())
+                .any(|component| {
+                    matches!(
+                        component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
+                        "back" | "backup"
+                    )
+                })
+            {
+                continue;
+            }
 
             // cheap 读头：拿 dbnum/db_type，非 db 文件（dbnum=0）跳过。
             let info = parse_db_basic_info(path.to_path_buf());
@@ -600,6 +614,9 @@ fn extract_outbound_ref0s(data: &parse_pdms_db::parse::PdmsDbData) -> Vec<u32> {
                     for &refno_enum in arr {
                         push(refno_enum.refno().get_0(), &mut set);
                     }
+                }
+                NamedAttrValue::RefnoEnumType(refno_enum) => {
+                    push(refno_enum.refno().get_0(), &mut set);
                 }
                 _ => {}
             }

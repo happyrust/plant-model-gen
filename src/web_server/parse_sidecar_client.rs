@@ -159,7 +159,17 @@ pub async fn run_cli_job(
     stdout_path: String,
     stderr_path: String,
 ) -> Result<RunCliJobResponse, SidecarProxyError> {
-    run_cli_job_with_status(key, config_no_ext, cwd, stdout_path, stderr_path, |_, _| {}).await
+    run_cli_job_with_status(
+        key,
+        config_no_ext,
+        cwd,
+        stdout_path,
+        stderr_path,
+        Vec::new(),
+        HashMap::new(),
+        |_, _| {},
+    )
+    .await
 }
 
 pub async fn cancel_cli_job(key: &str, job_id: &str) -> Result<Value, SidecarProxyError> {
@@ -191,6 +201,8 @@ pub async fn run_cli_job_with_status<F>(
     cwd: String,
     stdout_path: String,
     stderr_path: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
     mut on_status: F,
 ) -> Result<RunCliJobResponse, SidecarProxyError>
 where
@@ -208,6 +220,8 @@ where
             "cwd": cwd,
             "stdout_path": stdout_path,
             "stderr_path": stderr_path,
+            "args": args,
+            "env": env,
         }),
         client.clone(),
     )

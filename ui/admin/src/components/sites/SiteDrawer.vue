@@ -163,7 +163,8 @@ const form = ref<CreateManagedSiteRequest>({
   generate_db_files: [],
   parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
   force_rebuild_system_db: false,
-  auto_parse_related_dbnums: false,
+  // 默认启用按需解析：自动生成 CATA 闭包 manifest 并按 manifest 部分解析依赖库
+  auto_parse_related_dbnums: true,
   gen_model: true,
   gen_mesh: false,
   gen_spatial_tree: true,
@@ -458,7 +459,8 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       generate_db_files: [],
       parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
       force_rebuild_system_db: false,
-      auto_parse_related_dbnums: false,
+      // 默认启用按需解析（CATA 闭包 manifest 部分解析）
+      auto_parse_related_dbnums: true,
       gen_model: true,
       gen_mesh: false,
       gen_spatial_tree: true,

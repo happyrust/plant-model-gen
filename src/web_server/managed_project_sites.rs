@@ -1680,6 +1680,8 @@ fn build_generation_config(
     // 解析和模型生成使用同一套管线 DB 模式；plant3d-web 运行配置始终使用 ws。
     apply_site_db_mode_config(table, site, db_user, db_password, site.pipeline_db_mode);
     table.remove("web_server");
+    // 生成范围由 generate_db_nums/manual_db_nums 控制，不能继承模板中的示例文件过滤。
+    table.remove("included_db_files");
     set_or_remove_manual_db_nums(table, site_generate_db_nums(site));
     Ok(toml::to_string_pretty(&value)?)
 }
@@ -6026,6 +6028,8 @@ async fn run_sidecar_cli_job_with_site_events(
     cwd: String,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    args: Vec<String>,
+    env: HashMap<String, String>,
 ) -> std::result::Result<
     crate::web_server::parse_sidecar_client::RunCliJobResponse,
     crate::web_server::parse_sidecar_client::SidecarProxyError,
@@ -6049,6 +6053,8 @@ async fn run_sidecar_cli_job_with_site_events(
         cwd,
         stdout_path.to_string_lossy().to_string(),
         stderr_path.to_string_lossy().to_string(),
+        args,
+        env,
         move |job_id, status| {
             if let Ok(mut guard) = submitted_job_id.lock() {
                 *guard = Some(job_id.to_string());
@@ -8006,6 +8012,39 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         },
     )?;
 
+    if site.auto_parse_related_dbnums {
+        append_log_line(
+            &parse_log_path(&site.site_id),
+            "🧩 生成 CATA refno 闭包 manifest（仅处理 manual_db_nums 指定的 DESI 库）...",
+        );
+        let closure_job = run_sidecar_cli_job_with_site_events(
+            &site.site_id,
+            SidecarCliJobKind::Parse,
+            format!("cata-closure:{}", site.site_id),
+            config_no_ext.clone(),
+            repo.to_string_lossy().to_string(),
+            parse_log_path(&site.site_id),
+            parse_log_path(&site.site_id),
+            vec![
+                "gen-cata-closure".to_string(),
+                "--rescan-index".to_string(),
+            ],
+            HashMap::new(),
+        )
+        .await
+        .map_err(|err| anyhow!("CATA 闭包 sidecar 作业失败: {}", err.message))?;
+        if !closure_job.success {
+            bail!("CATA 闭包生成失败，退出码: {:?}", closure_job.exit_code);
+        }
+    }
+
+    let mut parse_env = HashMap::new();
+    if site.auto_parse_related_dbnums {
+        parse_env.insert(
+            "AIOS_CATA_CLOSURE_MODE".to_string(),
+            "manifest".to_string(),
+        );
+    }
     let job = run_sidecar_cli_job_with_site_events(
         &site.site_id,
         SidecarCliJobKind::Parse,
@@ -8014,6 +8053,8 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         repo.to_string_lossy().to_string(),
         parse_log_path(&site.site_id),
         parse_log_path(&site.site_id),
+        Vec::new(),
+        parse_env,
     )
     .await
     .map_err(|err| anyhow!("aios-database sidecar 解析作业失败: {}", err.message))?;
@@ -8109,6 +8150,8 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         repo.to_string_lossy().to_string(),
         generate_log_path(&site.site_id),
         generate_log_path(&site.site_id),
+        Vec::new(),
+        HashMap::new(),
     )
     .await
     .map_err(|err| anyhow!("aios-database sidecar 模型生成作业失败: {}", err.message))?;

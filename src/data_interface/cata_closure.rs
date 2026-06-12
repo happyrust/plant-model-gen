@@ -2,19 +2,14 @@
 //!
 //! 设计见 `specs/002-on-demand-cata-closure/`。本模块提供 T001b 地基：
 //! - [`parse_db_refnos`]：对单个 db 文件按 refno 子集做**部分解析**（不整库解析），
-//!   复用 `PdmsIO::build_index_map()`（refno→历史偏移，`last()` 为最新）+ `parse_element(offset)`。
+//!   复用 DB refno 索引（refno→元素偏移）+ 单 Element 解析。
 //! - [`outbound_refs_of`]：从元素属性里抽出向 `RefU64` 引用（闭包"跟边"的原子操作）。
-//!
-//! 注：`parse_pdms_db::parse::parse_file` 的第二参数是 `Option<PdmsDatabaseInfo>`（数据库信息），
-//! 并非 refno 过滤位，故 bulk 解析器无法按 refno 裁剪；本模块用 `PdmsIO` 的随机访问原语补足
-//! （T001 已确认可行、低风险）。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aios_core::{NamedAttrMap, NamedAttrValue, RefU64};
 use anyhow::Result;
-use pdms_io::PdmsIO;
 use serde::{Deserialize, Serialize};
 
 /// B+树索引起始标记 / 无效 ref0（与 `db_index` 保持一致，需跳过）。
@@ -61,50 +56,58 @@ pub fn outbound_refs_of(att: &NamedAttrMap) -> Vec<RefU64> {
                     }
                 }
             }
+            NamedAttrValue::RefnoEnumType(refno_enum) => {
+                let r = refno_enum.refno();
+                if is_valid_ref0(r.get_0()) {
+                    out.push(r);
+                }
+            }
             _ => {}
         }
     }
     out
 }
 
-/// 单个 db 的已打开读取会话：保持文件打开 + 缓存索引，供跨多次解析复用。
+/// 单个 db 的读取会话：缓存文件 bytes + refno 索引，供跨多次解析复用。
 ///
-/// 复用同一 `PdmsIO` 实例可保留其内部 `PageManager` 页缓存，跨 BFS 轮不重读已读页、
-/// 不重建索引 —— 逼近 core.dll 的 db1 页缓存常驻效果。
+/// 跨 BFS 轮不重读文件、不重建索引，只对命中的 refno 做单 Element 解析。
 struct DbSession {
-    io: PdmsIO,
-    /// refno -> 历史偏移（升序，`last()` 为最新版本）。
-    index_map: HashMap<RefU64, Vec<u64>>,
+    basic: aios_core::db::DbBasicData,
 }
 
-/// 打开一个 db 读取会话（`open` + 一次性建索引）。
+/// 打开一个 db 读取会话（一次性读文件 + 建 refno 索引）。
 fn open_db_session(project: &str, path: &Path) -> Result<DbSession> {
-    let mut io = PdmsIO::new(project, path, false);
-    io.open()?;
-    let index_map = io.build_index_map()?;
-    Ok(DbSession { io, index_map })
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let basic =
+        parse_pdms_db::parse::parse_file_db_basic_data(&path.to_path_buf(), file_name, project)?;
+    Ok(DbSession { basic })
 }
 
-/// 用已打开会话解析一批 refno（复用页缓存，不重开文件 / 不重建索引）。
+/// 用已打开会话解析一批 refno（不重读文件 / 不重建索引）。
 ///
 /// `attmap_sink`：可选保留完整属性表（T007 惰性兜底落库需要；闭包发现 pass 传 `None` 省内存）。
 async fn parse_refnos_with_session(
-    io: &mut PdmsIO,
-    index_map: &HashMap<RefU64, Vec<u64>>,
+    session: &DbSession,
     refnos: &[RefU64],
     mut attmap_sink: Option<&mut HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)>>,
 ) -> Result<HashMap<RefU64, ParsedCataEle>> {
+    use parse_pdms_db::parse::parse_ele_data_with_info_sync;
+
     let mut out = HashMap::with_capacity(refnos.len());
+    let db_info = aios_core::get_default_pdms_db_info();
     for &refno in refnos {
-        let Some(offsets) = index_map.get(&refno) else {
+        let Some(entry) = session.basic.refno_table_map.get(&refno) else {
             continue; // 本库不含此 refno
         };
-        let Some(&latest_offset) = offsets.last() else {
+        let pos = entry.pos;
+        drop(entry);
+        if pos < 4 || pos > session.basic.bytes.len() {
             continue;
-        };
-        match io.parse_element(latest_offset).await {
+        }
+        match parse_ele_data_with_info_sync(&session.basic.bytes[pos - 4..], &db_info) {
             Ok(ele) => {
-                let outbound = outbound_refs_of(ele.att_map());
+                let merged_attmap = ele.whole_attmap.merge();
+                let outbound = outbound_refs_of(&merged_attmap);
                 let children: Vec<RefU64> = ele
                     .children
                     .0
@@ -113,9 +116,9 @@ async fn parse_refnos_with_session(
                     .filter(|r| is_valid_ref0(r.get_0()))
                     .collect();
                 if let Some(sink) = attmap_sink.as_deref_mut() {
-                    sink.insert(refno, (ele.att_map().clone(), children.clone()));
+                    sink.insert(refno, (merged_attmap.clone(), children.clone()));
                 }
-                let noun_name = ele.att_map().get_type_str().trim().to_uppercase();
+                let noun_name = merged_attmap.get_type_str().trim().to_uppercase();
                 out.insert(
                     refno,
                     ParsedCataEle {
@@ -155,8 +158,8 @@ pub async fn parse_db_refnos(
     if refnos.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut session = open_db_session(project, path)?;
-    parse_refnos_with_session(&mut session.io, &session.index_map, refnos, None).await
+    let session = open_db_session(project, path)?;
+    parse_refnos_with_session(&session, refnos, None).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +318,10 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
 
             // 按 dbnum 聚合本轮 frontier（db_type 收口到 CATA）。
             let mut by_db: HashMap<u32, Vec<RefU64>> = HashMap::new();
+            let mut cata_candidates = 0usize;
+            let mut non_cata_candidates = 0usize;
+            let mut unresolved_candidates = 0usize;
+            let mut classification_samples = Vec::new();
             for r in current {
                 if self.visited.contains(&r) {
                     continue;
@@ -325,17 +332,35 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                 }
                 let Some(dbnum) = self.locator.dbnum_of_ref0(ref0) else {
                     missing += 1;
+                    unresolved_candidates += 1;
+                    if classification_samples.len() < 8 {
+                        classification_samples.push(format!("{r}:unresolved"));
+                    }
                     continue;
                 };
-                let is_cata = self
-                    .locator
-                    .db_type_of(dbnum)
-                    .map(|t| cata_types.contains(&t.to_uppercase()))
-                    .unwrap_or(false);
+                let db_type = self.locator.db_type_of(dbnum).unwrap_or_default();
+                let is_cata = cata_types.contains(&db_type.to_uppercase());
                 if !is_cata {
+                    non_cata_candidates += 1;
+                    if classification_samples.len() < 8 {
+                        classification_samples.push(format!("{r}:db={dbnum}/{db_type}"));
+                    }
                     continue; // 非 CATA（回指 DESI/DICT 等）不下探
                 }
+                cata_candidates += 1;
+                if classification_samples.len() < 8 {
+                    classification_samples.push(format!("{r}:db={dbnum}/{db_type}"));
+                }
                 by_db.entry(dbnum).or_default().push(r);
+            }
+            if rounds == 1 {
+                println!(
+                    "[cata_closure] 首轮引用分类: cata={} non_cata={} unresolved={} samples=[{}]",
+                    cata_candidates,
+                    non_cata_candidates,
+                    unresolved_candidates,
+                    classification_samples.join(", ")
+                );
             }
 
             // 每库部分解析（会话缓存：每库只 open + 建索引一次，跨轮复用页缓存）。
@@ -361,7 +386,13 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                         Ok(sess) => {
                             self.sessions.insert(dbnum, sess);
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!(
+                                "[cata_closure] 打开 CATA 库失败: dbnum={} path={} error={}",
+                                dbnum,
+                                path.display(),
+                                e
+                            );
                             missing += to_parse.len();
                             for r in &to_parse {
                                 self.visited.insert(*r);
@@ -370,22 +401,29 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                         }
                     }
                 }
-                let session = self
-                    .sessions
-                    .get_mut(&dbnum)
-                    .expect("session just ensured");
+                let session = self.sessions.get(&dbnum).expect("session just ensured");
                 let attmap_sink = if self.retain_attmaps {
                     Some(&mut self.attmaps)
                 } else {
                     None
                 };
-                let parsed = parse_refnos_with_session(
-                    &mut session.io,
-                    &session.index_map,
-                    &to_parse,
-                    attmap_sink,
-                )
-                .await?;
+                let parsed = parse_refnos_with_session(session, &to_parse, attmap_sink).await?;
+                if rounds == 1 {
+                    let miss_samples: Vec<String> = to_parse
+                        .iter()
+                        .filter(|r| !parsed.contains_key(r))
+                        .take(5)
+                        .map(|r| r.to_string())
+                        .collect();
+                    println!(
+                        "[cata_closure] 首轮库会话: dbnum={} requested={} parsed={} table_size={} miss_samples=[{}]",
+                        dbnum,
+                        to_parse.len(),
+                        parsed.len(),
+                        session.basic.refno_table_map.len(),
+                        miss_samples.join(", ")
+                    );
+                }
 
                 let mut next: Vec<RefU64> = Vec::new();
                 for r in &to_parse {
@@ -466,12 +504,59 @@ pub fn seed_refs_from_design_data(data: &parse_pdms_db::parse::PdmsDbData) -> Ve
     set.into_iter().collect()
 }
 
+async fn seed_refs_from_design_file(
+    project: &str,
+    desi_path: &Path,
+) -> Result<Vec<RefU64>> {
+    use parse_pdms_db::parse::{
+        parse_ele_data_with_info_sync, parse_file_db_basic_data,
+    };
+
+    let file_name = desi_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let basic = parse_file_db_basic_data(&desi_path.to_path_buf(), file_name, project)?;
+    if basic.refno_table_map.is_empty() {
+        anyhow::bail!("DESI 库没有可解析的 refno: {}", desi_path.display());
+    }
+
+    let db_info = aios_core::get_default_pdms_db_info();
+    let mut seeds: HashSet<RefU64> = HashSet::new();
+    let mut parsed_total = 0usize;
+    for entry in basic.refno_table_map.iter() {
+        let pos = entry.value().pos;
+        if pos < 4 || pos > basic.bytes.len() {
+            continue;
+        }
+        if let Ok(ele) = parse_ele_data_with_info_sync(&basic.bytes[pos - 4..], &db_info) {
+            parsed_total += 1;
+            seeds.extend(outbound_refs_of(&ele.whole_attmap.merge()));
+        }
+    }
+    if parsed_total == 0 {
+        anyhow::bail!(
+            "DESI 库索引包含 {} 个 refno，但随机访问解析结果为空: {}",
+            basic.refno_table_map.len(),
+            desi_path.display()
+        );
+    }
+    println!(
+        "[cata_closure] DESI 种子扫描完成: file={} indexed={} parsed={} seeds={}",
+        desi_path.display(),
+        basic.refno_table_map.len(),
+        parsed_total,
+        seeds.len()
+    );
+    Ok(seeds.into_iter().collect())
+}
+
 /// 端到端：解析单个 DESI 库文件 → 以其出向引用为种子 → 跑 refno 级 CATA 闭包。
 ///
 /// - `index`：db 定位器（`ref0→dbnum` / `db_type` / 文件），通常来自站点级 `db_index.sqlite`。
 /// - `project` / `desi_path`：DESI 库的工程名与文件路径。
 ///
-/// DESI 走 bulk `parse_file`（Phase1 必须全解析）；CATA 走 `parse_db_refnos` 部分解析（Phase2）。
+/// DESI 走 refno 索引随机访问以收集全部出向引用；CATA 走 `parse_db_refnos` 部分解析（Phase2）。
 /// 多 DESI 库由调用方循环本函数并合并各 `CataClosureManifest`。
 #[cfg(feature = "sqlite-index")]
 pub async fn resolve_cata_closure_from_design_file(
@@ -480,19 +565,16 @@ pub async fn resolve_cata_closure_from_design_file(
     desi_path: &Path,
     cfg: CataClosureConfig,
 ) -> Result<CataClosureManifest> {
-    let file_name = desi_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    let data =
-        parse_pdms_db::parse::parse_file(&desi_path.to_path_buf(), &None, &file_name, project)
-            .await?;
-    let seeds = seed_refs_from_design_data(&data);
+    let seeds = seed_refs_from_design_file(project, desi_path).await?;
+    let seed_count = seeds.len();
 
     let mut resolver = CataClosureResolver::new(index, cfg);
     resolver.seed(seeds);
-    resolver.resolve().await
+    let mut manifest = resolver.resolve().await?;
+    // merge_from 只合并 by_dbnum，seed_count 必须由本入口回填，
+    // 否则 dbnum 目标模式的"无种子"校验会对非空种子误报。
+    manifest.seed_count = seed_count;
+    Ok(manifest)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -615,12 +697,19 @@ pub fn apply_sync_filter(
             filtered
         }
         None => {
+            // manifest 已加载但该 CATA 库无任何被引用条目：闭包 pass 已确认目标
+            // DESI 不依赖此库，按需语义下直接跳过（T007 运行期惰性兜底仍可补漏）。
             log::warn!(
-                "[cata_closure] dbnum={} 不在 manifest 覆盖内，整库回退解析（{} refnos）",
+                "[cata_closure] dbnum={} 不在 manifest 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
                 dbnum,
                 all_refnos.len()
             );
-            all_refnos
+            println!(
+                "[cata_closure] dbnum={} 不在 manifest 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
+                dbnum,
+                all_refnos.len()
+            );
+            Vec::new()
         }
     }
 }
@@ -636,6 +725,17 @@ pub async fn run_cata_closure_pass_for_roots(
     roots: &[(String, PathBuf)],
     cfg: CataClosureConfig,
     out_path: &Path,
+) -> Result<CataClosureManifest> {
+    run_cata_closure_pass_for_roots_filtered(index, roots, cfg, out_path, None).await
+}
+
+#[cfg(feature = "sqlite-index")]
+async fn run_cata_closure_pass_for_roots_filtered(
+    index: &crate::data_interface::db_index::DbIndexStore,
+    roots: &[(String, PathBuf)],
+    cfg: CataClosureConfig,
+    out_path: &Path,
+    target_dbnums: Option<&HashSet<u32>>,
 ) -> Result<CataClosureManifest> {
     use parse_pdms_db::parse::parse_db_basic_info;
 
@@ -658,9 +758,19 @@ pub async fn run_cata_closure_pass_for_roots(
                 continue;
             }
             let path = entry.path();
+            let relative_path = path.strip_prefix(root).unwrap_or(path);
+            if relative_path.components().any(|component| {
+                matches!(
+                    component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
+                    "back" | "backup"
+                )
+            }) {
+                continue;
+            }
             let info = parse_db_basic_info(path.to_path_buf());
             if info.dbnum == 0
                 || !info.db_type.eq_ignore_ascii_case("DESI")
+                || target_dbnums.is_some_and(|targets| !targets.contains(&info.dbnum))
                 || !seen_dbnums.insert(info.dbnum)
             {
                 continue;
@@ -673,14 +783,38 @@ pub async fn run_cata_closure_pass_for_roots(
                     total.merge_from(&manifest);
                 }
                 Err(e) => {
+                    eprintln!(
+                        "[cata_closure] DESI 闭包失败 {}（跳过该库）: {}",
+                        path.display(),
+                        e
+                    );
                     log::warn!(
                         "[cata_closure] DESI 闭包失败 {}（跳过该库）: {}",
                         path.display(),
                         e
                     );
+                    if target_dbnums.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "目标 DESI 库闭包生成失败 {}: {}",
+                            path.display(),
+                            e
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    println!(
+        "[cata_closure] DESI 闭包汇总: targets={} seeds={} cata_dbs={} visited={} missing={}",
+        seen_dbnums.len(),
+        seed_sum,
+        total.by_dbnum.len(),
+        total.visited_count,
+        missing_sum
+    );
+    if target_dbnums.is_some() && seed_sum == 0 {
+        anyhow::bail!("目标 DESI 库未提取到任何 CATA 引用种子");
     }
 
     total.seed_count = seed_sum;
@@ -748,7 +882,21 @@ pub async fn run_cata_closure_pass_from_config(
 
     let out_path = out_override.unwrap_or_else(|| default_manifest_path(&project_name));
     let store = db_index::DbIndexStore::open(&index_path)?;
-    run_cata_closure_pass_for_roots(&store, &roots, CataClosureConfig::default(), &out_path).await
+    let target_dbnums: HashSet<u32> = db_option
+        .manual_db_nums
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .collect();
+    run_cata_closure_pass_for_roots_filtered(
+        &store,
+        &roots,
+        CataClosureConfig::precise(),
+        &out_path,
+        (!target_dbnums.is_empty()).then_some(&target_dbnums),
+    )
+    .await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -802,9 +950,8 @@ pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
                     }
                 }
             }
-            let session = sessions.get_mut(&dbnum).expect("session 已插入");
-            let parsed =
-                parse_refnos_with_session(&mut session.io, &session.index_map, &refs, None).await?;
+            let session = sessions.get(&dbnum).expect("session 已插入");
+            let parsed = parse_refnos_with_session(session, &refs, None).await?;
             parsed_count += parsed.len();
             for ele in parsed.values() {
                 seeds.extend(ele.outbound.iter().copied());

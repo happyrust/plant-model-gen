@@ -148,6 +148,10 @@ pub struct RunCliJobRequest {
     pub cwd: String,
     pub stdout_path: String,
     pub stderr_path: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -853,6 +857,8 @@ fn spawn_cli_child(payload: RunCliJobRequest) -> Result<Child> {
     command
         .arg("-c")
         .arg(config_no_ext)
+        .args(&payload.args)
+        .envs(&payload.env)
         .current_dir(cwd)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1284,6 +1290,8 @@ async fn run_cli_job_request(payload: RunCliJobRequest) -> Result<RunCliJobRespo
     let status = Command::new(exe)
         .arg("-c")
         .arg(config_no_ext)
+        .args(&payload.args)
+        .envs(&payload.env)
         .current_dir(cwd)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))

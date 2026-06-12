@@ -75,7 +75,8 @@ function rememberQuickDeployDbFile(value: string) {
 
 const quickDeployDbFile = ref(loadQuickDeployDbFile())
 const quickDeployDbMode = ref<ManagedSiteDbMode>('ws')
-const quickDeployAutoDeps = ref(false)
+// 默认启用按需解析依赖库（CATA 闭包 manifest 部分解析）
+const quickDeployAutoDeps = ref(true)
 const quickDeployGenMesh = ref(true)
 const quickDeployLoading = ref(false)
 const quickDeployError = ref('')

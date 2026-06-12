@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-12
+
+### Added — Admin 站点部署默认按需解析 CATA（闭包 manifest 部分解析）
+
+> 站点解析流水线在 `auto_parse_related_dbnums` 开启时，先对 `manual_db_nums` 指定的 DESI 库生成 CATA refno 闭包 manifest（precise 收口），再以 `AIOS_CATA_CLOSURE_MODE=manifest` 启动解析；被引用的 CATA 库按 manifest 部分解析，零引用的 CATA 库整库跳过。admin UI 新建站点与快速部署默认勾选该模式。
+
+- `managed_project_sites.rs` / `parse_sidecar.rs` / `parse_sidecar_client.rs` / `db_index.rs`：解析作业前置 `gen-cata-closure --rescan-index` sidecar 作业；CLI job 请求支持注入环境变量，解析作业携带 `AIOS_CATA_CLOSURE_MODE=manifest`。
+- `cata_closure.rs`：dbnum 目标模式（站点 `manual_db_nums`）改用 `CataClosureConfig::precise()` 收口；`resolve_cata_closure_from_design_file` 回填 `seed_count`，修复目标模式恒报"未提取到任何 CATA 引用种子"的误判；manifest 已加载但某 CATA 库零引用时按需跳过整库解析（原为整库回退），T007 运行期惰性兜底仍可补漏；新增首轮引用分类与库会话诊断输出。
+- `ui/admin`：`SiteDrawer.vue` 新建/重置表单与 `SitesView.vue` 快速部署的「自动解析依赖库」默认开启；admin 静态产物已重新生成。
+- 验证：AvevaMarineSample dbnum=7997 实测——DESI 种子 153,445 → precise 闭包 8,941 元素（default 模式为 1,237,253）；5 个被引用 CATA 库（5052/5053/5054/6890/7000）按 manifest 部分解析，未被引用的 ams7351（3,096,801 refnos）整库跳过；解析 sidecar 作业 exit=0；浏览器实测 admin UI 两处「自动解析依赖库」默认勾选。
+
 ## 2026-06-09
 
 ### Fixed — 受管站点进程清理、配置 URL 与空间索引刷新

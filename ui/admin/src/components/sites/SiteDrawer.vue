@@ -165,6 +165,7 @@ const form = ref<CreateManagedSiteRequest>({
   force_rebuild_system_db: false,
   // 默认启用按需解析：自动生成 CATA 闭包 manifest 并按 manifest 部分解析依赖库
   auto_parse_related_dbnums: true,
+  cata_partial_parse: true,
   gen_model: true,
   gen_mesh: false,
   gen_spatial_tree: true,
@@ -415,6 +416,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
         auto_parse_related_dbnums: s.auto_parse_related_dbnums ?? false,
+        cata_partial_parse: s.cata_partial_parse ?? true,
         gen_model: s.gen_model ?? true,
         gen_mesh: s.gen_mesh ?? false,
         gen_spatial_tree: s.gen_spatial_tree ?? true,
@@ -461,6 +463,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       force_rebuild_system_db: false,
       // 默认启用按需解析（CATA 闭包 manifest 部分解析）
       auto_parse_related_dbnums: true,
+      cata_partial_parse: true,
       gen_model: true,
       gen_mesh: false,
       gen_spatial_tree: true,
@@ -546,6 +549,7 @@ const previewPayload = computed<PreviewManagedSiteParsePlanRequest | null>(() =>
     parse_db_types: parseDbTypes,
     force_rebuild_system_db: parseDbTypes.includes('SYST') ? !!form.value.force_rebuild_system_db : false,
     auto_parse_related_dbnums: !!form.value.auto_parse_related_dbnums,
+    cata_partial_parse: !!form.value.cata_partial_parse,
     web_port: previewWebPort,
     bind_host: form.value.bind_host?.trim() || undefined,
     public_base_url: form.value.public_base_url?.trim() || undefined,
@@ -1198,6 +1202,23 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                     <span class="block text-sm font-medium">自动解析依赖库</span>
                     <span class="block text-xs text-muted-foreground">
                       开启后，解析所选设计库时会自动纳入其引用的关联库（基于全局 ref0→dbnum 依赖闭包递归展开，如元件库 CATA / 字典库 DICT 等）一并解析；关闭时仅解析所选库。
+                    </span>
+                  </span>
+                </label>
+                <label
+                  class="ml-6 flex items-start gap-3 rounded-lg border border-border/60 bg-background px-3 py-2"
+                  :class="form.auto_parse_related_dbnums ? 'cursor-pointer hover:border-border' : 'opacity-60'"
+                >
+                  <input
+                    v-model="form.cata_partial_parse"
+                    type="checkbox"
+                    class="mt-0.5 h-4 w-4 rounded border-input"
+                    :disabled="!form.auto_parse_related_dbnums"
+                  />
+                  <span class="min-w-0">
+                    <span class="block text-sm font-medium">按需解析 CATA（部分解析）</span>
+                    <span class="block text-xs text-muted-foreground">
+                      开启（默认）：解析前先扫描目标 DESI 的元件引用生成闭包 manifest，关联 CATA 库只解析被引用条目、零引用库整库跳过；关闭：关联 CATA 库整库全量解析（数据最全但耗时和体积显著增加）。
                     </span>
                   </span>
                 </label>

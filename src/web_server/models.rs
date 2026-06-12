@@ -972,6 +972,11 @@ pub struct ManagedProjectSite {
     /// 默认关闭；开启后解析范围会额外纳入依赖库（首版按 db 类型粗粒度纳入，后续完善为按引用精确解析）。
     #[serde(default)]
     pub auto_parse_related_dbnums: bool,
+    /// CATA 按需部分解析开关：与 `auto_parse_related_dbnums` 配合使用。
+    /// true（默认）= 解析前生成 refno 闭包 manifest，关联 CATA 库只解析被引用条目、
+    /// 零引用库整库跳过；false = 关联 CATA 库整库全量解析（与按需模式对照）。
+    #[serde(default = "default_true")]
+    pub cata_partial_parse: bool,
     #[serde(default = "default_true")]
     pub gen_model: bool,
     #[serde(default)]
@@ -1079,6 +1084,9 @@ pub struct CreateManagedSiteRequest {
     /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
     #[serde(default)]
     pub auto_parse_related_dbnums: bool,
+    /// CATA 按需部分解析（闭包 manifest）。默认开启；关闭时关联 CATA 库整库全量解析。
+    #[serde(default = "default_true")]
+    pub cata_partial_parse: bool,
     #[serde(default)]
     pub gen_model: Option<bool>,
     #[serde(default)]
@@ -1143,6 +1151,9 @@ pub struct UpdateManagedSiteRequest {
     /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。None 表示不修改。
     #[serde(default)]
     pub auto_parse_related_dbnums: Option<bool>,
+    /// CATA 按需部分解析开关。None 表示不修改。
+    #[serde(default)]
+    pub cata_partial_parse: Option<bool>,
     #[serde(default)]
     pub gen_model: Option<bool>,
     #[serde(default)]
@@ -1203,6 +1214,9 @@ pub struct PreviewManagedSiteParsePlanRequest {
     /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
     #[serde(default)]
     pub auto_parse_related_dbnums: bool,
+    /// CATA 按需部分解析（闭包 manifest）。默认开启。
+    #[serde(default = "default_true")]
+    pub cata_partial_parse: bool,
     pub web_port: u16,
     #[serde(default)]
     pub bind_host: Option<String>,
@@ -1235,6 +1249,9 @@ pub struct QuickDeployTestRequest {
     /// None 表示由具体入口决定默认值；快速部署默认关闭，便于快速 smoke。
     #[serde(default)]
     pub auto_parse_related_dbnums: Option<bool>,
+    /// CATA 按需部分解析（闭包 manifest）。None 时跟随入口默认（开启）。
+    #[serde(default)]
+    pub cata_partial_parse: Option<bool>,
     #[serde(default = "default_true")]
     pub gen_model: bool,
     #[serde(default)]

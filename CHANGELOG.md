@@ -2,6 +2,22 @@
 
 ## 2026-06-12
 
+### Added — 「按需解析 CATA」独立开关（与全量解析显式区分）
+
+> 新增站点级开关 `cata_partial_parse`（默认开启），与「自动解析依赖库」组合：两者都开 = 闭包 manifest 部分解析（被引用条目解析、零引用库整库跳过）；仅依赖库开 = 关联 CATA 库整库全量解析（解析日志明示「📦 CATA 按需解析已关闭」）。便于按需/全量两种模式对照与回退。
+
+- `models.rs`：`ManagedProjectSite` 与创建/更新/快速部署/解析计划预览 5 个请求结构体新增 `cata_partial_parse`（serde 默认 true，更新请求为 `Option` 不传不改）。
+- `managed_project_sites.rs`：SQLite 新增列 `cata_partial_parse INTEGER NOT NULL DEFAULT 1`（含 `ensure_column_exists` 迁移，存量站点默认开启）；`spawn_parse_process` 闭包作业与 `AIOS_CATA_CLOSURE_MODE=manifest` 注入统一改由 `auto_parse_related_dbnums && cata_partial_parse` 门控；开关状态写入站点 `metadata.json`。
+- `ui/admin`：新建站点抽屉在「自动解析依赖库」下新增嵌套开关「按需解析 CATA（部分解析）」（依赖库关闭时置灰）；快速部署卡片新增「按需解析 CATA」复选框；两处默认勾选；admin 静态产物重建。
+- 验证：`cargo check` 绿；`scripts/guard/web_server_parse_boundary_guard.ps1` PASS；新 web_server 重启后 API 返回存量站点 `cata_partial_parse=true`，浏览器实测两处开关默认勾选、置灰联动正常。
+
+### Fixed — 模型生成重跑中断：inst_relate_aabb 事务配对被并发拆散
+
+> 站点生成阶段重跑（表非空）时随机报 `Database record inst_relate_aabb:… already exists` 并中断。根因：`inst_relate_aabb` 走 DELETE+INSERT 成对语句，但事务批上限为奇数 5，配对会被拆进两个并发事务，INSERT 可能先于配对 DELETE 执行。
+
+- `pdms_inst.rs`：`save_instance_data_with_report` 与 `save_inst_relate_aabb_rows` 的 `MAX_TX_STATEMENTS` 5→4（偶数保证 DELETE+INSERT 同事务），注释写明约束；增量重跑生成实测越过原中断点。
+- `managed_project_sites.rs`：`build_generation_config` 显式写入 `total_sync/incr_sync/sync_history/only_sync_sys/gen_tree_only = false`，修复生成配置误继承解析配置 `incr_sync=true` 导致 `run_app` 按同步任务提前退出、不进入模型生成的问题。
+
 ### Added — Admin 站点部署默认按需解析 CATA（闭包 manifest 部分解析）
 
 > 站点解析流水线在 `auto_parse_related_dbnums` 开启时，先对 `manual_db_nums` 指定的 DESI 库生成 CATA refno 闭包 manifest（precise 收口），再以 `AIOS_CATA_CLOSURE_MODE=manifest` 启动解析；被引用的 CATA 库按 manifest 部分解析，零引用的 CATA 库整库跳过。admin UI 新建站点与快速部署默认勾选该模式。

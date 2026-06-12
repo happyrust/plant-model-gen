@@ -1683,6 +1683,16 @@ fn build_generation_config(
     // 生成范围由 generate_db_nums/manual_db_nums 控制，不能继承模板中的示例文件过滤。
     table.remove("included_db_files");
     set_or_remove_manual_db_nums(table, site_generate_db_nums(site));
+    // 生成作业必须进入 run_app 的模型生成分支：显式清掉同步触发开关，
+    // 否则继承模板里的 total_sync/incr_sync=true 会让 run_app 按"解析任务"
+    // 提前返回，模型生成永远不执行（generate job 空跑 exit=0）。
+    set_toml_bool(table, "total_sync", false);
+    set_toml_bool(table, "incr_sync", false);
+    set_toml_bool(table, "sync_history", false);
+    set_toml_bool(table, "only_sync_sys", false);
+    set_toml_bool(table, "gen_tree_only", false);
+    set_toml_bool(table, "save_db", true);
+    set_toml_bool(table, "enable_log", true);
     Ok(toml::to_string_pretty(&value)?)
 }
 
@@ -1749,6 +1759,7 @@ fn write_site_files_with_parse_plan(
         "parse_db_types": site.parse_db_types,
         "force_rebuild_system_db": site.force_rebuild_system_db,
         "auto_parse_related_dbnums": site.auto_parse_related_dbnums,
+        "cata_partial_parse": site.cata_partial_parse,
         "gen_model": site.gen_model,
         "gen_mesh": site.gen_mesh,
         "gen_spatial_tree": site.gen_spatial_tree,
@@ -1900,6 +1911,7 @@ fn preview_request_from_site(site: &ManagedProjectSite) -> PreviewManagedSitePar
         parse_db_types: site.parse_db_types.clone(),
         force_rebuild_system_db: site.force_rebuild_system_db,
         auto_parse_related_dbnums: site.auto_parse_related_dbnums,
+        cata_partial_parse: site.cata_partial_parse,
         web_port: site.web_port,
         bind_host: Some(site.bind_host.clone()),
         public_base_url: site.public_base_url.clone(),
@@ -2030,6 +2042,7 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
             .unwrap_or(0)
             != 0,
         auto_parse_related_dbnums: row_bool_or(row, "auto_parse_related_dbnums", false),
+        cata_partial_parse: row_bool_or(row, "cata_partial_parse", true),
         gen_model: row_bool_or(row, "gen_model", true),
         gen_mesh: row_bool_or(row, "gen_mesh", false),
         gen_spatial_tree: row_bool_or(row, "gen_spatial_tree", true),
@@ -2107,6 +2120,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             parse_db_types TEXT NOT NULL DEFAULT '["SYST","DESI","CATA","DICT","GLB","GLOB"]',
             force_rebuild_system_db INTEGER NOT NULL DEFAULT 0,
             auto_parse_related_dbnums INTEGER NOT NULL DEFAULT 0,
+            cata_partial_parse INTEGER NOT NULL DEFAULT 1,
             gen_model INTEGER NOT NULL DEFAULT 1,
             gen_mesh INTEGER NOT NULL DEFAULT 0,
             gen_spatial_tree INTEGER NOT NULL DEFAULT 1,
@@ -2340,6 +2354,7 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
     ensure_column_exists(conn, "site_name")?;
     ensure_column_exists(conn, "projects_json")?;
     ensure_column_exists(conn, "auto_parse_related_dbnums")?;
+    ensure_column_exists(conn, "cata_partial_parse")?;
     ensure_column_exists(conn, "generate_db_nums")?;
     conn.execute(
         "DROP INDEX IF EXISTS idx_managed_project_sites_project_name",
@@ -2373,6 +2388,7 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
             }
             "force_rebuild_system_db" => "INTEGER NOT NULL DEFAULT 0",
             "auto_parse_related_dbnums" => "INTEGER NOT NULL DEFAULT 0",
+            "cata_partial_parse" => "INTEGER NOT NULL DEFAULT 1",
             "gen_model" => "INTEGER NOT NULL DEFAULT 1",
             "gen_mesh" => "INTEGER NOT NULL DEFAULT 0",
             "gen_spatial_tree" => "INTEGER NOT NULL DEFAULT 1",
@@ -2449,8 +2465,9 @@ fn persist_site_with_conn(
                 db_pid, web_pid, viewer_pid, viewer_url, parse_pid,
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
-                created_at, updated_at, site_name, projects_json, auto_parse_related_dbnums
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)",
+                created_at, updated_at, site_name, projects_json, auto_parse_related_dbnums,
+                cata_partial_parse
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)",
             table = TABLE_NAME
         ),
         params![
@@ -2499,6 +2516,7 @@ fn persist_site_with_conn(
             &site.site_name,
             projects_to_json(&site.projects).unwrap_or_else(|_| "[]".to_string()),
             if site.auto_parse_related_dbnums { 1i64 } else { 0i64 },
+            if site.cata_partial_parse { 1i64 } else { 0i64 },
         ],
     )?;
     Ok(())
@@ -3338,6 +3356,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
             &parse_db_types,
         ),
         auto_parse_related_dbnums: req.auto_parse_related_dbnums,
+        cata_partial_parse: req.cata_partial_parse,
         parse_db_types,
         gen_model: req.gen_model.unwrap_or(generation_defaults.gen_model),
         gen_mesh: req.gen_mesh.unwrap_or(generation_defaults.gen_mesh),
@@ -3570,6 +3589,7 @@ async fn quick_create_deploy_config(
         parse_db_types: Vec::new(),
         force_rebuild_system_db: false,
         auto_parse_related_dbnums: req.auto_parse_related_dbnums.unwrap_or(false),
+        cata_partial_parse: req.cata_partial_parse.unwrap_or(true),
         gen_model: Some(req.gen_model),
         gen_mesh: Some(req.gen_mesh),
         gen_spatial_tree: Some(req.gen_spatial_tree),
@@ -3700,6 +3720,7 @@ async fn quick_deploy(
         parse_db_types: Vec::new(),
         force_rebuild_system_db: false,
         auto_parse_related_dbnums: req.auto_parse_related_dbnums.unwrap_or(false),
+        cata_partial_parse: req.cata_partial_parse.unwrap_or(true),
         gen_model: Some(req.gen_model),
         gen_mesh: Some(req.gen_mesh),
         gen_spatial_tree: Some(req.gen_spatial_tree),
@@ -3928,6 +3949,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
             auto_parse_related_dbnums: false,
+            cata_partial_parse: req.cata_partial_parse,
             gen_model: generation_defaults.gen_model,
             gen_mesh: generation_defaults.gen_mesh,
             gen_spatial_tree: generation_defaults.gen_spatial_tree,
@@ -4083,6 +4105,9 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
     }
     if let Some(value) = req.auto_parse_related_dbnums {
         site.auto_parse_related_dbnums = value;
+    }
+    if let Some(value) = req.cata_partial_parse {
+        site.cata_partial_parse = value;
     }
     if let Some(value) = req.gen_model {
         site.gen_model = value;
@@ -8012,7 +8037,8 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         },
     )?;
 
-    if site.auto_parse_related_dbnums {
+    let cata_partial_enabled = site.auto_parse_related_dbnums && site.cata_partial_parse;
+    if cata_partial_enabled {
         append_log_line(
             &parse_log_path(&site.site_id),
             "🧩 生成 CATA refno 闭包 manifest（仅处理 manual_db_nums 指定的 DESI 库）...",
@@ -8025,10 +8051,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             repo.to_string_lossy().to_string(),
             parse_log_path(&site.site_id),
             parse_log_path(&site.site_id),
-            vec![
-                "gen-cata-closure".to_string(),
-                "--rescan-index".to_string(),
-            ],
+            vec!["gen-cata-closure".to_string(), "--rescan-index".to_string()],
             HashMap::new(),
         )
         .await
@@ -8036,14 +8059,16 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
         if !closure_job.success {
             bail!("CATA 闭包生成失败，退出码: {:?}", closure_job.exit_code);
         }
+    } else if site.auto_parse_related_dbnums {
+        append_log_line(
+            &parse_log_path(&site.site_id),
+            "📦 CATA 按需解析已关闭：关联 CATA 库将整库全量解析（不生成闭包 manifest）。",
+        );
     }
 
     let mut parse_env = HashMap::new();
-    if site.auto_parse_related_dbnums {
-        parse_env.insert(
-            "AIOS_CATA_CLOSURE_MODE".to_string(),
-            "manifest".to_string(),
-        );
+    if cata_partial_enabled {
+        parse_env.insert("AIOS_CATA_CLOSURE_MODE".to_string(), "manifest".to_string());
     }
     let job = run_sidecar_cli_job_with_site_events(
         &site.site_id,
@@ -13287,6 +13312,7 @@ mod tests {
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
             auto_parse_related_dbnums: false,
+            cata_partial_parse: true,
             gen_model: false,
             gen_mesh: false,
             gen_spatial_tree: false,
@@ -13357,6 +13383,7 @@ mod tests {
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
             auto_parse_related_dbnums: false,
+            cata_partial_parse: true,
             gen_model: true,
             gen_mesh: false,
             gen_spatial_tree: false,
@@ -13422,6 +13449,7 @@ mod tests {
             parse_db_types: Vec::new(),
             force_rebuild_system_db: false,
             auto_parse_related_dbnums: false,
+            cata_partial_parse: true,
             gen_model: false,
             gen_mesh: false,
             gen_spatial_tree: false,

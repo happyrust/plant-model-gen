@@ -173,6 +173,7 @@ export interface ManagedProjectSite {
   parse_db_types: string[]
   force_rebuild_system_db: boolean
   auto_parse_related_dbnums: boolean
+  cata_partial_parse?: boolean
   gen_model: boolean
   gen_mesh: boolean
   gen_spatial_tree: boolean
@@ -402,6 +403,7 @@ export interface QuickDeploySiteRequest {
   project_code?: number
   dbnum?: number
   auto_parse_related_dbnums?: boolean
+  cata_partial_parse?: boolean
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -452,6 +454,7 @@ export interface CreateManagedSiteRequest {
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean
+  cata_partial_parse?: boolean
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -484,6 +487,7 @@ export interface UpdateManagedSiteRequest {
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean
+  cata_partial_parse?: boolean
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -515,6 +519,7 @@ export interface PreviewManagedSiteParsePlanRequest {
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean
+  cata_partial_parse?: boolean
   web_port: number
   bind_host?: string
   public_base_url?: string

@@ -77,6 +77,8 @@ const quickDeployDbFile = ref(loadQuickDeployDbFile())
 const quickDeployDbMode = ref<ManagedSiteDbMode>('ws')
 // 默认启用按需解析依赖库（CATA 闭包 manifest 部分解析）
 const quickDeployAutoDeps = ref(true)
+// 按需解析 CATA：关闭时关联 CATA 库整库全量解析
+const quickDeployCataPartial = ref(true)
 const quickDeployGenMesh = ref(true)
 const quickDeployLoading = ref(false)
 const quickDeployError = ref('')
@@ -300,6 +302,7 @@ async function submitQuickDeploy() {
     const result = await sitesApi.quickDeploy({
       db_file: dbFile,
       auto_parse_related_dbnums: quickDeployAutoDeps.value,
+      cata_partial_parse: quickDeployCataPartial.value,
       gen_model: true,
       gen_mesh: quickDeployGenMesh.value,
       gen_spatial_tree: true,
@@ -398,6 +401,19 @@ onMounted(async () => {
           <label class="flex items-center gap-1.5">
             <input v-model="quickDeployAutoDeps" type="checkbox" class="h-4 w-4 rounded border-input" />
             <span>自动解析依赖库</span>
+          </label>
+          <label
+            class="flex items-center gap-1.5"
+            :class="quickDeployAutoDeps ? '' : 'opacity-50'"
+            title="开启（默认）：CATA 库按引用闭包部分解析；关闭：关联 CATA 库整库全量解析"
+          >
+            <input
+              v-model="quickDeployCataPartial"
+              type="checkbox"
+              class="h-4 w-4 rounded border-input"
+              :disabled="!quickDeployAutoDeps"
+            />
+            <span>按需解析 CATA</span>
           </label>
           <label class="flex items-center gap-1.5">
             <input v-model="quickDeployGenMesh" type="checkbox" class="h-4 w-4 rounded border-input" />

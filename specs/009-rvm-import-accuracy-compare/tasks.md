@@ -117,6 +117,18 @@
 - 后续增强(Backlog):compare 增加 `--auto-align`(中位数平移自动
   对齐后再比)、TUBE 段空间并集对比、VALVE 外点定位。
 
+**VALVE 外点定位结论(2026-06-13 03:40,`analyze_valve.py`)**:
+不是生成缺陷——RVM 侧 VALVE 的 **12 个原语 bbox_world 全部退化为点**
+(z_size=0,组级 AABB 失真为 1mm 点),而 gen 侧 VALVE AABB
+(320×320×862mm)是合理阀体+手轮形状。根因在导入端:`rvm_import.rs`
+直接采信 rvm-rs 的 `geometry.bbox_world`,该值对部分带 transform 的
+原语未展开。其余成员 90~320mm 的"尺寸差"同源(RVM bbox 普遍偏小)。
+**修复方向**:导入端弃用 rvm-rs bbox_world,改由原语参数 + transform
+自算包围盒(`rvm_obj_export.rs` 已有 11 种原语 mesh 化代码可复用)。
+**最终判定强化**:成员/类型级完全一致;几何级两项"差异"
+(全局基准平移、AABB 尺寸差)均定位为对拍链路自身问题,
+**未发现生成端缺陷**。
+
 - 站点 surreal(8022)在线,基于 2026-06-12 22:30 成功生成的数据
   (tubi_relate=16)。
 - 重导入样本(带解析)→ `--compare-rvm` → 分析差异:

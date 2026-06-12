@@ -52,6 +52,10 @@ impl ModelRelationStore {
                 inst_id INTEGER NOT NULL,
                 parent_refno INTEGER,
                 world_matrix BLOB,
+                name TEXT,
+                noun TEXT,
+                identity_source TEXT,
+                resolved INTEGER DEFAULT 0,
                 created_at INTEGER DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_refno ON inst_relate(refno);
@@ -88,6 +92,30 @@ impl ModelRelationStore {
             );
             CREATE INDEX IF NOT EXISTS idx_bool_carrier ON inst_relate_bool(carrier_refno);",
         )?;
+        Self::ensure_inst_relate_identity_columns(conn)?;
+        Ok(())
+    }
+
+    /// spec 009:旧库幂等迁移——为 inst_relate 补 name/noun/identity_source/resolved 列。
+    /// 新建库由 CREATE TABLE 直接包含;已存在的旧库按 PRAGMA table_info 检测缺失列补齐。
+    fn ensure_inst_relate_identity_columns(conn: &Connection) -> Result<()> {
+        let existing: Vec<String> = conn
+            .prepare("PRAGMA table_info(inst_relate)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        let add = |col: &str, ddl: &str| -> Result<()> {
+            if !existing.iter().any(|c| c == col) {
+                conn.execute(
+                    &format!("ALTER TABLE inst_relate ADD COLUMN {ddl}"),
+                    [],
+                )?;
+            }
+            Ok(())
+        };
+        add("name", "name TEXT")?;
+        add("noun", "noun TEXT")?;
+        add("identity_source", "identity_source TEXT")?;
+        add("resolved", "resolved INTEGER DEFAULT 0")?;
         Ok(())
     }
 
@@ -148,8 +176,9 @@ impl ModelRelationStore {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO inst_relate
-                 (dbnum, refno, inst_id, parent_refno, world_matrix)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (dbnum, refno, inst_id, parent_refno, world_matrix,
+                  name, noun, identity_source, resolved)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
 
             for rec in records {
@@ -158,7 +187,11 @@ impl ModelRelationStore {
                     rec.refno.refno().0,
                     rec.inst_id,
                     rec.parent_refno.map(|r| r.refno().0),
-                    rec.world_matrix.as_ref()
+                    rec.world_matrix.as_ref(),
+                    rec.name.as_deref(),
+                    rec.noun.as_deref(),
+                    rec.identity_source.as_deref(),
+                    rec.resolved as i64
                 ])?;
             }
         }
@@ -306,6 +339,14 @@ pub struct InstRelateRecord {
     pub inst_id: u64,
     pub parent_refno: Option<RefnoEnum>,
     pub world_matrix: Option<Vec<u8>>,
+    /// spec 009:来源名称(RVM 组名末段 / E3D 元素名),用于身份解析与对拍报告。
+    pub name: Option<String>,
+    /// spec 009:PDMS 短名词(BRAN/FLAN/...);解析成功时回填。
+    pub noun: Option<String>,
+    /// spec 009:身份来源——`surreal_name` / `default_name_rule` / `stable_hash`。
+    pub identity_source: Option<String>,
+    /// spec 009:refno 是否为真实 PDMS refno(身份解析成功)。
+    pub resolved: bool,
 }
 
 #[derive(Debug, Clone)]

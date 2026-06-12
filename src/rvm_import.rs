@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
+use surrealdb::types::SurrealValue;
 use twox_hash::XxHash64;
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,9 @@ pub struct RvmImportOptions {
     pub rvm_path: PathBuf,
     pub att_paths: Vec<PathBuf>,
     pub verbose: bool,
+    /// spec 009:是否在导入期把 RVM 组名解析为真实 PDMS refno
+    /// (需要可用的 SurrealDB 连接,失败自动退化为 stable_hash)。
+    pub resolve_identity: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -30,9 +34,13 @@ pub struct RvmImportStats {
     pub group_nodes: usize,
     pub geometry_records: usize,
     pub cleaned_records: usize,
+    /// spec 009:身份解析成功(真实 refno)的 inst_relate 数。
+    pub resolved_records: usize,
+    /// spec 009:仍使用 stable_hash 伪 refno 的 inst_relate 数。
+    pub unresolved_records: usize,
 }
 
-pub fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImportStats> {
+pub async fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImportStats> {
     let mut store = Store::new();
     let rvm_bytes = fs::read(&options.rvm_path)
         .with_context(|| format!("读取 RVM 文件失败: {}", options.rvm_path.display()))?;
@@ -49,6 +57,12 @@ pub fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImportStats
     let mut builder = RelationBuilder::new(options.dbnum, options.verbose);
     builder.build(&store)?;
 
+    let (resolved_records, unresolved_records) = if options.resolve_identity {
+        resolve_identities(&mut builder, options.dbnum, options.verbose).await?
+    } else {
+        (0, builder.inst_relates.len())
+    };
+
     let relation_store = ModelRelationStore::new(&options.relation_store_root);
     let refnos: Vec<RefnoEnum> = builder.inst_relates.iter().map(|r| r.refno).collect();
     let cleaned_records = relation_store
@@ -64,7 +78,233 @@ pub fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImportStats
         group_nodes: builder.stats.group_nodes,
         geometry_records: builder.stats.geometry_records,
         cleaned_records,
+        resolved_records,
+        unresolved_records,
     })
+}
+
+// ──────────────────────── spec 009:导入期身份解析 ────────────────────────
+
+/// E3D 默认命名解析结果:`<NOUN_FULL> <n> of <OWNER_NOUN_FULL> <OWNER_NAME>`。
+#[derive(Debug)]
+struct DefaultNameParts<'a> {
+    noun_full: &'a str,
+    ordinal: usize,
+    owner_name: &'a str,
+}
+
+/// 解析 E3D 默认命名,如 `FLANGE 1 of BRANCH /03SKID1-PIPE-SUCTION/B1`。
+fn parse_default_name(name: &str) -> Option<DefaultNameParts<'_>> {
+    let (left, right) = name.split_once(" of ")?;
+    let (noun_full, ordinal_str) = left.rsplit_once(' ')?;
+    let ordinal: usize = ordinal_str.parse().ok()?;
+    if ordinal == 0 {
+        return None;
+    }
+    // right 形如 "BRANCH /03SKID1-PIPE-SUCTION/B1";owner 名称从首个 '/' 起。
+    let owner_name_start = right.find('/')?;
+    let owner_name = &right[owner_name_start..];
+    Some(DefaultNameParts {
+        noun_full: noun_full.trim(),
+        ordinal,
+        owner_name: owner_name.trim(),
+    })
+}
+
+/// RVM 默认命名里的名词全称 → PDMS 四字短名词(站点库 `pe.noun` 形态)。
+fn full_noun_to_short(full: &str) -> String {
+    match full {
+        "FLANGE" => "FLAN",
+        "ELBOW" => "ELBO",
+        "REDUCER" => "REDU",
+        "GASKET" => "GASK",
+        "VALVE" => "VALV",
+        "BRANCH" => "BRAN",
+        "TUBING" | "TUBE" => "TUBI",
+        "EQUIPMENT" => "EQUI",
+        "NOZZLE" => "NOZZ",
+        "COUPLING" => "COUP",
+        "INSTRUMENT" => "INST",
+        "ATTACHMENT" => "ATTA",
+        "STRUCTURE" => "STRU",
+        "FITTING" => "FITT",
+        other => {
+            let upper = other.to_ascii_uppercase();
+            let take = upper.chars().take(4).collect::<String>();
+            return take;
+        }
+    }
+    .to_string()
+}
+
+/// 把站点库 `record::id(pe)` 字符串 key(`ref0_ref1`)解析为 RefnoEnum。
+fn refno_from_pe_key(key: &str) -> Option<RefnoEnum> {
+    use std::str::FromStr;
+    RefnoEnum::from_str(key)
+        .ok()
+        .or_else(|| RefnoEnum::from_str(&key.replace('_', "/")).ok())
+}
+
+/// SurrealDB 字符串字面量转义(单引号)。
+fn escape_surreal_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[derive(Debug, serde::Deserialize, SurrealValue)]
+struct PeIdentRow {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    noun: Option<String>,
+}
+
+/// 按元素全名精确查 pe。返回 (refno, noun);多解/无解返回 None。
+async fn query_pe_by_name(dbnum: u32, name: &str) -> Result<Option<(RefnoEnum, Option<String>)>> {
+    use aios_core::{SurrealQueryExt, model_primary_db};
+    let sql = format!(
+        "SELECT record::id(id) AS key, noun FROM pe WHERE dbnum = {dbnum} AND name = '{}' LIMIT 2;",
+        escape_surreal_str(name)
+    );
+    let rows: Vec<PeIdentRow> = model_primary_db().query_take(&sql, 0).await?;
+    if rows.len() != 1 {
+        return Ok(None);
+    }
+    let row = &rows[0];
+    let Some(key) = row.key.as_deref() else {
+        return Ok(None);
+    };
+    Ok(refno_from_pe_key(key).map(|refno| (refno, row.noun.clone())))
+}
+
+/// 查 owner 的有序子元素(图遍历保持成员序),返回 (key, noun) 列表。
+async fn query_owner_children(owner: RefnoEnum) -> Result<Vec<PeIdentRow>> {
+    use aios_core::{SurrealQueryExt, model_primary_db};
+    let owner_key = owner.to_pe_key();
+    let sql = format!(
+        "SELECT VALUE (<-pe_owner.in).{{key: record::id(id), noun: noun}} FROM ONLY {owner_key} LIMIT 1;"
+    );
+    let rows: Vec<PeIdentRow> = model_primary_db().query_take(&sql, 0).await?;
+    Ok(rows)
+}
+
+/// 两段式身份解析:pass1 按遍历序(父先子)解析每个组的真实 refno,
+/// pass2 重写 inst_relates(refno/inst_id/parent_refno)与 geo_relates(inst_id)。
+async fn resolve_identities(
+    builder: &mut RelationBuilder,
+    dbnum: u32,
+    verbose: bool,
+) -> Result<(usize, usize)> {
+    use std::collections::HashMap;
+
+    if let Err(e) = crate::fast_model::utils::ensure_surreal_init().await {
+        eprintln!("[rvm-import] 身份解析跳过(SurrealDB 不可用,全部回退 stable_hash): {e}");
+        return Ok((0, builder.inst_relates.len()));
+    }
+
+    // old(stable_hash) refno -> (真实 refno, noun, identity_source)
+    let mut mapping: HashMap<RefnoEnum, (RefnoEnum, Option<String>, &'static str)> =
+        HashMap::new();
+    // 名称 -> 真实 refno(供默认命名 owner 查找;含本批已解析的命名元素)
+    let mut by_name: HashMap<String, RefnoEnum> = HashMap::new();
+    // owner refno -> 有序子元素缓存
+    let mut children_cache: HashMap<RefnoEnum, Vec<PeIdentRow>> = HashMap::new();
+
+    let records_snapshot: Vec<(RefnoEnum, Option<String>)> = builder
+        .inst_relates
+        .iter()
+        .map(|r| (r.refno, r.name.clone()))
+        .collect();
+
+    for (old_refno, name) in &records_snapshot {
+        let Some(name) = name.as_deref() else {
+            continue;
+        };
+
+        let resolved: Option<(RefnoEnum, Option<String>, &'static str)> = if name.starts_with('/')
+        {
+            query_pe_by_name(dbnum, name)
+                .await?
+                .map(|(refno, noun)| (refno, noun, "surreal_name"))
+        } else if let Some(parts) = parse_default_name(name) {
+            // owner 优先用本批已解析缓存,否则按名查询。
+            let owner = match by_name.get(parts.owner_name) {
+                Some(r) => Some(*r),
+                None => query_pe_by_name(dbnum, parts.owner_name)
+                    .await?
+                    .map(|(r, _)| r),
+            };
+            if let Some(owner) = owner {
+                by_name.insert(parts.owner_name.to_string(), owner);
+                if !children_cache.contains_key(&owner) {
+                    children_cache.insert(owner, query_owner_children(owner).await?);
+                }
+                let short = full_noun_to_short(parts.noun_full);
+                let children = &children_cache[&owner];
+                children
+                    .iter()
+                    .filter(|c| c.noun.as_deref() == Some(short.as_str()))
+                    .nth(parts.ordinal - 1)
+                    .and_then(|c| c.key.as_deref())
+                    .and_then(refno_from_pe_key)
+                    .map(|refno| (refno, Some(short.clone()), "default_name_rule"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        match resolved {
+            Some((new_refno, noun, src)) => {
+                if name.starts_with('/') {
+                    by_name.insert(name.to_string(), new_refno);
+                }
+                if verbose {
+                    println!(
+                        "[rvm-import] resolve {name} -> {new_refno} (source={src})"
+                    );
+                }
+                mapping.insert(*old_refno, (new_refno, noun, src));
+            }
+            None => {
+                if verbose {
+                    println!("[rvm-import] resolve {name} -> <unresolved>");
+                }
+            }
+        }
+    }
+
+    // pass2:重写记录。
+    let mut resolved_cnt = 0usize;
+    for rec in &mut builder.inst_relates {
+        if let Some((new_refno, noun, src)) = mapping.get(&rec.refno) {
+            let new_inst_id = new_refno.refno().0;
+            // geo_relates 的 inst_id 同步重映射。
+            let old_inst_id = rec.inst_id;
+            for (inst_id, _) in builder.geo_relates.iter_mut() {
+                if *inst_id == old_inst_id {
+                    *inst_id = new_inst_id;
+                }
+            }
+            rec.refno = *new_refno;
+            rec.inst_id = new_inst_id;
+            rec.noun = noun.clone();
+            rec.identity_source = Some((*src).to_string());
+            rec.resolved = true;
+            resolved_cnt += 1;
+        }
+        if let Some(parent) = rec.parent_refno {
+            if let Some((new_parent, _, _)) = mapping.get(&parent) {
+                rec.parent_refno = Some(*new_parent);
+            }
+        }
+    }
+
+    let unresolved_cnt = builder.inst_relates.len() - resolved_cnt;
+    println!(
+        "[rvm-import] 身份解析完成: resolved={resolved_cnt} unresolved={unresolved_cnt}"
+    );
+    Ok((resolved_cnt, unresolved_cnt))
 }
 
 struct RelationBuilder {
@@ -150,6 +390,12 @@ impl RelationBuilder {
                     inst_id,
                     parent_refno,
                     world_matrix: Some(encode_affine_blob(&world_affine)?),
+                    // spec 009:保留组名(末段)供身份解析与对拍报告;
+                    // T003 解析器接入前 identity 仍为 stable_hash。
+                    name: Some(name.clone()),
+                    noun: None,
+                    identity_source: Some("stable_hash".to_string()),
+                    resolved: false,
                 });
 
                 let mut geometry_link = group.first_geometry;

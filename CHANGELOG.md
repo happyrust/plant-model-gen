@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-06-13
+
+### Added — RVM 基准导入身份解析 + 模型生成准确性对拍 CLI(spec 009)
+
+> 把 E3D 官方 RVM 导出作为几何基准对拍 `gen_model` 生成数据。此前 `--import-rvm` 用 `stable_refno(dbnum, hash(path))` 伪 refno,与生成侧真实 refno 无法 join;且没有对比工具。
+
+- `model_relation_store.rs`:`inst_relate` 扩列 `name/noun/identity_source/resolved`(新库建表即含,旧库 PRAGMA 检测后幂等 ALTER)。
+- `rvm_import.rs`:导入期两段式身份解析——命名元素按 `pe.name` 精确查询(RVM 组名与站点库 name 逐字符一致);未命名成员按 E3D 默认命名 `<NOUN> <n> of <OWNER>` 在 owner 同 NOUN 子序列定位(全称→PDMS 短名词映射表);SurrealDB 不可用自动回退 stable_hash;CLI 增 `--no-resolve-identity`。
+- `rvm_compare.rs`(新增)+ `--compare-rvm` CLI:RVM relation store vs 站点 Parquet 包(instances/tubings/aabb)三层对拍——L1 成员清单(零几何成员豁免)、L2 noun、L3 组级合并 AABB 容差;JSON 报告落 `runtime/rvm-compare/`,有差异非零退出(CI 可用)。
+- **样本验收**(`2013286704_476 .rvm` ↔ 站点 quicktest-250160-8080):身份解析 15/15(BRAN→`2013286704_476`,默认命名反推 11/11 全中);matched=8 / extra=0 / noun_mismatch=0;AABB 差异经结构分析为全局坐标基准平移(中心偏移一致,散布 <100mm),扣除后尺寸差 90~320mm 属 L1 LOD 网格预期;VALVE z 向 861mm 为唯一外点待查;BRAN 管段口径差异(RVM 2 段 TUBE 挂组 vs gen 5 段 tubi_relate)已记录。
+- Backlog:`--auto-align` 基准自动对齐、TUBE 段空间并集对比、VALVE 外点定位、ATT 属性对比。
+- 旁证发现(spec 009 T003.5):release 包重新部署在"websocket 终态兜底成功"后任务悬挂且不可取消、锁死站点(重启 web_server 对账 Failed 恢复);站点重启后 surreal 端口可重分配(8022→8023),工具不可硬编码站点端口。
+
 ## 2026-06-12
 
 ### Fixed — ses 表缺失导致 tubi_relate 写入崩溃：schema 层第二道防线（spec 008）

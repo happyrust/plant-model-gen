@@ -3934,11 +3934,12 @@ pub fn import_spatial_index_mode(
 }
 
 #[cfg(feature = "rvm-import")]
-pub fn import_rvm_mode(
+pub async fn import_rvm_mode(
     rvm_path: &Path,
     att_paths: &[PathBuf],
     dbnum: u32,
     relation_store_root: &Path,
+    resolve_identity: bool,
     verbose: bool,
 ) -> Result<()> {
     use aios_database::rvm_import::{RvmImportOptions, import_rvm_to_sqlite};
@@ -3948,6 +3949,14 @@ pub fn import_rvm_mode(
     println!("   - RVM 文件: {}", rvm_path.display());
     println!("   - DBNUM: {}", dbnum);
     println!("   - 关系库存储根目录: {}", relation_store_root.display());
+    println!(
+        "   - 身份解析: {}",
+        if resolve_identity {
+            "开启(SurrealDB 不可用时自动回退)"
+        } else {
+            "关闭(stable_hash)"
+        }
+    );
     if att_paths.is_empty() {
         println!("   - ATT 文件: <none>");
     } else {
@@ -3962,7 +3971,9 @@ pub fn import_rvm_mode(
         rvm_path: rvm_path.to_path_buf(),
         att_paths: att_paths.to_vec(),
         verbose,
-    })?;
+        resolve_identity,
+    })
+    .await?;
 
     println!("\n🎉 RVM 导入完成！");
     println!("📊 统计信息:");
@@ -3971,20 +3982,57 @@ pub fn import_rvm_mode(
     println!("   - Group 节点: {}", stats.group_nodes);
     println!("   - Geometry 记录: {}", stats.geometry_records);
     println!("   - 清理旧记录数: {}", stats.cleaned_records);
+    println!("   - 身份解析成功: {}", stats.resolved_records);
+    println!("   - 身份未解析(stable_hash): {}", stats.unresolved_records);
 
     Ok(())
 }
 
 #[cfg(not(feature = "rvm-import"))]
-pub fn import_rvm_mode(
+pub async fn import_rvm_mode(
     _rvm_path: &Path,
     _att_paths: &[PathBuf],
     _dbnum: u32,
     _relation_store_root: &Path,
+    _resolve_identity: bool,
     _verbose: bool,
 ) -> Result<()> {
     Err(anyhow!(
         "当前二进制未包含 RVM 导入能力，请使用 --features rvm-import 重新构建 aios-database"
+    ))
+}
+
+/// spec 009:RVM 基准 vs gen Parquet 导出对拍(L1 成员/L2 类型/L3 AABB)。
+#[cfg(all(feature = "rvm-import", feature = "parquet-export"))]
+pub fn compare_rvm_cli_mode(
+    dbnum: u32,
+    root_refno: u64,
+    relation_store_root: &Path,
+    parquet_dir: &Path,
+    report_dir: &Path,
+    tol_aabb_mm: f64,
+) -> Result<()> {
+    aios_database::rvm_compare::compare_rvm_mode(&aios_database::rvm_compare::RvmCompareOptions {
+        dbnum,
+        root_refno,
+        relation_store_root: relation_store_root.to_path_buf(),
+        parquet_dir: parquet_dir.to_path_buf(),
+        report_dir: report_dir.to_path_buf(),
+        tol_aabb_mm,
+    })
+}
+
+#[cfg(not(all(feature = "rvm-import", feature = "parquet-export")))]
+pub fn compare_rvm_cli_mode(
+    _dbnum: u32,
+    _root_refno: u64,
+    _relation_store_root: &Path,
+    _parquet_dir: &Path,
+    _report_dir: &Path,
+    _tol_aabb_mm: f64,
+) -> Result<()> {
+    Err(anyhow!(
+        "当前二进制未包含 RVM 对拍能力，请使用 --features rvm-import,parquet-export 重新构建"
     ))
 }
 

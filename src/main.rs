@@ -744,6 +744,30 @@ async fn main() -> anyhow::Result<()> {
                 .num_args(1..),
         )
         .arg(
+            Arg::new("no-resolve-identity")
+                .long("no-resolve-identity")
+                .help("spec 009: disable resolving RVM group names to real PDMS refnos during --import-rvm")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("compare-rvm")
+                .long("compare-rvm")
+                .help("spec 009: compare imported RVM baseline against gen-model Parquet export. Requires --dbnum, --root-refno and --parquet-dir")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("parquet-dir")
+                .long("parquet-dir")
+                .help("Parquet export directory for --compare-rvm (e.g. .../output/<project>/parquet/<dbnum>)")
+                .value_name("PARQUET_DIR"),
+        )
+        .arg(
+            Arg::new("tol-aabb-mm")
+                .long("tol-aabb-mm")
+                .help("AABB per-component tolerance in mm for --compare-rvm (default 1.0)")
+                .value_name("MM"),
+        )
+        .arg(
             Arg::new("spatial-index-output")
                 .long("spatial-index-output")
                 .help("Output path for SQLite spatial index (default: output/spatial_index.sqlite)")
@@ -2576,13 +2600,56 @@ async fn main() -> anyhow::Result<()> {
             .get_one::<String>("relation-store-output")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("output/model_relations"));
+        // spec 009:默认尝试把 RVM 组名解析为真实 PDMS refno(连接不可用自动回退)。
+        let resolve_identity = !matches.get_flag("no-resolve-identity");
 
         return import_rvm_mode(
             Path::new(rvm_path),
             &att_paths,
             dbnum,
             &relation_store_root,
+            resolve_identity,
             verbose,
+        )
+        .await;
+    }
+
+    if matches.get_flag("compare-rvm") {
+        use crate::cli_modes::compare_rvm_cli_mode;
+        use aios_core::pdms_types::RefnoEnum;
+        use std::str::FromStr;
+
+        let dbnum = matches
+            .get_one::<u32>("dbnum")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("--compare-rvm 需要同时指定 --dbnum"))?;
+        let root_refno_str = matches
+            .get_one::<String>("root-refno")
+            .ok_or_else(|| anyhow::anyhow!("--compare-rvm 需要 --root-refno(如 2013286704/476)"))?;
+        let root_refno = RefnoEnum::from_str(root_refno_str)
+            .map_err(|e| anyhow::anyhow!("解析 --root-refno 失败: {e}"))?
+            .refno()
+            .0;
+        let parquet_dir = matches
+            .get_one::<String>("parquet-dir")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("--compare-rvm 需要 --parquet-dir"))?;
+        let relation_store_root = matches
+            .get_one::<String>("relation-store-output")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("output/model_relations"));
+        let tol_aabb_mm = matches
+            .get_one::<String>("tol-aabb-mm")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0);
+
+        return compare_rvm_cli_mode(
+            dbnum,
+            root_refno,
+            &relation_store_root,
+            &parquet_dir,
+            Path::new("runtime/rvm-compare"),
+            tol_aabb_mm,
         );
     }
 

@@ -195,6 +195,9 @@ pub mod model_relation_store;
 #[cfg(feature = "rvm-import")]
 pub mod rvm_import;
 
+#[cfg(all(feature = "rvm-import", feature = "parquet-export"))]
+pub mod rvm_compare;
+
 #[cfg(feature = "rvm-import")]
 pub mod rvm_obj_export;
 

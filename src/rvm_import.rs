@@ -85,15 +85,19 @@ pub async fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImpor
 
 // ──────────────────────── spec 009:导入期身份解析 ────────────────────────
 
-/// E3D 默认命名解析结果:`<NOUN_FULL> <n> of <OWNER_NOUN_FULL> <OWNER_NAME>`。
+/// E3D 默认命名解析结果:`<NOUN_FULL> <n> of <OWNER_DESC>`。
+/// `owner_desc` 可能是 `BRANCH /x/B1`(命名 owner)或
+/// `TMPLATE 1 of EQUIPMENT /x`(owner 自身也是默认命名,需递归解析)。
 #[derive(Debug)]
 struct DefaultNameParts<'a> {
     noun_full: &'a str,
     ordinal: usize,
-    owner_name: &'a str,
+    owner_desc: &'a str,
 }
 
-/// 解析 E3D 默认命名,如 `FLANGE 1 of BRANCH /03SKID1-PIPE-SUCTION/B1`。
+/// 解析 E3D 默认命名的最外层,如:
+/// `FLANGE 1 of BRANCH /03SKID1-PIPE-SUCTION/B1`
+/// `SNOUT 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1`(嵌套)。
 fn parse_default_name(name: &str) -> Option<DefaultNameParts<'_>> {
     let (left, right) = name.split_once(" of ")?;
     let (noun_full, ordinal_str) = left.rsplit_once(' ')?;
@@ -101,14 +105,24 @@ fn parse_default_name(name: &str) -> Option<DefaultNameParts<'_>> {
     if ordinal == 0 {
         return None;
     }
-    // right 形如 "BRANCH /03SKID1-PIPE-SUCTION/B1";owner 名称从首个 '/' 起。
-    let owner_name_start = right.find('/')?;
-    let owner_name = &right[owner_name_start..];
     Some(DefaultNameParts {
         noun_full: noun_full.trim(),
         ordinal,
-        owner_name: owner_name.trim(),
+        owner_desc: right.trim(),
     })
+}
+
+/// 从 owner 描述中提取命名 owner:`<OWNER_NOUN_FULL> /name` → `/name`。
+/// 仅当 `/` 前正好是单个名词(无序号)时成立;否则说明是嵌套默认命名。
+fn named_owner_from_desc(desc: &str) -> Option<&str> {
+    let slash = desc.find('/')?;
+    let prefix = desc[..slash].trim();
+    // 单层:前缀是一个纯名词(如 BRANCH / EQUIPMENT);嵌套:前缀含 " of " 或序号。
+    if !prefix.is_empty() && !prefix.contains(' ') {
+        Some(desc[slash..].trim())
+    } else {
+        None
+    }
 }
 
 /// RVM 默认命名里的名词全称 → PDMS 四字短名词(站点库 `pe.noun` 形态)。
@@ -226,27 +240,54 @@ async fn resolve_identities(
                 .await?
                 .map(|(refno, noun)| (refno, noun, "surreal_name"))
         } else if let Some(parts) = parse_default_name(name) {
-            // owner 优先用本批已解析缓存,否则按名查询。
-            let owner = match by_name.get(parts.owner_name) {
+            // owner 查找:① 本批缓存按 owner 完整描述命中(覆盖嵌套默认命名,
+            // 如 `TMPLATE 1 of EQUIPMENT /x`——遍历序父先子,owner 已解析过);
+            // ② owner 是命名元素(`BRANCH /x`)→ 提取 `/x` 查库。
+            let owner = match by_name.get(parts.owner_desc) {
                 Some(r) => Some(*r),
-                None => query_pe_by_name(dbnum, parts.owner_name)
-                    .await?
-                    .map(|(r, _)| r),
+                None => match named_owner_from_desc(parts.owner_desc) {
+                    Some(owner_name) => match by_name.get(owner_name) {
+                        Some(r) => Some(*r),
+                        None => query_pe_by_name(dbnum, owner_name)
+                            .await?
+                            .map(|(r, _)| r)
+                            .inspect(|r| {
+                                by_name.insert(owner_name.to_string(), *r);
+                            }),
+                    },
+                    None => None,
+                },
             };
             if let Some(owner) = owner {
-                by_name.insert(parts.owner_name.to_string(), owner);
                 if !children_cache.contains_key(&owner) {
                     children_cache.insert(owner, query_owner_children(owner).await?);
                 }
+                // 站点库 noun 是 PDMS 截断名,长度不定:TMPL/SUBE(4)、
+                // GENSEC/JLDATU(6)、SPINE(5,全名)——按 {映射短名, 全名,
+                // 截6, 截4} 多候选匹配(实测 851/1036 子序列)。
                 let short = full_noun_to_short(parts.noun_full);
+                let full_upper = parts.noun_full.to_ascii_uppercase();
+                let take6: String = full_upper.chars().take(6).collect();
+                let take4: String = full_upper.chars().take(4).collect();
                 let children = &children_cache[&owner];
-                children
+                let matched_child = children
                     .iter()
-                    .filter(|c| c.noun.as_deref() == Some(short.as_str()))
-                    .nth(parts.ordinal - 1)
-                    .and_then(|c| c.key.as_deref())
-                    .and_then(refno_from_pe_key)
-                    .map(|refno| (refno, Some(short.clone()), "default_name_rule"))
+                    .filter(|c| {
+                        let Some(n) = c.noun.as_deref() else {
+                            return false;
+                        };
+                        n == short || n == full_upper || n == take6 || n == take4
+                    })
+                    .nth(parts.ordinal - 1);
+                matched_child
+                    .and_then(|c| {
+                        let noun = c.noun.clone();
+                        c.key
+                            .as_deref()
+                            .and_then(refno_from_pe_key)
+                            .map(|refno| (refno, noun))
+                    })
+                    .map(|(refno, noun)| (refno, noun, "default_name_rule"))
             } else {
                 None
             }
@@ -256,9 +297,8 @@ async fn resolve_identities(
 
         match resolved {
             Some((new_refno, noun, src)) => {
-                if name.starts_with('/') {
-                    by_name.insert(name.to_string(), new_refno);
-                }
+                // 全名入缓存:命名元素与默认命名成员都可能是后续成员的 owner。
+                by_name.insert(name.to_string(), new_refno);
                 if verbose {
                     println!(
                         "[rvm-import] resolve {name} -> {new_refno} (source={src})"

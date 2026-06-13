@@ -159,6 +159,37 @@
 
 - 验收数据回填本文件;复跑同输入同输出。
 
+## T005.5 — 821 ZONE 案例:首个生成端缺陷实锤(2026-06-13 09:45)
+
+用户报告 `/03SKID3`(ZONE `2013286704/821`,样本 `2013286704_821.rvm`)
+生成结果与 E3D 截图不符(缺两个料仓设备、部分钢梁)。对拍 + 日志定界:
+
+**对拍工具增强**(随本案例落地,已验证):
+
+- 嵌套默认命名解析(`SNOUT 1 of TMPLATE 1 of EQUIPMENT /x`):owner 描述
+  整名缓存命中 + 命名 owner 提取,遍历序父先子保证 owner 先解析;
+- noun 多候选匹配(站点库截断名长度不定:TMPL/SUBE=4、GENSEC/JLDATU=6、
+  SPINE=5):{映射短名, 全名, 截6, 截4} 四候选;
+- 821 样本解析率:53/127 → **127/127(100%)**。
+
+**生成端缺陷(missing=35 重新生成后复现,确定性)**:
+
+- **EQUI 模板几何全缺**:EQUIP1/EQUIP2 的 `TMPL` 下 CYLI(906/998)、
+  DISH(907/999)、SNOU(908/1000)、SUBE→TMPL→PYRA(941/942/1033/1034)
+  及 NOZZ(852/909/944/1001)共 14 项在 instances.parquet 无行;
+- 生成日志证据:`[Cate:...]` 批次只处理了 FIXING/GENSEC/EQUI/SUBE/
+  PLOO/NOZZ/ELCONN;**CYLI/DISH/SNOU/PYRA 虽在目标 Noun 列表却入口
+  查询为 0 个**——它们是 EQUI→TMPL 下的深层参数化几何,按 target_type
+  的入口 roots 查询不可见;EQUI 作为 root 处理时只生成了部分直属件,
+  未递归 TMPL 模板几何路径;
+- 残余 17 项 JLDATU/PLDATU(datum 定位辅助件)不在目标 Noun 列表,
+  属有意排除(可豁免,RVM 含其标记几何);4 个 BRAN 为既知口径差异。
+
+**修复方向(建议开 spec 010)**:`cata_model` 的 EQUI/CATE 路径需覆盖
+TMPL 子树参数化几何(CYLI/DISH/SNOU/PYRA…),或 IndexTree 入口查询
+增补"EQUI 模板几何"的发现路径;以 821 ZONE 对拍 missing=0(豁免桶外)
+为验收线。
+
 ## T006 — 文档与变更记录
 
 - `CHANGELOG.md` 记录 spec 009;

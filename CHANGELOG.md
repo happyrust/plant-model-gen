@@ -2,6 +2,14 @@
 
 ## 2026-06-14
 
+### Changed — 清理 `refno_assoc_index` 聚合索引代码
+
+> 不再提供基于 `refno_assoc_index` 的模型数据删除路径，避免保留一套已停用的删旧索引 API 和写入链路。
+
+- 删除 `refno_assoc_index` 模块及其 `delete_by_refnos` / `RefnoAssocIndexBatch` 实现。
+- `pdms_inst.rs` 与 `manifold_bool.rs` 不再生成或写入 `refno_assoc_index` 记录，模型生成仍沿用原有业务表写入。
+- 移除 `regen_delete_mode` 配置入口和 DuckLake known-gap 中的 `raw_refno_assoc_index` 说明，避免把已清理机制继续暴露为可选能力。
+
 ### Fixed — EQUI/TMPL 模板原语生成补齐(spec 011)
 
 > `2013286704/821`(`/03SKID3`) 对拍中,EQUI/SUBE 下的 `TMPL` 参数化几何缺失。根因分两层:外部模板 `DESI` 库未进入 precise CATA closure;模板 PRIM 源尺寸为 0,实际尺寸需从父级 `DESP` 经 `DDSE/DDAT` 映射补入。随后发现 `NOZZ.CATR -> SPCO.CATR -> SCOM` 引用链在 fallback 场景未归一化,导致 NOZZ 被当作 tubing 求解且 `gm_out=0`。

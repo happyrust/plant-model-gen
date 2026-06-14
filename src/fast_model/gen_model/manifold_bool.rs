@@ -2250,8 +2250,6 @@ pub async fn run_bool_worker_from_tasks(
     db_option: Arc<aios_core::options::DbOption>,
     sql_writer: Option<Arc<SqlFileWriter>>,
 ) -> anyhow::Result<BoolWorkerReport> {
-    use super::refno_assoc_index::RefnoAssocIndexBatch;
-
     let started = std::time::Instant::now();
     let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
     let deferred_mode = sql_writer.is_some();
@@ -2271,8 +2269,6 @@ pub async fn run_bool_worker_from_tasks(
         "[bool_worker/memory] 启动: total={} defer_db_write={}",
         report.total, report.deferred_mode
     );
-
-    let mut assoc_batch = RefnoAssocIndexBatch::default();
 
     // T6: 批量预查询 DB 状态，用于非 deferred 模式下的增强 skip 判定
     let db_success_set: HashSet<RefnoEnum> = if !replace_exist && !deferred_mode {
@@ -2380,10 +2376,6 @@ pub async fn run_bool_worker_from_tasks(
             Ok((refno, outcome)) => match outcome {
                 Ok(TaskExecOutcome::Success) => {
                     report.success += 1;
-                    let bool_record_id = format!("inst_relate_bool:⟨{}⟩", refno);
-                    let cata_bool_record_id = format!("inst_relate_cata_bool:⟨{}⟩", refno);
-                    assoc_batch.add_inst_relate_bool_id(refno, bool_record_id);
-                    assoc_batch.add_inst_relate_cata_bool_id(refno, cata_bool_record_id);
                 }
                 Ok(TaskExecOutcome::Failed) => {
                     report.failed += 1;
@@ -2399,22 +2391,6 @@ pub async fn run_bool_worker_from_tasks(
             Err(e) => {
                 report.failed += 1;
                 eprintln!("[bool_worker/memory] 任务 panic: {}", e);
-            }
-        }
-    }
-
-    // 写入 refno_assoc_index
-    if !assoc_batch.is_empty() {
-        if let Some(ref w) = sql_writer {
-            if let Err(e) = assoc_batch.write_to_sql_file(w) {
-                eprintln!(
-                    "[bool_worker/memory] refno_assoc_index 写入 SQL 文件失败: {}",
-                    e
-                );
-            }
-        } else {
-            if let Err(e) = assoc_batch.upsert_to_db().await {
-                eprintln!("[bool_worker/memory] refno_assoc_index 写入 DB 失败: {}", e);
             }
         }
     }

@@ -68,7 +68,6 @@ pub mod prim_model; // PRIM 模型生成
 pub mod query; // 查询工具
 pub mod query_compat; // 查询兼容层
 pub mod query_provider; // TreeIndex 查询提供者
-pub mod refno_assoc_index; // refno 关联聚合索引（删旧加速）
 pub mod resolve; // 几何解析
 pub mod sql_file_writer; // 延迟 SQL 文件写入器（零 DB 写入模式）
 pub mod transform_cache; // 变换缓存

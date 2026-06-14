@@ -18,10 +18,6 @@ fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
     BooleanPipelineMode::DbLegacy
 }
 
-fn default_regen_delete_mode() -> RegenDeleteMode {
-    RegenDeleteMode::Legacy
-}
-
 fn default_model_writer_mode() -> ModelWriterMode {
     ModelWriterMode::Surreal
 }
@@ -48,15 +44,6 @@ fn default_mesh_compute_concurrency() -> usize {
 
 fn default_inst_aabb_write_concurrency() -> usize {
     2
-}
-
-fn parse_regen_delete_mode(raw: Option<&str>) -> RegenDeleteMode {
-    match raw.map(|s| s.to_ascii_lowercase()) {
-        // refno_assoc_index 已硬关闭：为兼容旧配置，这里统一降级为 Legacy。
-        Some(mode) if mode == "refno_assoc_index" => RegenDeleteMode::Legacy,
-        Some(_) => RegenDeleteMode::Legacy,
-        None => RegenDeleteMode::Legacy,
-    }
 }
 
 fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
@@ -267,22 +254,6 @@ impl Default for BooleanPipelineMode {
     }
 }
 
-/// regen-model 删旧模式
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RegenDeleteMode {
-    /// 旧路径：多表查询后逐表删除
-    Legacy,
-    /// 已停用：历史上按 refno_assoc_index 聚合索引删除
-    RefnoAssocIndex,
-}
-
-impl Default for RegenDeleteMode {
-    fn default() -> Self {
-        Self::Legacy
-    }
-}
-
 /// 扩展DbOption，添加异地部署相关的配置
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbOptionExt {
@@ -414,12 +385,6 @@ pub struct DbOptionExt {
     /// 刷新前是否清理目标 dbnum 的历史 pe_transform。
     #[serde(default)]
     pub clear_transform_before_refresh: bool,
-
-    /// regen-model 删旧模式。
-    ///
-    /// 注意：`refno_assoc_index` 已停用；即使旧配置显式填写，也会在解析时统一降级到 `Legacy`。
-    #[serde(default = "default_regen_delete_mode")]
-    pub regen_delete_mode: RegenDeleteMode,
 
     /// 布尔运算前是否从 DB 批量补齐缺失的 cata 任务
     #[serde(default)]
@@ -694,7 +659,6 @@ impl From<DbOption> for DbOptionExt {
             transform_ducklake_metadata: None,
             transform_ducklake_data_path: None,
             clear_transform_before_refresh: false,
-            regen_delete_mode: RegenDeleteMode::Legacy,
             enable_db_backfill: false,
             gen_model_dry_run: false,
             batch_channel_capacity: default_batch_channel_capacity(),
@@ -924,9 +888,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let regen_delete_mode =
-        parse_regen_delete_mode(toml_value.get("regen_delete_mode").and_then(|v| v.as_str()));
-
     let enable_db_backfill = toml_value
         .get("enable_db_backfill")
         .and_then(|v| v.as_bool())
@@ -1002,7 +963,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         transform_ducklake_metadata,
         transform_ducklake_data_path,
         clear_transform_before_refresh,
-        regen_delete_mode,
         enable_db_backfill,
         gen_model_dry_run,
         batch_channel_capacity,
@@ -1057,10 +1017,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         "   - boolean_pipeline_mode: {:?}",
         db_option_ext.boolean_pipeline_mode
     );
-    println!(
-        "   - regen_delete_mode: {:?}",
-        db_option_ext.regen_delete_mode
-    );
     if db_option_ext.enable_db_backfill {
         println!("   - enable_db_backfill: true");
     }
@@ -1073,7 +1029,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
 #[cfg(test)]
 mod tests {
-    use super::{DbOptionExt, RegenDeleteMode, parse_regen_delete_mode, validate_data_source_mode};
+    use super::{DbOptionExt, validate_data_source_mode};
     use aios_core::options::DbOption;
     use std::path::PathBuf;
 
@@ -1081,14 +1037,6 @@ mod tests {
     fn data_source_mode_requires_fixed_surreal_input() {
         assert!(validate_data_source_mode(true).is_ok());
         assert!(validate_data_source_mode(false).is_err());
-    }
-
-    #[test]
-    fn regen_delete_mode_refno_assoc_index_is_forced_to_legacy() {
-        assert_eq!(
-            parse_regen_delete_mode(Some("refno_assoc_index")),
-            RegenDeleteMode::Legacy
-        );
     }
 
     #[test]

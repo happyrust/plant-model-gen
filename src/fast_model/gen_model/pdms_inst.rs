@@ -26,16 +26,10 @@ use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
-use super::refno_assoc_index::RefnoAssocIndexBatch;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 use crate::fast_model::shared::aabb_apply_transform;
 // use crate::fast_model::EXIST_MESH_GEOS;
-
-#[inline]
-fn is_refno_assoc_index_enabled() -> bool {
-    true
-}
 
 const MAX_FAILED_SQL_DUMPS_PER_RUN: usize = 20;
 static FAILED_SQL_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -584,39 +578,6 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     let t = std::time::Instant::now();
 
-    if is_refno_assoc_index_enabled() {
-        let index_started = std::time::Instant::now();
-        let summary = super::refno_assoc_index::delete_by_refnos(&all_refnos, CHUNK_SIZE).await?;
-        println!(
-            "[pre_cleanup_for_regen] refno_assoc_index requested_refnos={} indexed_refnos={} cache_miss_refnos={} used_index={} deleted_statements={} inst_relate_ids={} inst_info_ids={} geo_relate_ids={} geo_hashes={} neg_relate_ids={} ngmr_relate_ids={} inst_relate_bool_ids={} inst_relate_cata_bool_ids={} inst_relate_aabb_ids={} tubi_branch_keys={} prefetched_ref0_groups={} overfetched_rows={} elapsed_ms={}",
-            summary.requested_refnos,
-            summary.indexed_refnos,
-            summary.cache_miss_refnos,
-            summary.used_index,
-            summary.deleted_statement_count,
-            summary.inst_relate_ids,
-            summary.inst_info_ids,
-            summary.geo_relate_ids,
-            summary.geo_hashes,
-            summary.neg_relate_ids,
-            summary.ngmr_relate_ids,
-            summary.inst_relate_bool_ids,
-            summary.inst_relate_cata_bool_ids,
-            summary.inst_relate_aabb_ids,
-            summary.tubi_branch_keys,
-            summary.prefetched_ref0_groups,
-            summary.overfetched_rows,
-            index_started.elapsed().as_millis()
-        );
-        if summary.used_index {
-            println!(
-                "[pre_cleanup_for_regen] 清理完成 (refno_assoc_index 模式)，耗时 {} ms",
-                t.elapsed().as_millis()
-            );
-            return Ok(());
-        }
-    }
-
     let refno_dbnum_map = query_refno_dbnum_map(&all_refnos, CHUNK_SIZE).await;
     let mut refnos_by_dbnum: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
     for &refno in &all_refnos {
@@ -819,12 +780,6 @@ pub async fn save_instance_data_with_report(
                 || debug_filters.contains(&target.to_string()))
     };
     let mut debug_neg_pairs: Vec<(RefnoEnum, RefnoEnum)> = Vec::new();
-    let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
-        Some(RefnoAssocIndexBatch::default())
-    } else {
-        None
-    };
-
     let mut aabb_map: HashMap<u64, String> = HashMap::new();
     let mut transform_map: HashMap<u64, String> = HashMap::new();
     let inst_refnos: Vec<RefnoEnum> = inst_mgr.inst_info_map.keys().copied().collect();
@@ -902,15 +857,6 @@ pub async fn save_instance_data_with_report(
             );
             let relate_id = gen_string_hash(&relate_json);
             geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_info_id(
-                    inst_geo_data.refno,
-                    format!("inst_info:⟨{}⟩", inst_geo_data.id()),
-                );
-                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
-                batch.add_geo_hash(inst_geo_data.refno, inst.geo_hash.to_string());
-            }
-
             // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
             // carrier_refno: 拥有这个 geo_relate 的实体
             // geom_refno: inst.refno (geo_relate 中的 geom_refno 字段)
@@ -1093,13 +1039,6 @@ pub async fn save_instance_data_with_report(
                             );
                             debug_neg_pairs.push((*target, *neg_refno));
                         }
-                        if let Some(batch) = refno_assoc_batch.as_mut() {
-                            batch.add_neg_relate_id(
-                                *neg_refno,
-                                format!("neg_relate:['{}',{}]", geo_relate_id, target.to_pe_key()),
-                            );
-                        }
-
                         if neg_buffer.len() >= CHUNK_SIZE {
                             let statement = if replace_exist {
                                 format!(
@@ -1196,13 +1135,6 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                             target_pe,      // 正实体（目标）
                             ngmr_pe         // NGMR 几何引用
                         ));
-                        if let Some(batch) = refno_assoc_batch.as_mut() {
-                            batch.add_ngmr_relate_id(
-                                *ele_refno,
-                                format!("ngmr_relate:['{}',{}]", geo_relate_id, target_pe),
-                            );
-                        }
-
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             let statement = if replace_exist {
                                 format!(
@@ -1257,11 +1189,6 @@ FROM neg_relate WHERE out = {} AND pe = {}",
 
     for (key, info) in &inst_mgr.inst_info_map {
         inst_keys.push(*key);
-        if let Some(batch) = refno_assoc_batch.as_mut() {
-            batch.add_inst_relate_id(*key, key.to_inst_relate_key());
-            batch.add_inst_relate_bool_id(*key, format!("inst_relate_bool:⟨{}⟩", key));
-            batch.add_inst_info_id(*key, format!("inst_info:⟨{}⟩", info.id_str()));
-        }
 
         if info.world_transform.translation.is_nan()
             || info.world_transform.rotation.is_nan()
@@ -1301,9 +1228,6 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                 key.to_pe_key(),
                 aabb_hash
             );
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_relate_aabb_id(*key, key.to_table_key("inst_relate_aabb"));
-            }
             inst_relate_aabb_buffer.push(aabb_row_sql);
             inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
         }
@@ -1377,10 +1301,6 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                 || info.world_transform.scale.is_nan()
             {
                 continue;
-            }
-
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_tubi_branch_key(info.refno, info.refno.to_pe_key());
             }
 
             // 收集 aabb 数据（用于 tubi_relate）
@@ -1529,16 +1449,6 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         }
 
         vec3_batcher.finish().await?;
-    }
-
-    if let Some(batch) = refno_assoc_batch.as_ref() {
-        if !batch.is_empty() {
-            batch.upsert_to_db().await?;
-            debug_model_debug!(
-                "save_instance_data_optimize upsert refno_assoc_index: refnos={}",
-                inst_mgr.inst_info_map.len()
-            );
-        }
     }
 
     debug_model_debug!(
@@ -2673,12 +2583,6 @@ pub async fn save_instance_data_to_sql_file(
     mesh_aabb_map: &DashMap<String, Aabb>,
 ) -> anyhow::Result<()> {
     const CHUNK_SIZE: usize = 200;
-    let mut refno_assoc_batch = if is_refno_assoc_index_enabled() {
-        Some(RefnoAssocIndexBatch::default())
-    } else {
-        None
-    };
-
     writer.write_comment(&format!(
         "batch: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}",
         inst_mgr.inst_info_map.len(),
@@ -2785,14 +2689,6 @@ pub async fn save_instance_data_to_sql_file(
             );
             let relate_id = gen_string_hash(&relate_json);
             geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_info_id(
-                    inst_geo_data.refno,
-                    format!("inst_info:⟨{}⟩", inst_geo_data.id()),
-                );
-                batch.add_geo_relate_id(inst_geo_data.refno, format!("geo_relate:⟨{}⟩", relate_id));
-                batch.add_geo_hash(inst_geo_data.refno, inst.geo_hash.to_string());
-            }
 
             use aios_core::geometry::GeoBasicType;
             let carrier_refno = inst_geo_data.refno;
@@ -2877,12 +2773,6 @@ pub async fn save_instance_data_to_sql_file(
                             neg_refno.to_pe_key(),
                             target.to_pe_key(),
                         ));
-                        if let Some(batch) = refno_assoc_batch.as_mut() {
-                            batch.add_neg_relate_id(
-                                *neg_refno,
-                                format!("neg_relate:['{}',{}]", geo_relate_id, target.to_pe_key()),
-                            );
-                        }
                         if neg_buffer.len() >= CHUNK_SIZE {
                             writer.write_statement(&format!(
                                 "INSERT RELATION IGNORE INTO neg_relate [{}]",
@@ -2917,12 +2807,6 @@ pub async fn save_instance_data_to_sql_file(
                             "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
                             geo_relate_id, ele_pe, target_pe, ngmr_pe
                         ));
-                        if let Some(batch) = refno_assoc_batch.as_mut() {
-                            batch.add_ngmr_relate_id(
-                                *ele_refno,
-                                format!("ngmr_relate:['{}',{}]", geo_relate_id, target_pe),
-                            );
-                        }
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             writer.write_statement(&format!(
                                 "INSERT RELATION IGNORE INTO ngmr_relate [{}]",
@@ -2949,11 +2833,6 @@ pub async fn save_instance_data_to_sql_file(
     let mut inst_relate_aabb_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
     for (key, info) in &inst_mgr.inst_info_map {
-        if let Some(batch) = refno_assoc_batch.as_mut() {
-            batch.add_inst_relate_id(*key, key.to_inst_relate_key());
-            batch.add_inst_relate_bool_id(*key, format!("inst_relate_bool:⟨{}⟩", key));
-            batch.add_inst_info_id(*key, format!("inst_info:⟨{}⟩", info.id_str()));
-        }
         if info.world_transform.translation.is_nan()
             || info.world_transform.rotation.is_nan()
             || info.world_transform.scale.is_nan()
@@ -2989,9 +2868,6 @@ pub async fn save_instance_data_to_sql_file(
                 aabb_hash
             ));
             inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_inst_relate_aabb_id(*key, key.to_table_key("inst_relate_aabb"));
-            }
         }
 
         // inst_relate: 使用预计算值替代 fn::find_ancestor_type / fn::ses_date
@@ -3021,14 +2897,6 @@ pub async fn save_instance_data_to_sql_file(
                 inst_relate_buffer.join(",")
             ))?;
             inst_relate_buffer.clear();
-        }
-    }
-
-    if !inst_mgr.inst_tubi_map.is_empty() {
-        for (_key, info) in &inst_mgr.inst_tubi_map {
-            if let Some(batch) = refno_assoc_batch.as_mut() {
-                batch.add_tubi_branch_key(info.refno, info.refno.to_pe_key());
-            }
         }
     }
 
@@ -3121,12 +2989,6 @@ pub async fn save_instance_data_to_sql_file(
                 "INSERT IGNORE INTO vec3 [{}]",
                 json_buffer.join(",")
             ))?;
-        }
-    }
-
-    if let Some(batch) = refno_assoc_batch.as_ref() {
-        if !batch.is_empty() {
-            batch.write_to_sql_file(writer)?;
         }
     }
 

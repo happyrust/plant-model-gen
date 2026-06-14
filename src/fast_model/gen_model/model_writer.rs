@@ -805,7 +805,6 @@ pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContr
             "raw_aabb(tubi)",
             "raw_trans",
             "raw_vec3(tubi)",
-            "raw_refno_assoc_index",
         ]
     } else {
         Vec::new()

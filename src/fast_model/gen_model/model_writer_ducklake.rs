@@ -16,9 +16,8 @@
 //
 // Phase 1 trait gap tables NOT written by this backend (per Q1=C scope lock):
 //   * raw_tubi_info / raw_tubi_relate / raw_aabb(tubi) / raw_trans
-//     / raw_vec3(tubi) / raw_refno_assoc_index
-//   They remain in `cata_model.rs` / `refno_assoc_index.rs` direct
-//   SurrealQL writes; closure is the responsibility of a future goal
+//     / raw_vec3(tubi)
+//   They remain in `cata_model.rs` direct SurrealQL writes; closure is the responsibility of a future goal
 //   (`09-phase-1-tubi-trait-migration`).
 //
 // Projection 9 tables and projection refresh SQL are deferred to a future
@@ -93,13 +92,12 @@ fn create_table_ddl(table: &str) -> String {
 ///
 /// Reported verbatim in `finalize().stage_reports` so downstream parity
 /// scripts can diff against an authoritative list.
-const DUCKLAKE_KNOWN_GAP_TABLES: [&str; 6] = [
+const DUCKLAKE_KNOWN_GAP_TABLES: [&str; 5] = [
     "raw_tubi_info",
     "raw_tubi_relate",
     "raw_aabb(tubi)",
     "raw_trans",
     "raw_vec3(tubi)",
-    "raw_refno_assoc_index",
 ];
 
 /// DuckLake namespace per `.factory/mission-docs/model-writer-storage/02-canonical-schema.md`.
@@ -623,12 +621,11 @@ impl ModelWriterBackend for DuckLakeModelWriterBackend {
                 "raw_aabb(tubi)" => "known_gap:raw_aabb_tubi",
                 "raw_trans" => "known_gap:raw_trans",
                 "raw_vec3(tubi)" => "known_gap:raw_vec3_tubi",
-                "raw_refno_assoc_index" => "known_gap:raw_refno_assoc_index",
                 _ => "known_gap:unknown",
             };
             self.record_report(ModelWriterStageReport::skipped(
                 stage_name,
-                "phase1 trait gap: written outside ModelWriterBackend (cata_model.rs / refno_assoc_index.rs); see goals/ducklake-model-writer/brief.md Q1=C scope",
+                "phase1 trait gap: written outside ModelWriterBackend (cata_model.rs); see goals/ducklake-model-writer/brief.md Q1=C scope",
                 0,
             ))?;
         }

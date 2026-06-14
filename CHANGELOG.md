@@ -2,6 +2,15 @@
 
 ## 2026-06-14
 
+### Added — MBD 名称驱动的一键快速部署测试接口
+
+> `quick-deploy-test` 支持只传 MBD 名称和搜索根，后端自动扫描工程目录、定位 `/ALL` 的成员 DB 与依赖项目库，再按目标 DB `aps250132_0001` 进入现有部署流水线。
+
+- `QuickDeployTestRequest` 新增 `projects` / `mbd_name` / `search_roots`，兼容原来的 `project_path + db_file/dbnum` 调用方式。
+- `managed_project_sites.rs` 复用 sidecar 的 `projects/scan` 与 `projects/mdb-candidates`，自动发现 design/library 工程组成、校验 MBD candidate 的 missing/ambiguous 状态，并回填 `project_path/projects/dbnum/db_file`。
+- `/api/admin/quick-deploy-test` 与 admin quick deploy 都可使用 `mbd_name="/ALL"`；`wait=false` 时继续复用持久化任务表返回 `task_id` 供轮询。
+- `goals/versioned-model-record-id/facts.md` 修正目标事实：`aps250132_0001` 是目标 DB 文件，`/ALL` 是 MBD 名称。
+
 ### Changed — 清理 `refno_assoc_index` 聚合索引代码
 
 > 不再提供基于 `refno_assoc_index` 的模型数据删除路径，避免保留一套已停用的删旧索引 API 和写入链路。

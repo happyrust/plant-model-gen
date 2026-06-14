@@ -1251,6 +1251,15 @@ pub struct QuickDeployTestRequest {
     /// 工程根目录（绝对路径）
     #[serde(default)]
     pub project_path: String,
+    /// 工程组成。测试 API 可直接传入，也可由 mbd_name/search_roots 自动发现。
+    #[serde(default)]
+    pub projects: Vec<SiteProject>,
+    /// MBD 名称（例如 `/ALL`）。提供后优先按 search_roots/project_path 自动发现成员 DB 和依赖工程。
+    #[serde(default)]
+    pub mbd_name: Option<String>,
+    /// MBD 自动发现搜索根。可传工程集合父目录；后端会扫描并识别 design/library 工程。
+    #[serde(default)]
+    pub search_roots: Vec<String>,
     /// E3D 项目名；缺省取 project_path 目录名，站点显示名用默认递增名 quicktest-N
     #[serde(default)]
     pub project_name: Option<String>,

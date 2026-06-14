@@ -1,0 +1,24 @@
+# Versioned Model Record ID Facts
+
+- 目标名称是“模型数据版本化 Record ID 重构”，不是单纯的 refno range cleanup。
+- 模型生成产物表的新 record id 采用 SurrealDB array id，基础结构为 `[ref0, ref1, sesno, ...extra]`。
+- `pe` 主表 record id 保持现状，不做迁移；模型数据表通过 `[ref0, ref1, sesno]` 承载版本维度。
+- `pe -> inst_relate -> inst_info/geo_relate` 的 latest/current 查询语义必须保持可用；默认 current 使用 `sesno = 0`。
+- 历史版本查询必须能按目标 `sesno` 定位模型数据，例如查询 `inst_relate:[ref0, ref1, sesno]`。
+- `inst_relate` 的 ID 必须考虑 `pe` 的 `sesno`，使同一 `pe` 的不同版本模型数据可以并存。
+- `tubi_relate` 也必须纳入版本维度，并按照 BRAN 的 `sesno` 构造可 range cleanup、可版本查询的 ID。
+- 本目标的目标 DB 文件为 `aps250132_0001`，MBD 名称指定为 `/ALL`；后续配置、输出目录和验证命名应区分二者。
+- 系统应能基于 MBD 名称和相关项目路径快速搜索目录，自动找到依赖项目库。
+- 依赖项目库自动发现应复用或扩展现有多工程项目路径候选、显式 library role、CATA closure manifest 和 db_index 对齐机制。
+- `RefnoEnum::Refno` 使用 `sesno = 0` 表示 latest/current；`RefnoEnum::SesRef` 使用真实 `sesno`。
+- 新实现不兼容旧 `table:⟨ref0_ref1⟩` 模型产物数据，不做旧数据迁移，不做 dual write，不做 dual cleanup。
+- 新增模型产物专用 record id helper，不复用或修改 `pe`、`pe_transform` 等通用 key helper。
+- 一对一模型产物表包括 `inst_relate`、`inst_relate_aabb`、`inst_relate_bool`、`inst_relate_cata_bool`、`refno_relations`，应使用 `[ref0, ref1, sesno]` ID。
+- `geo_relate` 不再用 `gen_string_hash(relate_json)` 作为主 ID，应在同一 `[carrier_ref0, carrier_ref1, carrier_sesno]` 内使用稳定递增的 `geo_index`。
+- `neg_relate` 和 `ngmr_relate` 必须保存并引用完整的新 `geo_relate` record id，不能再传裸 hash/string id。
+- `neg_relate` 和 `ngmr_relate` 的 ID 前缀所有权必须在实施前锁定，否则按 target refno/sesno 重生成时可能无法只靠 range 删除旧关系。
+- 清理主路径必须使用 SurrealDB record id range；`refno_assoc_index` 不再作为模型产物清理主路径。
+- `inst_geo` 清理仍需要先从将删除的 `geo_relate.out` 收集 hash，再删除 hash 大于等于 10 的 `inst_geo` 记录。
+- 读路径不能继续假设 `record::id(in)` 可直接转换为同 ID 的 `inst_relate_aabb`、`inst_relate_bool` 等模型产物 record id。
+- `save_instance_data_to_sql_file` 的删除 SQL file 方案不纳入本开发计划，应从实施范围中移除。
+- 验证禁止使用 `cargo test` 或编译 test；`aios-database` 通过 CLI、JSON 输出和 Surreal 查询验证。

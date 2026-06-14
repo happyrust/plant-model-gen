@@ -41,8 +41,9 @@ use super::models::{
     ManagedSiteParseStatus, ManagedSitePreflightCheck, ManagedSitePreflightReport,
     ManagedSitePreflightStatus, ManagedSiteProcessResource, ManagedSiteReconcileResponse,
     ManagedSiteResourceMetrics, ManagedSiteRiskLevel, ManagedSiteRuntimeStatus, ManagedSiteStatus,
-    ParsePlanFact, PreviewManagedSiteParsePlanRequest, ProjectRole, QuickDeployTestRequest,
-    QuickDeployTestResponse, ScanProjectsResult, SiteProject, UpdateManagedSiteRequest,
+    MdbCandidatesRequest, ParsePlanFact, PreviewManagedSiteParsePlanRequest, ProjectRole,
+    QuickDeployTestRequest, QuickDeployTestResponse, ScanProjectsResult, SiteProject,
+    UpdateManagedSiteRequest,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -3603,6 +3604,305 @@ impl QuickDeployProfile {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct QuickDeployScanProjectsResult {
+    #[serde(default)]
+    projects: Vec<SiteProject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickDeployMdbCandidatesResult {
+    #[serde(default)]
+    candidates: Vec<QuickDeployMdbCandidate>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickDeployMdbCandidate {
+    mdb_name: String,
+    project: String,
+    #[serde(default)]
+    db_files: Vec<QuickDeployMdbDbFileStatus>,
+    #[serde(default)]
+    ready_to_deploy: bool,
+    #[serde(default)]
+    missing_count: usize,
+    #[serde(default)]
+    ambiguous_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickDeployMdbDbFileStatus {
+    dbnum: u32,
+    #[serde(default)]
+    db_type: String,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    file_path: String,
+    #[serde(default)]
+    status: String,
+}
+
+fn normalize_quick_deploy_mbd_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    with_slash.to_ascii_uppercase()
+}
+
+fn quick_deploy_basename(raw: &str) -> String {
+    Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
+}
+
+fn quick_deploy_db_file_matches(status: &QuickDeployMdbDbFileStatus, db_file: &str) -> bool {
+    let wanted = quick_deploy_basename(db_file);
+    status.file_name.eq_ignore_ascii_case(&wanted)
+        || quick_deploy_basename(&status.file_path).eq_ignore_ascii_case(&wanted)
+}
+
+fn choose_quick_deploy_mbd_target<'a>(
+    candidate: &'a QuickDeployMdbCandidate,
+    req: &QuickDeployTestRequest,
+) -> Result<&'a QuickDeployMdbDbFileStatus> {
+    let matched = if let Some(dbnum) = req.dbnum.filter(|dbnum| *dbnum > 0) {
+        candidate
+            .db_files
+            .iter()
+            .find(|status| status.dbnum == dbnum)
+    } else if let Some(db_file) = req
+        .db_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        candidate
+            .db_files
+            .iter()
+            .find(|status| quick_deploy_db_file_matches(status, db_file))
+    } else {
+        let design_members = candidate
+            .db_files
+            .iter()
+            .filter(|status| status.db_type.eq_ignore_ascii_case("DESI"))
+            .collect::<Vec<_>>();
+        if design_members.len() == 1 {
+            design_members.into_iter().next()
+        } else {
+            None
+        }
+    };
+
+    let Some(target) = matched else {
+        bail!(
+            "MBD {}（工程 {}）中未找到目标 db_file/dbnum；请传 db_file 或 dbnum 指定目标设计库",
+            candidate.mdb_name,
+            candidate.project
+        );
+    };
+
+    if !target.status.eq_ignore_ascii_case("available") {
+        bail!(
+            "MBD {} 的目标 DB {} 状态为 {}，不能快速部署",
+            candidate.mdb_name,
+            target.dbnum,
+            target.status
+        );
+    }
+    Ok(target)
+}
+
+fn normalize_quick_deploy_projects(projects: &mut [SiteProject]) {
+    if projects.is_empty() {
+        return;
+    }
+    let primary_idx = projects
+        .iter()
+        .position(|project| matches!(project.role, ProjectRole::Design))
+        .unwrap_or(0);
+    for (idx, project) in projects.iter_mut().enumerate() {
+        project.is_primary = idx == primary_idx;
+        project.sort_order = idx as u32;
+    }
+}
+
+async fn discover_quick_deploy_projects(req: &QuickDeployTestRequest) -> Result<Vec<SiteProject>> {
+    if !req.projects.is_empty() {
+        let mut projects = req.projects.clone();
+        normalize_quick_deploy_projects(&mut projects);
+        return Ok(projects);
+    }
+
+    let mut roots = req
+        .search_roots
+        .iter()
+        .map(|root| root.trim())
+        .filter(|root| !root.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let project_path = req.project_path.trim();
+    if !project_path.is_empty()
+        && !roots
+            .iter()
+            .any(|root| root.eq_ignore_ascii_case(project_path))
+    {
+        roots.push(project_path.to_string());
+    }
+    if roots.is_empty() {
+        bail!("按 MBD 名称快速部署时必须提供 search_roots 或 project_path");
+    }
+
+    let mut projects = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for root in roots {
+        let value = crate::web_server::parse_sidecar_client::scan_projects(&root)
+            .await
+            .map_err(|err| anyhow!("扫描工程目录失败 root={root}: {}", err.message))?;
+        let scan: QuickDeployScanProjectsResult =
+            serde_json::from_value(value).context("解析工程扫描响应失败")?;
+        for project in scan.projects {
+            let key = project.path.to_ascii_lowercase();
+            if seen_paths.insert(key) {
+                projects.push(project);
+            }
+        }
+    }
+
+    if projects.is_empty() {
+        bail!("未在 search_roots/project_path 下发现可部署的 E3D 工程");
+    }
+    normalize_quick_deploy_projects(&mut projects);
+    Ok(projects)
+}
+
+async fn resolve_quick_deploy_mbd_request(
+    mut req: QuickDeployTestRequest,
+) -> Result<(QuickDeployTestRequest, Vec<String>)> {
+    let Some(mbd_name) = req
+        .mbd_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_quick_deploy_mbd_name)
+    else {
+        return Ok((req, Vec::new()));
+    };
+
+    let projects = discover_quick_deploy_projects(&req).await?;
+    let primary = projects
+        .iter()
+        .find(|project| project.is_primary)
+        .or_else(|| projects.first())
+        .ok_or_else(|| anyhow!("未发现可作为主工程的项目路径"))?;
+    let primary_path = primary.path.clone();
+    let primary_name = primary.name.clone();
+
+    let value = crate::web_server::parse_sidecar_client::mdb_candidates(MdbCandidatesRequest {
+        site_id: None,
+        projects: projects.clone(),
+        project_name: req.project_name.clone().unwrap_or_default(),
+        project_path: primary_path.clone(),
+    })
+    .await
+    .map_err(|err| anyhow!("MBD 候选发现失败: {}", err.message))?;
+    let result: QuickDeployMdbCandidatesResult =
+        serde_json::from_value(value).context("解析 MBD 候选发现响应失败")?;
+
+    let matching = result
+        .candidates
+        .iter()
+        .filter(|candidate| normalize_quick_deploy_mbd_name(&candidate.mdb_name) == mbd_name)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        bail!(
+            "未在已发现工程中找到 MBD {mbd}; warnings={warnings}",
+            mbd = mbd_name,
+            warnings = result.warnings.join("；")
+        );
+    }
+
+    let mut target_matches = Vec::new();
+    for candidate in matching {
+        if let Ok(target) = choose_quick_deploy_mbd_target(candidate, &req) {
+            target_matches.push((candidate, target));
+        }
+    }
+
+    if target_matches.is_empty() {
+        bail!(
+            "找到 MBD {mbd}，但没有候选匹配目标 db_file/dbnum；请确认目标 DB 属于该 MBD",
+            mbd = mbd_name
+        );
+    }
+    if target_matches.len() > 1 {
+        let details = target_matches
+            .iter()
+            .map(|(candidate, target)| {
+                format!(
+                    "{}:{}:{}",
+                    candidate.project, target.dbnum, target.file_name
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "MBD {mbd} 匹配到多个目标 DB 候选，请缩小 search_roots: {details}",
+            mbd = mbd_name
+        );
+    }
+
+    let (candidate, target) = target_matches[0];
+    if !candidate.ready_to_deploy {
+        bail!(
+            "MBD {} 依赖不完整: missing={}, ambiguous={}",
+            candidate.mdb_name,
+            candidate.missing_count,
+            candidate.ambiguous_count
+        );
+    }
+
+    req.projects = projects;
+    req.project_path = primary_path;
+    req.dbnum = Some(target.dbnum);
+    req.db_file = Some(if target.file_name.is_empty() {
+        quick_deploy_basename(&target.file_path)
+    } else {
+        target.file_name.clone()
+    });
+    if req
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        req.project_name = Some(primary_name);
+    }
+
+    let mut warnings = result.warnings.clone();
+    warnings.push(format!(
+        "MBD {} 已解析为工程 {}，目标 DB {} ({})，依赖工程数 {}",
+        candidate.mdb_name,
+        candidate.project,
+        target.dbnum,
+        req.db_file.as_deref().unwrap_or_default(),
+        req.projects.len()
+    ));
+    Ok((req, warnings))
+}
+
 async fn resolve_db_file_via_sidecar(
     project_roots: &[PathBuf],
     db_file: &str,
@@ -3669,6 +3969,7 @@ async fn quick_create_deploy_config(
     profile: QuickDeployProfile,
 ) -> Result<QuickDeployTestResponse> {
     let started = Instant::now();
+    let (req, mut discovery_warnings) = resolve_quick_deploy_mbd_request(req).await?;
 
     let project_path = req.project_path.trim().to_string();
     let canonical = if project_path.is_empty() {
@@ -3721,12 +4022,14 @@ async fn quick_create_deploy_config(
             name = site_name
         ));
     }
+    discovery_warnings.extend(warnings);
+    let warnings = discovery_warnings;
 
     let project_code = req.project_code.filter(|code| *code > 0).unwrap_or(1);
     let (db_user, db_password) = profile.db_credentials(dbnum);
     let site = create_site(CreateManagedSiteRequest {
         site_name: Some(site_name),
-        projects: Vec::new(),
+        projects: req.projects.clone(),
         project_name: e3d_project_name,
         project_path: canonical.to_string_lossy().to_string(),
         project_code,
@@ -3796,6 +4099,7 @@ async fn quick_deploy(
     profile: QuickDeployProfile,
 ) -> Result<QuickDeployTestResponse> {
     let started = Instant::now();
+    let (req, discovery_warnings) = resolve_quick_deploy_mbd_request(req).await?;
 
     let project_path = req.project_path.trim().to_string();
     let canonical = if project_path.is_empty() {
@@ -3857,7 +4161,7 @@ async fn quick_deploy(
     let (db_user, db_password) = profile.db_credentials(dbnum);
     let create_req = CreateManagedSiteRequest {
         site_name: Some(site_name.clone()),
-        projects: Vec::new(),
+        projects: req.projects.clone(),
         project_name: e3d_project_name.clone(),
         project_path: canonical.to_string_lossy().to_string(),
         project_code,
@@ -3967,7 +4271,8 @@ async fn quick_deploy(
                     )
                 }
             };
-        let mut warnings = name_warnings;
+        let mut warnings = discovery_warnings.clone();
+        warnings.extend(name_warnings);
         warnings.extend(task_warnings);
 
         return Ok(QuickDeployTestResponse {
@@ -4009,7 +4314,8 @@ async fn quick_deploy(
     };
 
     let parsed = final_site.parse_status == ManagedSiteParseStatus::Parsed;
-    let mut warnings = name_warnings;
+    let mut warnings = discovery_warnings;
+    warnings.extend(name_warnings);
     if let Err(err) = &pipeline_result {
         warnings.push(format!("pipeline 错误: {err}"));
     }

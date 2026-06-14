@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-06-15
+
+### Added — 模型产物版本化 array record id helper
+
+> `versioned-model-record-id` 实施进入独立 worktree，先落地 `[ref0, ref1, sesno]` 模型产物 ID helper，并锁定 `neg_relate/ngmr_relate` 的 target-first range cleanup 前缀。
+
+- 新增 `goals/versioned-model-record-id/goal.md` / `plan.md` / `implementation-decisions.md`，明确本轮只在 `D:\work\plant-code\plant-model-gen-range-id` 实施、禁止 Rust tests/test targets，并记录 D1 决策：`neg_relate/ngmr_relate` 采用 target-first array record id。
+- 新增 `model_record_id.rs`，提供 `model_refno_id`、`model_refno_id_with_sesno`、`geo_relate_id`、`tubi_relate_id`、`neg_relate_id`、`ngmr_relate_id` 以及 ref0/refno/sesno range helper。
+- `pdms_inst.rs` 的在线写入首批切换到新 helper：`inst_relate` 与 `inst_relate_aabb` 不再使用旧 `to_inst_relate_key()` / `to_table_key("inst_relate_aabb")` 构造模型产物 ID。
+- 验证：`rustfmt --edition 2024`；`cargo check --lib --features "review"` 通过，未运行 Rust tests/test targets。
+
 ## 2026-06-14
 
 ### Added — MBD 名称驱动的一键快速部署测试接口

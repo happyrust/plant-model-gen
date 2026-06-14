@@ -47,6 +47,7 @@ pub mod utilities; // 预检查协调器
 
 // Mesh 处理
 pub mod mesh_processing;
+pub mod model_record_id;
 pub mod model_writer;
 #[cfg(feature = "model-writer-ducklake")]
 pub mod model_writer_ducklake;

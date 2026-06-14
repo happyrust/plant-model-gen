@@ -26,6 +26,7 @@ use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
+use super::model_record_id::model_refno_id;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 use crate::fast_model::shared::aabb_apply_transform;
@@ -1222,14 +1223,15 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                 entry.insert(serde_json::to_string(&aabb)?);
             }
 
+            let inst_relate_aabb_id = model_refno_id("inst_relate_aabb", *key);
             let aabb_row_sql = format!(
                 "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                inst_relate_aabb_id,
                 key.to_pe_key(),
                 aabb_hash
             );
             inst_relate_aabb_buffer.push(aabb_row_sql);
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(inst_relate_aabb_id);
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
@@ -1239,9 +1241,10 @@ FROM neg_relate WHERE out = {} AND pe = {}",
             .filter(|dbnum| *dbnum != 0)
             .unwrap_or_else(|| inst_relate_precomputed.dbnum(key));
         let dt = inst_relate_precomputed.dt(key);
+        let inst_relate_id = model_refno_id("inst_relate", *key);
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: {4}, has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
-            key.to_inst_relate_key(),
+            inst_relate_id,
             key.to_pe_key(),
             info.id_str(),
             dbnum,
@@ -1676,13 +1679,14 @@ pub fn build_inst_relate_aabb_rows(
                 entry.insert(serde_json::to_string(&aabb)?);
             }
 
+            let inst_relate_aabb_id = model_refno_id("inst_relate_aabb", *key);
             inst_relate_aabb_rows.push(format!(
                 "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                inst_relate_aabb_id,
                 key.to_pe_key(),
                 aabb_hash
             ));
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(inst_relate_aabb_id);
         }
     }
 
@@ -2861,13 +2865,14 @@ pub async fn save_instance_data_to_sql_file(
             if let Entry::Vacant(entry) = aabb_map.entry(aabb_hash) {
                 entry.insert(serde_json::to_string(&aabb)?);
             }
+            let inst_relate_aabb_id = model_refno_id("inst_relate_aabb", *key);
             inst_relate_aabb_buffer.push(format!(
                 "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                inst_relate_aabb_id,
                 key.to_pe_key(),
                 aabb_hash
             ));
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(inst_relate_aabb_id);
         }
 
         // inst_relate: 使用预计算值替代 fn::find_ancestor_type / fn::ses_date
@@ -2875,10 +2880,11 @@ pub async fn save_instance_data_to_sql_file(
         let spec_value = precomputed.spec_value(key);
         let dt = precomputed.dt(key);
         let dbnum = precomputed.dbnum(key);
+        let inst_relate_id = model_refno_id("inst_relate", *key);
 
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: {4}, spec_value: {5}, dt: {6}, has_cata_neg: {7}, solid: {8}, owner_refno: {9}, owner_type: '{10}'}}",
-            key.to_inst_relate_key(),
+            inst_relate_id,
             key.to_pe_key(),
             info.id_str(),
             dbnum,

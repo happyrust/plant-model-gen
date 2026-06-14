@@ -163,7 +163,12 @@ pub fn init_task_metrics_from_env() {
             .and_then(|content| serde_json::from_str::<TaskMetricsFile>(&content).ok())
             .filter(|file| file.schema_version == TASK_METRICS_SCHEMA_VERSION)
             .map(|file| (file.stages, file.started_at))
-            .unwrap_or_else(|| (TaskStagesMetrics::default(), chrono::Local::now().to_rfc3339()));
+            .unwrap_or_else(|| {
+                (
+                    TaskStagesMetrics::default(),
+                    chrono::Local::now().to_rfc3339(),
+                )
+            });
         Some(TaskMetricsCollector {
             path,
             task_id,
@@ -203,15 +208,17 @@ impl TaskMetricsCollector {
             task_id: self.task_id.clone(),
             job_kind: self.infer_kind(inner),
             started_at: self.started_at.clone(),
-            finished_at: inner
-                .finished
-                .then(|| chrono::Local::now().to_rfc3339()),
+            finished_at: inner.finished.then(|| chrono::Local::now().to_rfc3339()),
             duration_ms: self.started.elapsed().as_millis() as u64,
             success: inner.success,
             stages: inner.stages.clone(),
         };
         if let Err(e) = write_json_atomic(&self.path, &file) {
-            eprintln!("[task_metrics] 指标落盘失败({}): {}", self.path.display(), e);
+            eprintln!(
+                "[task_metrics] 指标落盘失败({}): {}",
+                self.path.display(),
+                e
+            );
         }
     }
 }

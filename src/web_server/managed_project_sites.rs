@@ -1369,6 +1369,11 @@ fn parse_plan_fact_is_cata(entry: &ParsePlanFact) -> bool {
 }
 
 #[cfg(feature = "sqlite-index")]
+fn parse_plan_fact_is_closure_dependency(entry: &ParsePlanFact) -> bool {
+    parse_plan_fact_is_cata(entry)
+}
+
+#[cfg(feature = "sqlite-index")]
 fn site_project_tree_dir(site: &ManagedProjectSite) -> PathBuf {
     site_runtime_dir(&site.site_id)
         .join("output")
@@ -1400,7 +1405,18 @@ fn align_parse_plan_cata_with_manifest(
     plan: &ManagedSiteParsePlan,
     manifest: &crate::data_interface::cata_closure::CataClosureManifest,
 ) -> ManagedSiteParsePlan {
-    let covered_cata_dbnums = manifest.by_dbnum.keys().copied().collect::<BTreeSet<_>>();
+    align_parse_plan_cata_with_manifest_with_resolver(plan, manifest, |dbnum| {
+        cata_db_file_from_site_index(site, dbnum)
+    })
+}
+
+#[cfg(feature = "sqlite-index")]
+fn align_parse_plan_cata_with_manifest_with_resolver(
+    plan: &ManagedSiteParsePlan,
+    manifest: &crate::data_interface::cata_closure::CataClosureManifest,
+    mut resolve_db_file: impl FnMut(u32) -> Option<(String, String)>,
+) -> ManagedSiteParsePlan {
+    let covered_dependency_dbnums = manifest.by_dbnum.keys().copied().collect::<BTreeSet<_>>();
     let entries_by_file = plan
         .entries
         .iter()
@@ -1415,10 +1431,10 @@ fn align_parse_plan_cata_with_manifest(
             push_unique_file(&mut included_db_files, file_name.clone());
             continue;
         };
-        if parse_plan_fact_is_cata(entry)
+        if parse_plan_fact_is_closure_dependency(entry)
             && !entry
                 .dbnum
-                .is_some_and(|dbnum| covered_cata_dbnums.contains(&dbnum))
+                .is_some_and(|dbnum| covered_dependency_dbnums.contains(&dbnum))
         {
             continue;
         }
@@ -1426,12 +1442,12 @@ fn align_parse_plan_cata_with_manifest(
         entries.push(entry.clone());
     }
 
-    for dbnum in covered_cata_dbnums {
+    for dbnum in covered_dependency_dbnums {
         if entries.iter().any(|entry| entry.dbnum == Some(dbnum)) {
             continue;
         }
-        match cata_db_file_from_site_index(site, dbnum) {
-            Some((file_name, db_type)) => {
+        match resolve_db_file(dbnum) {
+            Some((file_name, db_type)) if db_type.eq_ignore_ascii_case("CATA") => {
                 push_unique_file(&mut included_db_files, file_name.clone());
                 entries.push(ParsePlanFact {
                     file_name,
@@ -1441,8 +1457,12 @@ fn align_parse_plan_cata_with_manifest(
                     priority: 35,
                 });
             }
+            Some((_file_name, db_type)) => aligned.warnings.push(format!(
+                "CATA closure manifest 覆盖 dbnum={}，但 db_type={} 不是 CATA；未写入 CATA 部分解析计划",
+                dbnum, db_type
+            )),
             None => aligned.warnings.push(format!(
-                "CATA manifest 覆盖 dbnum={}，但 db_index 未找到对应 db 文件；未写入解析计划",
+                "CATA closure manifest 覆盖 dbnum={}，但 db_index 未找到对应 db 文件；未写入解析计划",
                 dbnum
             )),
         }
@@ -1452,7 +1472,7 @@ fn align_parse_plan_cata_with_manifest(
     aligned.auto_related_db_files = entries
         .iter()
         .filter(|entry| {
-            parse_plan_fact_is_cata(entry)
+            parse_plan_fact_is_closure_dependency(entry)
                 && matches!(
                     entry.source.as_str(),
                     "auto_related" | "cata_closure_manifest"
@@ -1930,6 +1950,7 @@ fn parse_plan_inputs_hash(site: &ManagedProjectSite) -> Result<String> {
         "parse_db_types": &site.parse_db_types,
         "force_rebuild_system_db": site.force_rebuild_system_db,
         "auto_parse_related_dbnums": site.auto_parse_related_dbnums,
+        "cata_partial_parse": site.cata_partial_parse,
     });
     let raw = serde_json::to_vec(&input)?;
     Ok(hex::encode(Sha256::digest(raw)))
@@ -2021,11 +2042,29 @@ fn preview_request_from_site(site: &ManagedProjectSite) -> PreviewManagedSitePar
         force_rebuild_system_db: site.force_rebuild_system_db,
         auto_parse_related_dbnums: site.auto_parse_related_dbnums,
         cata_partial_parse: site.cata_partial_parse,
+        db_index_path: preview_request_db_index_path(site),
         web_port: site.web_port,
         bind_host: Some(site.bind_host.clone()),
         public_base_url: site.public_base_url.clone(),
         associated_project: site.associated_project.clone(),
     }
+}
+
+#[cfg(feature = "sqlite-index")]
+fn preview_request_db_index_path(site: &ManagedProjectSite) -> Option<String> {
+    if site.site_id.is_empty() {
+        return None;
+    }
+    Some(
+        site_db_index_path(&site.site_id)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+#[cfg(not(feature = "sqlite-index"))]
+fn preview_request_db_index_path(_site: &ManagedProjectSite) -> Option<String> {
+    None
 }
 
 async fn load_parse_plan_from_sidecar(site: &ManagedProjectSite) -> Result<ManagedSiteParsePlan> {
@@ -8252,6 +8291,17 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
     let mut parse_env = metrics_env;
     if cata_partial_enabled {
         parse_env.insert("AIOS_CATA_CLOSURE_MODE".to_string(), "manifest".to_string());
+        #[cfg(feature = "sqlite-index")]
+        {
+            parse_env.insert(
+                "AIOS_CATA_CLOSURE_MANIFEST_PATH".to_string(),
+                cata_manifest_path_for_site(&site).display().to_string(),
+            );
+            parse_env.insert(
+                "AIOS_CATA_CLOSURE_MAIN_PROJECT".to_string(),
+                site.project_name.clone(),
+            );
+        }
     }
     let job = run_sidecar_cli_job_with_site_events(
         &site.site_id,
@@ -8373,7 +8423,7 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         repo.to_string_lossy().to_string(),
         generate_log_path(&site.site_id),
         generate_log_path(&site.site_id),
-        Vec::new(),
+        vec!["--export-parquet-after-gen".to_string()],
         metrics_env,
     )
     .await
@@ -9726,7 +9776,7 @@ async fn ensure_site_db_started(
 
 /// 站点级 db_index.sqlite 路径（runtime/admin_sites/<site_id>/db_index.sqlite）。
 #[cfg(feature = "sqlite-index")]
-fn site_db_index_path(site_id: &str) -> PathBuf {
+pub(crate) fn site_db_index_path(site_id: &str) -> PathBuf {
     site_runtime_dir(site_id).join(crate::data_interface::db_index::DB_INDEX_FILE_NAME)
 }
 
@@ -13063,8 +13113,14 @@ fn summarize_log_line(key: &str, line: Option<&str>) -> Option<String> {
         if let Some((_, rest)) = line.split_once("db_type is ") {
             return Some(format!("正在处理 {} 数据", rest.trim()));
         }
+        if let Some((_, rest)) = line.split_once("按主项目 manifest 部分解析:") {
+            return Some(format!("CATA 部分解析 {}", rest.trim()));
+        }
+        if line.contains("不在主项目 manifest 覆盖内") {
+            return Some("CATA manifest 跳过未引用库".to_string());
+        }
         if let Some((_, rest)) = line.split_once("All refnos count:") {
-            return Some(format!("最近 refno 计数 {}", rest.trim()));
+            return Some(format!("读取 refno 索引 {}", rest.trim()));
         }
     }
 
@@ -13502,6 +13558,30 @@ mod tests {
     }
 
     #[test]
+    fn summarize_log_line_prefers_cata_actual_count() {
+        assert_eq!(
+            summarize_log_line(
+                "parse",
+                Some("[cata_closure] dbnum=7320 按主项目 manifest 部分解析: 41/1175904 refnos"),
+            ),
+            Some("CATA 部分解析 41/1175904 refnos".to_string())
+        );
+        assert_eq!(
+            summarize_log_line(
+                "parse",
+                Some(
+                    "[cata_closure] dbnum=250166 不在主项目 manifest 覆盖内，按需跳过该 CATA 库（3 refnos 不解析）"
+                ),
+            ),
+            Some("CATA manifest 跳过未引用库".to_string())
+        );
+        assert_eq!(
+            summarize_log_line("parse", Some("All refnos count: 1175904")),
+            Some("读取 refno 索引 1175904".to_string())
+        );
+    }
+
+    #[test]
     fn build_parse_config_sets_site_output_root() {
         let now = now_rfc3339();
         let site = ManagedProjectSite {
@@ -13714,6 +13794,165 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn align_parse_plan_cata_with_manifest_keeps_only_manifest_cata() {
+        let plan = parse_plan_with_entries(vec![
+            parse_plan_fact("aps250160_0001", 250160, "DESI", "manual_db_num", 10),
+            parse_plan_fact("aps250166_0001", 250166, "CATA", "auto_related", 35),
+            parse_plan_fact("aps250193_0001", 250193, "CATA", "auto_related", 35),
+            parse_plan_fact("aps7032_0001", 7032, "DICT", "mandatory_preparse", 20),
+        ]);
+        let manifest = cata_manifest(&[250193]);
+
+        let aligned = align_parse_plan_cata_with_manifest_with_resolver(&plan, &manifest, |_| {
+            panic!("existing manifest-covered CATA should not require db_index lookup")
+        });
+
+        assert_eq!(
+            aligned.included_db_files,
+            vec!["aps250160_0001", "aps250193_0001", "aps7032_0001"]
+        );
+        assert_eq!(aligned.auto_related_db_files, vec!["aps250193_0001"]);
+        assert!(
+            aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(250160))
+        );
+        assert!(
+            aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(250193))
+        );
+        assert!(
+            aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(7032))
+        );
+        assert!(
+            !aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(250166))
+        );
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn align_parse_plan_cata_with_manifest_adds_missing_covered_cata_from_resolver() {
+        let plan = parse_plan_with_entries(vec![
+            parse_plan_fact("aps250160_0001", 250160, "DESI", "manual_db_num", 10),
+            parse_plan_fact("aps7032_0001", 7032, "DICT", "mandatory_preparse", 20),
+        ]);
+        let manifest = cata_manifest(&[250193]);
+
+        let aligned =
+            align_parse_plan_cata_with_manifest_with_resolver(&plan, &manifest, |dbnum| {
+                (dbnum == 250193).then(|| ("aps250193_0001".to_string(), "CATA".to_string()))
+            });
+
+        assert_eq!(
+            aligned.included_db_files,
+            vec!["aps250160_0001", "aps7032_0001", "aps250193_0001"]
+        );
+        assert_eq!(aligned.auto_related_db_files, vec!["aps250193_0001"]);
+        let added = aligned
+            .entries
+            .iter()
+            .find(|entry| entry.dbnum == Some(250193))
+            .expect("manifest covered CATA entry");
+        assert_eq!(added.file_name, "aps250193_0001");
+        assert_eq!(added.db_type.as_deref(), Some("CATA"));
+        assert_eq!(added.source, "cata_closure_manifest");
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn align_parse_plan_cata_with_empty_manifest_removes_all_cata() {
+        let plan = parse_plan_with_entries(vec![
+            parse_plan_fact("aps250160_0001", 250160, "DESI", "manual_db_num", 10),
+            parse_plan_fact("aps250166_0001", 250166, "CATA", "auto_related", 35),
+            parse_plan_fact("aps250193_0001", 250193, "CATA", "auto_related", 35),
+            parse_plan_fact("aps7032_0001", 7032, "DICT", "mandatory_preparse", 20),
+        ]);
+        let manifest = cata_manifest(&[]);
+
+        let aligned = align_parse_plan_cata_with_manifest_with_resolver(&plan, &manifest, |_| None);
+
+        assert_eq!(
+            aligned.included_db_files,
+            vec!["aps250160_0001", "aps7032_0001"]
+        );
+        assert!(aligned.auto_related_db_files.is_empty());
+        assert!(
+            aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(250160))
+        );
+        assert!(
+            aligned
+                .entries
+                .iter()
+                .any(|entry| entry.dbnum == Some(7032))
+        );
+        assert!(
+            !aligned
+                .entries
+                .iter()
+                .any(|entry| entry.db_type.as_deref() == Some("CATA"))
+        );
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    fn parse_plan_with_entries(entries: Vec<ParsePlanFact>) -> ManagedSiteParsePlan {
+        ManagedSiteParsePlan {
+            included_db_files: entries
+                .iter()
+                .map(|entry| entry.file_name.clone())
+                .collect(),
+            auto_related_db_files: entries
+                .iter()
+                .filter(|entry| entry.source == "auto_related")
+                .map(|entry| entry.file_name.clone())
+                .collect(),
+            entries,
+            ..ManagedSiteParsePlan::default()
+        }
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    fn parse_plan_fact(
+        file_name: &str,
+        dbnum: u32,
+        db_type: &str,
+        source: &str,
+        priority: u32,
+    ) -> ParsePlanFact {
+        ParsePlanFact {
+            file_name: file_name.to_string(),
+            dbnum: Some(dbnum),
+            db_type: Some(db_type.to_string()),
+            source: source.to_string(),
+            priority,
+        }
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    fn cata_manifest(dbnums: &[u32]) -> crate::data_interface::cata_closure::CataClosureManifest {
+        let mut manifest = crate::data_interface::cata_closure::CataClosureManifest::default();
+        for dbnum in dbnums {
+            manifest.by_dbnum.insert(
+                *dbnum,
+                BTreeSet::from([aios_core::RefU64::from_two_nums(*dbnum, 1)]),
+            );
+        }
+        manifest
     }
 
     fn toml_manual_db_nums(value: &toml::Value) -> Option<Vec<i64>> {

@@ -42,7 +42,10 @@ use crate::defines::CACHED_MDB_SITE_MAP;
 #[cfg(feature = "mqtt")]
 use crate::mqtt_service::{SyncE3dFileMsg, new_mqtt_inst};
 
-pub const TUBI_TOL: f32 = 1.0f32;
+// PDMS/RVM treats sub-2 mm endpoint residue as a coincident connection rather
+// than a physical tubing segment. Keeping the same tolerance avoids exporting
+// tiny branch-end cylinders caused by rounded arrive/leave coordinates.
+pub const TUBI_TOL: f32 = 2.0f32;
 
 // project + mdb + module
 pub static GLOBAL_MDB_WORLD_MAP: Lazy<DashMap<String, PdmsElement>> = Lazy::new(DashMap::new);

@@ -38,7 +38,7 @@ $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $NginxCacheExe = Join-Path $RepoRoot "tools/nginx/windows/nginx.exe"
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
-$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,kv-rocksdb"
+$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import,kv-rocksdb"
 if ($BuildProfile -eq "both") {
     $RequestedProfiles = @("release", "debug")
 } else {

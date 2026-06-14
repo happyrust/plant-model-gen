@@ -601,6 +601,14 @@ fn normalized_distance(distance: Option<f32>) -> f32 {
     }
 }
 
+fn default_shape_for_mode(mode: &str) -> &'static str {
+    if mode == "refno" || mode == "position" {
+        "sphere"
+    } else {
+        "cube"
+    }
+}
+
 fn min_axis_gap(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> f32 {
     if a_max < b_min {
         b_min - a_max
@@ -695,10 +703,11 @@ fn query_by_target_aabbs(
     }
 
     // 球体模式：使用候选 AABB 到目标 AABB/点的最小距离做二次过滤。
+    let mode = parse_mode(&params);
     let is_sphere = params
         .shape
         .as_deref()
-        .unwrap_or("cube")
+        .unwrap_or(default_shape_for_mode(mode))
         .eq_ignore_ascii_case("sphere");
     let (ids, query_aabb) = match query_ids_for_regions(cached, &target_aabbs, search_distance) {
         Ok(v) => v,
@@ -1038,5 +1047,144 @@ mod tests {
         let items = resp.results.unwrap_or_default();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].spec_value, 0);
+    }
+
+    #[test]
+    fn position_query_defaults_to_sphere_filter() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                ((1u64 << 32) | 2u64) as i64,
+                "PIPE".to_string(),
+                0,
+                9.0,
+                10.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                ((1u64 << 32) | 3u64) as i64,
+                "PIPE".to_string(),
+                0,
+                8.0,
+                9.0,
+                8.0,
+                9.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        let resp = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                mode: Some("position".to_string()),
+                refno: None,
+                x: Some(0.0),
+                y: Some(0.0),
+                z: Some(0.0),
+                radius: Some(10.0),
+                distance: None,
+                minx: None,
+                miny: None,
+                minz: None,
+                maxx: None,
+                maxy: None,
+                maxz: None,
+                max_results: None,
+                page: None,
+                per_page: None,
+                nouns: None,
+                spec_values: None,
+                include_self: None,
+                shape: None,
+            };
+            do_spatial_query(params, None)
+        });
+
+        assert!(resp.success);
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_2");
+    }
+
+    #[test]
+    fn refno_query_defaults_to_sphere_filter_and_can_exclude_self() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                ((1u64 << 32) | 1u64) as i64,
+                "EQUI".to_string(),
+                0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                ((1u64 << 32) | 2u64) as i64,
+                "PIPE".to_string(),
+                0,
+                6.0,
+                7.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                ((1u64 << 32) | 3u64) as i64,
+                "PIPE".to_string(),
+                0,
+                5.0,
+                6.0,
+                5.0,
+                6.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        let resp = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                mode: Some("refno".to_string()),
+                refno: Some("1_1".to_string()),
+                x: None,
+                y: None,
+                z: None,
+                radius: None,
+                distance: Some(5.0),
+                minx: None,
+                miny: None,
+                minz: None,
+                maxx: None,
+                maxy: None,
+                maxz: None,
+                max_results: None,
+                page: None,
+                per_page: None,
+                nouns: None,
+                spec_values: None,
+                include_self: Some(false),
+                shape: None,
+            };
+            do_spatial_query(params, None)
+        });
+
+        assert!(resp.success);
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_2");
     }
 }

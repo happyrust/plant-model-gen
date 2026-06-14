@@ -147,6 +147,21 @@
 4. L3 中心定位对比在 rvm-rs 层级矩阵修复前不可判;
    尺寸(形状)级与成员/类型级结论维持:**生成端无缺陷**。
 
+**compare 收敛语义修正(2026-06-13 17:17 续)**:
+
+1. `rvm_obj_export.rs::mesh_from_payload` 对 `FacetGroup` 不再二次应用
+   `transform`;RVM facet 顶点在样本中已是 model/world 坐标,二次 transform
+   会把 FLANGE AABB 误差放大到百万级。修复后 476 样本 FLANGE 误差收敛到
+   12~13.5mm 的 LOD/网格差异量级。
+2. `rvm_compare.rs` 将 root BRAN 自身的 TUBE 挂组差异归入
+   `root_tubi_exempted`:RVM 将 2 段 TUBE geometry 挂在 BRAN 组,gen 侧
+   BRAN 不进 `instances.parquet`,管段落在 `tubings.parquet`。
+3. `--compare-rvm` 的退出语义改为 L1/L2 阻断、AABB 诊断:
+   `missing/extra/noun` 仍返回错误;AABB mismatch 继续写报告和控制台警告,
+   但在 rvm-rs PRIM transform 归一化前不阻断生成验收。
+4. 复跑 476: `matched=8 / missing=0 / extra=0 / noun=0 /
+   root_tubi_exempted=1`,命令退出 0;AABB 仍有 8 个诊断差异。
+
 - 站点 surreal(8022)在线,基于 2026-06-12 22:30 成功生成的数据
   (tubi_relate=16)。
 - 重导入样本(带解析)→ `--compare-rvm` → 分析差异:
@@ -189,6 +204,18 @@
 TMPL 子树参数化几何(CYLI/DISH/SNOU/PYRA…),或 IndexTree 入口查询
 增补"EQUI 模板几何"的发现路径;以 821 ZONE 对拍 missing=0(豁免桶外)
 为验收线。
+
+**深一层定界(09:55 续)**:PRIM 阶段并非没跑——日志显示
+`[Prim:CYLI] 168 / [Prim:DISH] 34 / [Prim:SNOU] 4 / [Prim:PYRA] 106`
+全部处理完成,但 906/908 等 EQUI 模板件**不在 BFS 收集结果里**
+(BFS 总计 1070:loop=127/prim=779/cate=164)。BFS 数据源是
+`scene_tree/<dbnum>.tree`(`TreeIndexManager`,解析期
+`versioned_db/tree_export.rs::export_tree_file` 从 `total_attr_map`
+全量构建,无 noun 过滤)。**头号嫌疑:树文件中 TMPL(904)子树缺失或
+未挂接**(tree_nodes 有节点但 children_map 断链时 indextree append
+不会发生,节点成孤儿,BFS 从 roots 不可达)。spec 010 第一步:
+dump `250160.tree` 验证 904/906 节点存在性与父链;若孤儿,
+修 children_map 构建(owner 在 map 中但顺序/来源缺 TMPL 的场景)。
 
 ## T006 — 文档与变更记录
 

@@ -79,10 +79,7 @@ impl BaselineHttp {
             .await
             .with_context(|| format!("基准站点 HTTP 请求失败: {}", self.url))?;
         let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .context("基准站点响应非 JSON")?;
+        let body: serde_json::Value = resp.json().await.context("基准站点响应非 JSON")?;
         anyhow::ensure!(status.is_success(), "基准站点 HTTP {}: {}", status, body);
 
         // 响应形如 [{status:"OK", result:[...]}, ...]（单语句也可能直接为对象）。
@@ -239,9 +236,7 @@ pub async fn verify_cata_closure_against_baseline(
 
     // ── 2. 几何指纹（cata_hash）一致性 ──────────────────────────────────
     let pair_sql = |table: &str| {
-        format!(
-            "SELECT VALUE [<string>in, <string>out] FROM {table} WHERE in IN [{member_list}];"
-        )
+        format!("SELECT VALUE [<string>in, <string>out] FROM {table} WHERE in IN [{member_list}];")
     };
     let ondemand_map = pairs_to_map(ondemand_json(&pair_sql("inst_relate")).await?);
 

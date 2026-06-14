@@ -1,3 +1,120 @@
+# refno_assoc_index 使用清理开发计划
+
+## Goal
+
+把 `refno_assoc_index` 从“配置层声称停用、生成链路实际硬启用”的隐式状态，收敛为一个边界清晰、可验证、可选择的模型生成数据清理组件。
+
+核心目标：
+
+- 统一 `regen_delete_mode`、`pre_cleanup_for_regen()`、`pdms_inst` 写入路径、`manifold_bool` 布尔写入路径对 `refno_assoc_index` 的认知。
+- 明确 `refno_assoc_index` 是保留为 indexed cleanup backend，还是彻底移除；推荐短期不删除，先改为显式 opt-in/auto cleanup backend。
+- 消除硬编码 `is_refno_assoc_index_enabled() -> true`，避免配置和运行行为相互矛盾。
+- 让 legacy 清理路径和 index 清理路径的覆盖表清单对齐，避免 `inst_info` / `inst_relate_aabb` 等模型产物漏删。
+- 不把 `pe` / `ATT_*` 解析数据纳入模型生成数据清理范围。
+
+## Current Phase
+
+Phase R1 complete; next Phase R2
+
+## Phases
+
+### Phase R1: 使用面审计与现状定界
+
+- [x] 确认 `delete_by_refnos()` 当前只由 `pdms_inst::pre_cleanup_for_regen()` 调用。
+- [x] 确认 `RefnoAssocIndexBatch` 写入点分布在 `pdms_inst.rs` 两条实例保存路径，以及 `manifold_bool.rs` 布尔 worker。
+- [x] 确认 `options.rs` 将 `regen_delete_mode=refno_assoc_index` 解析为 `Legacy`，但 `pdms_inst.rs` 的 `is_refno_assoc_index_enabled()` 仍硬编码 `true`。
+- [x] 确认 DuckLake writer 当前把 `raw_refno_assoc_index` 标记为 known gap，说明该索引仍绕开 `ModelWriterBackend` 抽象。
+- **Status:** complete
+
+### Phase R2: 删除模式契约收敛
+
+- [ ] 决定 `refno_assoc_index` 的产品定位：保留为 indexed cleanup backend，而不是隐式总开关。
+- [ ] 将 `RegenDeleteMode` 调整为真实可执行配置：`Legacy` / `RefnoAssocIndex` / 可选 `AutoIndexedThenLegacy`。
+- [ ] 移除或替换 `is_refno_assoc_index_enabled() -> true`，让启用状态来自明确配置或 cleanup context。
+- [ ] 明确 fallback 语义：显式 `RefnoAssocIndex` 模式索引加载失败应 fail closed；`Auto` 模式才允许回退 legacy。
+- **Status:** pending
+
+### Phase R3: 写入路径解耦
+
+- [ ] 抽出 `RefnoAssocIndexWriter` / `GeneratedModelAssocIndex` 小接口，集中封装 `add_*_id` 和 `upsert/write_to_sql_file`。
+- [ ] 让 `pdms_inst.rs` 和 `manifold_bool.rs` 通过同一个 writer/context 写索引，不再各自判断全局开关。
+- [ ] 明确 deferred SQL 文件路径和 DB 直写路径的一致性，避免一条路径写索引、另一条路径漏写。
+- [ ] 更新 DuckLake known gap 文案：如果索引仍属于 Surreal-only cleanup，应说明它不属于 DuckLake raw writer；如果要迁入 writer，则另立后续目标。
+- **Status:** pending
+
+### Phase R4: 清理覆盖范围对齐
+
+- [ ] 列出 index 模式实际删除表：`inst_relate`、`inst_info`、`geo_relate`、`inst_geo`、`neg_relate`、`ngmr_relate`、`inst_relate_bool`、`inst_relate_cata_bool`、`inst_relate_aabb`、`tubi_relate` 等。
+- [ ] 对齐 legacy 模式覆盖范围；若 legacy 默认保留，必须补齐 `inst_info`、`inst_relate_aabb` 等已知缺口，或在日志中明确不可清项目。
+- [ ] 对 `aabb`、`trans`、`vec3` 等共享 hash/content-addressed 表保持保守策略：不做按 refno 盲删，除非有引用计数或孤儿扫描。
+- [ ] 让 `RefnoAssocDeleteSummary` / legacy summary 输出统一字段，便于日志和 admin API 展示。
+- **Status:** pending
+
+### Phase R5: 独立清理入口设计
+
+- [ ] 设计 `clear-generated-model` CLI 或 admin API，参数支持 `site_id` / `dbnum` / `refnos`。
+- [ ] 明确默认只清模型生成产物，不清 `pe`、`ATT_*`、`ATT_UDA`、CATA 解析库。
+- [ ] 对 dbnum/site 清理先解析为 refno 集合，再调用统一 cleanup service；不要在 API 层散落多表 DELETE。
+- [ ] 把 Parquet、mesh/cache、SQLite `model_relations` / `spatial_index.sqlite` 文件产物列为单独开关或后续 Phase，避免和 SurrealDB 清理混在一个不可回滚动作里。
+- **Status:** pending
+
+### Phase R6: 验证与回归守护
+
+- [ ] 不运行 `cargo test`，遵守仓库规则。
+- [ ] 运行允许的静态检查：`cargo check` 对相关 bin/feature、`rustfmt`、`ReadLints`、`git diff --check`。
+- [ ] 用小 dbnum/refno 执行 CLI 级 smoke：生成前写入、清理、再生成，查询目标表确认旧行不残留。
+- [ ] 用 web_server/admin 路径通过 HTTP/POST 验证独立清理入口，不使用 Rust test。
+- [ ] 记录清理前后 SurrealDB 表行数、index 命中/缺失统计、fallback 或 fail-closed 行为。
+- **Status:** pending
+
+### Phase R7: 文档与收口
+
+- [ ] 更新 `findings.md` / `progress.md`，记录最终模式、命令、验证证据和残留风险。
+- [ ] 在合适文档中说明 `regen_delete_mode` 的真实行为、默认值和推荐用法。
+- [ ] 若最终决定彻底移除 `refno_assoc_index`，同步删除 dead config/test/comment；若保留，则删除“已停用”的误导注释。
+- **Status:** pending
+
+## Key Questions
+
+1. `refno_assoc_index` 是要完全下线，还是保留为显式 indexed cleanup backend？
+2. 默认删除模式应继续是 `Legacy`，还是改为 `AutoIndexedThenLegacy`？
+3. 当索引缺失或不完整时，是回退 legacy、报错、还是先重建索引？
+4. `refno_assoc_index` 是否应进入 `ModelWriterBackend` 抽象，还是保持为 SurrealDB cleanup service？
+5. 站点级/dbnum 级独立清理是否要同时删除 Parquet/SQLite/mesh 文件产物，还是先只覆盖 SurrealDB 模型表？
+
+## Decisions Made
+
+| Decision | Rationale |
+|----------|-----------|
+| 先制定计划，不直接改代码 | 用户明确要求使用 `planning-with-files` 制定开发计划，本轮先收敛范围和实施步骤。 |
+| 推荐短期保留 `refno_assoc_index`，但改为显式模式 | 它能覆盖 legacy 当前不稳定的精确删除场景；问题不是索引存在，而是配置层与运行层矛盾、写入面散落。 |
+| 不把解析表纳入模型清理 | `pe` / `ATT_*` 是解析输入事实，误删会破坏后续生成和属性查询。 |
+| 验证不用 Rust test | 仓库规则要求 web_server 走 HTTP/POST，aios-database 走 CLI+JSON。 |
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|-------|---------|------------|
+| `memanto memory sync --project-dir .` 失败：No agent specified and no active agent | 1 | 记录为非阻塞；本轮以项目 planning 文件和源码上下文继续。 |
+| 用户级 `planning-with-files` 模板路径不存在 | 1 | 改读项目内 `.cursor/skills/planning-with-files/templates/*`。 |
+| 项目内 `session-catchup.py` 路径不存在 | 2 | 记录为非阻塞；继续读取现有 `task_plan.md` / `findings.md` / `progress.md`。 |
+| Plan mode 切换被拒绝 | 1 | 继续在当前模式下只制定计划，不执行代码实现。 |
+
+## Notes
+
+- 关键文件：
+  - `src/fast_model/gen_model/refno_assoc_index.rs`
+  - `src/fast_model/gen_model/pdms_inst.rs`
+  - `src/fast_model/gen_model/manifold_bool.rs`
+  - `src/fast_model/gen_model/model_writer.rs`
+  - `src/fast_model/gen_model/model_writer_ducklake.rs`
+  - `src/options.rs`
+  - `src/cli_modes.rs`
+- 当前最大问题不是“有没有索引”，而是“索引的配置契约、写入契约、删除契约不一致”。
+- 下一步第一条动作：进入 Phase R2，先决定 `RegenDeleteMode` 的真实枚举和默认语义，再改 `pdms_inst` / `manifold_bool` 的索引写入开关。
+
+## Archived Previous Plan
+
 # Release 包 sidecar job 终态竞态修复计划
 
 ## Goal

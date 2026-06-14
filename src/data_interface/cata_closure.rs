@@ -188,6 +188,11 @@ pub struct CataClosureConfig {
     /// 收口的 db_type 集合（大小写不敏感，默认 {"CATA"}）。
     /// 若规格库为单独类型（如 "PADD"），可在此追加。
     pub cata_db_types: HashSet<String>,
+    /// 闭包解析时显式排除的 dbnum。
+    ///
+    /// 精确按需模式会允许被 DESI 元素直接引用的外部模板 DESI 库进入闭包；
+    /// 这里用于排除当前正在扫描的主设计库，避免把根 DESI 自身重新写入 manifest。
+    pub excluded_dbnums: HashSet<u32>,
     /// 防御性轮数上限。
     pub max_rounds: usize,
     /// 容器子树展开白名单（noun 名，大写）。
@@ -207,6 +212,7 @@ impl Default for CataClosureConfig {
             include_owner_chain: true,
             follow_children: true,
             cata_db_types,
+            excluded_dbnums: HashSet::new(),
             max_rounds: 64,
             container_subtree_nouns: None,
         }
@@ -224,10 +230,24 @@ impl CataClosureConfig {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let mut cata_db_types = HashSet::new();
+        cata_db_types.insert("CATA".to_string());
+        cata_db_types.insert("DESI".to_string());
         Self {
+            cata_db_types,
             container_subtree_nouns: Some(container),
             ..Self::default()
         }
+    }
+
+    pub fn excluding_dbnum(mut self, dbnum: u32) -> Self {
+        self.excluded_dbnums.insert(dbnum);
+        self
+    }
+
+    pub fn excluding_dbnums(mut self, dbnums: impl IntoIterator<Item = u32>) -> Self {
+        self.excluded_dbnums.extend(dbnums);
+        self
     }
 }
 
@@ -306,6 +326,7 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
             .iter()
             .map(|t| t.to_uppercase())
             .collect();
+        let excluded_dbnums = self.cfg.excluded_dbnums.clone();
 
         let seed_count = self.frontier.len();
         let mut by_dbnum: BTreeMap<u32, BTreeSet<RefU64>> = BTreeMap::new();
@@ -338,6 +359,13 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                     }
                     continue;
                 };
+                if excluded_dbnums.contains(&dbnum) {
+                    non_cata_candidates += 1;
+                    if classification_samples.len() < 8 {
+                        classification_samples.push(format!("{r}:db={dbnum}/excluded"));
+                    }
+                    continue;
+                }
                 let db_type = self.locator.db_type_of(dbnum).unwrap_or_default();
                 let is_cata = cata_types.contains(&db_type.to_uppercase());
                 if !is_cata {
@@ -388,7 +416,7 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                         }
                         Err(e) => {
                             eprintln!(
-                                "[cata_closure] 打开 CATA 库失败: dbnum={} path={} error={}",
+                                "[cata_closure] 打开闭包依赖库失败: dbnum={} path={} error={}",
                                 dbnum,
                                 path.display(),
                                 e
@@ -557,9 +585,15 @@ pub async fn resolve_cata_closure_from_design_file(
     desi_path: &Path,
     cfg: CataClosureConfig,
 ) -> Result<CataClosureManifest> {
+    let self_dbnum = parse_pdms_db::parse::parse_db_basic_info(desi_path.to_path_buf()).dbnum;
     let seeds = seed_refs_from_design_file(project, desi_path).await?;
     let seed_count = seeds.len();
 
+    let cfg = if self_dbnum == 0 {
+        cfg
+    } else {
+        cfg.excluding_dbnum(self_dbnum)
+    };
     let mut resolver = CataClosureResolver::new(index, cfg);
     resolver.seed(seeds);
     let mut manifest = resolver.resolve().await?;
@@ -578,7 +612,7 @@ pub async fn resolve_cata_closure_from_design_file(
 pub enum CataClosureSyncMode {
     /// 整库解析（默认，与历史行为一致）。
     Off,
-    /// manifest 部分解析：CATA 库只解析 `cata_closure.json` 覆盖的 refno；
+    /// manifest 部分解析：闭包依赖库只解析 `cata_closure.json` 覆盖的 refno；
     /// manifest 缺失 / 未覆盖该 dbnum 时整库回退（仅告警，不失败）。
     Manifest,
 }
@@ -598,6 +632,9 @@ pub fn default_manifest_path(project_name: &str) -> PathBuf {
     crate::versioned_db::db_meta_info::get_project_tree_dir(project_name).join("cata_closure.json")
 }
 
+const CATA_CLOSURE_MANIFEST_PATH_ENV: &str = "AIOS_CATA_CLOSURE_MANIFEST_PATH";
+const CATA_CLOSURE_MAIN_PROJECT_ENV: &str = "AIOS_CATA_CLOSURE_MAIN_PROJECT";
+
 /// 判断 db_type 是否属于"元件库"类型（与 [`CataClosureConfig::default`] 的收口集合一致）。
 pub fn is_cata_db_type(db_type: &str) -> bool {
     CataClosureConfig::default()
@@ -605,8 +642,90 @@ pub fn is_cata_db_type(db_type: &str) -> bool {
         .contains(&db_type.to_uppercase())
 }
 
-/// sync 解析用过滤器：dbnum -> 允许解析的 refno 集合。
-pub type CataClosureFilter = HashMap<u32, HashSet<RefU64>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CataClosureManifestPathSource {
+    Explicit,
+    Derived,
+}
+
+impl CataClosureManifestPathSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+struct CataClosureManifestContext {
+    path: PathBuf,
+    main_project: Option<String>,
+    path_source: CataClosureManifestPathSource,
+}
+
+/// sync 解析用过滤器，包含允许解析的 refno 集合和 manifest 来源上下文。
+pub struct CataClosureFilter {
+    by_dbnum: HashMap<u32, HashSet<RefU64>>,
+    manifest_path: PathBuf,
+    main_project: Option<String>,
+    path_source: CataClosureManifestPathSource,
+}
+
+impl CataClosureFilter {
+    fn from_manifest(manifest: &CataClosureManifest, context: CataClosureManifestContext) -> Self {
+        let by_dbnum = manifest
+            .by_dbnum
+            .iter()
+            .map(|(dbnum, refs)| (*dbnum, refs.iter().copied().collect::<HashSet<RefU64>>()))
+            .collect();
+        Self {
+            by_dbnum,
+            manifest_path: context.path,
+            main_project: context.main_project,
+            path_source: context.path_source,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.by_dbnum.len()
+    }
+
+    fn allowed_refnos(&self, dbnum: u32) -> Option<&HashSet<RefU64>> {
+        self.by_dbnum.get(&dbnum)
+    }
+
+    fn manifest_label(&self) -> &'static str {
+        if self.main_project.is_some() {
+            "主项目 manifest"
+        } else {
+            "manifest"
+        }
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn sync_manifest_context(project_name: &str) -> CataClosureManifestContext {
+    let main_project = non_empty_env(CATA_CLOSURE_MAIN_PROJECT_ENV);
+    if let Some(path) = non_empty_env(CATA_CLOSURE_MANIFEST_PATH_ENV) {
+        return CataClosureManifestContext {
+            path: PathBuf::from(path),
+            main_project,
+            path_source: CataClosureManifestPathSource::Explicit,
+        };
+    }
+
+    CataClosureManifestContext {
+        path: default_manifest_path(project_name),
+        main_project,
+        path_source: CataClosureManifestPathSource::Derived,
+    }
+}
 
 /// 按当前模式为 sync 加载 CATA 闭包过滤器。
 ///
@@ -621,34 +740,43 @@ pub fn load_sync_filter(project_name: &str, db_types: &[String]) -> Option<CataC
     if !db_types.iter().any(|t| is_cata_db_type(t)) {
         return None;
     }
-    let path = default_manifest_path(project_name);
-    if !path.exists() {
+    let context = sync_manifest_context(project_name);
+    let main_project = context.main_project.as_deref().unwrap_or("<unset>");
+    let path_source = context.path_source.as_str();
+    if !context.path.exists() {
         log::warn!(
-            "[cata_closure] AIOS_CATA_CLOSURE_MODE=manifest 但 manifest 不存在: {}（CATA 整库回退）",
-            path.display()
+            "[cata_closure] AIOS_CATA_CLOSURE_MODE=manifest 但 manifest 不存在: path={} main_project={} current_project={} source={}（CATA 整库回退）",
+            context.path.display(),
+            main_project,
+            project_name,
+            path_source
         );
         return None;
     }
-    match CataClosureManifest::load_json(&path) {
+    match CataClosureManifest::load_json(&context.path) {
         Ok(manifest) => {
-            let filter: CataClosureFilter = manifest
-                .by_dbnum
-                .iter()
-                .map(|(dbnum, refs)| (*dbnum, refs.iter().copied().collect::<HashSet<RefU64>>()))
-                .collect();
+            let visited_count = manifest.visited_count;
+            let missing = manifest.missing;
+            let filter = CataClosureFilter::from_manifest(&manifest, context);
             log::info!(
-                "[cata_closure] 已加载 manifest: {}（{} 个 CATA 库, visited={}, missing={}）",
-                path.display(),
+                "[cata_closure] 已加载 manifest: path={} main_project={} current_project={} source={}（{} 个闭包库, visited={}, missing={}）",
+                filter.manifest_path.display(),
+                filter.main_project.as_deref().unwrap_or("<unset>"),
+                project_name,
+                filter.path_source.as_str(),
                 filter.len(),
-                manifest.visited_count,
-                manifest.missing
+                visited_count,
+                missing
             );
             Some(filter)
         }
         Err(e) => {
             log::warn!(
-                "[cata_closure] manifest 解析失败: {}: {}（CATA 整库回退）",
-                path.display(),
+                "[cata_closure] manifest 解析失败: path={} main_project={} current_project={} source={} error={}（CATA 整库回退）",
+                context.path.display(),
+                main_project,
+                project_name,
+                path_source,
                 e
             );
             None
@@ -658,8 +786,8 @@ pub fn load_sync_filter(project_name: &str, db_types: &[String]) -> Option<CataC
 
 /// 对单个 db 文件的 refno 全集应用闭包过滤（sync per-file 调用点）。
 ///
-/// 仅当 `db_type` 属于 CATA 类型、filter 已加载且覆盖该 dbnum 时裁剪；
-/// 其余情况原样返回（= 整库解析回退）。
+/// 当 filter 已加载且 manifest 覆盖该 dbnum 时裁剪；
+/// 未覆盖的 CATA/模板库按需跳过，其余库原样返回（= 整库解析回退）。
 pub fn apply_sync_filter(
     filter: Option<&CataClosureFilter>,
     db_type: &str,
@@ -669,10 +797,7 @@ pub fn apply_sync_filter(
     let Some(filter) = filter else {
         return all_refnos;
     };
-    if !is_cata_db_type(db_type) {
-        return all_refnos;
-    }
-    match filter.get(&dbnum) {
+    match filter.allowed_refnos(dbnum) {
         Some(allow) => {
             let before = all_refnos.len();
             let filtered: Vec<RefU64> = all_refnos
@@ -680,25 +805,28 @@ pub fn apply_sync_filter(
                 .filter(|r| allow.contains(r))
                 .collect();
             log::info!(
-                "[cata_closure] dbnum={} 按 manifest 部分解析: {}/{} refnos",
+                "[cata_closure] dbnum={} 按{} 部分解析: {}/{} refnos",
                 dbnum,
+                filter.manifest_label(),
                 filtered.len(),
                 before
             );
             crate::perf_metrics::note_parse_db_mode(dbnum, "partial", before);
             filtered
         }
-        None => {
+        None if is_cata_db_type(db_type) => {
             // manifest 已加载但该 CATA 库无任何被引用条目：闭包 pass 已确认目标
             // DESI 不依赖此库，按需语义下直接跳过（T007 运行期惰性兜底仍可补漏）。
             log::info!(
-                "[cata_closure] dbnum={} 不在 manifest 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
+                "[cata_closure] dbnum={} 不在{} 覆盖内，按需跳过该 CATA 库（{} refnos 不解析）",
                 dbnum,
+                filter.manifest_label(),
                 all_refnos.len()
             );
             crate::perf_metrics::note_parse_db_mode(dbnum, "skipped", all_refnos.len());
             Vec::new()
         }
+        None => all_refnos,
     }
 }
 
@@ -798,7 +926,7 @@ async fn run_cata_closure_pass_for_roots_filtered(
     }
 
     println!(
-        "[cata_closure] DESI 闭包汇总: targets={} seeds={} cata_dbs={} visited={} missing={}",
+        "[cata_closure] DESI 闭包汇总: targets={} seeds={} dependency_dbs={} visited={} missing={}",
         seen_dbnums.len(),
         seed_sum,
         total.by_dbnum.len(),
@@ -814,7 +942,7 @@ async fn run_cata_closure_pass_for_roots_filtered(
     total.rounds = max_rounds;
     total.save_json(out_path)?;
     log::info!(
-        "[cata_closure] 前置闭包 pass 完成: {} 个 CATA 库 / visited={} / missing={} → {}",
+        "[cata_closure] 前置闭包 pass 完成: {} 个闭包库 / visited={} / missing={} → {}",
         total.by_dbnum.len(),
         total.visited_count,
         total.missing,
@@ -980,13 +1108,17 @@ pub async fn run_cata_closure_pass_for_refnos(
         seeds.len()
     );
     let seed_count = seeds.len();
-    let mut resolver = CataClosureResolver::new(index, cfg);
+    let exclude_dbnums = seed_roots
+        .iter()
+        .filter_map(|root| index.dbnum_of_ref0(root.get_0()))
+        .collect::<HashSet<_>>();
+    let mut resolver = CataClosureResolver::new(index, cfg.excluding_dbnums(exclude_dbnums));
     resolver.seed(seeds);
     let mut manifest = resolver.resolve().await?;
     manifest.seed_count = seed_count;
     manifest.save_json(out_path)?;
     log::info!(
-        "[cata_closure] refno 级闭包 pass 完成: {} 个 CATA 库 / visited={} / missing={} → {}",
+        "[cata_closure] refno 级闭包 pass 完成: {} 个闭包库 / visited={} / missing={} → {}",
         manifest.by_dbnum.len(),
         manifest.visited_count,
         manifest.missing,
@@ -1036,7 +1168,14 @@ pub async fn run_cata_closure_pass_for_refno_strs_from_config(
         seeds.len()
     );
     let seed_count = seeds.len();
-    let mut resolver = CataClosureResolver::new(&locator, CataClosureConfig::precise());
+    let exclude_dbnums = seed_roots
+        .iter()
+        .filter_map(|root| locator.dbnum_of_ref0(root.get_0()))
+        .collect::<HashSet<_>>();
+    let mut resolver = CataClosureResolver::new(
+        &locator,
+        CataClosureConfig::precise().excluding_dbnums(exclude_dbnums),
+    );
     resolver.seed(seeds);
     let mut manifest = resolver.resolve().await?;
     manifest.seed_count = seed_count;
@@ -1366,5 +1505,77 @@ impl CataClosureManifest {
                 .extend(refs.iter().copied());
         }
         self.visited_count = self.by_dbnum.values().map(|s| s.len()).sum();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnv {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(old) = &self.old {
+                    std::env::set_var(self.key, old);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_sync_filter_prefers_explicit_manifest_path() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cata-manifest-test-{unique}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let manifest_path = dir.join("cata_closure.json");
+
+        let mut manifest = CataClosureManifest::default();
+        let allowed = RefU64::from_two_nums(7320, 41);
+        manifest.by_dbnum.insert(7320, BTreeSet::from([allowed]));
+        manifest.save_json(&manifest_path).expect("save manifest");
+
+        let _mode = ScopedEnv::set("AIOS_CATA_CLOSURE_MODE", "manifest");
+        let _path = ScopedEnv::set(
+            CATA_CLOSURE_MANIFEST_PATH_ENV,
+            &manifest_path.to_string_lossy(),
+        );
+        let _main_project = ScopedEnv::set(CATA_CLOSURE_MAIN_PROJECT_ENV, "AvevaPlantSample");
+
+        let db_types = vec!["CATA".to_string()];
+        let filter = load_sync_filter("AvevaCatalogue", &db_types).expect("explicit filter");
+        assert_eq!(filter.manifest_path, manifest_path);
+        assert_eq!(filter.main_project.as_deref(), Some("AvevaPlantSample"));
+        assert_eq!(filter.path_source, CataClosureManifestPathSource::Explicit);
+
+        let all_refnos = vec![allowed, RefU64::from_two_nums(7320, 42)];
+        let filtered = apply_sync_filter(Some(&filter), "CATA", 7320, all_refnos);
+        assert_eq!(filtered, vec![allowed]);
+
+        std::fs::remove_dir_all(dir).ok();
     }
 }

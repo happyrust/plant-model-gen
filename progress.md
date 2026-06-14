@@ -1,3 +1,57 @@
+# refno_assoc_index 使用清理进度
+
+## 2026-06-14
+
+- 已按用户要求使用 `planning-with-files` 制定 `refno_assoc_index` 使用清理开发计划。
+- 已读取项目内 `planning-with-files` skill，确认规划文件写入项目根目录：`task_plan.md`、`findings.md`、`progress.md`。
+- 已尝试启动检查：
+  - `memanto memory sync --project-dir .` 失败：`No agent specified and no active agent`。
+  - 用户级 `planning-with-files` 模板路径不存在。
+  - 项目内 `session-catchup.py` 路径不存在。
+  - 处理：全部记录为非阻塞，继续读取现有 planning 文件并前置新计划。
+- 已读取现有根目录 planning 文件，确认当前使用“新 active plan 在顶部，旧计划进入 Archived”模式。
+- 已用 codegraph 和精确检索审计 `refno_assoc_index` 使用面：
+  - `delete_by_refnos()` 只由 `pdms_inst::pre_cleanup_for_regen()` 调用。
+  - `pdms_inst.rs` 两条保存路径都会写 `RefnoAssocIndexBatch`。
+  - `manifold_bool.rs` bool worker 也写 `RefnoAssocIndexBatch`。
+  - `options.rs` 把 `regen_delete_mode=refno_assoc_index` 强制降级为 `Legacy`。
+  - `pdms_inst.rs::is_refno_assoc_index_enabled()` 仍硬编码为 `true`。
+  - `model_writer_ducklake.rs` 仍把 `raw_refno_assoc_index` 标为 known gap。
+- 已把新开发计划前置写入 `task_plan.md`：
+  - Phase R1：使用面审计与现状定界，已完成。
+  - Phase R2：删除模式契约收敛，待执行。
+  - Phase R3：写入路径解耦，待执行。
+  - Phase R4：清理覆盖范围对齐，待执行。
+  - Phase R5：独立清理入口设计，待执行。
+  - Phase R6：验证与回归守护，待执行。
+  - Phase R7：文档与收口，待执行。
+- 已把本轮发现前置写入 `findings.md`，包括配置/运行矛盾、写入面、cleanup 抽象边界、DuckLake known gap 和验证约束。
+- 当前结论：本轮计划建议先把 `refno_assoc_index` 从隐式硬启用状态改成显式 cleanup backend；不建议第一步直接删除整个模块。
+
+## Test Results
+
+| Check | Input | Expected | Actual | Status |
+|-------|-------|----------|--------|--------|
+| planning-with-files skill 读取 | `.cursor/skills/planning-with-files/SKILL.md` | 确认三文件规划约定 | 已读取 | PASS |
+| memanto sync | `memanto memory sync --project-dir .` | 同步并生成/更新 `MEMORY.md` | 失败：No agent specified and no active agent | WARN |
+| session catchup | `session-catchup.py` | 恢复未同步上下文 | 用户级/项目级脚本路径均不存在 | WARN |
+| 现有 planning 文件读取 | `task_plan.md` / `findings.md` / `progress.md` | 避免覆盖历史计划 | 已读取并采用前置归档模式 | PASS |
+| codegraph 审计 | `refno_assoc_index pre_cleanup_for_regen ...` | 定位核心使用面 | 找到 `delete_by_refnos` caller、writer 相关 blast radius | PASS |
+| 精确检索 | `refno_assoc_index` / `RefnoAssocIndexBatch` / `regen_delete_mode` | 验证写入点和配置点 | 确认 `options.rs` 与 `pdms_inst.rs` 存在语义矛盾 | PASS |
+| planning 文件更新 | `task_plan.md` / `findings.md` / `progress.md` | 新任务成为 active plan | 已完成 | PASS |
+
+## 5-Question Reboot Check
+
+| Question | Answer |
+|----------|--------|
+| Where am I? | `refno_assoc_index` 使用清理计划已制定，Phase R1 审计完成，准备进入 Phase R2 删除模式契约收敛。 |
+| Where am I going? | 下一步应先改配置/运行契约：移除硬编码 `is_refno_assoc_index_enabled() -> true`，让 `RegenDeleteMode` 成为真实行为来源。 |
+| What's the goal? | 把 `refno_assoc_index` 从隐式、矛盾、散落的用法，收敛为明确、可验证、可选择的模型生成数据清理组件。 |
+| What have I learned? | 最大风险是 `options.rs` 声称停用但 `pdms_inst.rs` 实际启用；写入点分散在 `pdms_inst.rs` 和 `manifold_bool.rs`，不能只改一个文件。 |
+| What have I done? | 已读取技能和现有 planning 文件，完成使用面审计，并前置更新 `task_plan.md`、`findings.md`、`progress.md`。 |
+
+## Archived Previous Progress
+
 # Release 包 sidecar job 终态竞态修复进度
 
 ## 2026-06-08

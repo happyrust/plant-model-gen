@@ -2880,7 +2880,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("✅ 校验通过");
                 return Ok(());
             }
-            anyhow::bail!("校验未通过（missing={}, mismatch={}）", report.member_missing.len(), report.hash_mismatched.len());
+            anyhow::bail!(
+                "校验未通过（missing={}, mismatch={}）",
+                report.member_missing.len(),
+                report.hash_mismatched.len()
+            );
         }
         #[cfg(not(all(feature = "sqlite-index", feature = "surreal-save")))]
         {

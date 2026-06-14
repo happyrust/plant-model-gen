@@ -11,10 +11,13 @@ use aios_core::pdms_types::*;
 use aios_core::prim_geo::polyhedron::Polygon;
 use aios_core::prim_geo::*;
 use aios_core::shape::pdms_shape::BrepShapeTrait;
-use glam::Vec3;
-use std::collections::HashMap;
+use aios_core::types::named_attvalue::NamedAttrValue;
+use aios_core::{NamedAttrMap, SurrealQueryExt};
+use glam::{Quat, Vec3};
+use std::collections::{HashMap, HashSet};
 use std::mem::take;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
@@ -40,6 +43,400 @@ fn calculate_batch_chunks(total: usize) -> (usize, usize) {
     (batch_count, batch_size)
 }
 
+static SPEC011_WATCH_REFNOS: OnceLock<Option<HashSet<u64>>> = OnceLock::new();
+
+/// Env-gated probe for spec 011. Set `AIOS_SPEC011_REFNOS` to comma-separated
+/// `ref0/ref1`, `ref0_ref1`, or raw u64 values to trace only those PRIMs.
+fn spec011_watch_refnos() -> Option<&'static HashSet<u64>> {
+    SPEC011_WATCH_REFNOS
+        .get_or_init(|| {
+            let raw = std::env::var("AIOS_SPEC011_REFNOS").ok()?;
+            let set = raw
+                .split(|c| matches!(c, ',' | ';' | ' ' | '\n' | '\r' | '\t'))
+                .filter_map(parse_spec011_refno)
+                .collect::<HashSet<_>>();
+            (!set.is_empty()).then_some(set)
+        })
+        .as_ref()
+}
+
+fn parse_spec011_refno(token: &str) -> Option<u64> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if let Some((left, right)) = token.split_once('/').or_else(|| token.split_once('_')) {
+        let ref0: u64 = left.trim().parse().ok()?;
+        let ref1: u64 = right.trim().parse().ok()?;
+        return Some((ref0 << 32) | ref1);
+    }
+    token.parse::<u64>().ok()
+}
+
+fn spec011_watch_hit(refno: RefnoEnum) -> bool {
+    let Some(watch) = spec011_watch_refnos() else {
+        return false;
+    };
+    watch.contains(&refno.refno().0)
+}
+
+fn spec011_log(refno: RefnoEnum, message: impl AsRef<str>) {
+    if spec011_watch_hit(refno) {
+        println!("[spec011][prim] refno={} {}", refno, message.as_ref());
+    }
+}
+
+fn spec011_param_summary(attr: &aios_core::NamedAttrMap) -> String {
+    const KEYS: &[&str] = &[
+        "DIAM",
+        "HEIG",
+        "RADI",
+        "DTOP",
+        "DBOT",
+        "XBOT",
+        "YBOT",
+        "XTOP",
+        "YTOP",
+        "XOFF",
+        "YOFF",
+        "DHEI",
+        "SHEI",
+        "DRAD",
+        "SDIA",
+        "SWID",
+        "STHI",
+        "SDIS",
+        "DIMD",
+        "PBTP",
+        "PCTP",
+        "PBBT",
+        "PCBT",
+        "PTDI",
+        "PBDI",
+        "PTOF",
+        "PBOF",
+        "PCOF",
+        "_AIOS_TEMPLATE_Z_OFFSET",
+        "_AIOS_TEMPLATE_ROT_Z",
+    ];
+    KEYS.iter()
+        .filter_map(|key| attr.get_f32(key).map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_desp_index_expr(expr: &str, desp: &[f32]) -> Option<f32> {
+    let upper = expr.to_ascii_uppercase();
+    let Some(start) = upper.find("DESP[") else {
+        return expr.trim().trim_matches('\'').parse::<f32>().ok();
+    };
+    let after = &upper[start + "DESP[".len()..];
+    let end = after.find(']')?;
+    let idx = after[..end].trim().parse::<usize>().ok()?;
+    idx.checked_sub(1)
+        .and_then(|zero_idx| desp.get(zero_idx).copied())
+}
+
+fn ddat_value_from_attr(attr: &NamedAttrMap, desp: &[f32]) -> Option<f32> {
+    attr.get_as_string("DDPR")
+        .as_deref()
+        .and_then(|expr| parse_desp_index_expr(expr, desp))
+        .or_else(|| {
+            attr.get_as_string("DDDF")
+                .as_deref()
+                .and_then(|expr| parse_desp_index_expr(expr, desp))
+        })
+}
+
+fn set_template_f32(attr: &mut NamedAttrMap, key: &str, value: f32) {
+    if value.is_finite() {
+        attr.map
+            .insert(key.to_string(), NamedAttrValue::F32Type(value.max(0.0)));
+    }
+}
+
+fn set_template_adjustment(attr: &mut NamedAttrMap, key: &str, value: f32) {
+    if value.is_finite() {
+        attr.map
+            .insert(key.to_string(), NamedAttrValue::F32Type(value));
+    }
+}
+
+fn apply_template_prim_params(
+    cur_type: &str,
+    params: &HashMap<String, f32>,
+    attr: &mut NamedAttrMap,
+) -> bool {
+    let get = |key: &str| params.get(key).copied().filter(|v| v.is_finite());
+    match cur_type {
+        "CYLI" => {
+            let Some(diam) = get("DIAM") else {
+                return false;
+            };
+            let Some(total_height) = get("HEIG") else {
+                return false;
+            };
+            let height =
+                total_height - get("DHEI").unwrap_or_default() - get("SHEI").unwrap_or_default();
+            set_template_f32(attr, "DIAM", diam);
+            set_template_f32(attr, "HEIG", height);
+            set_template_adjustment(attr, "_AIOS_TEMPLATE_Z_OFFSET", height * 0.5);
+            height > f32::EPSILON
+        }
+        "DISH" => {
+            let Some(diam) = get("DIAM") else {
+                return false;
+            };
+            let Some(height) = get("DHEI").or_else(|| get("HEIG")) else {
+                return false;
+            };
+            set_template_f32(attr, "DIAM", diam);
+            set_template_f32(attr, "HEIG", height);
+            if let Some(radius) = get("DRAD") {
+                set_template_f32(attr, "RADI", radius);
+            }
+            if let Some(body_height) = get("HEIG") {
+                set_template_adjustment(attr, "_AIOS_TEMPLATE_Z_OFFSET", body_height);
+            }
+            height > f32::EPSILON
+        }
+        "SNOU" => {
+            let Some(height) = get("SHEI").or_else(|| get("HEIG")) else {
+                return false;
+            };
+            let Some(top_diam) = get("DIAM") else {
+                return false;
+            };
+            let Some(bottom_diam) = get("SDIA").or_else(|| get("DBOT")) else {
+                return false;
+            };
+            set_template_f32(attr, "HEIG", height);
+            set_template_f32(attr, "DTOP", top_diam);
+            set_template_f32(attr, "DBOT", bottom_diam);
+            set_template_f32(attr, "XOFF", 0.0);
+            set_template_f32(attr, "YOFF", 0.0);
+            set_template_adjustment(attr, "_AIOS_TEMPLATE_Z_OFFSET", -height * 0.5);
+            height > f32::EPSILON
+        }
+        "PYRA" => {
+            let Some(width) = get("SWID") else {
+                return false;
+            };
+            let Some(thickness) = get("STHI") else {
+                return false;
+            };
+            let Some(height) = get("SHEI").or_else(|| get("HEIG")) else {
+                return false;
+            };
+            let span = get("DIMD").map(|value| value * 2.0).unwrap_or(width);
+            set_template_f32(attr, "XBOT", thickness);
+            set_template_f32(attr, "XTOP", thickness);
+            set_template_f32(attr, "YBOT", span);
+            set_template_f32(attr, "YTOP", (span - width).max(thickness));
+            set_template_f32(attr, "HEIG", height);
+            set_template_f32(attr, "XOFF", 0.0);
+            set_template_f32(attr, "YOFF", 0.0);
+            let z_offset = get("SDIS").unwrap_or_default() + height * 0.5;
+            set_template_adjustment(attr, "_AIOS_TEMPLATE_Z_OFFSET", z_offset);
+            span > f32::EPSILON && thickness > f32::EPSILON && height > f32::EPSILON
+        }
+        _ => false,
+    }
+}
+
+fn apply_template_inst_adjustments(attr: &NamedAttrMap, inst: &mut EleInstGeo) {
+    if let Some(z_offset) = attr.get_f32("_AIOS_TEMPLATE_Z_OFFSET") {
+        inst.geo_transform.translation.z += z_offset;
+    }
+    if let Some(rotation_deg) = attr.get_f32("_AIOS_TEMPLATE_ROT_Z") {
+        inst.geo_transform.rotation *= Quat::from_rotation_z(rotation_deg.to_radians());
+    }
+}
+
+fn attr_refno(attr: &NamedAttrMap, key: &str) -> Option<RefnoEnum> {
+    match attr.map.get(key)? {
+        NamedAttrValue::RefU64Type(value) => Some(RefnoEnum::Refno(*value)),
+        NamedAttrValue::RefnoEnumType(value) => Some(*value),
+        _ => None,
+    }
+}
+
+async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAttrMap) {
+    if cur_type != "PYRA" {
+        return;
+    }
+    let Some(origin_refno) = attr_refno(attr, "ORRF") else {
+        return;
+    };
+    let origin_attr = aios_core::get_named_attmap(origin_refno)
+        .await
+        .unwrap_or_default();
+    let origin_owner = origin_attr.get_owner();
+    if !origin_owner.is_valid() {
+        return;
+    }
+    let siblings = crate::fast_model::query_provider::get_children(origin_owner)
+        .await
+        .unwrap_or_default();
+    let mut same_type = Vec::new();
+    for sibling in siblings {
+        let sibling_type = aios_core::get_type_name(sibling).await.unwrap_or_default();
+        if sibling_type == cur_type {
+            same_type.push(sibling);
+        }
+    }
+    let Some(index) = same_type
+        .iter()
+        .position(|candidate| *candidate == origin_refno)
+    else {
+        return;
+    };
+    let rotation_deg = if index % 2 == 0 { 180.0 } else { -90.0 };
+    set_template_adjustment(attr, "_AIOS_TEMPLATE_ROT_Z", rotation_deg);
+}
+
+async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> NamedAttrMap {
+    let cur_type = attr.get_type_str().to_string();
+    if !matches!(cur_type.as_str(), "CYLI" | "DISH" | "SNOU" | "PYRA") {
+        return attr;
+    }
+
+    let tmpl_refno = attr.get_owner();
+    spec011_log(
+        refno,
+        format!("template_resolve_start type={cur_type} owner={tmpl_refno}"),
+    );
+    if !tmpl_refno.is_valid() {
+        spec011_log(refno, "template_resolve_stop=invalid_template_owner");
+        return attr;
+    }
+    let tmpl_attr = aios_core::get_named_attmap(tmpl_refno)
+        .await
+        .unwrap_or_default();
+    if tmpl_attr.get_type_str() != "TMPL" {
+        spec011_log(
+            refno,
+            format!(
+                "template_resolve_stop=owner_not_tmpl owner_type={}",
+                tmpl_attr.get_type_str()
+            ),
+        );
+        return attr;
+    }
+
+    let design_owner = tmpl_attr.get_owner();
+    if !design_owner.is_valid() {
+        spec011_log(refno, "template_resolve_stop=invalid_design_owner");
+        return attr;
+    }
+    let design_attr = aios_core::get_named_attmap(design_owner)
+        .await
+        .unwrap_or_default();
+    let Some(desp) = design_attr
+        .get_f32_vec("DESP")
+        .filter(|values| !values.is_empty())
+    else {
+        spec011_log(
+            refno,
+            format!(
+                "template_resolve_stop=missing_desp design_owner={} design_type={}",
+                design_owner,
+                design_attr.get_type_str()
+            ),
+        );
+        return attr;
+    };
+
+    let tmpl_children = crate::fast_model::query_provider::get_children(tmpl_refno)
+        .await
+        .unwrap_or_default();
+    spec011_log(
+        refno,
+        format!(
+            "template_resolve_desp={:?} tmpl_children={}",
+            desp,
+            tmpl_children.len()
+        ),
+    );
+    let mut ddat_owner_refno = None;
+    let mut ddat_fallback_owner_refno = None;
+    for child in tmpl_children {
+        let child_attr = aios_core::get_named_attmap(child).await.unwrap_or_default();
+        if child_attr.get_type_str() == "DDSE" {
+            ddat_owner_refno = Some(child);
+            ddat_fallback_owner_refno = attr_refno(&child_attr, "ORRF");
+            break;
+        }
+    }
+    let Some(mut ddat_owner_refno) = ddat_owner_refno else {
+        spec011_log(refno, "template_resolve_stop=missing_ddse");
+        return attr;
+    };
+
+    let mut ddat_refnos = crate::fast_model::query_provider::get_children(ddat_owner_refno)
+        .await
+        .unwrap_or_default();
+    if ddat_refnos.is_empty() {
+        if let Some(fallback_owner) = ddat_fallback_owner_refno {
+            ddat_owner_refno = fallback_owner;
+            ddat_refnos = crate::fast_model::query_provider::get_children(fallback_owner)
+                .await
+                .unwrap_or_default();
+        }
+    }
+    let mut params = HashMap::new();
+    for ddat_refno in &ddat_refnos {
+        let ddat_attr = aios_core::get_named_attmap(*ddat_refno)
+            .await
+            .unwrap_or_default();
+        if ddat_attr.get_type_str() != "DDAT" {
+            continue;
+        }
+        let Some(key) = ddat_attr
+            .get_as_string("DKEY")
+            .map(|key| key.trim().to_uppercase())
+        else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(value) = ddat_value_from_attr(&ddat_attr, &desp) {
+            params.insert(key, value);
+        }
+    }
+    spec011_log(
+        refno,
+        format!(
+            "template_resolve_ddat_owner={} ddat_count={} params={:?}",
+            ddat_owner_refno,
+            ddat_refnos.len(),
+            params
+        ),
+    );
+
+    let mut resolved = attr;
+    if apply_template_prim_params(&cur_type, &params, &mut resolved) {
+        apply_template_primitive_orientation(&cur_type, &mut resolved).await;
+        spec011_log(
+            refno,
+            format!(
+                "template_params_applied type={} owner={} design_owner={} params={}",
+                cur_type,
+                tmpl_refno,
+                design_owner,
+                spec011_param_summary(&resolved)
+            ),
+        );
+    } else {
+        spec011_log(
+            refno,
+            format!("template_resolve_stop=required_params_missing type={cur_type}"),
+        );
+    }
+    resolved
+}
+
 /// 从 CSG shape 构建 EleInstGeo（两个入口函数的核心公共逻辑）。
 ///
 /// 返回 `Some((inst_geo, geo_insts_has_pos))` 或 `None`（表示跳过）。
@@ -50,11 +447,21 @@ fn build_inst_geo_from_shape(
     is_neg: bool,
 ) -> Option<EleInstGeo> {
     if !csg_shape.check_valid() {
+        spec011_log(refno, "skip_detail=shape_check_valid_false");
         return None;
     }
 
     let mut transform = csg_shape.get_trans();
     if transform.translation.is_nan() || transform.rotation.is_nan() || transform.scale.is_nan() {
+        spec011_log(
+            refno,
+            format!(
+                "skip_detail=transform_nan translation_nan={} rotation_nan={} scale_nan={}",
+                transform.translation.is_nan(),
+                transform.rotation.is_nan(),
+                transform.scale.is_nan()
+            ),
+        );
         return None;
     }
 
@@ -89,6 +496,24 @@ fn build_inst_geo_from_shape(
         },
         cata_neg_refnos: vec![],
     })
+}
+
+fn build_datum_marker_geos(refno: RefnoEnum, visible: bool) -> Vec<EleInstGeo> {
+    [Vec3::X, Vec3::Y, Vec3::Z]
+        .into_iter()
+        .filter_map(|direction| {
+            let shape: Box<dyn BrepShapeTrait> = Box::new(SCylinder {
+                phei: 100.0,
+                pdia: 10.0,
+                center_in_mid: false,
+                ..Default::default()
+            });
+            let mut inst = build_inst_geo_from_shape(shape, refno, visible, false)?;
+            inst.geo_transform.rotation = Quat::from_rotation_arc(Vec3::Z, direction);
+            inst.geo_transform.translation = direction * -50.0;
+            Some(inst)
+        })
+        .collect()
 }
 
 /// 从 DB 查询构建多面体 CSG shape（POHE/POLYHE）。
@@ -197,12 +622,12 @@ fn build_polyhedron_from_cache(
 fn insert_prim_result(
     shape_insts_data: &mut ShapeInstancesData,
     geos_info: EleGeosInfo,
-    inst_geo: EleInstGeo,
+    insts: Vec<EleInstGeo>,
     neg_refnos: &[RefnoEnum],
     type_name: &str,
 ) {
     let refno = geos_info.refno;
-    let is_solid = inst_geo.geo_type == GeoBasicType::Pos;
+    let is_solid = insts.iter().any(|inst| inst.geo_type == GeoBasicType::Pos);
     let mut geos_info = geos_info;
     geos_info.is_solid = is_solid;
 
@@ -216,7 +641,7 @@ fn insert_prim_result(
         EleInstGeosData {
             inst_key,
             refno,
-            insts: vec![inst_geo],
+            insts,
             aabb: None,
             type_name: type_name.to_string(),
         },
@@ -306,6 +731,18 @@ pub async fn gen_prim_geos(
         return Ok(true);
     }
 
+    if let Some(watch) = spec011_watch_refnos() {
+        let hits = prim_refnos
+            .iter()
+            .copied()
+            .filter(|refno| watch.contains(&refno.refno().0))
+            .collect::<Vec<_>>();
+        println!(
+            "[spec011][prim] page_input total={} watched_hits={:?}",
+            prim_cnt, hits
+        );
+    }
+
     let (batch_chunks_cnt, batch_size) = calculate_batch_chunks(prim_cnt);
     e3d_dbg!(
         "[gen_prim_geos] 分块策略: {} 个批次, 每批 {} 个元素",
@@ -393,6 +830,7 @@ pub async fn gen_prim_geos(
                     .await;
                 let Ok(Some(trans_origin)) = trans_result else {
                     skipped_in_batch += 1;
+                    spec011_log(refno, "skip=world_transform_missing");
                     if let Err(e) = &trans_result {
                         e3d_dbg!(
                             "批次 {} 跳过 refno={}: 获取世界变换失败 - {:?}",
@@ -405,6 +843,7 @@ pub async fn gen_prim_geos(
                 };
 
                 let attr = aios_core::get_named_attmap(refno).await.unwrap_or_default();
+                let attr = resolve_template_prim_attr(refno, attr).await;
                 let visible = attr.is_visible_by_level(None).unwrap_or(true);
                 let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attr).await;
                 let cur_type = attr.get_type_str();
@@ -426,22 +865,44 @@ pub async fn gen_prim_geos(
                     None
                 };
 
-                let csg_shape = if cur_type == "POHE" || cur_type == "POLYHE" {
+                let datum_geos = matches!(cur_type, "JLDATU" | "PLDATU")
+                    .then(|| build_datum_marker_geos(refno, visible));
+                let csg_shape = if datum_geos.is_some() {
+                    None
+                } else if cur_type == "POHE" || cur_type == "POLYHE" {
                     build_polyhedron_from_db(refno).await
                 } else {
                     attr.create_csg_shape(neg_limit_size)
                 };
 
-                let Some(csg_shape) = csg_shape else {
-                    skipped_in_batch += 1;
-                    continue;
-                };
-
-                let Some(inst_geo) =
-                    build_inst_geo_from_shape(csg_shape, refno, visible, attr.is_neg())
-                else {
-                    skipped_in_batch += 1;
-                    continue;
+                let inst_geos = if let Some(insts) = datum_geos {
+                    insts
+                } else {
+                    let Some(csg_shape) = csg_shape else {
+                        skipped_in_batch += 1;
+                        spec011_log(
+                            refno,
+                            format!(
+                                "skip=create_csg_shape_failed type={cur_type} visible={visible}"
+                            ),
+                        );
+                        continue;
+                    };
+                    let Some(mut inst_geo) =
+                        build_inst_geo_from_shape(csg_shape, refno, visible, attr.is_neg())
+                    else {
+                        skipped_in_batch += 1;
+                        spec011_log(
+                            refno,
+                            format!(
+                                "skip=invalid_inst_geo type={cur_type} params={}",
+                                spec011_param_summary(&attr)
+                            ),
+                        );
+                        continue;
+                    };
+                    apply_template_inst_adjustments(&attr, &mut inst_geo);
+                    vec![inst_geo]
                 };
 
                 let neg_refnos = neg_map.get(&refno).cloned().unwrap_or_default();
@@ -449,11 +910,21 @@ pub async fn gen_prim_geos(
                 insert_prim_result(
                     &mut shape_insts_data,
                     geos_info,
-                    inst_geo,
+                    inst_geos,
                     &neg_refnos,
                     cur_type,
                 );
                 processed_in_batch += 1;
+                spec011_log(
+                    refno,
+                    format!(
+                        "inserted type={} visible={} is_neg={} batch={}",
+                        cur_type,
+                        visible,
+                        attr.is_neg(),
+                        i
+                    ),
+                );
 
                 flush_if_needed(&mut shape_insts_data, &sender, i, &mut sent_count).await?;
             }
@@ -599,31 +1070,39 @@ pub async fn gen_prim_geos_from_inputs(
                     None
                 };
 
+                let datum_geos = matches!(cur_type, "JLDATU" | "PLDATU")
+                    .then(|| build_datum_marker_geos(refno, visible));
                 let csg_shape: Option<Box<dyn BrepShapeTrait>> =
-                    if cur_type == "POHE" || cur_type == "POLYHE" {
+                    if datum_geos.is_some() {
+                        None
+                    } else if cur_type == "POHE" || cur_type == "POLYHE" {
                         input.poly_extra.as_ref().map(build_polyhedron_from_cache)
                     } else {
                         attr.create_csg_shape(neg_limit_size)
                     };
 
-                let Some(csg_shape) = csg_shape else {
-                    skipped_in_batch += 1;
-                    continue;
-                };
-
-                // 构建 inst_geo（复用公共逻辑）
-                let Some(inst_geo) = build_inst_geo_from_shape(
-                    csg_shape, refno, visible, attr.is_neg(),
-                ) else {
-                    skipped_in_batch += 1;
-                    continue;
+                let inst_geos = if let Some(insts) = datum_geos {
+                    insts
+                } else {
+                    let Some(csg_shape) = csg_shape else {
+                        skipped_in_batch += 1;
+                        continue;
+                    };
+                    let Some(mut inst_geo) =
+                        build_inst_geo_from_shape(csg_shape, refno, visible, attr.is_neg())
+                    else {
+                        skipped_in_batch += 1;
+                        continue;
+                    };
+                    apply_template_inst_adjustments(attr, &mut inst_geo);
+                    vec![inst_geo]
                 };
 
                 // 插入结果
                 insert_prim_result(
                     &mut shape_insts_data,
                     geos_info,
-                    inst_geo,
+                    inst_geos,
                     &input.neg_refnos,
                     cur_type,
                 );
@@ -692,3 +1171,124 @@ pub async fn gen_prim_geos_from_inputs(
     Ok(true)
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attr_with_type(noun: &str) -> NamedAttrMap {
+        let mut attr = NamedAttrMap::default();
+        attr.map.insert(
+            "TYPE".to_string(),
+            NamedAttrValue::StringType(noun.to_string()),
+        );
+        attr
+    }
+
+    fn f32_attr(attr: &NamedAttrMap, key: &str) -> f32 {
+        attr.get_f32(key)
+            .unwrap_or_else(|| panic!("missing f32 attr {key}"))
+    }
+
+    #[test]
+    fn spec011_desp_index_expr_reads_one_based_desp_values() {
+        let desp = [1200.0, 800.0, 200.0, 100.0, 600.0, 80.0, 150.0];
+
+        assert_eq!(parse_desp_index_expr("DESP[1]", &desp), Some(1200.0));
+        assert_eq!(parse_desp_index_expr("'DESP[7]'", &desp), Some(150.0));
+        assert_eq!(parse_desp_index_expr("42.5", &desp), Some(42.5));
+        assert_eq!(parse_desp_index_expr("DESP[0]", &desp), None);
+        assert_eq!(parse_desp_index_expr("DESP[99]", &desp), None);
+    }
+
+    #[test]
+    fn spec011_template_params_fill_cyli_dish_and_snou_fields() {
+        let params = HashMap::from([
+            ("DIAM".to_string(), 800.0),
+            ("HEIG".to_string(), 1200.0),
+            ("DHEI".to_string(), 200.0),
+            ("DRAD".to_string(), 100.0),
+            ("SHEI".to_string(), 600.0),
+            ("SDIA".to_string(), 150.0),
+        ]);
+
+        let mut cyli = attr_with_type("CYLI");
+        assert!(apply_template_prim_params("CYLI", &params, &mut cyli));
+        assert_eq!(f32_attr(&cyli, "DIAM"), 800.0);
+        assert_eq!(f32_attr(&cyli, "HEIG"), 400.0);
+        assert_eq!(f32_attr(&cyli, "_AIOS_TEMPLATE_Z_OFFSET"), 200.0);
+
+        let mut dish = attr_with_type("DISH");
+        assert!(apply_template_prim_params("DISH", &params, &mut dish));
+        assert_eq!(f32_attr(&dish, "DIAM"), 800.0);
+        assert_eq!(f32_attr(&dish, "HEIG"), 200.0);
+        assert_eq!(f32_attr(&dish, "RADI"), 100.0);
+        assert_eq!(f32_attr(&dish, "_AIOS_TEMPLATE_Z_OFFSET"), 1200.0);
+
+        let mut snou = attr_with_type("SNOU");
+        assert!(apply_template_prim_params("SNOU", &params, &mut snou));
+        assert_eq!(f32_attr(&snou, "HEIG"), 600.0);
+        assert_eq!(f32_attr(&snou, "DTOP"), 800.0);
+        assert_eq!(f32_attr(&snou, "DBOT"), 150.0);
+        assert_eq!(f32_attr(&snou, "XOFF"), 0.0);
+        assert_eq!(f32_attr(&snou, "YOFF"), 0.0);
+        assert_eq!(f32_attr(&snou, "_AIOS_TEMPLATE_Z_OFFSET"), -300.0);
+    }
+
+    #[test]
+    fn spec011_template_params_fill_pyra_fields() {
+        let params = HashMap::from([
+            ("SWID".to_string(), 600.0),
+            ("STHI".to_string(), 80.0),
+            ("SHEI".to_string(), 150.0),
+            ("DIMD".to_string(), 400.0),
+            ("SDIS".to_string(), 25.0),
+        ]);
+
+        let mut pyra = attr_with_type("PYRA");
+        assert!(apply_template_prim_params("PYRA", &params, &mut pyra));
+        assert_eq!(f32_attr(&pyra, "XBOT"), 80.0);
+        assert_eq!(f32_attr(&pyra, "XTOP"), 80.0);
+        assert_eq!(f32_attr(&pyra, "YBOT"), 800.0);
+        assert_eq!(f32_attr(&pyra, "YTOP"), 200.0);
+        assert_eq!(f32_attr(&pyra, "HEIG"), 150.0);
+        assert_eq!(f32_attr(&pyra, "XOFF"), 0.0);
+        assert_eq!(f32_attr(&pyra, "YOFF"), 0.0);
+        assert_eq!(f32_attr(&pyra, "_AIOS_TEMPLATE_Z_OFFSET"), 100.0);
+    }
+
+    #[test]
+    fn spec011_template_params_reject_missing_required_values() {
+        let mut cyli = attr_with_type("CYLI");
+        assert!(!apply_template_prim_params(
+            "CYLI",
+            &HashMap::from([("DIAM".to_string(), 800.0)]),
+            &mut cyli,
+        ));
+
+        let mut pyra = attr_with_type("PYRA");
+        assert!(!apply_template_prim_params(
+            "PYRA",
+            &HashMap::from([("SWID".to_string(), 600.0), ("STHI".to_string(), 80.0),]),
+            &mut pyra,
+        ));
+    }
+
+    #[test]
+    fn datum_marker_geos_emit_three_visible_positive_axes() {
+        let refno = RefnoEnum::default();
+        let geos = build_datum_marker_geos(refno, true);
+
+        assert_eq!(geos.len(), 3);
+        assert!(geos.iter().all(|geo| geo.refno == refno));
+        assert!(geos.iter().all(|geo| geo.visible));
+        assert!(geos.iter().all(|geo| geo.geo_type == GeoBasicType::Pos));
+        assert!(
+            geos.iter()
+                .all(|geo| geo.geo_transform.translation.is_finite())
+        );
+        assert_eq!(geos[0].geo_transform.translation, Vec3::X * -50.0);
+        assert_eq!(geos[1].geo_transform.translation, Vec3::Y * -50.0);
+        assert_eq!(geos[2].geo_transform.translation, Vec3::Z * -50.0);
+    }
+}

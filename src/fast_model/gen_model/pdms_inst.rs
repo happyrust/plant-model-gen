@@ -233,7 +233,7 @@ async fn delete_inst_relate_bool_records(
 /// - BRAN/HANG 重新生成后，新世界坐标直段已写入；
 /// - 但旧的局部坐标 tubi_relate 仍残留在同一 branch range 下；
 /// - 导出阶段按 `tubi_relate:[bran,0]..[bran,..]` 全量读取时，会把新旧两套直段一起带出。
-async fn delete_tubi_relate_by_branch_refnos(
+pub(crate) async fn delete_tubi_relate_by_branch_refnos(
     branch_refnos: &[RefnoEnum],
     chunk_size: usize,
 ) -> anyhow::Result<()> {
@@ -1465,10 +1465,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         // 旧数据由重生成入口整体清理（pre_cleanup），首次部署为空库；
         // 写入统一 INSERT IGNORE 幂等，不再逐 chunk DELETE+INSERT 替换。
         for rows in deduped_rows.chunks(CHUNK_SIZE) {
-            let insert_stmt = format!(
-                "INSERT IGNORE INTO inst_relate_aabb [{}];",
-                rows.join(",")
-            );
+            let insert_stmt = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", rows.join(","));
             inst_aabb_batcher.push(insert_stmt).await?;
         }
 
@@ -1852,10 +1849,7 @@ pub async fn save_inst_relate_aabb_rows(
             dedupe_inst_relate_aabb_rows(inst_relate_aabb_rows, inst_relate_aabb_ids);
         // 同上：写入统一 INSERT IGNORE，旧数据由入口整体清理，不做逐行替换。
         for rows in deduped_rows.chunks(CHUNK_SIZE) {
-            let insert_stmt = format!(
-                "INSERT IGNORE INTO inst_relate_aabb [{}];",
-                rows.join(",")
-            );
+            let insert_stmt = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", rows.join(","));
             inst_aabb_batcher.push(insert_stmt).await?;
         }
         inst_aabb_batcher.finish().await?;

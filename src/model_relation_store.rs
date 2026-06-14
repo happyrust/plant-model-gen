@@ -56,6 +56,7 @@ impl ModelRelationStore {
                 noun TEXT,
                 identity_source TEXT,
                 resolved INTEGER DEFAULT 0,
+                attrs_json TEXT,
                 created_at INTEGER DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_refno ON inst_relate(refno);
@@ -92,23 +93,20 @@ impl ModelRelationStore {
             );
             CREATE INDEX IF NOT EXISTS idx_bool_carrier ON inst_relate_bool(carrier_refno);",
         )?;
-        Self::ensure_inst_relate_identity_columns(conn)?;
+        Self::ensure_inst_relate_columns(conn)?;
         Ok(())
     }
 
     /// spec 009:旧库幂等迁移——为 inst_relate 补 name/noun/identity_source/resolved 列。
     /// 新建库由 CREATE TABLE 直接包含;已存在的旧库按 PRAGMA table_info 检测缺失列补齐。
-    fn ensure_inst_relate_identity_columns(conn: &Connection) -> Result<()> {
+    fn ensure_inst_relate_columns(conn: &Connection) -> Result<()> {
         let existing: Vec<String> = conn
             .prepare("PRAGMA table_info(inst_relate)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<std::result::Result<_, _>>()?;
         let add = |col: &str, ddl: &str| -> Result<()> {
             if !existing.iter().any(|c| c == col) {
-                conn.execute(
-                    &format!("ALTER TABLE inst_relate ADD COLUMN {ddl}"),
-                    [],
-                )?;
+                conn.execute(&format!("ALTER TABLE inst_relate ADD COLUMN {ddl}"), [])?;
             }
             Ok(())
         };
@@ -116,6 +114,7 @@ impl ModelRelationStore {
         add("noun", "noun TEXT")?;
         add("identity_source", "identity_source TEXT")?;
         add("resolved", "resolved INTEGER DEFAULT 0")?;
+        add("attrs_json", "attrs_json TEXT")?;
         Ok(())
     }
 
@@ -164,6 +163,26 @@ impl ModelRelationStore {
         Ok(total_deleted)
     }
 
+    /// 清理指定名称的旧 inst_relate 记录。
+    ///
+    /// RVM 导入可能在解析规则修复后把同一个节点映射到不同 refno；仅按新 refno
+    /// 清理会留下旧错误身份记录，因此导入前也按本轮节点名做一次幂等清理。
+    pub fn cleanup_inst_relates_by_names(&self, dbnum: u32, names: &[String]) -> Result<usize> {
+        if names.is_empty() {
+            return Ok(0);
+        }
+
+        let conn = self.get_conn(dbnum)?;
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM inst_relate WHERE dbnum = ?1 AND name = ?2",
+        )?;
+        let mut total_deleted = 0usize;
+        for name in names {
+            total_deleted += stmt.execute(params![dbnum, name])?;
+        }
+        Ok(total_deleted)
+    }
+
     /// 批量插入 inst_relate
     pub fn insert_inst_relates(&self, dbnum: u32, records: &[InstRelateRecord]) -> Result<()> {
         if records.is_empty() {
@@ -177,8 +196,8 @@ impl ModelRelationStore {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR REPLACE INTO inst_relate
                  (dbnum, refno, inst_id, parent_refno, world_matrix,
-                  name, noun, identity_source, resolved)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  name, noun, identity_source, resolved, attrs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
 
             for rec in records {
@@ -191,7 +210,8 @@ impl ModelRelationStore {
                     rec.name.as_deref(),
                     rec.noun.as_deref(),
                     rec.identity_source.as_deref(),
-                    rec.resolved as i64
+                    rec.resolved as i64,
+                    rec.attrs_json.as_deref()
                 ])?;
             }
         }
@@ -283,6 +303,29 @@ impl ModelRelationStore {
         Ok(inst_ids)
     }
 
+    /// 查询 RVM/ATT 导入时保存在关系库中的属性。
+    pub fn query_attrs_by_refno(
+        &self,
+        dbnum: u32,
+        refno: RefnoEnum,
+    ) -> Result<Option<serde_json::Value>> {
+        let conn = self.get_conn(dbnum)?;
+        let attrs_json: Option<String> = conn
+            .query_row(
+                "SELECT attrs_json FROM inst_relate WHERE refno = ?1 AND attrs_json IS NOT NULL LIMIT 1",
+                [refno.refno().0],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(attrs_json) = attrs_json else {
+            return Ok(None);
+        };
+        let attrs =
+            serde_json::from_str(&attrs_json).context("解析 inst_relate.attrs_json 失败")?;
+        Ok(Some(attrs))
+    }
+
     /// 获取统计信息
     pub fn get_stats(&self, dbnum: u32) -> Result<StoreStats> {
         let conn = self.get_conn(dbnum)?;
@@ -347,6 +390,8 @@ pub struct InstRelateRecord {
     pub identity_source: Option<String>,
     /// spec 009:refno 是否为真实 PDMS refno(身份解析成功)。
     pub resolved: bool,
+    /// RVM ATT 文件中的原始属性键值，JSON object 字符串。
+    pub attrs_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -6,6 +6,7 @@
 //! 输出表（按 dbnum 分目录，文件名固定）：
 //! - `instances.parquet`     — 一行一个实例 refno
 //! - `ptsets.parquet`        — 一行一个 cata_hash 局部坐标系关键点
+//! - `primitive_keypoints.parquet` — 一行一个 geo_hash 局部坐标系基础几何关键点
 //! - `geo_instances.parquet` — 一行一个几何引用 (refno × geo_index)
 //! - `tubings.parquet`       — 一行一个 TUBI 段
 //! - `transforms.parquet`    — 一行一个唯一 trans_hash
@@ -135,6 +136,22 @@ struct PtsetRow {
     pwidth: f64,
     pheight: f64,
     pconnect: String,
+}
+
+/// primitive_keypoints.parquet 的一行：按 geo_hash 复用局部坐标系基础几何关键点定义。
+#[derive(Clone)]
+struct PrimitiveKeyPointRow {
+    geo_hash: String,
+    keypoint_index: i32,
+    kind: String,
+    local_x: f64,
+    local_y: f64,
+    local_z: f64,
+    has_dir: bool,
+    dir_x: f64,
+    dir_y: f64,
+    dir_z: f64,
+    source: String,
 }
 
 // =============================================================================
@@ -504,6 +521,22 @@ fn ptsets_schema() -> Schema {
     ])
 }
 
+fn primitive_keypoints_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("geo_hash", DataType::Utf8, false),
+        Field::new("keypoint_index", DataType::Int32, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("local_x", DataType::Float64, false),
+        Field::new("local_y", DataType::Float64, false),
+        Field::new("local_z", DataType::Float64, false),
+        Field::new("has_dir", DataType::Boolean, false),
+        Field::new("dir_x", DataType::Float64, false),
+        Field::new("dir_y", DataType::Float64, false),
+        Field::new("dir_z", DataType::Float64, false),
+        Field::new("source", DataType::Utf8, false),
+    ])
+}
+
 // =============================================================================
 // RecordBatch 构建
 // =============================================================================
@@ -628,6 +661,49 @@ fn build_ptsets_batch(rows: &[PtsetRow]) -> Result<RecordBatch> {
             )) as ArrayRef,
             Arc::new(StringArray::from(
                 rows.iter().map(|r| r.pconnect.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )?;
+    Ok(batch)
+}
+
+fn build_primitive_keypoints_batch(rows: &[PrimitiveKeyPointRow]) -> Result<RecordBatch> {
+    let schema = Arc::new(primitive_keypoints_schema());
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.geo_hash.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int32Array::from(
+                rows.iter().map(|r| r.keypoint_index).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.local_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.local_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.local_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.has_dir).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_x).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_y).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Float64Array::from(
+                rows.iter().map(|r| r.dir_z).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.source.as_str()).collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )?;
@@ -847,6 +923,12 @@ struct InstInfoPtsetQueryRow {
     refno: RefnoEnum,
     cata_hash: Option<serde_json::Value>,
     ptset: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PrimitiveKeyPointQueryRow {
+    geo_hash: String,
+    pts: Option<Vec<Option<aios_core::shape::pdms_shape::RsVec3>>>,
 }
 
 struct PtsetExportData {
@@ -1231,6 +1313,105 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
     })
 }
 
+/// 批量查询 geo_relate.pts 中的基础几何关键点，按 geo_hash 导出局部坐标模板。
+async fn query_primitive_keypoint_rows(
+    geo_hashes: &HashSet<String>,
+    verbose: bool,
+) -> Result<Vec<PrimitiveKeyPointRow>> {
+    if geo_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rows_by_geo_hash: HashMap<String, Vec<PrimitiveKeyPointRow>> = HashMap::new();
+    let mut sorted_geo_hashes = geo_hashes.iter().cloned().collect::<Vec<_>>();
+    sorted_geo_hashes.sort();
+
+    for chunk in sorted_geo_hashes.chunks(500) {
+        let quoted_hashes = chunk
+            .iter()
+            .map(|hash| format!("'{}'", hash.replace('\\', "\\\\").replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            r#"
+            SELECT
+                record::id(out) AS geo_hash,
+                pts[*].d AS pts
+            FROM geo_relate
+            WHERE visible
+              AND record::id(out) IN [{quoted_hashes}]
+              AND pts != NONE
+            "#
+        );
+
+        let query_rows: Vec<PrimitiveKeyPointQueryRow> = aios_core::project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .with_context(|| format!("query_primitive_keypoint_rows SQL: {sql}"))?;
+
+        for query_row in query_rows {
+            if rows_by_geo_hash.contains_key(&query_row.geo_hash) {
+                continue;
+            }
+
+            let rows = query_row
+                .pts
+                .unwrap_or_default()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(idx, point)| {
+                    let v = point.0;
+                    PrimitiveKeyPointRow {
+                        geo_hash: query_row.geo_hash.clone(),
+                        keypoint_index: idx as i32,
+                        kind: "key_point".to_string(),
+                        local_x: v.x as f64,
+                        local_y: v.y as f64,
+                        local_z: v.z as f64,
+                        has_dir: false,
+                        dir_x: 0.0,
+                        dir_y: 0.0,
+                        dir_z: 0.0,
+                        source: "geo_relate.pts".to_string(),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            if !rows.is_empty() {
+                rows_by_geo_hash.insert(query_row.geo_hash, rows);
+            }
+        }
+    }
+
+    let mut rows = rows_by_geo_hash
+        .into_values()
+        .flatten()
+        .collect::<Vec<PrimitiveKeyPointRow>>();
+    rows.sort_by(|a, b| {
+        a.geo_hash
+            .cmp(&b.geo_hash)
+            .then(a.keypoint_index.cmp(&b.keypoint_index))
+    });
+
+    if verbose {
+        let with_points = rows
+            .iter()
+            .map(|row| row.geo_hash.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        println!(
+            "✅ primitive_keypoints.parquet 准备写入: {} / {} 个 geo_hash, {} 个点",
+            with_points,
+            geo_hashes.len(),
+            rows.len()
+        );
+    }
+
+    Ok(rows)
+}
+
 /// 本地实现导出专用实例查询。
 ///
 /// 直接内联导出所需的 SurrealQL，避免外部 aios_core 依赖图或 cargo patch
@@ -1592,6 +1773,7 @@ async fn query_aabb_rows(
 pub struct ParquetExportStats {
     pub instance_count: usize,
     pub ptset_count: usize,
+    pub primitive_keypoint_count: usize,
     pub geo_instance_count: usize,
     pub tubing_count: usize,
     pub transform_count: usize,
@@ -2074,6 +2256,14 @@ pub async fn export_dbnum_instances_parquet(
         );
     }
 
+    let used_geo_hashes = geo_instance_rows
+        .iter()
+        .map(|row| row.geo_hash.clone())
+        .chain(tubing_rows.iter().map(|row| row.geo_hash.clone()))
+        .filter(|hash| !hash.trim().is_empty())
+        .collect::<HashSet<_>>();
+    let primitive_keypoint_rows = query_primitive_keypoint_rows(&used_geo_hashes, verbose).await?;
+
     // =========================================================================
     // 6. 查询 trans/aabb 实际数据
     // =========================================================================
@@ -2133,6 +2323,21 @@ pub async fn export_dbnum_instances_parquet(
             println!(
                 "   ✅ ptsets.parquet: {} 行, {} 字节",
                 ptset_rows.len(),
+                size
+            );
+        }
+    }
+
+    // primitive_keypoints.parquet
+    {
+        let batch = build_primitive_keypoints_batch(&primitive_keypoint_rows)?;
+        let path = output_dir.join("primitive_keypoints.parquet");
+        let size = write_parquet(&path, &batch)?;
+        total_bytes += size;
+        if verbose {
+            println!(
+                "   ✅ primitive_keypoints.parquet: {} 行, {} 字节",
+                primitive_keypoint_rows.len(),
                 size
             );
         }
@@ -2218,6 +2423,11 @@ pub async fn export_dbnum_instances_parquet(
                 "rows": ptset_rows.len(),
                 "key": ["cata_hash", "point_number"],
             },
+            "primitive_keypoints": {
+                "file": "primitive_keypoints.parquet",
+                "rows": primitive_keypoint_rows.len(),
+                "key": ["geo_hash", "keypoint_index"],
+            },
             "geo_instances": {
                 "file": "geo_instances.parquet",
                 "rows": geo_instance_rows.len(),
@@ -2247,6 +2457,12 @@ pub async fn export_dbnum_instances_parquet(
             "target": target.name(),
             "conversion_factor": unit_converter.conversion_factor(),
             "coordinate_space": "local",
+        },
+        "primitive_keypoint_unit": {
+            "source": LengthUnit::Millimeter.name(),
+            "target": target.name(),
+            "conversion_factor": unit_converter.conversion_factor(),
+            "coordinate_space": "geo_local",
         },
         "ptset_export": {
             "cata_hashes": used_cata_hashes.len(),
@@ -2285,6 +2501,11 @@ pub async fn export_dbnum_instances_parquet(
                     "rows": ptset_rows.len(),
                     "key": ["cata_hash", "point_number"],
                 },
+                "primitive_keypoints": {
+                    "file": format!("{}/primitive_keypoints.parquet", subdir),
+                    "rows": primitive_keypoint_rows.len(),
+                    "key": ["geo_hash", "keypoint_index"],
+                },
                 "geo_instances": {
                     "file": format!("{}/geo_instances.parquet", subdir),
                     "rows": geo_instance_rows.len(),
@@ -2315,6 +2536,12 @@ pub async fn export_dbnum_instances_parquet(
                 "conversion_factor": unit_converter.conversion_factor(),
                 "coordinate_space": "local",
             },
+            "primitive_keypoint_unit": {
+                "source": LengthUnit::Millimeter.name(),
+                "target": target.name(),
+                "conversion_factor": unit_converter.conversion_factor(),
+                "coordinate_space": "geo_local",
+            },
             "ptset_export": {
                 "cata_hashes": used_cata_hashes.len(),
                 "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
@@ -2337,6 +2564,7 @@ pub async fn export_dbnum_instances_parquet(
     Ok(ParquetExportStats {
         instance_count: instance_rows.len(),
         ptset_count: ptset_rows.len(),
+        primitive_keypoint_count: primitive_keypoint_rows.len(),
         geo_instance_count: geo_instance_rows.len(),
         tubing_count: tubing_rows.len(),
         transform_count: transform_rows.len(),

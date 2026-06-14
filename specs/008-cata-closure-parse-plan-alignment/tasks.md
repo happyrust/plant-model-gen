@@ -20,11 +20,11 @@
   - [x] 不再在 `manual_db_nums` 非空时跳过 `collect_design_outbound()`。
   - [x] 收集全部 DESI outbound 后，只保留 `src_dbnum in manual_db_nums` 的 source。
   - [x] 继续用 `DbIndexStore::resolve_dbnums(ref0s)` + `record_dependencies(src, dsts)` 写边。
-- [ ] 增加/更新测试覆盖：
-  - manual target 非空时仍记录目标库依赖。
-  - manual target 为空时保持全 DESI 依赖收集。
-- [ ] 验证站点根 `db_index.sqlite`：
-  - `db_dependency where src_dbnum=250160` 至少包含 `250193`。
+- [x] 增加/更新测试覆盖：
+  - [x] manual target 非空时仍记录目标库依赖。
+  - [x] manual target 为空时保持全 DESI 依赖收集。
+- [x] 验证站点根 `db_index.sqlite`：
+  - [x] `db_dependency where src_dbnum=250160` 包含 `250193`（实测 dst=`7015,250124,250193`）。
 
 ## T003 新增 manifest 驱动的 parse plan CATA 对齐 helper
 
@@ -38,12 +38,12 @@
   - [x] 如果 manifest 覆盖的 CATA dbnum 不在原 plan 中，通过同目录 `db_index.sqlite` 补入文件名；不扫描 E3D 文件头。
   - [x] 同步更新 `included_db_files` 与 `auto_related_db_files`。
   - [x] 保持原解析计划顺序，缺失的 manifest 覆盖项追加在末尾，避免 UI diff 大幅抖动。
-- [ ] 单元测试：
-  - `250166` 被移除。
-  - `250193` 被保留。
-  - 原 plan 缺 `250193` 但 manifest 覆盖时，`250193` 可被补入。
-  - 非 CATA 文件全部保留。
-  - manifest 为空时移除全部 CATA。
+- [x] 单元测试：
+  - [x] `250166` 被移除。
+  - [x] `250193` 被保留。
+  - [x] 原 plan 缺 `250193` 但 manifest 覆盖时，`250193` 可被补入。
+  - [x] 非 CATA 文件全部保留。
+  - [x] manifest 为空时移除全部 CATA。
 
 ## T004 在 spawn_parse_process 中接入 closure 后对齐
 
@@ -64,11 +64,11 @@
   - [x] 最终进入 parse 的配置不再因 `auto_parse_related_dbnums=true` 无条件收集所有 CATA。
 - [x] 短期实现：
   - [x] 在 T003/T004 已能补入 manifest-covered CATA 后，`cata_partial_parse=true` 的 preview 不再加入全量 CATA；`cata_partial_parse=false` 仍保留全量 CATA 预览。
-- [ ] 中期增强：
-  - 扩展 preview 请求，携带可选 `db_index_path`。
-  - 如果 index 可用，使用 `DbIndexStore::resolve_related_closure(manual_db_nums)` 生成 preview 的 CATA 列表。
-- [ ] UI 文案：
-  - 对 CATA partial 模式显示“CATA 目标由 closure manifest 决定”，避免用户误以为未纳入依赖。
+- [x] 中期增强：
+  - [x] 扩展 preview 请求，携带可选 `db_index_path`。
+  - [x] 如果 index 可用，使用 `DbIndexStore::resolve_related_closure(manual_db_nums)` 生成 preview 的 CATA 列表。
+- [x] UI 文案：
+  - [x] 对 CATA partial 模式显示“CATA 目标由 closure manifest 决定”，避免用户误以为未纳入依赖。
 
 ## T006 调整 CATA skip 日志等级
 
@@ -84,19 +84,20 @@
 
 ## T007 验证 quicktest-250160-8080
 
-- [ ] 重建二进制/发布包。
-- [ ] 使用相同站点配置重跑 parse/generate。
-- [ ] 检查最终 `DbOption-parse.toml`：
-  - 包含 `aps250160_0001`。
-  - 包含 `aps250193_0001`。
-  - 不包含 `aps250166_0001`、`aps7351_0001`、`aps7355_0001` 等 manifest 外 CATA。
-- [ ] 检查 parse log：
-  - 不再出现 `dbnum=250166 不在 manifest 覆盖内`。
-  - closure summary 仍为 `cata_dbs=1 visited=16` 或有明确解释的变化。
-- [ ] 检查 metrics：
-  - `250193 mode=partial elements=16`。
-  - 无 `250166 mode=skipped`。
-  - `success=true`、`error_count=0`。
+- [x] 重建二进制/发布包。
+  - 本次为保留现场 runtime，执行 release 二进制重建并替换发布包 `bin/web_server.exe` / `bin/aios-database.exe`，未运行会删除整包目录的 bundle 脚本。
+- [x] 使用相同站点配置重跑 parse/generate。
+- [x] 检查最终 `DbOption-parse.toml`：
+  - [x] 包含 `aps250160_0001`。
+  - [x] 包含 `aps250193_0001`。
+  - [x] 不包含 `aps250166_0001`、`aps7351_0001`、`aps7355_0001` 等 manifest 外 CATA。
+- [x] 检查 parse log：
+  - [x] 不再出现 `dbnum=250166 不在 manifest 覆盖内`。
+  - [x] closure summary 仍为 `cata_dbs=1 visited=16`。
+- [x] 检查 metrics：
+  - [x] `250193 mode=partial elements=16`。
+  - [x] 无 `250166 mode=skipped`。
+  - [x] `success=true`、`error_count=0`。
 
 ## T008 回归验证
 
@@ -106,5 +107,6 @@
   - `scripts/guard/web_server_parse_boundary_guard.ps1`
 - [ ] 对已有 spec 002 的验证入口补一轮：
   - `verify-cata-closure` 对按需站点与整库基准 diff 不回归。
-- [ ] 若生成阶段仍失败：
-  - 单独记录到新问题；`The table 'ses' does not exist` 不归入本 spec。
+  - 2026-06-12 本轮已尝试定位基准 endpoint；历史文档中的 `8031/3202` 当前未监听，`3102` 旧服务登录返回 503。缺少可用整库基准站点时不做同库假验证。
+- [x] 若生成阶段仍失败：
+  - 生成阶段已通过；无需记录 `The table 'ses' does not exist` 新问题。

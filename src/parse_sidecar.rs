@@ -103,11 +103,24 @@ pub struct ParsePreviewRequest {
     pub auto_parse_related_dbnums: bool,
     #[serde(default = "default_true")]
     pub cata_partial_parse: bool,
+    #[serde(default)]
+    pub db_index_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ProjectScanRequest {
     pub root: String,
+}
+
+/// MBD 候选发现请求：工程组成与 preview 请求同构，便于 UI 复用站点表单状态。
+#[derive(Debug, Deserialize)]
+pub struct MdbCandidatesRequest {
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(default)]
+    pub project_path: String,
+    #[serde(default)]
+    pub projects: Vec<SidecarSiteProject>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +306,7 @@ pub async fn run_parse_sidecar(options: ParseSidecarOptions) -> Result<()> {
         .route("/health", get(health))
         .route("/parse/preview-plan", post(preview_plan))
         .route("/projects/scan", post(scan_projects))
+        .route("/projects/mdb-candidates", post(mdb_candidates))
         .route("/db-files/resolve", post(resolve_db_file))
         .route("/db-index/rebuild", post(rebuild_db_index))
         .route("/jobs/run-cli", post(run_cli_job))
@@ -328,7 +342,7 @@ async fn health(
         json!({
             "site_key": state.site_key,
             "runtime_dir": state.runtime_dir,
-            "capabilities": ["health", "preview-plan", "projects-scan", "db-file-resolve", "db-index-rebuild", "run-cli-job", "submit-cli-job", "job-status", "job-cancel", "events"]
+            "capabilities": ["health", "preview-plan", "projects-scan", "mdb-candidates", "db-file-resolve", "db-index-rebuild", "run-cli-job", "submit-cli-job", "job-status", "job-cancel", "events"]
         }),
     )))
 }
@@ -353,6 +367,18 @@ async fn scan_projects(
     authorize(&state, &headers)?;
     match scan_projects_under_root(&payload.root) {
         Ok(result) => Ok(Json(ok("工程扫描完成", json!(result)))),
+        Err(err) => Err(domain_error(err)),
+    }
+}
+
+async fn mdb_candidates(
+    State(state): State<ParseSidecarState>,
+    headers: HeaderMap,
+    Json(payload): Json<MdbCandidatesRequest>,
+) -> Result<Json<SidecarEnvelope<Value>>, Response> {
+    authorize(&state, &headers)?;
+    match discover_mdb_candidates_request(payload).await {
+        Ok(result) => Ok(Json(ok("MBD 候选发现完成", json!(result)))),
         Err(err) => Err(domain_error(err)),
     }
 }
@@ -1103,7 +1129,7 @@ fn build_preview_plan(payload: ParsePreviewRequest) -> Result<ManagedSiteParsePl
     let parse_db_types = normalize_parse_db_types(payload.parse_db_types);
     let force_rebuild_system_db =
         payload.force_rebuild_system_db && parse_db_types.iter().any(|v| v == "SYST");
-    let included_db_files = resolve_included_db_files(
+    let mut included_db_files = resolve_included_db_files(
         &project_roots,
         &primary_project_roots,
         &manual_db_nums,
@@ -1112,13 +1138,25 @@ fn build_preview_plan(payload: ParsePreviewRequest) -> Result<ManagedSiteParsePl
         payload.auto_parse_related_dbnums,
         payload.cata_partial_parse,
     )?;
-    let (entries, warnings) = build_parse_plan_facts(
+    let mut warnings = Vec::new();
+    append_related_cata_from_db_index(
+        &mut included_db_files,
+        payload.db_index_path.as_deref(),
+        &manual_db_nums,
+        payload.auto_parse_related_dbnums,
+        payload.cata_partial_parse,
+        &mut warnings,
+    );
+    included_db_files.sort();
+    included_db_files.dedup();
+    let (entries, fact_warnings) = build_parse_plan_facts(
         &project_roots,
         &manual_db_nums,
         &parse_db_types,
         payload.auto_parse_related_dbnums,
         &included_db_files,
     );
+    warnings.extend(fact_warnings);
     let auto_related_db_files = entries
         .iter()
         .filter(|entry| entry.source == "auto_related")
@@ -1133,6 +1171,78 @@ fn build_preview_plan(payload: ParsePreviewRequest) -> Result<ManagedSiteParsePl
         entries,
         warnings,
     ))
+}
+
+/// MBD 候选发现：规范化工程组成后，离线读 SYST 枚举 MDB 及成员 DB 文件定位状态。
+async fn discover_mdb_candidates_request(
+    payload: MdbCandidatesRequest,
+) -> Result<crate::data_interface::mdb_candidates::MdbCandidatesResult> {
+    let project_name = payload.project_name.trim();
+    let project_path = payload.project_path.trim();
+    let projects = normalize_projects(payload.projects, project_name, project_path)?;
+    if projects.is_empty() {
+        bail!("工程组成为空：请先在站点配置中添加至少一个工程路径");
+    }
+    let named_roots = projects
+        .into_iter()
+        .map(|project| (project.name, project.path))
+        .collect::<Vec<_>>();
+    crate::data_interface::mdb_candidates::discover_mdb_candidates_for_roots(named_roots).await
+}
+
+fn append_related_cata_from_db_index(
+    included_db_files: &mut Vec<String>,
+    db_index_path: Option<&str>,
+    manual_db_nums: &[u32],
+    auto_parse_related_dbnums: bool,
+    cata_partial_parse: bool,
+    warnings: &mut Vec<String>,
+) {
+    if !auto_parse_related_dbnums || !cata_partial_parse || manual_db_nums.is_empty() {
+        return;
+    }
+    let Some(raw_path) = db_index_path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return;
+    };
+
+    #[cfg(feature = "sqlite-index")]
+    {
+        use crate::data_interface::db_index::DbIndexStore;
+
+        let path = PathBuf::from(raw_path);
+        if !path.is_file() {
+            warnings.push(format!(
+                "CATA 精确预览跳过：db_index 不存在或未就绪: {}",
+                path.display()
+            ));
+            return;
+        }
+        let store = match DbIndexStore::open(&path) {
+            Ok(store) => store,
+            Err(err) => {
+                warnings.push(format!(
+                    "CATA 精确预览跳过：db_index 打开失败 {}: {}",
+                    path.display(),
+                    err
+                ));
+                return;
+            }
+        };
+        for dbnum in store.resolve_related_closure(manual_db_nums) {
+            let Some(record) = store.file_by_dbnum(dbnum) else {
+                continue;
+            };
+            if record.db_type.eq_ignore_ascii_case("CATA") {
+                included_db_files.push(record.file_name);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sqlite-index"))]
+    {
+        let _ = raw_path;
+        warnings.push("CATA 精确预览跳过：当前构建未启用 sqlite-index feature".to_string());
+    }
 }
 
 fn resolve_db_file_request(payload: DbFileResolveRequest) -> Result<DbFileResolveResponse> {
@@ -1235,15 +1345,10 @@ async fn rebuild_db_index_request(
         Err(err) => bail!("db_index phase1 任务失败: {err}"),
     }
 
-    let target_dbnums = payload
-        .manual_db_nums
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let mut outbound = collect_design_outbound(&roots).await;
-    if !target_dbnums.is_empty() {
-        outbound.retain(|(src, _)| target_dbnums.contains(src));
-    }
+    let outbound = filter_design_outbound_for_manual_dbnums(
+        collect_design_outbound(&roots).await,
+        &payload.manual_db_nums,
+    );
     if !outbound.is_empty() {
         let index_p2 = index_path.clone();
         match task::spawn_blocking(move || -> Result<usize> {
@@ -1266,6 +1371,18 @@ async fn rebuild_db_index_request(
     }
 
     Ok(summary)
+}
+
+#[cfg(feature = "sqlite-index")]
+fn filter_design_outbound_for_manual_dbnums(
+    mut outbound: Vec<(u32, Vec<u32>)>,
+    manual_db_nums: &[u32],
+) -> Vec<(u32, Vec<u32>)> {
+    let target_dbnums = manual_db_nums.iter().copied().collect::<HashSet<_>>();
+    if !target_dbnums.is_empty() {
+        outbound.retain(|(src, _)| target_dbnums.contains(src));
+    }
+    outbound
 }
 
 async fn run_cli_job_request(payload: RunCliJobRequest) -> Result<RunCliJobResponse> {
@@ -2032,4 +2149,91 @@ fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
         conflicts,
         has_conflict,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn filter_design_outbound_keeps_all_sources_when_manual_targets_empty() {
+        let outbound = vec![(250160, vec![250193]), (250161, vec![250194])];
+
+        let filtered = filter_design_outbound_for_manual_dbnums(outbound.clone(), &[]);
+
+        assert_eq!(filtered, outbound);
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn filter_design_outbound_keeps_only_manual_target_sources() {
+        let outbound = vec![
+            (250160, vec![7015, 250193]),
+            (250161, vec![250194]),
+            (250162, vec![250195]),
+        ];
+
+        let filtered = filter_design_outbound_for_manual_dbnums(outbound, &[250160, 250162]);
+
+        assert_eq!(
+            filtered,
+            vec![(250160, vec![7015, 250193]), (250162, vec![250195])]
+        );
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    #[test]
+    fn append_related_cata_from_db_index_adds_only_cata_dependencies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index_path = dir
+            .path()
+            .join(crate::data_interface::db_index::DB_INDEX_FILE_NAME);
+        let store = crate::data_interface::db_index::DbIndexStore::open(&index_path)
+            .expect("db index store");
+        store
+            .upsert_db_file(&db_file_record(250160, "DESI", "aps250160_0001"))
+            .expect("desi file");
+        store
+            .upsert_db_file(&db_file_record(250193, "CATA", "aps250193_0001"))
+            .expect("cata file");
+        store
+            .upsert_db_file(&db_file_record(250206, "DICT", "aps250206_0001"))
+            .expect("dict file");
+        store
+            .record_dependencies(250160, &[250193, 250206])
+            .expect("dependencies");
+
+        let path_text = index_path.to_string_lossy().to_string();
+        let mut included = vec!["aps250160_0001".to_string()];
+        let mut warnings = Vec::new();
+        append_related_cata_from_db_index(
+            &mut included,
+            Some(&path_text),
+            &[250160],
+            true,
+            true,
+            &mut warnings,
+        );
+
+        assert_eq!(included, vec!["aps250160_0001", "aps250193_0001"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[cfg(feature = "sqlite-index")]
+    fn db_file_record(
+        dbnum: u32,
+        db_type: &str,
+        file_name: &str,
+    ) -> crate::data_interface::db_index::DbFileRecord {
+        crate::data_interface::db_index::DbFileRecord {
+            dbnum,
+            db_type: db_type.to_string(),
+            file_name: file_name.to_string(),
+            file_path: file_name.to_string(),
+            project: "TestProject".to_string(),
+            latest_sesno: 1,
+            fingerprint: format!("{dbnum}:1"),
+        }
+    }
 }

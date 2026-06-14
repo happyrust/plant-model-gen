@@ -520,6 +520,7 @@ export interface PreviewManagedSiteParsePlanRequest {
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean
   cata_partial_parse?: boolean
+  db_index_path?: string
   web_port: number
   bind_host?: string
   public_base_url?: string

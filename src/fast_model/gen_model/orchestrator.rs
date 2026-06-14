@@ -1684,8 +1684,12 @@ async fn process_index_tree_generation(
             .stages()
             .iter()
             .filter_map(|s| {
-                s.ended_at
-                    .map(|end| (s.name.clone(), end.duration_since(s.started_at).as_millis() as u64))
+                s.ended_at.map(|end| {
+                    (
+                        s.name.clone(),
+                        end.duration_since(s.started_at).as_millis() as u64,
+                    )
+                })
             })
             .collect();
         crate::perf_metrics::record_generate_stage_ms(&stage_ms);

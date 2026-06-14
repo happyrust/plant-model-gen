@@ -110,6 +110,36 @@ pub async fn scan_projects(root: &str) -> Result<Value, SidecarProxyError> {
     post_sidecar(&handle, "/projects/scan", &json!({ "root": root })).await
 }
 
+/// MBD 候选发现（只读）：有 site_id 时复用站点 sidecar，否则按工程组成派生独立 key。
+pub async fn mdb_candidates(
+    payload: crate::web_server::models::MdbCandidatesRequest,
+) -> Result<Value, SidecarProxyError> {
+    let key = mdb_candidates_sidecar_key(&payload);
+    let handle = ensure_sidecar(&key).await.map_err(internal_proxy_error)?;
+    post_sidecar(&handle, "/projects/mdb-candidates", &payload).await
+}
+
+fn mdb_candidates_sidecar_key(payload: &crate::web_server::models::MdbCandidatesRequest) -> String {
+    if let Some(site_id) = payload
+        .site_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("site:{site_id}");
+    }
+    let mut material = payload.project_name.clone();
+    material.push('|');
+    material.push_str(&payload.project_path);
+    for project in &payload.projects {
+        material.push('|');
+        material.push_str(&project.path);
+        material.push(':');
+        material.push_str(&project.name);
+    }
+    format!("mdb:{}", stable_key(&material))
+}
+
 pub async fn resolve_db_file(
     project_roots: Vec<String>,
     db_file: String,

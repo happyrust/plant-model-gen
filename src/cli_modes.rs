@@ -1784,7 +1784,9 @@ pub async fn run_generate_model(
     ensure_surreal_connected(db_option_ext).await?;
 
     use aios_database::fast_model::gen_all_geos_data;
-    let refresh_roots = collect_transform_refresh_roots(config).await?;
+    let refresh_roots =
+        collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
+            .await?;
     if !refresh_roots.is_empty() {
         let refreshed =
             aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
@@ -1793,7 +1795,8 @@ pub async fn run_generate_model(
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
     }
-    let target_refnos = collect_regen_target_refnos(config).await?;
+    let target_refnos =
+        collect_regen_target_refnos(config, db_option_ext.inner.manual_db_nums.as_deref()).await?;
     let mut db_option_override = db_option_ext.clone();
     let derived_dbnums = derive_dbnums_from_refnos(&target_refnos);
     if !derived_dbnums.is_empty() {
@@ -1831,7 +1834,9 @@ pub async fn run_regen_model(
 
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;
-    let refresh_roots = collect_transform_refresh_roots(config).await?;
+    let refresh_roots =
+        collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
+            .await?;
     if !refresh_roots.is_empty() {
         let refreshed =
             aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
@@ -1840,7 +1845,8 @@ pub async fn run_regen_model(
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
     }
-    let target_refnos = collect_regen_target_refnos(config).await?;
+    let target_refnos =
+        collect_regen_target_refnos(config, db_option_ext.inner.manual_db_nums.as_deref()).await?;
 
     if db_option_override.model_writer_mode.writes_to_surreal() {
         // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
@@ -1875,7 +1881,29 @@ pub async fn run_regen_model(
 /// - 有 refnos → 展开子孙节点（优先级高于 dbnum，避免 ref0 风格数字被误当成 dbnum）
 /// - 有 dbnum → 查询该 dbnum 下所有 SITE
 /// - 都没有（全库模式）→ 查询所有 dbnum 的 SITE
-async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoEnum>> {
+async fn collect_sites_for_dbnums(dbnums: &[u32], purpose: &str) -> Result<Vec<RefnoEnum>> {
+    use aios_database::fast_model::query_provider;
+
+    let mut all_sites = Vec::new();
+    for dbnum in dbnums {
+        let sites: Vec<RefnoEnum> =
+            query_provider::query_by_type(&["SITE"], *dbnum as i32, None).await?;
+        all_sites.extend(sites);
+    }
+    if all_sites.is_empty() {
+        anyhow::bail!(
+            "manual_db_nums={:?} 下未找到任何 SITE，无法{}",
+            dbnums,
+            purpose
+        );
+    }
+    Ok(all_sites)
+}
+
+async fn collect_regen_target_refnos(
+    config: &ExportConfig,
+    manual_db_nums: Option<&[u32]>,
+) -> Result<Vec<RefnoEnum>> {
     if !config.refnos_str.is_empty() {
         // 按 refnos → 展开子孙
         let refnos = config.parse_refnos()?;
@@ -1898,6 +1926,15 @@ async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoE
             sites.len()
         );
         Ok(sites)
+    } else if let Some(dbnums) = manual_db_nums.filter(|dbnums| !dbnums.is_empty()) {
+        // 按需解析站点可能没有 MDB 表，站点配置的 manual_db_nums 就是完整目标范围。
+        let all_sites = collect_sites_for_dbnums(dbnums, " regen").await?;
+        println!(
+            "   - regen 目标: manual_db_nums={:?}, 共 {} 个 SITE",
+            dbnums,
+            all_sites.len()
+        );
+        Ok(all_sites)
     } else if config.run_all_dbnos {
         // 全库模式 → 查询所有 dbnum 的 SITE
         use aios_database::fast_model::query_provider;
@@ -1919,7 +1956,10 @@ async fn collect_regen_target_refnos(config: &ExportConfig) -> Result<Vec<RefnoE
     }
 }
 
-async fn collect_transform_refresh_roots(config: &ExportConfig) -> Result<Vec<RefnoEnum>> {
+async fn collect_transform_refresh_roots(
+    config: &ExportConfig,
+    manual_db_nums: Option<&[u32]>,
+) -> Result<Vec<RefnoEnum>> {
     if !config.refnos_str.is_empty() {
         let roots = config.parse_refnos()?;
         println!("   - transform 刷新 roots: {} 个 refno", roots.len());
@@ -1937,6 +1977,14 @@ async fn collect_transform_refresh_roots(config: &ExportConfig) -> Result<Vec<Re
             sites.len()
         );
         Ok(sites)
+    } else if let Some(dbnums) = manual_db_nums.filter(|dbnums| !dbnums.is_empty()) {
+        let all_sites = collect_sites_for_dbnums(dbnums, "刷新 pe_transform").await?;
+        println!(
+            "   - transform 刷新 roots: manual_db_nums={:?}, 共 {} 个 SITE",
+            dbnums,
+            all_sites.len()
+        );
+        Ok(all_sites)
     } else if config.run_all_dbnos {
         use aios_database::fast_model::query_provider;
         let dbnos: Vec<u32> = query_mdb_db_nums(None, DBType::DESI).await?;

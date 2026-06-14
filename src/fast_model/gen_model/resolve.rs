@@ -243,10 +243,39 @@ pub async fn resolve_axis_params(
     Ok(map)
 }
 
+async fn normalize_catalog_scom_ref(mut catalog_ref: RefnoEnum) -> RefnoEnum {
+    for _ in 0..4 {
+        if !catalog_ref.is_valid() {
+            break;
+        }
+        let Ok(attr) = aios_core::get_named_attmap(catalog_ref).await else {
+            break;
+        };
+        let type_name = attr.get_type_str();
+        if matches!(type_name, "SCOM" | "SPRF" | "SFIT" | "JOIN") {
+            break;
+        }
+        let Some(next_ref) = attr.get_foreign_refno("CATR") else {
+            break;
+        };
+        if !next_ref.is_valid() || next_ref == catalog_ref {
+            break;
+        }
+        debug_model_trace!(
+            "normalize catalog ref via CATR: from={:?} type={} to={:?}",
+            catalog_ref,
+            type_name,
+            next_ref
+        );
+        catalog_ref = next_ref;
+    }
+    catalog_ref
+}
+
 ///求解design component
 pub async fn resolve_desi_comp(
     desi_refno: RefnoEnum,
-    mut tubi_scom: Option<RefnoEnum>,
+    tubi_scom: Option<RefnoEnum>,
     desi_att_opt: Option<&NamedAttrMap>,
 ) -> anyhow::Result<CateGeomsInfo> {
     let trace_resolve = should_trace_resolve_desi(desi_refno);
@@ -260,20 +289,36 @@ pub async fn resolve_desi_comp(
         &owned_att
     };
     let desi_att_fetch_time = t_desi_att.elapsed().as_millis();
-    let is_tubi = tubi_scom.is_some();
+    let initial_tubi_scom = tubi_scom;
+    let mut is_tubi = initial_tubi_scom.is_some();
 
     let t_scom_ref = Instant::now();
-    let scom_ref = if let Some(scom) = tubi_scom {
+    let mut scom_ref = if let Some(scom) = tubi_scom {
         scom
     } else {
         let scom = aios_core::get_cat_refno(desi_refno)
             .await?
+            .or_else(|| desi_att.get_foreign_refno("CATR"))
             .ok_or(anyhow::anyhow!(format!(
                 "CAT引用不存在: {}",
                 desi_refno.to_string()
             )))?;
         scom
     };
+    let normalized_scom_ref = normalize_catalog_scom_ref(scom_ref).await;
+    if normalized_scom_ref != scom_ref {
+        if initial_tubi_scom == Some(desi_refno) {
+            is_tubi = false;
+        }
+        debug_model_trace!(
+            "catalog ref normalized: design_refno={:?}, from={:?}, to={:?}, is_tubi={}",
+            desi_refno,
+            scom_ref,
+            normalized_scom_ref,
+            is_tubi
+        );
+        scom_ref = normalized_scom_ref;
+    }
     let scom_ref_time = t_scom_ref.elapsed().as_millis();
     debug_model_trace!("scom_ref: {:?}", &scom_ref);
     let t_scom_info = Instant::now();

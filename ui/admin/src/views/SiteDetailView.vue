@@ -150,7 +150,7 @@ async function fetchMetrics() {
   metricsLoading.value = true
   metricsError.value = ''
   try {
-    const data = await sitesApi.metrics(siteId, 20)
+    const data = await sitesApi.metrics(siteId.value, 20)
     metricsItems.value = data.items ?? []
   } catch (err) {
     metricsError.value = extractErrorMessage(err)

@@ -289,9 +289,9 @@ impl DbIndexStore {
         let Ok(mut stmt) = self.conn.prepare("SELECT ref0, dbnum FROM ref0_owner") else {
             return out;
         };
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?))
-        }) {
+        if let Ok(rows) =
+            stmt.query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))
+        {
             for r in rows.flatten() {
                 out.push(r);
             }
@@ -506,7 +506,11 @@ where
                 .flat_map(|relative| relative.components())
                 .any(|component| {
                     matches!(
-                        component.as_os_str().to_string_lossy().to_ascii_lowercase().as_str(),
+                        component
+                            .as_os_str()
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .as_str(),
                         "back" | "backup"
                     )
                 })

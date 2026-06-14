@@ -59,26 +59,38 @@ async fn get_ui_attr(Path(refno): Path<String>) -> Result<Json<UiAttrResponse>, 
                     full_name,
                     error_message: None,
                 })),
-                Err(full_fallback_error) => match query_basic_pe_attrs(refno, &primary_error).await
-                {
+                Err(full_fallback_error) => match query_rvm_relation_attrs(refno).await {
                     Ok((attrs, full_name)) => Ok(Json(UiAttrResponse {
                         success: true,
                         refno: refno_str,
                         attrs,
                         full_name,
                         error_message: Some(format!(
-                            "using basic pe fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}"
+                            "using rvm relation-store fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}"
                         )),
                     })),
-                    Err(pe_fallback_error) => Ok(Json(UiAttrResponse {
-                        success: false,
-                        refno: refno_str,
-                        attrs: serde_json::Value::Object(serde_json::Map::new()),
-                        full_name: None,
-                        error_message: Some(format!(
-                            "get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; basic pe fallback failed: {pe_fallback_error}"
-                        )),
-                    })),
+                    Err(rvm_fallback_error) => {
+                        match query_basic_pe_attrs(refno, &primary_error).await {
+                            Ok((attrs, full_name)) => Ok(Json(UiAttrResponse {
+                                success: true,
+                                refno: refno_str,
+                                attrs,
+                                full_name,
+                                error_message: Some(format!(
+                                    "using basic pe fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; rvm relation-store fallback failed: {rvm_fallback_error}"
+                                )),
+                            })),
+                            Err(pe_fallback_error) => Ok(Json(UiAttrResponse {
+                                success: false,
+                                refno: refno_str,
+                                attrs: serde_json::Value::Object(serde_json::Map::new()),
+                                full_name: None,
+                                error_message: Some(format!(
+                                    "get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; rvm relation-store fallback failed: {rvm_fallback_error}; basic pe fallback failed: {pe_fallback_error}"
+                                )),
+                            })),
+                        }
+                    }
                 },
             }
         }
@@ -160,6 +172,24 @@ fn non_empty_string(value: impl AsRef<str>) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+async fn query_rvm_relation_attrs(
+    refno: RefnoEnum,
+) -> anyhow::Result<(serde_json::Value, Option<String>)> {
+    let dbnum = (refno.refno().0 >> 32) as u32;
+    if dbnum == 0 {
+        return Err(anyhow!("refno does not encode dbnum: {refno}"));
+    }
+
+    let attrs = crate::model_relation_store::global_store()
+        .query_attrs_by_refno(dbnum, refno)?
+        .ok_or_else(|| anyhow!("relation-store attributes not found: {refno}"))?;
+    let full_name = attrs
+        .get("NAME")
+        .and_then(|value| value.as_str())
+        .and_then(non_empty_string);
+    Ok((attrs, full_name))
 }
 
 #[cfg(feature = "web_server")]

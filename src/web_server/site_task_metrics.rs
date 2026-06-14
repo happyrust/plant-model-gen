@@ -8,10 +8,10 @@
 use std::path::PathBuf;
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path as AxumPath, Query};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -105,7 +105,8 @@ pub fn ingest_task_metrics(site_id: &str, task_id: &str, job_success: bool) {
             return;
         }
     };
-    if file.get("schema_version").and_then(Value::as_u64) != Some(TASK_METRICS_SCHEMA_VERSION as u64)
+    if file.get("schema_version").and_then(Value::as_u64)
+        != Some(TASK_METRICS_SCHEMA_VERSION as u64)
     {
         tracing::warn!(site = %site_id, task = %task_id, "任务指标 schema_version 不匹配，跳过入库");
         return;

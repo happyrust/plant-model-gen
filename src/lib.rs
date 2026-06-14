@@ -430,9 +430,10 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                     Err(_) => 0,
                 }
             }
-            let cache_miss = crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
-                .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
-                .unwrap_or(0);
+            let cache_miss =
+                crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
+                    .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
+                    .unwrap_or(0);
             crate::perf_metrics::finish_generate_stage(
                 surreal_count("inst_relate").await,
                 surreal_count("inst_info").await,

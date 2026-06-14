@@ -6199,6 +6199,18 @@ async fn gen_cata_geos_inner(
 
         tubi_query_time = 0;
 
+        if enable_surreal_outputs {
+            let branch_refnos = branch_map
+                .iter()
+                .map(|item| *item.key())
+                .collect::<Vec<_>>();
+            crate::fast_model::gen_model::pdms_inst::delete_tubi_relate_by_branch_refnos(
+                &branch_refnos,
+                100,
+            )
+            .await?;
+        }
+
         if enable_surreal_outputs && !tubi_relates.is_empty() {
             // 先补齐 tubi_relate 依赖的 trans/aabb/vec3 记录：
 
@@ -6243,14 +6255,15 @@ async fn gen_cata_geos_inner(
                 Err(e) => {
                     debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
 
-                    // 保持原来的 unwrap 语义
-
-                    panic!("写入 tubi_relate 失败: {}", e);
+                    return Err(anyhow::anyhow!("写入 tubi_relate 失败: {}", e));
                 }
                 Ok(response) => {
                     if let Err(e) = response.check() {
                         eprintln!("[BRAN_TUBI] tubi_relate 语句执行失败（数据未写入）: {}", e);
-                        panic!("写入 tubi_relate 失败（语句级错误）: {}", e);
+                        return Err(anyhow::anyhow!(
+                            "写入 tubi_relate 失败（语句级错误）: {}",
+                            e
+                        ));
                     }
                 }
             }

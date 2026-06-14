@@ -1052,6 +1052,12 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                     </span>
                   </div>
                   <p class="text-xs text-muted-foreground">{{ previewPlan.detail }}</p>
+                  <p
+                    v-if="form.auto_parse_related_dbnums && form.cata_partial_parse"
+                    class="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground"
+                  >
+                    CATA 目标由 closure manifest 决定：预览只展示 db_index 已知的关联 CATA 库；最终解析会在扫描目标 DESI 后按 manifest 精确保留被引用条目，未覆盖的 CATA 库会按需跳过。
+                  </p>
                   <div class="rounded-md border border-border/60 bg-muted/20 p-3">
                     <div class="text-xs text-muted-foreground">预计解析文件</div>
                     <div v-if="previewPlan.included_db_files.length" class="mt-2">
@@ -1095,7 +1101,7 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
                       </span>
                     </div>
                     <p class="mt-1 text-xs text-muted-foreground">
-                      已开启「自动解析依赖库」，以下文件由 ref0→dbnum 依赖闭包自动纳入，已计入上方解析文件。
+                      已开启「自动解析依赖库」，以下文件由 ref0→dbnum 依赖闭包自动纳入，已计入上方解析文件；CATA partial 模式下最终条目仍以 closure manifest 为准。
                     </p>
                     <div class="mt-2 flex max-h-32 flex-wrap gap-2 overflow-auto">
                       <span

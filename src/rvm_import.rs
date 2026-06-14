@@ -8,6 +8,7 @@ use rvm_rs::store::geometry::{Geometry, GeometryKind, GeometryType};
 use rvm_rs::store::node::{NodeId, NodeKind};
 use rvm_rs::{parse_att, parse_rvm};
 use serde_json::json;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::hash::Hasher;
@@ -54,20 +55,39 @@ pub async fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImpor
             .with_context(|| format!("解析 ATT 文件失败: {}", att_path.display()))?;
     }
 
-    let mut builder = RelationBuilder::new(options.dbnum, options.verbose);
+    let att_index = load_att_attr_index(&options.att_paths)?;
+    let root_name_hint = infer_root_name_from_att_index(&att_index);
+    let mut builder = RelationBuilder::new(options.dbnum, options.verbose, att_index);
     builder.build(&store)?;
 
     let (resolved_records, unresolved_records) = if options.resolve_identity {
-        resolve_identities(&mut builder, options.dbnum, options.verbose).await?
+        let root_refno_hint = infer_root_refno_from_rvm_path(&options.rvm_path);
+        resolve_identities(
+            &mut builder,
+            options.dbnum,
+            options.verbose,
+            root_refno_hint,
+            root_name_hint.as_deref(),
+        )
+        .await?
     } else {
         (0, builder.inst_relates.len())
     };
 
     let relation_store = ModelRelationStore::new(&options.relation_store_root);
     let refnos: Vec<RefnoEnum> = builder.inst_relates.iter().map(|r| r.refno).collect();
-    let cleaned_records = relation_store
+    let names: Vec<String> = builder
+        .inst_relates
+        .iter()
+        .filter_map(|r| r.name.clone())
+        .collect();
+    let cleaned_records_by_name = relation_store
+        .cleanup_inst_relates_by_names(options.dbnum, &names)
+        .unwrap_or(0);
+    let cleaned_records_by_refno = relation_store
         .cleanup_by_refnos(options.dbnum, &refnos)
         .unwrap_or(0);
+    let cleaned_records = cleaned_records_by_name + cleaned_records_by_refno;
     relation_store.insert_inst_geos(options.dbnum, &builder.inst_geos)?;
     relation_store.insert_inst_relates(options.dbnum, &builder.inst_relates)?;
     relation_store.insert_geo_relates(options.dbnum, &builder.geo_relates)?;
@@ -159,6 +179,56 @@ fn refno_from_pe_key(key: &str) -> Option<RefnoEnum> {
         .or_else(|| RefnoEnum::from_str(&key.replace('_', "/")).ok())
 }
 
+fn refno_from_att_value(value: &str) -> Option<RefnoEnum> {
+    let value = value.trim();
+    if !value.starts_with('=') {
+        return None;
+    }
+    let trimmed = value.trim_start_matches('=');
+    let refno = refno_from_pe_key(trimmed)?;
+    let r = refno.refno();
+    if r.get_0() == 0 || r.get_1() == 0 {
+        return None;
+    }
+    Some(refno)
+}
+
+fn direct_refno_from_attrs(
+    attrs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<RefnoEnum> {
+    let value = attrs?.get("NAME")?.as_str()?;
+    refno_from_att_value(value)
+}
+
+fn noun_from_attrs(attrs: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let noun = attrs?.get("TYPE")?.as_str()?.trim();
+    (!noun.is_empty()).then(|| noun.to_ascii_uppercase())
+}
+
+fn infer_root_refno_from_rvm_path(path: &Path) -> Option<RefnoEnum> {
+    let stem = path.file_stem()?.to_str()?;
+    refno_from_pe_key(stem)
+}
+
+fn infer_root_name_from_att_index(
+    att_index: &HashMap<String, serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    let value = att_index.get("Header Information")?.get("Element")?.as_str()?;
+    let name = value.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn previous_refno(refno: RefnoEnum) -> Option<RefnoEnum> {
+    use std::str::FromStr;
+    let r = refno.refno();
+    let low = r.get_1().checked_sub(1)?;
+    RefnoEnum::from_str(&format!("{}/{}", r.get_0(), low)).ok()
+}
+
+fn min_refno(values: impl IntoIterator<Item = RefnoEnum>) -> Option<RefnoEnum> {
+    values.into_iter().min_by_key(|r| r.refno().0)
+}
+
 /// SurrealDB 字符串字面量转义(单引号)。
 fn escape_surreal_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
@@ -179,7 +249,13 @@ async fn query_pe_by_name(dbnum: u32, name: &str) -> Result<Option<(RefnoEnum, O
         "SELECT record::id(id) AS key, noun FROM pe WHERE dbnum = {dbnum} AND name = '{}' LIMIT 2;",
         escape_surreal_str(name)
     );
-    let rows: Vec<PeIdentRow> = model_primary_db().query_take(&sql, 0).await?;
+    let rows: Vec<PeIdentRow> = match model_primary_db().query_take(&sql, 0).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[rvm-import] PE name lookup unavailable, fallback to ATT refs: {e}");
+            return Ok(None);
+        }
+    };
     if rows.len() != 1 {
         return Ok(None);
     }
@@ -197,8 +273,13 @@ async fn query_owner_children(owner: RefnoEnum) -> Result<Vec<PeIdentRow>> {
     let sql = format!(
         "SELECT VALUE (<-pe_owner.in).{{key: record::id(id), noun: noun}} FROM ONLY {owner_key} LIMIT 1;"
     );
-    let rows: Vec<PeIdentRow> = model_primary_db().query_take(&sql, 0).await?;
-    Ok(rows)
+    match model_primary_db().query_take(&sql, 0).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            eprintln!("[rvm-import] PE owner-child lookup unavailable, fallback to ATT refs: {e}");
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// 两段式身份解析:pass1 按遍历序(父先子)解析每个组的真实 refno,
@@ -207,6 +288,8 @@ async fn resolve_identities(
     builder: &mut RelationBuilder,
     dbnum: u32,
     verbose: bool,
+    root_refno_hint: Option<RefnoEnum>,
+    root_name_hint: Option<&str>,
 ) -> Result<(usize, usize)> {
     use std::collections::HashMap;
 
@@ -216,29 +299,51 @@ async fn resolve_identities(
     }
 
     // old(stable_hash) refno -> (真实 refno, noun, identity_source)
-    let mut mapping: HashMap<RefnoEnum, (RefnoEnum, Option<String>, &'static str)> =
-        HashMap::new();
+    let mut mapping: HashMap<RefnoEnum, (RefnoEnum, Option<String>, &'static str)> = HashMap::new();
     // 名称 -> 真实 refno(供默认命名 owner 查找;含本批已解析的命名元素)
     let mut by_name: HashMap<String, RefnoEnum> = HashMap::new();
     // owner refno -> 有序子元素缓存
     let mut children_cache: HashMap<RefnoEnum, Vec<PeIdentRow>> = HashMap::new();
 
-    let records_snapshot: Vec<(RefnoEnum, Option<String>)> = builder
+    let records_snapshot: Vec<(
+        RefnoEnum,
+        Option<RefnoEnum>,
+        Option<String>,
+        Option<serde_json::Map<String, serde_json::Value>>,
+    )> = builder
         .inst_relates
         .iter()
-        .map(|r| (r.refno, r.name.clone()))
+        .map(|r| {
+            let attrs = r
+                .attrs_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .and_then(|v| v.as_object().cloned());
+            (r.refno, r.parent_refno, r.name.clone(), attrs)
+        })
         .collect();
 
-    for (old_refno, name) in &records_snapshot {
+    for (old_refno, _old_parent, name, attrs) in &records_snapshot {
         let Some(name) = name.as_deref() else {
             continue;
         };
 
-        let resolved: Option<(RefnoEnum, Option<String>, &'static str)> = if name.starts_with('/')
+        let resolved: Option<(RefnoEnum, Option<String>, &'static str)> = if let Some(refno) =
+            direct_refno_from_attrs(attrs.as_ref())
         {
+            Some((refno, noun_from_attrs(attrs.as_ref()), "att_name_refno"))
+        } else if name.starts_with('/') {
             query_pe_by_name(dbnum, name)
                 .await?
                 .map(|(refno, noun)| (refno, noun, "surreal_name"))
+                .or_else(|| {
+                    if root_name_hint == Some(name) {
+                        root_refno_hint
+                            .map(|refno| (refno, noun_from_attrs(attrs.as_ref()), "rvm_filename_root"))
+                    } else {
+                        None
+                    }
+                })
         } else if let Some(parts) = parse_default_name(name) {
             // owner 查找:① 本批缓存按 owner 完整描述命中(覆盖嵌套默认命名,
             // 如 `TMPLATE 1 of EQUIPMENT /x`——遍历序父先子,owner 已解析过);
@@ -300,9 +405,7 @@ async fn resolve_identities(
                 // 全名入缓存:命名元素与默认命名成员都可能是后续成员的 owner。
                 by_name.insert(name.to_string(), new_refno);
                 if verbose {
-                    println!(
-                        "[rvm-import] resolve {name} -> {new_refno} (source={src})"
-                    );
+                    println!("[rvm-import] resolve {name} -> {new_refno} (source={src})");
                 }
                 mapping.insert(*old_refno, (new_refno, noun, src));
             }
@@ -311,6 +414,45 @@ async fn resolve_identities(
                     println!("[rvm-import] resolve {name} -> <unresolved>");
                 }
             }
+        }
+    }
+
+    // If the PE table is unavailable, recover named container refnos from the ATT
+    // tree: a named owner immediately precedes its child members in the same ref0
+    // sequence, so it is one less than the minimum resolved child refno.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (old_refno, _old_parent, name, attrs) in &records_snapshot {
+            if mapping.contains_key(old_refno) {
+                continue;
+            }
+            let Some(name) = name.as_deref() else {
+                continue;
+            };
+            if !name.starts_with('/') {
+                continue;
+            }
+
+            let direct_children = records_snapshot
+                .iter()
+                .filter(|(_, parent, _, _)| parent == &Some(*old_refno))
+                .filter_map(|(child_old, _, _, _)| mapping.get(child_old).map(|(r, _, _)| *r));
+            let Some(candidate) = min_refno(direct_children).and_then(previous_refno) else {
+                continue;
+            };
+
+            if verbose {
+                println!(
+                    "[rvm-import] resolve {name} -> {candidate} (source=att_owner_sequence)"
+                );
+            }
+            by_name.insert(name.to_string(), candidate);
+            mapping.insert(
+                *old_refno,
+                (candidate, noun_from_attrs(attrs.as_ref()), "att_owner_sequence"),
+            );
+            changed = true;
         }
     }
 
@@ -341,9 +483,7 @@ async fn resolve_identities(
     }
 
     let unresolved_cnt = builder.inst_relates.len() - resolved_cnt;
-    println!(
-        "[rvm-import] 身份解析完成: resolved={resolved_cnt} unresolved={unresolved_cnt}"
-    );
+    println!("[rvm-import] 身份解析完成: resolved={resolved_cnt} unresolved={unresolved_cnt}");
     Ok((resolved_cnt, unresolved_cnt))
 }
 
@@ -353,17 +493,23 @@ struct RelationBuilder {
     inst_relates: Vec<InstRelateRecord>,
     inst_geos: Vec<InstGeoRecord>,
     geo_relates: Vec<(u64, u64)>,
+    att_index: HashMap<String, serde_json::Map<String, serde_json::Value>>,
     stats: RvmImportStats,
 }
 
 impl RelationBuilder {
-    fn new(dbnum: u32, verbose: bool) -> Self {
+    fn new(
+        dbnum: u32,
+        verbose: bool,
+        att_index: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
         Self {
             dbnum,
             verbose,
             inst_relates: Vec::new(),
             inst_geos: Vec::new(),
             geo_relates: Vec::new(),
+            att_index,
             stats: RvmImportStats::default(),
         }
     }
@@ -412,7 +558,10 @@ impl RelationBuilder {
                 let current_path = join_path(path);
                 let refno = stable_refno(self.dbnum, &current_path, "group");
                 let inst_id = refno.0;
-                let world_translation = parent_translation + group.translation;
+                // CNTB translations in observed E3D RVM exports are absolute world
+                // positions in millimetres. They must not be accumulated through the
+                // hierarchy; doing so multiplies coordinates by the nesting depth.
+                let world_translation = group.translation;
                 let world_affine = affine_from_translation(world_translation);
 
                 if self.verbose {
@@ -436,6 +585,7 @@ impl RelationBuilder {
                     noun: None,
                     identity_source: Some("stable_hash".to_string()),
                     resolved: false,
+                    attrs_json: self.group_attrs_json(store, group, &name)?,
                 });
 
                 let mut geometry_link = group.first_geometry;
@@ -445,13 +595,7 @@ impl RelationBuilder {
                         .get_geometry(geometry_id)
                         .ok_or_else(|| anyhow!("无效的几何 ID: {}", geometry_id.0))?;
                     geometry_index += 1;
-                    self.push_geometry(
-                        inst_id,
-                        &current_path,
-                        geometry_index,
-                        geometry,
-                        world_translation,
-                    )?;
+                    self.push_geometry(inst_id, &current_path, geometry_index, geometry)?;
                     geometry_link = geometry.next;
                 }
 
@@ -494,18 +638,11 @@ impl RelationBuilder {
         group_path: &str,
         geometry_index: usize,
         geometry: &Geometry,
-        world_translation: Vec3,
     ) -> Result<()> {
         self.stats.geometry_records += 1;
         let geo_hash = stable_geo_hash(self.dbnum, group_path, geometry_index, geometry);
-        let final_bbox = translate_bbox(geometry.bbox_world, world_translation);
-        let geometry_blob = encode_geometry_blob(
-            geometry,
-            group_path,
-            geometry_index,
-            world_translation,
-            final_bbox,
-        )?;
+        let final_bbox = scale_bbox(geometry.bbox_world, 1000.0);
+        let geometry_blob = encode_geometry_blob(geometry, group_path, geometry_index, final_bbox)?;
 
         // spec 009:rvm-rs 的 bbox_world 对部分带 transform 的原语退化为点
         // (VALVE 12 原语实测全为零尺寸盒)。优先用原语参数 mesh 化后的精确
@@ -531,6 +668,35 @@ impl RelationBuilder {
         });
         self.geo_relates.push((inst_id, geo_hash));
         Ok(())
+    }
+
+    fn group_attrs_json(
+        &self,
+        store: &Store,
+        group: &rvm_rs::store::node::GroupNode,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let mut map = self.att_index.get(name).cloned().unwrap_or_default();
+
+        for attr in &group.attributes {
+            let key = store.get_string(attr.key).trim();
+            if key.is_empty() {
+                continue;
+            }
+            let value = store.get_string(attr.value).trim();
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+
+        if map.is_empty() {
+            return Ok(None);
+        }
+
+        serde_json::to_string(&serde_json::Value::Object(map))
+            .map(Some)
+            .context("序列化 RVM ATT 属性失败")
     }
 }
 
@@ -595,6 +761,67 @@ fn count_group_geometries(
         first = store.get_geometry(id).and_then(|geo| geo.next);
     }
     count
+}
+
+fn load_att_attr_index(
+    att_paths: &[PathBuf],
+) -> Result<HashMap<String, serde_json::Map<String, serde_json::Value>>> {
+    let mut index = HashMap::new();
+    for att_path in att_paths {
+        let att_text = fs::read_to_string(att_path)
+            .with_context(|| format!("读取 ATT 文件失败: {}", att_path.display()))?;
+        merge_att_attr_index(&att_text, &mut index);
+    }
+    Ok(index)
+}
+
+fn merge_att_attr_index(
+    att_text: &str,
+    index: &mut HashMap<String, serde_json::Map<String, serde_json::Value>>,
+) {
+    let mut current_name: Option<String> = None;
+
+    for line in att_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(name) = trimmed.strip_prefix("NEW") {
+            let name = name.trim().trim_matches(|c| c == '\'' || c == '"');
+            current_name = (!name.is_empty()).then(|| name.to_string());
+            if let Some(name) = current_name.as_ref() {
+                index.entry(name.clone()).or_default();
+            }
+            continue;
+        }
+
+        if trimmed == "END" {
+            current_name = None;
+            continue;
+        }
+
+        let Some(name) = current_name.as_ref() else {
+            continue;
+        };
+        for part in trimmed.split("&end&") {
+            let part = part.trim();
+            let Some((key, value)) = part.split_once(":=") else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+            index.entry(name.clone()).or_default().insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+
+    index.retain(|_, attrs| !attrs.is_empty());
 }
 
 fn stable_refno(dbnum: u32, path: &str, kind: &str) -> RefU64 {
@@ -776,26 +1003,25 @@ fn matrix3_to_array(matrix: &Mat3A) -> [f32; 9] {
     ]
 }
 
-fn translate_bbox(bbox: rvm_rs::math::BBox3, translation: Vec3) -> rvm_rs::math::BBox3 {
+fn scale_bbox(bbox: rvm_rs::math::BBox3, scale: f32) -> rvm_rs::math::BBox3 {
     if !bbox.is_valid() {
         return bbox;
     }
-    rvm_rs::math::BBox3::from_min_max(bbox.min + translation, bbox.max + translation)
+    rvm_rs::math::BBox3::from_min_max(bbox.min * scale, bbox.max * scale)
 }
 
 fn encode_geometry_blob(
     geometry: &Geometry,
     group_path: &str,
     geometry_index: usize,
-    world_translation: Vec3,
     final_bbox: rvm_rs::math::BBox3,
 ) -> Result<Vec<u8>> {
     let transform = json!({
         "matrix3": matrix3_to_array(&geometry.transform.matrix3),
         "translation": [
-            geometry.transform.translation.x + world_translation.x,
-            geometry.transform.translation.y + world_translation.y,
-            geometry.transform.translation.z + world_translation.z,
+            geometry.transform.translation.x * 1000.0,
+            geometry.transform.translation.y * 1000.0,
+            geometry.transform.translation.z * 1000.0,
         ],
     });
     let bbox_local = json!({

@@ -186,6 +186,12 @@ Until preview reads the same precise db_index/manifest source, it may remain con
 
 Use `cata_closure::default_manifest_path(&site.project_name)` after `gen-cata-closure` because this is the same path `load_sync_filter()` reads. Do not derive from cwd manually.
 
+2026-06-13 note: spec 009 tightened this assumption. Managed-site parse
+jobs now pass the main-project manifest path explicitly via
+`AIOS_CATA_CLOSURE_MANIFEST_PATH`, so runtime parsing no longer depends
+on deriving `default_manifest_path(current_project)` while iterating
+associated projects such as `AvevaCatalogue`.
+
 ### R3: Non-CATA dependencies must not be removed
 
 DICT and system/reuse DB files are not governed by CATA manifest and must remain in `included_db_files`.

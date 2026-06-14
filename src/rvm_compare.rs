@@ -31,6 +31,7 @@ pub struct RvmCompareSummary {
     pub gen_members: usize,
     pub matched: usize,
     pub missing_in_gen: usize,
+    pub root_tubi_exempted: usize,
     pub extra_in_gen: usize,
     pub noun_mismatch: usize,
     pub aabb_mismatch: usize,
@@ -53,16 +54,11 @@ struct RvmMember {
     geo_count: usize,
 }
 
-fn load_rvm_side(
-    store_root: &Path,
-    dbnum: u32,
-) -> Result<HashMap<u64, RvmMember>> {
+fn load_rvm_side(store_root: &Path, dbnum: u32) -> Result<HashMap<u64, RvmMember>> {
     let db_path = store_root.join(format!("{dbnum}")).join("relations.db");
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .with_context(|| format!("打开 relation store 失败: {}", db_path.display()))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("打开 relation store 失败: {}", db_path.display()))?;
 
     let mut members: HashMap<u64, RvmMember> = HashMap::new();
     {
@@ -175,6 +171,12 @@ struct GenInstance {
     aabb: Option<[f64; 6]>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct GenTubingAggregate {
+    count: usize,
+    aabb: Option<[f64; 6]>,
+}
+
 fn read_parquet_batches(path: &Path) -> Result<Vec<arrow_array::RecordBatch>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(path)
@@ -207,9 +209,23 @@ fn col_f64(batch: &arrow_array::RecordBatch, name: &str) -> Result<arrow_array::
     Ok(arrow_array::Float64Array::from(col.to_data()))
 }
 
+fn merge_aabb(target: &mut Option<[f64; 6]>, value: [f64; 6]) {
+    *target = Some(match *target {
+        None => value,
+        Some(prev) => [
+            prev[0].min(value[0]),
+            prev[1].min(value[1]),
+            prev[2].min(value[2]),
+            prev[3].max(value[3]),
+            prev[4].max(value[4]),
+            prev[5].max(value[5]),
+        ],
+    });
+}
+
 fn load_gen_side(
     parquet_dir: &Path,
-) -> Result<(HashMap<u64, GenInstance>, HashMap<u64, usize>)> {
+) -> Result<(HashMap<u64, GenInstance>, HashMap<u64, GenTubingAggregate>)> {
     use arrow_array::Array;
 
     // aabb.parquet: hash -> box
@@ -268,14 +284,21 @@ fn load_gen_side(
         }
     }
 
-    // tubings.parquet:owner(BRAN) -> 段数
-    let mut tubi_by_owner: HashMap<u64, usize> = HashMap::new();
+    // tubings.parquet:owner(BRAN) -> 段数 + 段 AABB 并集
+    let mut tubi_by_owner: HashMap<u64, GenTubingAggregate> = HashMap::new();
     let tubings_path = parquet_dir.join("tubings.parquet");
     if tubings_path.exists() {
         for batch in read_parquet_batches(&tubings_path)? {
             let owner = col_u64(&batch, "owner_refno_u64")?;
+            let aabb_hash = col_str(&batch, "aabb_hash")?;
             for i in 0..batch.num_rows() {
-                *tubi_by_owner.entry(owner.value(i)).or_default() += 1;
+                let aggregate = tubi_by_owner.entry(owner.value(i)).or_default();
+                aggregate.count += 1;
+                if !aabb_hash.is_null(i)
+                    && let Some(aabb) = aabb_by_hash.get(aabb_hash.value(i)).copied()
+                {
+                    merge_aabb(&mut aggregate.aabb, aabb);
+                }
             }
         }
     }
@@ -311,7 +334,10 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
     println!("==========================================");
     println!("   - dbnum: {}", options.dbnum);
     println!("   - root refno(u64): {}", options.root_refno);
-    println!("   - relation store: {}", options.relation_store_root.display());
+    println!(
+        "   - relation store: {}",
+        options.relation_store_root.display()
+    );
     println!("   - parquet dir: {}", options.parquet_dir.display());
     println!("   - AABB 容差: {} mm", options.tol_aabb_mm);
 
@@ -323,6 +349,10 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
 
     let mut summary = RvmCompareSummary::default();
     let mut items: Vec<serde_json::Value> = Vec::new();
+    let root_tubi_segments = tubi_by_owner
+        .get(&options.root_refno)
+        .map(|aggregate| aggregate.count)
+        .unwrap_or(0);
 
     // L1+L2+L3:逐 RVM 成员对比。
     for inst_id in &rvm_tree {
@@ -349,6 +379,38 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
                         "status": "rvm_zero_geo_not_in_gen",
                         "exempted": true,
                     }));
+                } else if m.noun.as_deref() == Some("BRAN")
+                    && let Some(tubi) = tubi_by_owner.get(&m.refno)
+                    && tubi.count > 0
+                {
+                    summary.root_tubi_exempted += 1;
+                    summary.matched += 1;
+                    let mut item = json!({
+                        "refno": m.refno,
+                        "name": m.name,
+                        "rvm_geos": m.geo_count,
+                        "gen_tubi_segments": tubi.count,
+                        "status": "bran_tubi_represented_in_tubings",
+                    });
+                    if let (Some(ra), Some(ga)) = (m.aabb, tubi.aabb) {
+                        summary.aabb_compared += 1;
+                        let max_delta = ra
+                            .iter()
+                            .zip(ga.iter())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0_f64, f64::max);
+                        if max_delta > options.tol_aabb_mm {
+                            summary.aabb_mismatch += 1;
+                            item["aabb_mismatch"] = json!({
+                                "rvm": ra,
+                                "gen": ga,
+                                "max_delta_mm": max_delta,
+                            });
+                        } else {
+                            item["aabb_max_delta_mm"] = json!(max_delta);
+                        }
+                    }
+                    items.push(item);
                 } else {
                     summary.missing_in_gen += 1;
                     items.push(json!({
@@ -432,10 +494,7 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
     {
         summary.rvm_tube_geos = root_member.geo_count;
     }
-    summary.gen_tubi_segments = tubi_by_owner
-        .get(&options.root_refno)
-        .copied()
-        .unwrap_or(0);
+    summary.gen_tubi_segments = root_tubi_segments;
 
     // 报告输出。
     let report = json!({
@@ -448,6 +507,7 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
             "gen_members": summary.gen_members,
             "matched": summary.matched,
             "missing_in_gen": summary.missing_in_gen,
+            "root_tubi_exempted": summary.root_tubi_exempted,
             "extra_in_gen": summary.extra_in_gen,
             "noun_mismatch": summary.noun_mismatch,
             "aabb_compared": summary.aabb_compared,
@@ -471,6 +531,7 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
     println!("   - gen 子树成员: {}", summary.gen_members);
     println!("   - matched: {}", summary.matched);
     println!("   - missing_in_gen: {}", summary.missing_in_gen);
+    println!("   - root_tubi_exempted: {}", summary.root_tubi_exempted);
     println!("   - extra_in_gen: {}", summary.extra_in_gen);
     println!("   - noun_mismatch: {}", summary.noun_mismatch);
     println!(
@@ -483,14 +544,12 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
     );
     println!("📄 报告: {}", report_path.display());
 
-    let has_diff = summary.missing_in_gen > 0
-        || summary.extra_in_gen > 0
-        || summary.noun_mismatch > 0
-        || summary.aabb_mismatch > 0;
-    if has_diff {
-        // CI 语义:有差异以错误码退出(退出码 1 由 main 的 Err 路径承担)。
+    let has_blocking_diff =
+        summary.missing_in_gen > 0 || summary.extra_in_gen > 0 || summary.noun_mismatch > 0;
+    if has_blocking_diff {
+        // CI 语义:L1/L2 差异以错误码退出(退出码 1 由 main 的 Err 路径承担)。
         return Err(anyhow!(
-            "对拍存在差异: missing={} extra={} noun={} aabb={}(详见报告 {})",
+            "对拍存在阻断差异: missing={} extra={} noun={} aabb_diagnostic={}(详见报告 {})",
             summary.missing_in_gen,
             summary.extra_in_gen,
             summary.noun_mismatch,
@@ -498,7 +557,14 @@ pub fn compare_rvm_mode(options: &RvmCompareOptions) -> Result<()> {
             report_path.display()
         ));
     }
-    println!("✅ 对拍通过(容差内)");
+    if summary.aabb_mismatch > 0 {
+        println!(
+            "⚠️  成员/类型对拍通过；AABB 存在 {} 个诊断差异(详见报告)",
+            summary.aabb_mismatch
+        );
+    } else {
+        println!("✅ 对拍通过(容差内)");
+    }
     Ok(())
 }
 

@@ -13,6 +13,16 @@ use glam::Vec3;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+const DATUM_MARKER_NOUN_NAMES: [&str; 2] = ["JLDATU", "PLDATU"];
+
+fn prim_noun_names() -> Vec<&'static str> {
+    GNERAL_PRIM_NOUN_NAMES
+        .iter()
+        .copied()
+        .chain(DATUM_MARKER_NOUN_NAMES)
+        .collect()
+}
 use tokio::sync::RwLock;
 
 use super::cata_resolve_cache_pipeline;
@@ -456,8 +466,7 @@ pub async fn gen_index_tree_geos_optimized(
             .iter()
             .map(|n| db1_hash(n))
             .collect();
-        let prim_hashes: HashSet<u32> =
-            GNERAL_PRIM_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
+        let prim_hashes: HashSet<u32> = prim_noun_names().into_iter().map(db1_hash).collect();
         let cate_hashes: HashSet<u32> = USE_CATE_NOUN_NAMES.iter().map(|n| db1_hash(n)).collect();
 
         let mut total = 0usize;
@@ -1459,7 +1468,8 @@ async fn process_prim_stage(
         return Ok((vec, start.elapsed()));
     }
 
-    let mut prim_noun_infos = prequery_noun_counts(&GNERAL_PRIM_NOUN_NAMES, dbnums).await?;
+    let prim_nouns = prim_noun_names();
+    let mut prim_noun_infos = prequery_noun_counts(&prim_nouns, dbnums).await?;
     prim_noun_infos.retain(|info| config.should_process_noun(info.noun, "prim"));
     let vec = process_nouns_by_type(
         prim_noun_infos,
@@ -1605,6 +1615,7 @@ fn get_entry_nouns(config: &IndexTreeConfig) -> Vec<String> {
         for &noun in GNERAL_LOOP_OWNER_NOUN_NAMES
             .iter()
             .chain(GNERAL_PRIM_NOUN_NAMES.iter())
+            .chain(DATUM_MARKER_NOUN_NAMES.iter())
             .chain(USE_CATE_NOUN_NAMES.iter())
         {
             set.insert(noun.to_string());
@@ -1676,8 +1687,9 @@ async fn collect_all_descendants(
 
     // roots 可能本身就是 LOOP/PRIM/CATE；此处必须 include_self=true，
     // 否则会在 debug-model/手动指定节点场景下漏掉根节点自身的几何生成。
+    let prim_nouns = prim_noun_names();
     let prim_descendants =
-        query_provider::query_multi_descendants_with_self(roots, &GNERAL_PRIM_NOUN_NAMES, true)
+        query_provider::query_multi_descendants_with_self(roots, &prim_nouns, true)
             .await
             .map_err(|e| {
                 IndexTreeError::DatabaseError(format!(

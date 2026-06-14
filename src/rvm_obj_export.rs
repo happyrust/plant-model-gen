@@ -131,6 +131,13 @@ pub(crate) fn mesh_from_payload(payload: &Value) -> Result<Option<PlantMesh>> {
         _ => build_bbox_fallback_mesh(payload)?,
     };
 
+    // RVM FacetGroup vertices are already baked into model/world coordinates in
+    // observed E3D exports. Applying the group transform again double-translates
+    // flange-like meshes and poisons RVM-vs-gen AABB comparison.
+    if kind == "FacetGroup" {
+        return Ok(local_mesh);
+    }
+
     Ok(local_mesh.map(|mesh| mesh.transform_by(&transform)))
 }
 

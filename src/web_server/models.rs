@@ -1217,6 +1217,9 @@ pub struct PreviewManagedSiteParsePlanRequest {
     /// CATA 按需部分解析（闭包 manifest）。默认开启。
     #[serde(default = "default_true")]
     pub cata_partial_parse: bool,
+    /// 可选 db_index.sqlite 路径；提供后 sidecar preview 可用精确依赖闭包显示 CATA 目标。
+    #[serde(default)]
+    pub db_index_path: Option<String>,
     pub web_port: u16,
     #[serde(default)]
     pub bind_host: Option<String>,
@@ -1224,6 +1227,21 @@ pub struct PreviewManagedSiteParsePlanRequest {
     pub public_base_url: Option<String>,
     #[serde(default)]
     pub associated_project: Option<String>,
+}
+
+/// MBD 部署前候选发现请求（只读）：
+/// 按当前工程组成离线读 SYST，枚举 MDB 候选及成员 DB 文件定位状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MdbCandidatesRequest {
+    /// 站点 ID（可选）：提供后复用该站点的 sidecar 进程。
+    #[serde(default)]
+    pub site_id: Option<String>,
+    #[serde(default)]
+    pub projects: Vec<SiteProject>,
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(default)]
+    pub project_path: String,
 }
 
 /// 一键部署测试请求（免鉴权快测专用）：

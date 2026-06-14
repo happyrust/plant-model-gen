@@ -1,3 +1,26 @@
+# refno_assoc_index 使用清理发现
+
+## 2026-06-14 Discovery
+
+- [任务] 用户要求“帮我清理 `refno_assoc_index` 的使用，使用 `planning-with-files` skill 制定开发计划”；本轮只制定计划，不直接改 Rust 代码。
+- [技能] 已读取项目内 `d:\work\plant-code\plant-model-gen\.cursor\skills\planning-with-files\SKILL.md`，确认规划文件应写在项目根目录：`task_plan.md`、`findings.md`、`progress.md`。
+- [上下文] 当前项目根目录按 Bridge 指定为 `D:/work/plant-code/plant-model-gen-cata-closure`；根目录已有 active planning 文件，采用“新计划前置、旧计划归档”模式。
+- [错误] `memanto memory sync --project-dir .` 失败：`No agent specified and no active agent`；本轮记录为非阻塞。
+- [错误] 用户级模板路径 `C:\Users\dpc\.cursor\skills-cursor\planning-with-files\templates\*.md` 不存在；已改读项目内 `.cursor/skills/planning-with-files/templates/*.md`。
+- [错误] 用户级和项目内 `session-catchup.py` 路径均不存在；本轮记录为非阻塞，继续读取现有 planning 文件。
+- [代码发现] `src/fast_model/gen_model/refno_assoc_index.rs` 定义 `refno_assoc_index` SurrealDB 表，记录每个 refno 关联的模型生成产物 ID，包括 `inst_relate_ids`、`inst_info_ids`、`geo_relate_ids`、`geo_hashes`、`neg_relate_ids`、`ngmr_relate_ids`、`inst_relate_bool_ids`、`inst_relate_cata_bool_ids`、`inst_relate_aabb_ids`、`inst_relate_booled_aabb_ids`、`tubi_branch_keys`。
+- [代码发现] `delete_by_refnos()` 当前只有一个生产调用点：`pdms_inst::pre_cleanup_for_regen()`；它用于 regen 前按 refno 精确删除旧模型生成产物。
+- [矛盾] `src/options.rs` 中 `parse_regen_delete_mode("refno_assoc_index")` 会强制降级为 `Legacy`，注释也写明 `refno_assoc_index` 已停用；但 `src/fast_model/gen_model/pdms_inst.rs::is_refno_assoc_index_enabled()` 硬编码返回 `true`，导致配置层“停用”和运行层“启用”矛盾。
+- [写入面] `pdms_inst.rs` 中两条实例保存路径都会创建 `RefnoAssocIndexBatch`，写入 `inst_info`、`geo_relate`、`geo_hash`、`neg/ngmr`、`inst_relate`、`inst_relate_bool`、`inst_relate_aabb`、`tubi_branch` 等关联。
+- [写入面] `manifold_bool.rs` 的 bool worker 也会创建 `RefnoAssocIndexBatch`，写入 `inst_relate_bool` 与 `inst_relate_cata_bool` 关联 ID；因此不能只改 `pdms_inst.rs`。
+- [抽象边界] `ModelWriterBackend::cleanup()` 默认是 skipped；`SurrealModelWriterBackend` 没有实际 cleanup override。当前生成前清理不是 writer 抽象负责，而是外层 `pre_cleanup_for_regen()` 负责。
+- [DuckLake 边界] `model_writer_ducklake.rs` 把 `raw_refno_assoc_index` 标记为 known gap，并说明它仍由 `cata_model.rs / refno_assoc_index.rs` 直写；这说明该索引还没有进入多 writer 后端抽象。
+- [风险] 如果默认仍是 Legacy 清理，则必须核对 legacy 是否覆盖 `inst_info`、`inst_relate_aabb` 等 index 模式覆盖的表，否则切回 Legacy 会引入旧模型产物残留。
+- [策略建议] 不建议第一步直接删除 `refno_assoc_index`。更稳妥的清理是：先把它改为显式 cleanup backend，删除硬编码开关和误导注释，再决定是否继续保留或完全下线。
+- [验证约束] 仓库规则禁止运行 Rust test；后续验证应走 `cargo check`、CLI+JSON、web_server HTTP/POST、SurrealDB 查询和 `ReadLints`。
+
+## Archived Previous Findings
+
 # Release 包 sidecar job 终态竞态修复发现
 
 ## 2026-06-08 Discovery

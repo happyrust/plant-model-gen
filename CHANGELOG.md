@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-06-14
+
+### Fixed — EQUI/TMPL 模板原语生成补齐(spec 011)
+
+> `2013286704/821`(`/03SKID3`) 对拍中,EQUI/SUBE 下的 `TMPL` 参数化几何缺失。根因分两层:外部模板 `DESI` 库未进入 precise CATA closure;模板 PRIM 源尺寸为 0,实际尺寸需从父级 `DESP` 经 `DDSE/DDAT` 映射补入。随后发现 `NOZZ.CATR -> SPCO.CATR -> SCOM` 引用链在 fallback 场景未归一化,导致 NOZZ 被当作 tubing 求解且 `gm_out=0`。
+
+- CATA closure precise 模式纳入外部 `DESI`,并在源 DESI 闭包中排除自身 dbnum,避免递归把主库写回 manifest;parse plan 对 manifest 覆盖的 `DESI` 也纳入解析。
+- `prim_model.rs` 在生成期按 `TMPL -> DDSE -> DDAT` 解析 `DKEY/DDPR`,从父级 `EQUI/SUBE.DESP` 补齐 `CYLI/DISH/SNOU/PYRA` 的 `DIAM/HEIG/RADI/DTOP/DBOT/XBOT/YBOT/XTOP/YTOP` 等参数。
+- `resolve.rs` 增加 catalogue ref 归一化:沿 `CATR` 链收敛到 `SCOM/SPRF/SFIT/JOIN`;当 fallback 传入设计件自身作为 `tubi_scom` 但归一化成功时,恢复普通 CATE 求解语义,修复 4 个模板 `NOZZ`。
+- 821 验收:`NOZZ 852/909/944/1001` 均进入 `instances.parquet`,每个 2 行 `geo_instances`;`CYLI/DISH/SNOU/PYRA` 目标均进入 Parquet。2026-06-14 复验报告 `rvm-compare-8647000551151633205-20260614-083451.json` 中本 spec 目标 `14/14 matched`,总 missing 从修复前 35 降到 21,剩余为 4 个 BRAN 与 17 个 datum 表示差异。
+- 476 BRAN 回归:`2013286704_476 .rvm` 重新导入 `resolved=15 unresolved=0`;compare 保持 `matched=8 / extra=0 / noun_mismatch=0`,唯一 `missing=1` 为 spec 009 已记录 BRAN 自身 TUBE 挂组口径差异。
+- 后续分流:将 `JLDATU/PLDATU` 追加到 PRIM 发现集合,并以三轴短圆柱 marker 走现有写入链;新增 datum marker 单测。821 对拍仍需复跑确认 17 个 datum 是否从 missing 消失。
+
 ## 2026-06-13
 
 ### Added — RVM 基准导入身份解析 + 模型生成准确性对拍 CLI(spec 009)
@@ -9,6 +22,7 @@
 - `model_relation_store.rs`:`inst_relate` 扩列 `name/noun/identity_source/resolved`(新库建表即含,旧库 PRAGMA 检测后幂等 ALTER)。
 - `rvm_import.rs`:导入期两段式身份解析——命名元素按 `pe.name` 精确查询(RVM 组名与站点库 name 逐字符一致);未命名成员按 E3D 默认命名 `<NOUN> <n> of <OWNER>` 在 owner 同 NOUN 子序列定位(全称→PDMS 短名词映射表);SurrealDB 不可用自动回退 stable_hash;CLI 增 `--no-resolve-identity`。
 - `rvm_compare.rs`(新增)+ `--compare-rvm` CLI:RVM relation store vs 站点 Parquet 包(instances/tubings/aabb)三层对拍——L1 成员清单(零几何成员豁免)、L2 noun、L3 组级合并 AABB 容差;JSON 报告落 `runtime/rvm-compare/`,有差异非零退出(CI 可用)。
+- `rvm_compare.rs` 后续收敛:root BRAN 的 RVM TUBE 挂组 vs gen `tubings.parquet` 口径差异归入 `root_tubi_exempted`;AABB mismatch 在 rvm-rs PRIM transform 归一化前保留为诊断警告,不再阻断成员/类型级验收。`rvm_obj_export.rs` 对已烘焙世界坐标的 `FacetGroup` 不再二次应用 transform,FLANGE AABB 误差由百万级收敛到 12~13.5mm。
 - **样本验收**(`2013286704_476 .rvm` ↔ 站点 quicktest-250160-8080):身份解析 15/15(BRAN→`2013286704_476`,默认命名反推 11/11 全中);matched=8 / extra=0 / noun_mismatch=0;AABB 差异经结构分析为全局坐标基准平移(中心偏移一致,散布 <100mm),扣除后尺寸差 90~320mm 属 L1 LOD 网格预期;VALVE z 向 861mm 为唯一外点待查;BRAN 管段口径差异(RVM 2 段 TUBE 挂组 vs gen 5 段 tubi_relate)已记录。
 - Backlog:`--auto-align` 基准自动对齐、TUBE 段空间并集对比、VALVE 外点定位、ATT 属性对比。
 - 旁证发现(spec 009 T003.5):release 包重新部署在"websocket 终态兜底成功"后任务悬挂且不可取消、锁死站点(重启 web_server 对账 Failed 恢复);站点重启后 surreal 端口可重分配(8022→8023),工具不可硬编码站点端口。

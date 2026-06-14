@@ -606,7 +606,8 @@
                 queryParams = {
                     refno: refno,
                     distance: distance,
-                    mode: 'refno'
+                    mode: 'refno',
+                    shape: 'sphere'
                 };
             } else if (activeMode === 'radius') {
                 const centerX = parseFloat(document.getElementById('center-x').value);
@@ -614,12 +615,12 @@
                 const centerZ = parseFloat(document.getElementById('center-z').value);
                 const radius = parseFloat(document.getElementById('radius').value);
                 queryParams = {
-                    minx: centerX - radius,
-                    maxx: centerX + radius,
-                    miny: centerY - radius,
-                    maxy: centerY + radius,
-                    minz: centerZ - radius,
-                    maxz: centerZ + radius
+                    mode: 'position',
+                    x: centerX,
+                    y: centerY,
+                    z: centerZ,
+                    radius: radius,
+                    shape: 'sphere'
                 };
             }
             

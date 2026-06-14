@@ -56,6 +56,7 @@ pub fn create_admin_routes() -> Router {
         .route("/api/admin/ports/check", get(check_port))
         .route("/api/admin/ports/kill", post(kill_port))
         .route("/api/admin/projects/scan", get(scan_projects))
+        .route("/api/admin/projects/mdb-candidates", post(mdb_candidates))
         .route(
             "/api/admin/remote-targets",
             get(list_remote_targets).post(upsert_remote_target),
@@ -867,6 +868,27 @@ pub async fn scan_projects(Query(params): Query<ProjectScanQuery>) -> impl IntoR
     }
 }
 
+/// MBD 部署前候选发现（只读）：离线读 SYST 枚举 MDB 候选，并对成员 DB
+/// 做文件定位检查（available/missing/ambiguous）。实际读取由 sidecar 完成。
+pub async fn mdb_candidates(
+    Json(payload): Json<crate::web_server::models::MdbCandidatesRequest>,
+) -> impl IntoResponse {
+    let has_project_root = !payload.project_path.trim().is_empty()
+        || payload
+            .projects
+            .iter()
+            .any(|project| !project.path.trim().is_empty());
+    if !has_project_root {
+        return admin_response::managed_error(
+            "工程组成为空：请提供 projects[] 或 project_path".to_string(),
+        );
+    }
+    match parse_sidecar_client::mdb_candidates(payload).await {
+        Ok(result) => admin_response::ok("MBD 候选发现完成", result),
+        Err(err) => admin_response::response(err.status, false, err.message, Some(err.body)),
+    }
+}
+
 fn project_roots_from_parts(projects: &[SiteProject], fallback_project_path: &str) -> Vec<String> {
     let roots = projects
         .iter()
@@ -1037,8 +1059,27 @@ pub async fn create_site(Json(mut payload): Json<CreateManagedSiteRequest>) -> i
 }
 
 pub async fn preview_parse_plan(
-    Json(payload): Json<PreviewManagedSiteParsePlanRequest>,
+    Json(mut payload): Json<PreviewManagedSiteParsePlanRequest>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "sqlite-index")]
+    if payload
+        .db_index_path
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        if let Some(site_id) = payload
+            .site_id
+            .as_deref()
+            .filter(|site_id| !site_id.is_empty())
+        {
+            payload.db_index_path = Some(
+                managed_sites::site_db_index_path(site_id)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
     match parse_sidecar_client::preview_parse_plan(payload).await {
         Ok(plan) => admin_response::ok("获取解析预览成功", plan),
         Err(err) => admin_response::response(err.status, false, err.message, Some(err.body)),

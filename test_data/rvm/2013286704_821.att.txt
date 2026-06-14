@@ -1,0 +1,5337 @@
+﻿AVEVA_Attributes_File v1.0 , start: NEW , end: END , name_end: := , sep: &end&
+NEW Header Information
+  Source:= Everything3D Data &end& Date:= 14 Jun 2026 &end& Time:= 20:14
+  Project:= APS &end& MDB:= /ALL &end& Element:= /03SKID3
+END
+NEW /SITE-EQUIPMENT-AREA03
+        NAME:=  /SITE-EQUIPMENT-AREA03
+        TYPE:=  SITE
+        LOCK:=  false
+       OWNER:=  /*
+        FUNC:=  Equipment
+        PURP:=  EQUI
+        NUMB:=  0
+        AREA:=  0
+         POS:=  E 0mm N 0mm U 0mm
+         ORI:=  Y is N and Z is U
+   :FABMODNR:=  1
+  :FABTARGET:=  Target Contractor
+  :FABDECODE:=  Design Code
+    :FABPRID:=  Object
+    :FABSTID:=  Project Number
+    :FABCLID:=  Customer
+    :FABEFID:=  Project Leader
+  :FABTRRVNO:=  _.0
+   :FABTRANO:=  1
+   :FABREVNO:=  0
+  :SDNFMODNR:=  1
+  :SDNFREVNO:=  0
+  :SDNFTRANO:=  1
+ :SDNFTRRVNO:=  _.0
+   :SDNFEFID:=  Engineering Firm Id
+   :SDNFCLID:=  Client Id
+   :SDNFSTID:=  Structure Id
+   :SDNFPRID:=  Project Id
+ :SDNFDECODE:=  Design Code
+ :SDNFTARGET:=  Target Contractor
+NEW /03SKID3
+            NAME:=  /03SKID3
+            TYPE:=  ZONE
+            LOCK:=  false
+           OWNER:=  /SITE-EQUIPMENT-AREA03
+            DESC:=  AREA03EQUI
+            NUMB:=  0
+            AREA:=  0
+             POS:=  W 294600mm N 292460mm U 100400mm
+             ORI:=  Y is E and Z is U
+           DUNIO:=  0
+       :FABMODNR:=  1
+      :FABTARGET:=  Target Contractor
+      :FABDECODE:=  Design Code
+        :FABPRID:=  Object
+        :FABSTID:=  Project Number
+        :FABCLID:=  Customer
+        :FABEFID:=  Project Leader
+      :FABTRRVNO:=  _.0
+       :FABTRANO:=  1
+       :FABREVNO:=  0
+        :MDSBARS:=  true
+        :MDSEDIT:=  true
+   :MDSHANGGROUP:=  0
+     :MDSHANGROT:=  1:false,1,2
+          :MDSHV:=  BOTH
+     :MDSMAXBORE:=  1200
+    :MDSMAXPIPES:=  10
+     :MDSMINBORE:=  0
+      :SDNFMODNR:=  1
+       :SDNFEFID:=  Engineering Firm Id
+       :SDNFCLID:=  Client Id
+       :SDNFSTID:=  Structure Id
+       :SDNFPRID:=  Project Id
+     :SDNFDECODE:=  Design Code
+     :SDNFTARGET:=  Target Contractor
+  NEW /03SKID3-PIPE-1
+            NAME:=  /03SKID3-PIPE-1
+            TYPE:=  PIPE
+            LOCK:=  false
+           OWNER:=  /03SKID3
+            FUNC:=  Piping
+            BUIL:=  false
+            SHOP:=  false
+            ISOH:=  false
+            BORE:=  100mm
+            TEMP:=  -100000degC
+            PRES:=  0pascal
+          TPRESS:=  0pascal
+            PSPE:=  /A3B
+            CCEN:=  0
+            CCLA:=  0
+            EREC:=  0
+             REV:=  -1
+            SAFC:=  0
+            LISS:=  false
+            WMAX:=  0
+            PMAX:=  0
+            SMAX:=  0
+            JMAX:=  0
+          DELDSG:=  FALSE
+            JNTC:=  0
+            WLDC:=  0
+           HEATT:=  0
+    NEW /03SKID3-PIPE-1/B1
+              NAME:=  /03SKID3-PIPE-1/B1
+              TYPE:=  BRAN
+              LOCK:=  false
+             OWNER:=  /03SKID3-PIPE-1
+              BUIL:=  false
+              SHOP:=  false
+              ISOH:=  false
+              HPOS:=  E 500mm N 500mm U 300mm
+              TPOS:=  E 1150mm N 748.1mm U 149.29mm
+              HDIR:=  D
+              TDIR:=  S
+              HREF:=  =2013286704/909
+              LHEA:=  true
+              LTAI:=  true
+              HBOR:=  50mm
+              TBOR:=  50mm
+              HCON:=  FBD
+              TCON:=  GBD
+              DETA:=  false
+              LSTR:=  false
+              EREC:=  0
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              HSTU:=  /A3B/PA50
+              CCEN:=  0
+              CCLA:=  0
+              SAFC:=  0
+              PSPE:=  /A3B
+              LISS:=  false
+              WMAX:=  0
+              PMAX:=  0
+              PTNH:=  0
+              SMAX:=  0
+              JMAX:=  0
+              BSTA:=  0
+              BRLO:=  0
+             TSFBR:=  false
+            DELDSG:=  FALSE
+            AEXCES:=  0mm
+            LEXCES:=  0mm
+              LOOS:=  false
+        :PFCONSCHK:=  false
+          :MDSTRUN:=  false
+      NEW GASKET 1 of BRANCH /03SKID3-PIPE-1/B1
+                NAME:=  =2013286704/824
+                TYPE:=  GASK
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-1/B1
+                 POS:=  E 500mm N 500mm U 300mm
+                 ORI:=  Y is N and Z is E
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/GC50
+                LSTU:=  /A3B/PA50
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 500mm N 500mm U 300mm
+                HEIG:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  2
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 500mm N 500mm U 300mm
+                LPOS:=  E 500mm N 500mm U 298.5mm
+                DTXR:=  GASKET RF 1.5MM ANSI B16.5 #300
+                MTXX:=  SS & ASB
+      END
+      NEW FLANGE 1 of BRANCH /03SKID3-PIPE-1/B1
+                  NAME:=  =2013286704/825
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B1
+                   POS:=  E 500mm N 500mm U 298.5mm
+                   ORI:=  Y is N and Z is E
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 500mm N 500mm U 298.5mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 500mm N 500mm U 298.5mm
+                  LPOS:=  E 500mm N 500mm U 287.39mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+      END
+      NEW ELBOW 1 of BRANCH /03SKID3-PIPE-1/B1
+                  NAME:=  =2013286704/826
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B1
+                   POS:=  E 500mm N 500mm U 149.29mm
+                   ORI:=  Y is E and Z is S
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 500mm N 500mm U 149.29mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 500mm N 500mm U 187.39mm
+                  LPOS:=  E 538.1mm N 500mm U 149.29mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW VALVE 1 of BRANCH /03SKID3-PIPE-1/B1
+                NAME:=  =2013286704/827
+                TYPE:=  VALV
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-1/B1
+                 POS:=  E 841.684mm N 500mm U 149.29mm
+                 ORI:=  Y is N 30 D and Z is N 60 U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/VG50
+                LSTU:=  /A3B/PA50
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 841.684mm N 500mm U 149.29mm
+                ANGL:=  90degree
+                HEIG:=  0mm
+                RADI:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  -1
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 759.184mm N 500mm U 149.29mm
+                LPOS:=  E 924.184mm N 500mm U 149.29mm
+                DTXR:=  VALVE GATE SW #800
+                MTXX:=  ASTM A105
+      END
+      NEW TEE 1 of BRANCH /03SKID3-PIPE-1/B1
+                  NAME:=  =2013286704/828
+                  TYPE:=  TEE
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B1
+                   POS:=  E 1150mm N 500mm U 149.29mm
+                   ORI:=  Y is D and Z is N
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/TA50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  1
+                  LEAV:=  3
+                  POSI:=  E 1150mm N 500mm U 149.29mm
+                  ANGL:=  90degree
+                  HEIG:=  0mm
+                  RADI:=  0mm
+                  LOFF:=  false
+                  CREF:=  /03SKID3-PIPE-1/B2
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1111.9mm N 500mm U 149.29mm
+                  LPOS:=  E 1150mm N 538.1mm U 149.29mm
+                  DTXR:=  TEE ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW FLANGE 2 of BRANCH /03SKID3-PIPE-1/B1
+                  NAME:=  =2013286704/829
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B1
+                   POS:=  E 1150mm N 748.1mm U 149.29mm
+                   ORI:=  Y is E and Z is U
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 1150mm N 748.1mm U 149.29mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  2
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1150mm N 736.99mm U 149.29mm
+                  LPOS:=  E 1150mm N 748.1mm U 149.29mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+     END
+    END
+    NEW /03SKID3-PIPE-1/B2
+              NAME:=  /03SKID3-PIPE-1/B2
+              TYPE:=  BRAN
+              LOCK:=  false
+             OWNER:=  /03SKID3-PIPE-1
+              BUIL:=  false
+              SHOP:=  false
+              ISOH:=  false
+              HPOS:=  E 1800mm N 500mm U 300mm
+              TPOS:=  E 1188.1mm N 500mm U 149.29mm
+              HDIR:=  D
+              TDIR:=  E
+              HREF:=  =2013286704/1001
+              TREF:=  =2013286704/828
+              LHEA:=  true
+              LTAI:=  true
+              HBOR:=  50mm
+              TBOR:=  50mm
+              HCON:=  FBD
+              TCON:=  SWF
+              DETA:=  false
+              LSTR:=  false
+              EREC:=  0
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              HSTU:=  /A3B/PA50
+              CCEN:=  0
+              CCLA:=  0
+              SAFC:=  0
+              PSPE:=  /A3B
+              LISS:=  false
+              WMAX:=  0
+              PMAX:=  0
+              PTNH:=  0
+              SMAX:=  0
+              JMAX:=  0
+              BSTA:=  0
+              BRLO:=  0
+             TSFBR:=  false
+            DELDSG:=  FALSE
+            AEXCES:=  0mm
+            LEXCES:=  0mm
+              LOOS:=  false
+        :PFCONSCHK:=  false
+          :MDSTRUN:=  false
+      NEW GASKET 1 of BRANCH /03SKID3-PIPE-1/B2
+                NAME:=  =2013286704/831
+                TYPE:=  GASK
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-1/B2
+                 POS:=  E 1800mm N 500mm U 300mm
+                 ORI:=  Y is N and Z is E
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/GC50
+                LSTU:=  /A3B/PA50
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 1800mm N 500mm U 300mm
+                HEIG:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  2
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 1800mm N 500mm U 300mm
+                LPOS:=  E 1800mm N 500mm U 298.5mm
+                DTXR:=  GASKET RF 1.5MM ANSI B16.5 #300
+                MTXX:=  SS & ASB
+      END
+      NEW FLANGE 1 of BRANCH /03SKID3-PIPE-1/B2
+                  NAME:=  =2013286704/832
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B2
+                   POS:=  E 1800mm N 500mm U 298.5mm
+                   ORI:=  Y is N and Z is E
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 1800mm N 500mm U 298.5mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1800mm N 500mm U 298.5mm
+                  LPOS:=  E 1800mm N 500mm U 287.39mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+      END
+      NEW ELBOW 1 of BRANCH /03SKID3-PIPE-1/B2
+                  NAME:=  =2013286704/833
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-1/B2
+                   POS:=  E 1800mm N 500mm U 149.29mm
+                   ORI:=  Y is W and Z is N
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB50
+                  LSTU:=  /A3B/PA50
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 1800mm N 500mm U 149.29mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1800mm N 500mm U 187.39mm
+                  LPOS:=  E 1761.9mm N 500mm U 149.29mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW VALVE 1 of BRANCH /03SKID3-PIPE-1/B2
+                NAME:=  =2013286704/834
+                TYPE:=  VALV
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-1/B2
+                 POS:=  E 1479.731mm N 500mm U 149.29mm
+                 ORI:=  Y is S 30 U and Z is N 60 U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/VG50
+                LSTU:=  /A3B/PA50
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 1479.731mm N 500mm U 149.29mm
+                ANGL:=  90degree
+                HEIG:=  0mm
+                RADI:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  -1
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 1562.231mm N 500mm U 149.29mm
+                LPOS:=  E 1397.231mm N 500mm U 149.29mm
+                DTXR:=  VALVE GATE SW #800
+                MTXX:=  ASTM A105
+     END
+    END
+   END
+  NEW /03SKID3-PIPE-2
+            NAME:=  /03SKID3-PIPE-2
+            TYPE:=  PIPE
+            LOCK:=  false
+           OWNER:=  /03SKID3
+            FUNC:=  Piping
+            BUIL:=  false
+            SHOP:=  false
+            ISOH:=  false
+            BORE:=  40mm
+            TEMP:=  -100000degC
+            PRES:=  0pascal
+          TPRESS:=  0pascal
+            PSPE:=  /A3B
+            CCEN:=  0
+            CCLA:=  0
+            EREC:=  0
+             REV:=  -1
+            SAFC:=  0
+            LISS:=  false
+            WMAX:=  0
+            PMAX:=  0
+            SMAX:=  0
+            JMAX:=  0
+          DELDSG:=  FALSE
+            JNTC:=  0
+            WLDC:=  0
+           HEATT:=  0
+    NEW /03SKID3-PIPE-2/B1
+              NAME:=  /03SKID3-PIPE-2/B1
+              TYPE:=  BRAN
+              LOCK:=  false
+             OWNER:=  /03SKID3-PIPE-2
+              BUIL:=  false
+              SHOP:=  false
+              ISOH:=  false
+              HPOS:=  E 813.5mm N 1126.02mm U 1763.5mm
+              TPOS:=  E 150mm N 850mm U 2100mm
+              HDIR:=  S
+              TDIR:=  N
+              HREF:=  /50-B-321/B1
+              TREF:=  =2013286704/852
+              LHEA:=  true
+              LTAI:=  true
+              HBOR:=  40mm
+              TBOR:=  40mm
+              HCON:=  GBD
+              TCON:=  FBD
+              DETA:=  false
+              LSTR:=  false
+              EREC:=  0
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              HSTU:=  /A3B/PA40
+              CCEN:=  0
+              CCLA:=  0
+              SAFC:=  0
+              PSPE:=  /A3B
+              LISS:=  false
+              WMAX:=  0
+              PMAX:=  0
+              PTNH:=  0
+              SMAX:=  0
+              JMAX:=  0
+              BSTA:=  0
+              BRLO:=  0
+             TSFBR:=  false
+            DELDSG:=  FALSE
+            AEXCES:=  0mm
+            LEXCES:=  0mm
+              LOOS:=  false
+        :PFCONSCHK:=  false
+          :MDSTRUN:=  false
+      NEW FLANGE 1 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/837
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 813.5mm N 1126.02mm U 1763.5mm
+                   ORI:=  Y is E and Z is U
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 813.5mm N 1126.02mm U 1763.5mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 813.5mm N 1126.02mm U 1763.5mm
+                  LPOS:=  E 813.5mm N 1116.5mm U 1763.5mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+      END
+      NEW ELBOW 1 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/838
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 813.5mm N 992.77mm U 1763.5mm
+                   ORI:=  Y is N and Z is W
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 813.5mm N 992.77mm U 1763.5mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 813.5mm N 1024.52mm U 1763.5mm
+                  LPOS:=  E 813.5mm N 992.77mm U 1731.75mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW TEE 1 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/839
+                  TYPE:=  TEE
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 813.5mm N 992.77mm U 1550mm
+                   ORI:=  Y is N and Z is U
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/TA40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  3
+                  LEAV:=  1
+                  POSI:=  E 813.5mm N 992.77mm U 1550mm
+                  ANGL:=  90degree
+                  HEIG:=  0mm
+                  RADI:=  0mm
+                  LOFF:=  false
+                  CREF:=  /03SKID3-PIPE-2/B2
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 813.5mm N 992.77mm U 1581.75mm
+                  LPOS:=  E 781.75mm N 992.77mm U 1550mm
+                  DTXR:=  TEE ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW VALVE 1 of BRANCH /03SKID3-PIPE-2/B1
+                NAME:=  =2013286704/840
+                TYPE:=  VALV
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-2/B1
+                 POS:=  E 481.75mm N 992.77mm U 1550mm
+                 ORI:=  Y is N and Z is U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/VG40
+                LSTU:=  /A3B/PA40
+                ARRI:=  2
+                LEAV:=  1
+                POSI:=  E 481.75mm N 992.77mm U 1550mm
+                ANGL:=  90degree
+                HEIG:=  0mm
+                RADI:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  -1
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 555.25mm N 992.77mm U 1550mm
+                LPOS:=  E 408.25mm N 992.77mm U 1550mm
+                DTXR:=  VALVE GATE SW #800
+                MTXX:=  ASTM A105
+      END
+      NEW ELBOW 2 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/841
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 150mm N 992.77mm U 1550mm
+                   ORI:=  Y is E and Z is S
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 150mm N 992.77mm U 1550mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 181.75mm N 992.77mm U 1550mm
+                  LPOS:=  E 150mm N 992.77mm U 1581.75mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW ELBOW 3 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/842
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 150mm N 992.77mm U 2100mm
+                   ORI:=  Y is S and Z is E
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 150mm N 992.77mm U 2100mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 150mm N 992.77mm U 2068.25mm
+                  LPOS:=  E 150mm N 961.02mm U 2100mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW FLANGE 2 of BRANCH /03SKID3-PIPE-2/B1
+                  NAME:=  =2013286704/843
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B1
+                   POS:=  E 150mm N 851.5mm U 2100mm
+                   ORI:=  Y is W and Z is U
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 150mm N 851.5mm U 2100mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 150mm N 861.02mm U 2100mm
+                  LPOS:=  E 150mm N 851.5mm U 2100mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+      END
+      NEW GASKET 1 of BRANCH /03SKID3-PIPE-2/B1
+                NAME:=  =2013286704/844
+                TYPE:=  GASK
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-2/B1
+                 POS:=  E 150mm N 851.5mm U 2100mm
+                 ORI:=  Y is E and Z is U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/GC40
+                LSTU:=  /A3B/PA40
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 150mm N 851.5mm U 2100mm
+                HEIG:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  2
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 150mm N 851.5mm U 2100mm
+                LPOS:=  E 150mm N 850mm U 2100mm
+                DTXR:=  GASKET RF 1.5MM ANSI B16.5 #300
+                MTXX:=  SS & ASB
+     END
+    END
+    NEW /03SKID3-PIPE-2/B2
+              NAME:=  /03SKID3-PIPE-2/B2
+              TYPE:=  BRAN
+              LOCK:=  false
+             OWNER:=  /03SKID3-PIPE-2
+              BUIL:=  false
+              SHOP:=  false
+              ISOH:=  false
+              HPOS:=  E 845.25mm N 992.77mm U 1550mm
+              TPOS:=  E 1450mm N 850mm U 2100mm
+              HDIR:=  E
+              TDIR:=  N
+              HREF:=  =2013286704/839
+              TREF:=  =2013286704/944
+              LHEA:=  true
+              LTAI:=  true
+              HBOR:=  40mm
+              TBOR:=  40mm
+              HCON:=  SWF
+              TCON:=  FBD
+              DETA:=  false
+              LSTR:=  false
+              EREC:=  0
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              HSTU:=  /A3B/PA40
+              CCEN:=  0
+              CCLA:=  0
+              SAFC:=  0
+              PSPE:=  /A3B
+              LISS:=  false
+              WMAX:=  0
+              PMAX:=  0
+              PTNH:=  0
+              SMAX:=  0
+              JMAX:=  0
+              BSTA:=  0
+              BRLO:=  0
+             TSFBR:=  false
+            DELDSG:=  FALSE
+            AEXCES:=  0mm
+            LEXCES:=  0mm
+              LOOS:=  false
+        :PFCONSCHK:=  false
+          :MDSTRUN:=  false
+      NEW VALVE 1 of BRANCH /03SKID3-PIPE-2/B2
+                NAME:=  =2013286704/846
+                TYPE:=  VALV
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-2/B2
+                 POS:=  E 1145.25mm N 992.77mm U 1550mm
+                 ORI:=  Y is S and Z is U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/VG40
+                LSTU:=  /A3B/PA40
+                ARRI:=  2
+                LEAV:=  1
+                POSI:=  E 1145.25mm N 992.77mm U 1550mm
+                ANGL:=  90degree
+                HEIG:=  0mm
+                RADI:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  -1
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 1071.75mm N 992.77mm U 1550mm
+                LPOS:=  E 1218.75mm N 992.77mm U 1550mm
+                DTXR:=  VALVE GATE SW #800
+                MTXX:=  ASTM A105
+      END
+      NEW ELBOW 1 of BRANCH /03SKID3-PIPE-2/B2
+                  NAME:=  =2013286704/847
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B2
+                   POS:=  E 1450mm N 992.77mm U 1550mm
+                   ORI:=  Y is W and Z is N
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 1450mm N 992.77mm U 1550mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1418.25mm N 992.77mm U 1550mm
+                  LPOS:=  E 1450mm N 992.77mm U 1581.75mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW ELBOW 2 of BRANCH /03SKID3-PIPE-2/B2
+                  NAME:=  =2013286704/848
+                  TYPE:=  ELBO
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B2
+                   POS:=  E 1450mm N 992.77mm U 2100mm
+                   ORI:=  Y is S and Z is E
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/EB40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  1
+                  LEAV:=  2
+                  POSI:=  E 1450mm N 992.77mm U 2100mm
+                  ANGL:=  90degree
+                  RADI:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+                  LOOS:=  false
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1450mm N 992.77mm U 2068.25mm
+                  LPOS:=  E 1450mm N 961.02mm U 2100mm
+                  DTXR:=  ELBOW 90DEG ANSI B16.11 SW #3000
+                  MTXX:=  ASTM A105
+      END
+      NEW FLANGE 1 of BRANCH /03SKID3-PIPE-2/B2
+                  NAME:=  =2013286704/849
+                  TYPE:=  FLAN
+                  LOCK:=  false
+                 OWNER:=  /03SKID3-PIPE-2/B2
+                   POS:=  E 1450mm N 851.5mm U 2100mm
+                   ORI:=  Y is W and Z is U
+                  BUIL:=  false
+                  SHOP:=  true
+                  ISOH:=  false
+                  SPRE:=  /A3B/FS40
+                  LSTU:=  /A3B/PA40
+                  ARRI:=  2
+                  LEAV:=  1
+                  POSI:=  E 1450mm N 851.5mm U 2100mm
+                  LOOS:=  false
+                  HEIG:=  0mm
+                 CSFBR:=  false
+                 TSFBR:=  false
+                 ASFBR:=  false
+                 LSFBR:=  false
+                  PTNO:=  0
+                  PTNT:=  0
+                DPGRID:=  0
+                NWELDS:=  0
+                  ALLO:=  0mm
+                  RLOC:=  -1
+                  HREL:=  true
+                DELDSG:=  FALSE
+                AEXCES:=  0mm
+                LEXCES:=  0mm
+            :PSIWEIGHT:=  0kg
+           :MDSVPRMMTO:=  true
+                  APOS:=  E 1450mm N 861.02mm U 2100mm
+                  LPOS:=  E 1450mm N 851.5mm U 2100mm
+                  DTXR:=  FLANGE SW ANSI B16.5 #300.RF
+                  MTXX:=  ASTM A105
+      END
+      NEW GASKET 1 of BRANCH /03SKID3-PIPE-2/B2
+                NAME:=  =2013286704/850
+                TYPE:=  GASK
+                LOCK:=  false
+               OWNER:=  /03SKID3-PIPE-2/B2
+                 POS:=  E 1450mm N 851.5mm U 2100mm
+                 ORI:=  Y is E and Z is U
+                BUIL:=  false
+                SHOP:=  false
+                ISOH:=  false
+                SPRE:=  /A3B/GC40
+                LSTU:=  /A3B/PA40
+                ARRI:=  1
+                LEAV:=  2
+                POSI:=  E 1450mm N 851.5mm U 2100mm
+                HEIG:=  0mm
+               CSFBR:=  false
+               TSFBR:=  false
+               ASFBR:=  false
+               LSFBR:=  false
+                PTNO:=  0
+                PTNT:=  0
+              DPGRID:=  0
+              NWELDS:=  0
+                RLOC:=  2
+                HREL:=  true
+              DELDSG:=  FALSE
+              AEXCES:=  0mm
+              LEXCES:=  0mm
+                LOOS:=  false
+          :PSIWEIGHT:=  0kg
+         :MDSVPRMMTO:=  true
+                APOS:=  E 1450mm N 851.5mm U 2100mm
+                LPOS:=  E 1450mm N 850mm U 2100mm
+                DTXR:=  GASKET RF 1.5MM ANSI B16.5 #300
+                MTXX:=  SS & ASB
+     END
+    END
+   END
+  NEW /03SKID3-EQUIP1
+            NAME:=  /03SKID3-EQUIP1
+            TYPE:=  EQUI
+            LOCK:=  false
+           OWNER:=  /03SKID3
+            FUNC:=  Equipment
+            NUMB:=  0
+            AREA:=  0
+             POS:=  E 500mm N 500mm U 1050mm
+             ORI:=  Y is N and Z is U
+            DESP:=  1200 800 200 100 600 80 150
+            BUIL:=  false
+            SPRE:=  /STD/Storage-Hoppers/TYPEA
+    NEW NOZZLE 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/852
+              TYPE:=  NOZZ
+              LOCK:=  false
+             OWNER:=  /03SKID3-EQUIP1
+               POS:=  W 350mm N 350mm U 1050mm
+               ORI:=  Y is D and Z is E
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              CREF:=  /03SKID3-PIPE-2/B1
+              CATR:=  /300lb_Ansi_Flanged/AAZFBD0HH
+              HEIG:=  300mm
+              ANGL:=  90degree
+              RADI:=  0mm
+    END
+    NEW SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/910
+             TYPE:=  SUBE
+             LOCK:=  false
+            OWNER:=  /03SKID3-EQUIP1
+             PURP:=  SUPP
+             NUMB:=  0
+             AREA:=  0
+              POS:=  E 0mm N 0mm U 0mm
+              ORI:=  Y is N and Z is U
+             BUIL:=  false
+             DESP:=  300 100 100 100 0
+             SPRE:=  /STD-VVES-SUP-4LUGS
+      NEW TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+           NAME:=  =2013286704/3536
+           TYPE:=  TMPL
+           LOCK:=  true
+          OWNER:=  =2013286704/910
+           DESC:=  4 Lugs
+           FUNC:=  Supports
+           PURP:=  SUPP
+           NUMB:=  0
+           ORRF:=  /STD/VVES-SUP-4LUGS
+          LCNFA:=  =2013286704/932 =2013286704/933 =2013286704/934 =2013286704/935 =2013286704/936 =2013286704/937 =2013286704/938 =2013286704/939 =2013286704/940 =2013286704/941 =2013286704/942
+        NEW DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/912
+            TYPE:=  DDSE
+            LOCK:=  false
+           OWNER:=  =2013286704/3536
+            NUMB:=  0
+            ORRF:=  =15207/8755
+          NEW DDATA 1 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/913
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               PURP:=  PLOT
+               NUMB:=  0
+               DKEY:=  PLOT
+               PTYP:=  PPLT
+               DTIT:=  Plotfile
+               DDPR:=  ( 'STD-VESS001G.plt' )
+               DDDF:=  ( 'EQUIP' )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8756
+              LDISP:=  true
+             PTOLER:=  0
+          END
+          NEW DDATA 2 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/914
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               DESC:=  Distance
+               PURP:=  DESP
+               NUMB:=  1
+               DKEY:=  SDIS
+               PTYP:=  DIST
+               DTIT:=  A = Distance from orig
+               DDPR:=  ( ATTRIB DESP[1 ] )
+               DDDF:=  ( 300 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8757
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 3 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/915
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               DESC:=  Lug Width
+               PURP:=  DESP
+               NUMB:=  2
+               DKEY:=  SWID
+               PTYP:=  DIST
+               DTIT:=  B = Lug Width
+               DDPR:=  ( ATTRIB DESP[2 ] )
+               DDDF:=  ( 500 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8758
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 4 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/916
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               DESC:=  Lug Thickness
+               PURP:=  DESP
+               NUMB:=  3
+               DKEY:=  STHI
+               PTYP:=  DIST
+               DTIT:=  C = Lug Thickness
+               DDPR:=  ( ATTRIB DESP[3 ] )
+               DDDF:=  ( 200 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8759
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 5 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/917
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               DESC:=  Lug Height
+               PURP:=  DESP
+               NUMB:=  4
+               DKEY:=  SHEI
+               PTYP:=  DIST
+               DTIT:=  D = Lug Height
+               DDPR:=  ( ATTRIB DESP[4 ] )
+               DDDF:=  ( 300 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8760
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 6 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/918
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               PURP:=  EXPR
+               NUMB:=  0
+               DKEY:=  EDIA
+               PTYP:=  DIST
+               DTIT:=  Vessel Diameter
+               DDPR:=  ( ATTRIB DESP[2 ] OF EQUIPMENT )
+               DDDF:=  ( 4000 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8761
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 7 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/919
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               PURP:=  DESP
+               NUMB:=  5
+               DKEY:=  ANGL
+               PTYP:=  REAL
+               DTIT:=  E = Lug Angle
+               DDPR:=  ( ATTRIB DESP[5 ] )
+               DDDF:=  ( 0 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8762
+              LDISP:=  true
+             PTOLER:=  0
+          END
+          NEW DDATA 8 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/920
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/912
+               PURP:=  EXPR
+               NUMB:=  0
+               DKEY:=  DIMD
+               PTYP:=  DIST
+               DTIT:=  Dimension Distance
+               DDPR:=  ( 500 )
+               DDDF:=  ( 500 )
+               PREF:=  false
+               POEF:=  true
+               ORRF:=  =15207/8763
+              LDISP:=  true
+             PTOLER:=  0
+       END
+      END
+        NEW DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/921
+            TYPE:=  DPSE
+            LOCK:=  false
+           OWNER:=  =2013286704/3536
+            NUMB:=  0
+            ORRF:=  =15207/8764
+          NEW DPSPHERICAL 1 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/922
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  A = Distance 1st Dim. Point (SDIS)
+              FUNC:=  1
+              PURP:=  DIM
+              NUMB:=  101
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  900mm
+              PVIF:=  3
+              ORRF:=  =15207/8765
+          END
+          NEW DPSPHERICAL 2 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/923
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  A = Distance 2nd Dim. Point (SDIS)
+              FUNC:=  1
+              PURP:=  DIM
+              NUMB:=  102
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8766
+          END
+          NEW DPSPHERICAL 3 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/924
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  B = Lug Width 1st Dim. Point (SWID)
+              FUNC:=  2
+              PURP:=  DIM
+              NUMB:=  201
+              BORE:=  0mm
+               POS:=  E 0mm N 500mm D 500mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  U
+              RADI:=  800mm
+              PVIF:=  3
+              ORRF:=  =15207/8767
+          END
+          NEW DPSPHERICAL 4 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/925
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  B = Lug Width 2nd Dim. Point (SWID)
+              FUNC:=  2
+              PURP:=  DIM
+              NUMB:=  202
+              BORE:=  0mm
+               POS:=  E 0mm N 400mm D 500mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  U
+              RADI:=  800mm
+              PVIF:=  3
+              ORRF:=  =15207/8768
+          END
+          NEW DPSPHERICAL 5 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/926
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  C = Lug Thickness 1st Dim. Point (STHI)
+              FUNC:=  3
+              PURP:=  DIM
+              NUMB:=  301
+              BORE:=  0mm
+               POS:=  E 50mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8769
+          END
+          NEW DPSPHERICAL 6 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/927
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  C = Lug Thickness 2nd Dim. Point (STHI)
+              FUNC:=  3
+              PURP:=  DIM
+              NUMB:=  302
+              BORE:=  0mm
+               POS:=  W 50mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8770
+          END
+          NEW DPSPHERICAL 7 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/928
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  D = Lug Height 1st Dim. Point (SHEI)
+              FUNC:=  4
+              PURP:=  DIM
+              NUMB:=  401
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8771
+          END
+          NEW DPSPHERICAL 8 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/929
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  D = Lug Height 2nd Dim. Point (SHEI)
+              FUNC:=  4
+              PURP:=  DIM
+              NUMB:=  402
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 400mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  600mm
+              PVIF:=  3
+              ORRF:=  =15207/8772
+          END
+          NEW DPSPHERICAL 9 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/930
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  E = Lug Angel 1st Dim. Point (ANGL)
+              FUNC:=  5
+              PURP:=  DIM
+              NUMB:=  501
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8773
+          END
+          NEW DPSPHERICAL 10 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/931
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              DESC:=  E = Lug Angel 2nd Dim. Point (ANGL)
+              FUNC:=  5
+              PURP:=  DIM
+              NUMB:=  502
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+              ORRF:=  =15207/8774
+          END
+          NEW DPCARTESIAN 1 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/932
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  1
+              BORE:=  0mm
+               ORI:=  Y is N and Z is U
+               POS:=  E 0mm N 0mm U 0mm
+              PVIF:=  0
+              ORRF:=  =15207/8775
+          END
+          NEW DPCARTESIAN 2 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/933
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  2
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 0mm
+              PVIF:=  0
+              ORRF:=  =15207/8776
+          END
+          NEW DPCARTESIAN 3 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/934
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  3
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8777
+          END
+          NEW DPCARTESIAN 4 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/935
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  4
+              BORE:=  0mm
+               ORI:=  Y is N and Z is D
+               POS:=  E 0mm S 400mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8778
+          END
+          NEW DPCARTESIAN 5 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/936
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  5
+              BORE:=  0mm
+               ORI:=  Y is N and Z is D
+               POS:=  E 0mm S 500mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8779
+          END
+          NEW DPCARTESIAN 6 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/937
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  6
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  W 50mm N 0mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8780
+          END
+          NEW DPCARTESIAN 7 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/938
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  7
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 50mm N 0mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8781
+          END
+          NEW DPCARTESIAN 8 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/939
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  8
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 300mm
+              PVIF:=  0
+              ORRF:=  =15207/8782
+          END
+          NEW DPCARTESIAN 9 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+              NAME:=  =2013286704/940
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/921
+              NUMB:=  9
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 400mm
+              PVIF:=  0
+              ORRF:=  =15207/8783
+       END
+      END
+        NEW PYRAMID 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/941
+             TYPE:=  PYRA
+             LOCK:=  false
+            OWNER:=  =2013286704/3536
+              POS:=  E 0mm N 0mm U 350mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XBOT:=  100mm
+             YBOT:=  1000mm
+             XTOP:=  100mm
+             YTOP:=  900mm
+             HEIG:=  100mm
+             XOFF:=  0mm
+             YOFF:=  0mm
+             ORRF:=  =15207/8784
+           REPCOU:=  0
+        END
+        NEW PYRAMID 2 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/942
+             TYPE:=  PYRA
+             LOCK:=  false
+            OWNER:=  =2013286704/3536
+              POS:=  E 0mm N 0mm U 350mm
+              ORI:=  Y is E and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XBOT:=  100mm
+             YBOT:=  1000mm
+             XTOP:=  100mm
+             YTOP:=  900mm
+             HEIG:=  100mm
+             XOFF:=  0mm
+             YOFF:=  0mm
+             ORRF:=  =15207/8785
+           REPCOU:=  0
+      END
+     END
+    END
+    NEW TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+         NAME:=  =2013286704/3535
+         TYPE:=  TMPL
+         LOCK:=  true
+        OWNER:=  /03SKID3-EQUIP1
+         DESC:=  Dished Top And Coned Bottom
+         FUNC:=  Vessel
+         PURP:=  EQUI
+         GTYP:=  VVES
+         NUMB:=  0
+         ORRF:=  /STD/VESS002
+        LCNFA:=  =2013286704/891 =2013286704/892 =2013286704/893 =2013286704/894 =2013286704/895 =2013286704/896 =2013286704/897 =2013286704/898 =2013286704/899 =2013286704/900 =2013286704/901 =2013286704/902 =2013286704/903 =2013286704/904 =2013286704/905 =2013286704/906 =2013286704/908 =2013286704/909
+      NEW DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+          NAME:=  =2013286704/854
+          TYPE:=  DDSE
+          LOCK:=  false
+         OWNER:=  =2013286704/3535
+          NUMB:=  0
+          ORRF:=  =15207/10195
+        NEW DDATA 1 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/855
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             PURP:=  PLOT
+             NUMB:=  0
+             DKEY:=  PLOT
+             PTYP:=  PPLT
+             DTIT:=  Plotfile
+             DDPR:=  ( 'STD-VESS002.plt' )
+             DDDF:=  ( 'EQUIP' )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10196
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 2 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/856
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Height
+             PURP:=  DESP
+             NUMB:=  1
+             DKEY:=  HEIG
+             PTYP:=  DIST
+             DTIT:=  A = Height
+             DDPR:=  ( ATTRIB DESP[1 ] )
+             DDDF:=  ( 4000 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10197
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 3 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/857
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Diameter
+             PURP:=  DESP
+             NUMB:=  2
+             DKEY:=  DIAM
+             PTYP:=  DIST
+             DTIT:=  B = Diameter
+             DDPR:=  ( ATTRIB DESP[2 ] )
+             DDDF:=  ( 2000 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10198
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 4 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/858
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Height Dish
+             PURP:=  DESP
+             NUMB:=  3
+             DKEY:=  DHEI
+             PTYP:=  DIST
+             DTIT:=  C = Height Dish
+             DDPR:=  ( ATTRIB DESP[3 ] )
+             DDDF:=  ( 250 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10199
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 5 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/859
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Dish Radius
+             PURP:=  DESP
+             NUMB:=  4
+             DKEY:=  DRAD
+             PTYP:=  DIST
+             DTIT:=  D = Dish Radius
+             DDPR:=  ( ATTRIB DESP[4 ] )
+             DDDF:=  ( 100 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10200
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 6 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/860
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Snout Height
+             PURP:=  DESP
+             NUMB:=  5
+             DKEY:=  SHEI
+             PTYP:=  DIST
+             DTIT:=  E = Snout Height
+             DDPR:=  ( ATTRIB DESP[5 ] )
+             DDDF:=  ( 600 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10201
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 7 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/861
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Bottom Diameter
+             PURP:=  DESP
+             NUMB:=  6
+             DKEY:=  SDIA
+             PTYP:=  DIST
+             DTIT:=  F = Bottom Diameter
+             DDPR:=  ( ATTRIB DESP[6 ] )
+             DDDF:=  ( 200 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10202
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 8 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/862
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             DESC:=  Nozzle Height
+             PURP:=  DESP
+             NUMB:=  7
+             DKEY:=  NHEI
+             PTYP:=  DIST
+             DTIT:=  G = Nozzle Height
+             DDPR:=  ( ATTRIB DESP[7 ] )
+             DDDF:=  ( 300 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10203
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 9 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/863
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             PURP:=  EXPR
+             NUMB:=  0
+             DKEY:=  NZEL
+             PTYP:=  TEXT
+             DTIT:=  Nozzle Spec
+             DDPR:=  ( ATTRIB CATR OF MLNID /NOZA )
+             DDDF:=  ( '' )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  /VESS002-Nozzle
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/864
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             PURP:=  SBRE
+             NUMB:=  0
+             DKEY:=  SUPP
+             PTYP:=  SUBE
+             DTIT:=  Vessel Support
+             DDDF:=  ( ID /STD-VVES-SUP-4SQUARE )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10205
+            LDISP:=  true
+           PTOLER:=  0
+          NEW VVALUE 1 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/865
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-3SQUARE )
+               ORRF:=  =15207/10206
+          END
+          NEW VVALUE 2 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/866
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-4SQUARE )
+               ORRF:=  =15207/10207
+          END
+          NEW VVALUE 3 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/867
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-3PIPE )
+               ORRF:=  =15207/10208
+          END
+          NEW VVALUE 4 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/868
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-4PIPE )
+               ORRF:=  =15207/10209
+          END
+          NEW VVALUE 5 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/869
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-2LUGS )
+               ORRF:=  =15207/10210
+          END
+          NEW VVALUE 6 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/870
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-3LUGS )
+               ORRF:=  =15207/10211
+          END
+          NEW VVALUE 7 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/871
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-4LUGS )
+               ORRF:=  =15207/10212
+          END
+          NEW VVALUE 8 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/872
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-SKIRT )
+               ORRF:=  =15207/10213
+          END
+          NEW VVALUE 9 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/873
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-FLSKIRT )
+               ORRF:=  =15207/10214
+          END
+          NEW VVALUE 10 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+               NAME:=  =2013286704/874
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/864
+             VALIDV:=  ( ID /STD-VVES-SUP-NOSUPPORT )
+               ORRF:=  =15207/10215
+       END
+      END
+        NEW DDATA 11 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+             NAME:=  =2013286704/875
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/854
+             PURP:=  EXPR
+             NUMB:=  0
+             DKEY:=  DIMD
+             PTYP:=  DIST
+             DTIT:=  Dimension Distance
+             DDPR:=  ( 500 )
+             DDDF:=  ( 500 )
+             PREF:=  false
+             POEF:=  true
+             ORRF:=  =15207/10216
+            LDISP:=  true
+           PTOLER:=  0
+      END
+     END
+      NEW DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+          NAME:=  =2013286704/876
+          TYPE:=  DPSE
+          LOCK:=  false
+         OWNER:=  =2013286704/3535
+          NUMB:=  0
+          ORRF:=  =15207/10217
+        NEW DPSPHERICAL 1 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/877
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  A = Height 1st Dim. Point (HEIG)
+            FUNC:=  1
+            PURP:=  DIM
+            NUMB:=  101
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 0mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10218
+        END
+        NEW DPSPHERICAL 2 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/878
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  A = Height 2nd Dim. Point (HEIG)
+            FUNC:=  1
+            PURP:=  DIM
+            NUMB:=  102
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1200mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10219
+        END
+        NEW DPSPHERICAL 3 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/879
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  B = Diameter 1st Dim. Point (DIAM)
+            FUNC:=  2
+            PURP:=  DIM
+            NUMB:=  201
+            BORE:=  0mm
+             POS:=  E 400mm N 0mm U 1900mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  D
+            RADI:=  700mm
+            PVIF:=  3
+            ORRF:=  =15207/10220
+        END
+        NEW DPSPHERICAL 4 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/880
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  B = Diameter 2nd Dim. Point (DIAM)
+            FUNC:=  2
+            PURP:=  DIM
+            NUMB:=  202
+            BORE:=  0mm
+             POS:=  W 400mm N 0mm U 1900mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  D
+            RADI:=  700mm
+            PVIF:=  3
+            ORRF:=  =15207/10221
+        END
+        NEW DPSPHERICAL 5 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/881
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  C = Height Dish 1st Dim. Point (DHEI)
+            FUNC:=  3
+            PURP:=  DIM
+            NUMB:=  301
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1200mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10222
+        END
+        NEW DPSPHERICAL 6 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/882
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  C = Height Dish 2nd Dim. Point (DHEI)
+            FUNC:=  3
+            PURP:=  DIM
+            NUMB:=  302
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1400mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10223
+        END
+        NEW DPSPHERICAL 7 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/883
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  D = Dish Radius 1st Dim. Point (DRAD)
+            FUNC:=  4
+            PURP:=  DIM
+            NUMB:=  401
+            BORE:=  0mm
+             POS:=  W 886.327mm N 0mm U 1356.283mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  E 10 D
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10224
+        END
+        NEW DPSPHERICAL 8 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/884
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  D = Dish Radius 2nd Dim. Point (DRAD)
+            FUNC:=  4
+            PURP:=  DIM
+            NUMB:=  402
+            BORE:=  0mm
+             POS:=  W 886.598mm N 0mm U 1354.736mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  E 9.9 D
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10225
+        END
+        NEW DPSPHERICAL 9 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/885
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  E = Snout Height 1st Dim. Point (SHEI)
+            FUNC:=  5
+            PURP:=  DIM
+            NUMB:=  501
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 0mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10226
+        END
+        NEW DPSPHERICAL 10 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/886
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  E = Snout Height 2nd Dim. Point (SHEI)
+            FUNC:=  5
+            PURP:=  DIM
+            NUMB:=  502
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 600mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10227
+        END
+        NEW DPSPHERICAL 11 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/887
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  F = Bottom Diameter 1st Dim. Point (SDIA)
+            FUNC:=  6
+            PURP:=  DIM
+            NUMB:=  601
+            BORE:=  0mm
+             POS:=  E 40mm N 0mm D 1250mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  U
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10228
+        END
+        NEW DPSPHERICAL 12 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/888
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  F = Bottom Diameter 2nd Dim. Point (SDIA)
+            FUNC:=  6
+            PURP:=  DIM
+            NUMB:=  602
+            BORE:=  0mm
+             POS:=  W 40mm N 0mm D 1250mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  U
+            RADI:=  500mm
+            PVIF:=  3
+            ORRF:=  =15207/10229
+        END
+        NEW DPSPHERICAL 13 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/889
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  G = Nozzle Height 1st Dim. Point (NHEI)
+            FUNC:=  7
+            PURP:=  DIM
+            NUMB:=  701
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 600mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10230
+        END
+        NEW DPSPHERICAL 14 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/890
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  G = Nozzle Height 2nd Dim. Point (NHEI)
+            FUNC:=  7
+            PURP:=  DIM
+            NUMB:=  702
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 750mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+            ORRF:=  =15207/10231
+        END
+        NEW DPCARTESIAN 1 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/891
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  1
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  E 0mm N 0mm U 0mm
+            PVIF:=  0
+            ORRF:=  =15207/10232
+        END
+        NEW DPCARTESIAN 2 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/892
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  2
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 0mm
+            PVIF:=  0
+            ORRF:=  =15207/10233
+        END
+        NEW DPCARTESIAN 3 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/893
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  3
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1200mm
+            PVIF:=  0
+            ORRF:=  =15207/10234
+        END
+        NEW DPCARTESIAN 4 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/894
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  4
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  W 400mm N 0mm U 1200mm
+            PVIF:=  0
+            ORRF:=  =15207/10235
+        END
+        NEW DPCARTESIAN 5 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/895
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  5
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  E 400mm N 0mm U 1200mm
+            PVIF:=  0
+            ORRF:=  =15207/10236
+        END
+        NEW DPCARTESIAN 6 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/896
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  6
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1200mm
+            PVIF:=  0
+            ORRF:=  =15207/10237
+        END
+        NEW DPCARTESIAN 7 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/897
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  7
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1400mm
+            PVIF:=  0
+            ORRF:=  =15207/10238
+        END
+        NEW DPCARTESIAN 8 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/898
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  8
+            BORE:=  0mm
+             ORI:=  Y is N and Z is W 45 U
+             POS:=  W 400mm N 0mm U 1200mm
+            PVIF:=  0
+            ORRF:=  =15207/10239
+        END
+        NEW DPCARTESIAN 9 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/899
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  9
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  W 1000mm N 0mm U 0mm
+            PVIF:=  0
+            ORRF:=  =15207/10240
+        END
+        NEW DPCARTESIAN 10 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/900
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  10
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 600mm
+            PVIF:=  0
+            ORRF:=  =15207/10241
+        END
+        NEW DPCARTESIAN 11 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/901
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  11
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  W 40mm N 0mm D 600mm
+            PVIF:=  0
+            ORRF:=  =15207/10242
+        END
+        NEW DPCARTESIAN 12 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/902
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  12
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  E 40mm N 0mm D 600mm
+            PVIF:=  0
+            ORRF:=  =15207/10243
+        END
+        NEW DPCARTESIAN 13 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/903
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  13
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 600mm
+            PVIF:=  0
+            ORRF:=  =15207/10244
+        END
+        NEW DPCARTESIAN 14 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/904
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            NUMB:=  14
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 750mm
+            PVIF:=  0
+            ORRF:=  =15207/10245
+        END
+        NEW DPCARTESIAN 15 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+            NAME:=  =2013286704/905
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/876
+            DESC:=  Nozzle Face
+            NUMB:=  15
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  E 0mm N 0mm D 750mm
+            PVIF:=  0
+            ORRF:=  =15207/10246
+      END
+     END
+      NEW CYLINDER 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+           NAME:=  =2013286704/906
+           TYPE:=  CYLI
+           LOCK:=  false
+          OWNER:=  =2013286704/3535
+            POS:=  E 0mm N 0mm U 600mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  2 10
+           OBST:=  2
+           DIAM:=  800mm
+           HEIG:=  1200mm
+           ORRF:=  =15207/10247
+         REPCOU:=  0
+      END
+      NEW DISH 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+           NAME:=  =2013286704/907
+           TYPE:=  DISH
+           LOCK:=  false
+          OWNER:=  =2013286704/3535
+            POS:=  E 0mm N 0mm U 1200mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  2 10
+           OBST:=  2
+           DIAM:=  800mm
+           HEIG:=  200mm
+           RADI:=  100mm
+           ORRF:=  =15207/10248
+         REPCOU:=  0
+      END
+      NEW SNOUT 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+           NAME:=  =2013286704/908
+           TYPE:=  SNOU
+           LOCK:=  false
+          OWNER:=  =2013286704/3535
+            POS:=  E 0mm N 0mm D 300mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  0 10
+           OBST:=  2
+           DTOP:=  800mm
+           DBOT:=  80mm
+           XOFF:=  0mm
+           YOFF:=  0mm
+           HEIG:=  600mm
+           ORRF:=  =15207/10249
+         REPCOU:=  0
+      END
+      NEW NOZZLE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP1
+                NAME:=  =2013286704/909
+                TYPE:=  NOZZ
+                LOCK:=  false
+               OWNER:=  =2013286704/3535
+                 POS:=  E 0mm N 0mm D 750mm
+                 ORI:=  Y is N and Z is W
+                TEMP:=  -100000degC
+                PRES:=  0pascal
+              TPRESS:=  0pascal
+                CREF:=  /03SKID3-PIPE-1/B1
+                CATR:=  /300lb_Ansi_Flanged/AAZFBD0JJ
+                HEIG:=  750mm
+                ANGL:=  90degree
+                RADI:=  0mm
+                ORRF:=  =15207/10250
+     END
+    END
+   END
+  NEW /03SKID3-EQUIP2
+            NAME:=  /03SKID3-EQUIP2
+            TYPE:=  EQUI
+            LOCK:=  false
+           OWNER:=  /03SKID3
+            FUNC:=  Equipment
+            NUMB:=  0
+            AREA:=  0
+             POS:=  E 1800mm N 500mm U 1050mm
+             ORI:=  Y is N and Z is U
+            DESP:=  1200 800 200 100 600 80 150
+            BUIL:=  false
+            SPRE:=  /STD/Storage-Hoppers/TYPEA
+    NEW NOZZLE 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/944
+              TYPE:=  NOZZ
+              LOCK:=  false
+             OWNER:=  /03SKID3-EQUIP2
+               POS:=  W 350mm N 350mm U 1050mm
+               ORI:=  Y is D and Z is E
+              TEMP:=  -100000degC
+              PRES:=  0pascal
+            TPRESS:=  0pascal
+              CREF:=  /03SKID3-PIPE-2/B2
+              CATR:=  /300lb_Ansi_Flanged/AAZFBD0HH
+              HEIG:=  300mm
+              ANGL:=  90degree
+              RADI:=  0mm
+    END
+    NEW SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/1002
+             TYPE:=  SUBE
+             LOCK:=  false
+            OWNER:=  /03SKID3-EQUIP2
+             PURP:=  SUPP
+             NUMB:=  0
+             AREA:=  0
+              POS:=  E 0mm N 0mm U 0mm
+              ORI:=  Y is N and Z is U
+             BUIL:=  false
+             DESP:=  300 100 100 100 0
+             SPRE:=  /STD-VVES-SUP-4LUGS
+      NEW TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+           NAME:=  =2013286704/3538
+           TYPE:=  TMPL
+           LOCK:=  true
+          OWNER:=  =2013286704/1002
+           DESC:=  4 Lugs
+           FUNC:=  Supports
+           PURP:=  SUPP
+           NUMB:=  0
+          LCNFA:=  =2013286704/1024 =2013286704/1025 =2013286704/1026 =2013286704/1027 =2013286704/1028 =2013286704/1029 =2013286704/1030 =2013286704/1031 =2013286704/1032 =2013286704/1033 =2013286704/1034
+        NEW DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/1004
+            TYPE:=  DDSE
+            LOCK:=  false
+           OWNER:=  =2013286704/3538
+            NUMB:=  0
+          NEW DDATA 1 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1005
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               PURP:=  PLOT
+               NUMB:=  0
+               DKEY:=  PLOT
+               PTYP:=  PPLT
+               DTIT:=  Plotfile
+               DDPR:=  ( 'STD-VESS001G.plt' )
+               DDDF:=  ( 'EQUIP' )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             PTOLER:=  0
+          END
+          NEW DDATA 2 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1006
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               DESC:=  Distance
+               PURP:=  DESP
+               NUMB:=  1
+               DKEY:=  SDIS
+               PTYP:=  DIST
+               DTIT:=  A = Distance from orig
+               DDPR:=  ( ATTRIB DESP[1 ] )
+               DDDF:=  ( 300 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 3 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1007
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               DESC:=  Lug Width
+               PURP:=  DESP
+               NUMB:=  2
+               DKEY:=  SWID
+               PTYP:=  DIST
+               DTIT:=  B = Lug Width
+               DDPR:=  ( ATTRIB DESP[2 ] )
+               DDDF:=  ( 500 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 4 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1008
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               DESC:=  Lug Thickness
+               PURP:=  DESP
+               NUMB:=  3
+               DKEY:=  STHI
+               PTYP:=  DIST
+               DTIT:=  C = Lug Thickness
+               DDPR:=  ( ATTRIB DESP[3 ] )
+               DDDF:=  ( 200 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 5 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1009
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               DESC:=  Lug Height
+               PURP:=  DESP
+               NUMB:=  4
+               DKEY:=  SHEI
+               PTYP:=  DIST
+               DTIT:=  D = Lug Height
+               DDPR:=  ( ATTRIB DESP[4 ] )
+               DDDF:=  ( 300 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 6 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1010
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               PURP:=  EXPR
+               NUMB:=  0
+               DKEY:=  EDIA
+               PTYP:=  DIST
+               DTIT:=  Vessel Diameter
+               DDPR:=  ( ATTRIB DESP[2 ] OF EQUIPMENT )
+               DDDF:=  ( 4000 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             MAXMIN:=  6000mm 1mm
+             PTOLER:=  0
+          END
+          NEW DDATA 7 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1011
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               PURP:=  DESP
+               NUMB:=  5
+               DKEY:=  ANGL
+               PTYP:=  REAL
+               DTIT:=  E = Lug Angle
+               DDPR:=  ( ATTRIB DESP[5 ] )
+               DDDF:=  ( 0 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             PTOLER:=  0
+          END
+          NEW DDATA 8 of DDSE 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/1012
+               TYPE:=  DDAT
+               LOCK:=  false
+              OWNER:=  =2013286704/1004
+               PURP:=  EXPR
+               NUMB:=  0
+               DKEY:=  DIMD
+               PTYP:=  DIST
+               DTIT:=  Dimension Distance
+               DDPR:=  ( 500 )
+               DDDF:=  ( 500 )
+               PREF:=  false
+               POEF:=  true
+              LDISP:=  true
+             PTOLER:=  0
+       END
+      END
+        NEW DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/1013
+            TYPE:=  DPSE
+            LOCK:=  false
+           OWNER:=  =2013286704/3538
+            NUMB:=  0
+          NEW DPSPHERICAL 1 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1014
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  A = Distance 1st Dim. Point (SDIS)
+              FUNC:=  1
+              PURP:=  DIM
+              NUMB:=  101
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  900mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 2 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1015
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  A = Distance 2nd Dim. Point (SDIS)
+              FUNC:=  1
+              PURP:=  DIM
+              NUMB:=  102
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 3 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1016
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  B = Lug Width 1st Dim. Point (SWID)
+              FUNC:=  2
+              PURP:=  DIM
+              NUMB:=  201
+              BORE:=  0mm
+               POS:=  E 0mm N 500mm D 500mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  U
+              RADI:=  800mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 4 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1017
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  B = Lug Width 2nd Dim. Point (SWID)
+              FUNC:=  2
+              PURP:=  DIM
+              NUMB:=  202
+              BORE:=  0mm
+               POS:=  E 0mm N 400mm D 500mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  U
+              RADI:=  800mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 5 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1018
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  C = Lug Thickness 1st Dim. Point (STHI)
+              FUNC:=  3
+              PURP:=  DIM
+              NUMB:=  301
+              BORE:=  0mm
+               POS:=  E 50mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 6 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1019
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  C = Lug Thickness 2nd Dim. Point (STHI)
+              FUNC:=  3
+              PURP:=  DIM
+              NUMB:=  302
+              BORE:=  0mm
+               POS:=  W 50mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 7 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1020
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  D = Lug Height 1st Dim. Point (SHEI)
+              FUNC:=  4
+              PURP:=  DIM
+              NUMB:=  401
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 300mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 8 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1021
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  D = Lug Height 2nd Dim. Point (SHEI)
+              FUNC:=  4
+              PURP:=  DIM
+              NUMB:=  402
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 400mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  600mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 9 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1022
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  E = Lug Angel 1st Dim. Point (ANGL)
+              FUNC:=  5
+              PURP:=  DIM
+              NUMB:=  501
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPSPHERICAL 10 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1023
+              TYPE:=  DPSP
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              DESC:=  E = Lug Angel 2nd Dim. Point (ANGL)
+              FUNC:=  5
+              PURP:=  DIM
+              NUMB:=  502
+              BORE:=  0mm
+               POS:=  E 0mm N 1000mm U 0mm
+               ORI:=  Y is N and Z is U
+              DDIR:=  S
+              RADI:=  500mm
+              PVIF:=  3
+          END
+          NEW DPCARTESIAN 1 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1024
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  1
+              BORE:=  0mm
+               ORI:=  Y is N and Z is U
+               POS:=  E 0mm N 0mm U 0mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 2 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1025
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  2
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 0mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 3 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1026
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  3
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 4 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1027
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  4
+              BORE:=  0mm
+               ORI:=  Y is N and Z is D
+               POS:=  E 0mm S 400mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 5 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1028
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  5
+              BORE:=  0mm
+               ORI:=  Y is N and Z is D
+               POS:=  E 0mm S 500mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 6 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1029
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  6
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  W 50mm N 0mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 7 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1030
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  7
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 50mm N 0mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 8 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1031
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  8
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 300mm
+              PVIF:=  0
+          END
+          NEW DPCARTESIAN 9 of DPSET 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+              NAME:=  =2013286704/1032
+              TYPE:=  DPCA
+              LOCK:=  false
+             OWNER:=  =2013286704/1013
+              NUMB:=  9
+              BORE:=  0mm
+               ORI:=  Y is U and Z is N
+               POS:=  E 0mm N 0mm U 400mm
+              PVIF:=  0
+       END
+      END
+        NEW PYRAMID 1 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/1033
+             TYPE:=  PYRA
+             LOCK:=  false
+            OWNER:=  =2013286704/3538
+              POS:=  E 0mm N 0mm U 350mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XBOT:=  100mm
+             YBOT:=  1000mm
+             XTOP:=  100mm
+             YTOP:=  900mm
+             HEIG:=  100mm
+             XOFF:=  0mm
+             YOFF:=  0mm
+           REPCOU:=  0
+        END
+        NEW PYRAMID 2 of TMPLATE 1 of SUBEQUIPMENT 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/1034
+             TYPE:=  PYRA
+             LOCK:=  false
+            OWNER:=  =2013286704/3538
+              POS:=  E 0mm N 0mm U 350mm
+              ORI:=  Y is E and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XBOT:=  100mm
+             YBOT:=  1000mm
+             XTOP:=  100mm
+             YTOP:=  900mm
+             HEIG:=  100mm
+             XOFF:=  0mm
+             YOFF:=  0mm
+           REPCOU:=  0
+      END
+     END
+    END
+    NEW TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+         NAME:=  =2013286704/3537
+         TYPE:=  TMPL
+         LOCK:=  true
+        OWNER:=  /03SKID3-EQUIP2
+         DESC:=  Dished Top And Coned Bottom
+         FUNC:=  Vessel
+         PURP:=  EQUI
+         GTYP:=  VVES
+         NUMB:=  0
+        LCNFA:=  =2013286704/983 =2013286704/984 =2013286704/985 =2013286704/986 =2013286704/987 =2013286704/988 =2013286704/989 =2013286704/990 =2013286704/991 =2013286704/992 =2013286704/993 =2013286704/994 =2013286704/995 =2013286704/996 =2013286704/997 =2013286704/998 =2013286704/1000 =2013286704/1001
+      NEW DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+          NAME:=  =2013286704/946
+          TYPE:=  DDSE
+          LOCK:=  false
+         OWNER:=  =2013286704/3537
+          NUMB:=  0
+        NEW DDATA 1 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/947
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             PURP:=  PLOT
+             NUMB:=  0
+             DKEY:=  PLOT
+             PTYP:=  PPLT
+             DTIT:=  Plotfile
+             DDPR:=  ( 'STD-VESS002.plt' )
+             DDDF:=  ( 'EQUIP' )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 2 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/948
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Height
+             PURP:=  DESP
+             NUMB:=  1
+             DKEY:=  HEIG
+             PTYP:=  DIST
+             DTIT:=  A = Height
+             DDPR:=  ( ATTRIB DESP[1 ] )
+             DDDF:=  ( 4000 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 3 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/949
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Diameter
+             PURP:=  DESP
+             NUMB:=  2
+             DKEY:=  DIAM
+             PTYP:=  DIST
+             DTIT:=  B = Diameter
+             DDPR:=  ( ATTRIB DESP[2 ] )
+             DDDF:=  ( 2000 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 4 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/950
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Height Dish
+             PURP:=  DESP
+             NUMB:=  3
+             DKEY:=  DHEI
+             PTYP:=  DIST
+             DTIT:=  C = Height Dish
+             DDPR:=  ( ATTRIB DESP[3 ] )
+             DDDF:=  ( 250 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 5 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/951
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Dish Radius
+             PURP:=  DESP
+             NUMB:=  4
+             DKEY:=  DRAD
+             PTYP:=  DIST
+             DTIT:=  D = Dish Radius
+             DDPR:=  ( ATTRIB DESP[4 ] )
+             DDDF:=  ( 100 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 6 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/952
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Snout Height
+             PURP:=  DESP
+             NUMB:=  5
+             DKEY:=  SHEI
+             PTYP:=  DIST
+             DTIT:=  E = Snout Height
+             DDPR:=  ( ATTRIB DESP[5 ] )
+             DDDF:=  ( 600 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 7 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/953
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Bottom Diameter
+             PURP:=  DESP
+             NUMB:=  6
+             DKEY:=  SDIA
+             PTYP:=  DIST
+             DTIT:=  F = Bottom Diameter
+             DDPR:=  ( ATTRIB DESP[6 ] )
+             DDDF:=  ( 200 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 8 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/954
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             DESC:=  Nozzle Height
+             PURP:=  DESP
+             NUMB:=  7
+             DKEY:=  NHEI
+             PTYP:=  DIST
+             DTIT:=  G = Nozzle Height
+             DDPR:=  ( ATTRIB DESP[7 ] )
+             DDDF:=  ( 300 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 9 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/955
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             PURP:=  EXPR
+             NUMB:=  0
+             DKEY:=  NZEL
+             PTYP:=  TEXT
+             DTIT:=  Nozzle Spec
+             DDPR:=  ( ATTRIB CATR OF MLNID /NOZA )
+             DDDF:=  ( '' )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+        END
+        NEW DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/956
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             PURP:=  SBRE
+             NUMB:=  0
+             DKEY:=  SUPP
+             PTYP:=  SUBE
+             DTIT:=  Vessel Support
+             DDDF:=  ( ID /STD-VVES-SUP-4SQUARE )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+          NEW VVALUE 1 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/957
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-3SQUARE )
+          END
+          NEW VVALUE 2 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/958
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-4SQUARE )
+          END
+          NEW VVALUE 3 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/959
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-3PIPE )
+          END
+          NEW VVALUE 4 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/960
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-4PIPE )
+          END
+          NEW VVALUE 5 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/961
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-2LUGS )
+          END
+          NEW VVALUE 6 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/962
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-3LUGS )
+          END
+          NEW VVALUE 7 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/963
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-4LUGS )
+          END
+          NEW VVALUE 8 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/964
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-SKIRT )
+          END
+          NEW VVALUE 9 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/965
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-FLSKIRT )
+          END
+          NEW VVALUE 10 of DDATA 10 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+               NAME:=  =2013286704/966
+               TYPE:=  VVALUE
+               LOCK:=  false
+              OWNER:=  =2013286704/956
+             VALIDV:=  ( ID /STD-VVES-SUP-NOSUPPORT )
+       END
+      END
+        NEW DDATA 11 of DDSE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+             NAME:=  =2013286704/967
+             TYPE:=  DDAT
+             LOCK:=  false
+            OWNER:=  =2013286704/946
+             PURP:=  EXPR
+             NUMB:=  0
+             DKEY:=  DIMD
+             PTYP:=  DIST
+             DTIT:=  Dimension Distance
+             DDPR:=  ( 500 )
+             DDDF:=  ( 500 )
+             PREF:=  false
+             POEF:=  true
+            LDISP:=  true
+           PTOLER:=  0
+      END
+     END
+      NEW DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+          NAME:=  =2013286704/968
+          TYPE:=  DPSE
+          LOCK:=  false
+         OWNER:=  =2013286704/3537
+          NUMB:=  0
+        NEW DPSPHERICAL 1 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/969
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  A = Height 1st Dim. Point (HEIG)
+            FUNC:=  1
+            PURP:=  DIM
+            NUMB:=  101
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 0mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 2 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/970
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  A = Height 2nd Dim. Point (HEIG)
+            FUNC:=  1
+            PURP:=  DIM
+            NUMB:=  102
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1200mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 3 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/971
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  B = Diameter 1st Dim. Point (DIAM)
+            FUNC:=  2
+            PURP:=  DIM
+            NUMB:=  201
+            BORE:=  0mm
+             POS:=  E 400mm N 0mm U 1900mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  D
+            RADI:=  700mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 4 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/972
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  B = Diameter 2nd Dim. Point (DIAM)
+            FUNC:=  2
+            PURP:=  DIM
+            NUMB:=  202
+            BORE:=  0mm
+             POS:=  W 400mm N 0mm U 1900mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  D
+            RADI:=  700mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 5 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/973
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  C = Height Dish 1st Dim. Point (DHEI)
+            FUNC:=  3
+            PURP:=  DIM
+            NUMB:=  301
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1200mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 6 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/974
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  C = Height Dish 2nd Dim. Point (DHEI)
+            FUNC:=  3
+            PURP:=  DIM
+            NUMB:=  302
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 1400mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 7 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/975
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  D = Dish Radius 1st Dim. Point (DRAD)
+            FUNC:=  4
+            PURP:=  DIM
+            NUMB:=  401
+            BORE:=  0mm
+             POS:=  W 886.327mm N 0mm U 1356.283mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  E 10 D
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 8 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/976
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  D = Dish Radius 2nd Dim. Point (DRAD)
+            FUNC:=  4
+            PURP:=  DIM
+            NUMB:=  402
+            BORE:=  0mm
+             POS:=  W 886.598mm N 0mm U 1354.736mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  E 9.9 D
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 9 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/977
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  E = Snout Height 1st Dim. Point (SHEI)
+            FUNC:=  5
+            PURP:=  DIM
+            NUMB:=  501
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm U 0mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 10 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/978
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  E = Snout Height 2nd Dim. Point (SHEI)
+            FUNC:=  5
+            PURP:=  DIM
+            NUMB:=  502
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 600mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 11 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/979
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  F = Bottom Diameter 1st Dim. Point (SDIA)
+            FUNC:=  6
+            PURP:=  DIM
+            NUMB:=  601
+            BORE:=  0mm
+             POS:=  E 40mm N 0mm D 1250mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  U
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 12 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/980
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  F = Bottom Diameter 2nd Dim. Point (SDIA)
+            FUNC:=  6
+            PURP:=  DIM
+            NUMB:=  602
+            BORE:=  0mm
+             POS:=  W 40mm N 0mm D 1250mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  U
+            RADI:=  500mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 13 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/981
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  G = Nozzle Height 1st Dim. Point (NHEI)
+            FUNC:=  7
+            PURP:=  DIM
+            NUMB:=  701
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 600mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPSPHERICAL 14 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/982
+            TYPE:=  DPSP
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  G = Nozzle Height 2nd Dim. Point (NHEI)
+            FUNC:=  7
+            PURP:=  DIM
+            NUMB:=  702
+            BORE:=  0mm
+             POS:=  E 900mm N 0mm D 750mm
+             ORI:=  Y is N and Z is U
+            DDIR:=  W
+            RADI:=  900mm
+            PVIF:=  3
+        END
+        NEW DPCARTESIAN 1 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/983
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  1
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  E 0mm N 0mm U 0mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 2 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/984
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  2
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 0mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 3 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/985
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  3
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1200mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 4 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/986
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  4
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  W 400mm N 0mm U 1200mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 5 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/987
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  5
+            BORE:=  0mm
+             ORI:=  Y is N and Z is U
+             POS:=  E 400mm N 0mm U 1200mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 6 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/988
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  6
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1200mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 7 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/989
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  7
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm U 1400mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 8 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/990
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  8
+            BORE:=  0mm
+             ORI:=  Y is N and Z is W 45 U
+             POS:=  W 400mm N 0mm U 1200mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 9 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/991
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  9
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  W 1000mm N 0mm U 0mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 10 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/992
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  10
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 600mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 11 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/993
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  11
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  W 40mm N 0mm D 600mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 12 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/994
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  12
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  E 40mm N 0mm D 600mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 13 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/995
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  13
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 600mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 14 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/996
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            NUMB:=  14
+            BORE:=  0mm
+             ORI:=  Y is N and Z is E
+             POS:=  E 0mm N 0mm D 750mm
+            PVIF:=  0
+        END
+        NEW DPCARTESIAN 15 of DPSET 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+            NAME:=  =2013286704/997
+            TYPE:=  DPCA
+            LOCK:=  false
+           OWNER:=  =2013286704/968
+            DESC:=  Nozzle Face
+            NUMB:=  15
+            BORE:=  0mm
+             ORI:=  Y is N and Z is D
+             POS:=  E 0mm N 0mm D 750mm
+            PVIF:=  0
+      END
+     END
+      NEW CYLINDER 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+           NAME:=  =2013286704/998
+           TYPE:=  CYLI
+           LOCK:=  false
+          OWNER:=  =2013286704/3537
+            POS:=  E 0mm N 0mm U 600mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  2 10
+           OBST:=  2
+           DIAM:=  800mm
+           HEIG:=  1200mm
+         REPCOU:=  0
+      END
+      NEW DISH 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+           NAME:=  =2013286704/999
+           TYPE:=  DISH
+           LOCK:=  false
+          OWNER:=  =2013286704/3537
+            POS:=  E 0mm N 0mm U 1200mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  2 10
+           OBST:=  2
+           DIAM:=  800mm
+           HEIG:=  200mm
+           RADI:=  100mm
+         REPCOU:=  0
+      END
+      NEW SNOUT 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+           NAME:=  =2013286704/1000
+           TYPE:=  SNOU
+           LOCK:=  false
+          OWNER:=  =2013286704/3537
+            POS:=  E 0mm N 0mm D 300mm
+            ORI:=  Y is N and Z is U
+           LEVE:=  0 10
+           OBST:=  2
+           DTOP:=  800mm
+           DBOT:=  80mm
+           XOFF:=  0mm
+           YOFF:=  0mm
+           HEIG:=  600mm
+         REPCOU:=  0
+      END
+      NEW NOZZLE 1 of TMPLATE 1 of EQUIPMENT /03SKID3-EQUIP2
+                NAME:=  =2013286704/1001
+                TYPE:=  NOZZ
+                LOCK:=  false
+               OWNER:=  =2013286704/3537
+                 POS:=  E 0mm N 0mm D 750mm
+                 ORI:=  Y is N and Z is W
+                TEMP:=  -100000degC
+                PRES:=  0pascal
+              TPRESS:=  0pascal
+                CREF:=  /03SKID3-PIPE-1/B2
+                CATR:=  /300lb_Ansi_Flanged/AAZFBD0JJ
+                HEIG:=  750mm
+                ANGL:=  90degree
+                RADI:=  0mm
+     END
+    END
+   END
+  NEW /03SKID3/STEEL
+              NAME:=  /03SKID3/STEEL
+              TYPE:=  STRU
+              LOCK:=  false
+             OWNER:=  /03SKID3
+              FUNC:=  Structural
+              PURP:=  STL
+              NUMB:=  0
+              AREA:=  0
+               POS:=  E 0mm N 0mm U 0mm
+               ORI:=  Y is N and Z is U
+              BUIL:=  false
+             DUNIO:=  2
+         :FABMODNR:=  1
+        :FABTARGET:=  Target Contractor
+        :FABDECODE:=  Design Code
+          :FABPRID:=  Object
+          :FABSTID:=  Project Number
+          :FABCLID:=  Customer
+          :FABEFID:=  Project Leader
+        :FABTRRVNO:=  _.0
+         :FABTRANO:=  1
+         :FABREVNO:=  0
+     :MDSBUILDSTYL:=  INSIDE
+       :MDSTMPLORI:=  0
+          :MDSBARS:=  true
+         :MDSCHECK:=  false
+     :MDSFRAMIRROR:=  true
+            :MDSHV:=  BOTH
+       :MDSMAXBORE:=  1200
+       :MDSMINBORE:=  0
+     :MDSPOSNUMMAX:=  0
+      :MDSSHOPWELD:=  0
+      :MDSSITEWELD:=  0
+        :MDSSPLROT:=  0
+       :MDSTRIMMER:=  false
+      :MDSVIEWFLIP:=  false
+        :SDNFMODNR:=  1
+         :SDNFEFID:=  Engineering Firm Id
+         :SDNFCLID:=  Client Id
+         :SDNFSTID:=  Structure Id
+         :SDNFPRID:=  Project Id
+       :SDNFDECODE:=  Design Code
+       :SDNFTARGET:=  Target Contractor
+    NEW FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/1036
+              TYPE:=  FRMW
+              LOCK:=  false
+             OWNER:=  /03SKID3/STEEL
+              PURP:=  STL
+              NUMB:=  0
+              BUIL:=  false
+              SHOP:=  false
+              FIRE:=  0
+             DUNIO:=  2
+         :FABCLASS:=  0
+        :SDNFPSPEC:=  0
+      NEW GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1037
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  CTOP
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 2250mm N 0mm U 2550mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3374
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1037
+            DRNS:=  W
+            DRNE:=  E
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3375
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3374
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3376
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3374
+                     POS:=  W 2200mm N 0mm U 0mm
+       END
+      END
+        NEW JLDATUM 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/3377
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1037
+             NUMB:=  0
+             ZDIS:=  200mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3378
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/3377
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  CTOP
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 1 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1038
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3378
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       FIRE:=  0
+                       SPRE:=  =15193/10519
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+        NEW JLDATUM 2 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/3379
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1037
+             NUMB:=  0
+             ZDIS:=  2000mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 2 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3380
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/3379
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  CTOP
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 2 of GENSEC 1 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1039
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3380
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       FIRE:=  0
+                       SPRE:=  =15193/10519
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+     END
+      NEW GENSEC 2 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1040
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  CTOP
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 2300mm N 950mm U 2550mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 2 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3382
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1040
+            DRNS:=  S
+            DRNE:=  N
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 2 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3383
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3382
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 2 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3384
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3382
+                     POS:=  E 0mm S 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1041
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  CTOP
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 50mm N 1000mm U 2550mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3388
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1041
+            DRNS:=  E
+            DRNE:=  W
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3389
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3388
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3390
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3388
+                     POS:=  E 2200mm N 0mm U 0mm
+       END
+      END
+        NEW JLDATUM 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/3391
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1041
+             NUMB:=  0
+             ZDIS:=  200mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3392
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/3391
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  CTOP
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 1 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1042
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3392
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       FIRE:=  0
+                       SPRE:=  =15193/10519
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+        NEW JLDATUM 2 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/3393
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1041
+             NUMB:=  0
+             ZDIS:=  2000mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 2 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3394
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/3393
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  CTOP
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 2 of GENSEC 3 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1043
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3394
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       FIRE:=  0
+                       SPRE:=  =15193/10519
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+     END
+      NEW GENSEC 4 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1044
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  CTOP
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 50mm U 2550mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 4 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3396
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1044
+            DRNS:=  N
+            DRNE:=  S
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 4 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3397
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3396
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 4 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3398
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3396
+                     POS:=  E 0mm N 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 5 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1045
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JOIS:=  =2013286704/1057
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 2300mm N 0mm U 2650mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 5 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3400
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1045
+            DRNS:=  D
+            DRNE:=  U
+            YDIR:=  N
+          NEW POINSP 1 of SPINE 1 of GENSEC 5 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3401
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3400
+                     POS:=  E 0mm N 0mm D 1400mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 5 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3402
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3400
+                     POS:=  E 0mm N 0mm D 2650mm
+       END
+      END
+     END
+      NEW GENSEC 6 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1046
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 0mm U 2650mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 6 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3404
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1046
+            DRNS:=  D
+            DRNE:=  U
+            YDIR:=  N
+          NEW POINSP 1 of SPINE 1 of GENSEC 6 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3405
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3404
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 6 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3406
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3404
+                     POS:=  E 0mm N 0mm D 2650mm
+       END
+      END
+     END
+      NEW GENSEC 7 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1047
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 1000mm U 2650mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 7 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3408
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1047
+            DRNS:=  D
+            DRNE:=  U
+            YDIR:=  N
+          NEW POINSP 1 of SPINE 1 of GENSEC 7 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3409
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3408
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 7 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3410
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3408
+                     POS:=  E 0mm N 0mm D 2650mm
+       END
+      END
+     END
+      NEW GENSEC 8 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1048
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 2300mm N 1000mm U 2650mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 8 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3412
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1048
+            DRNS:=  D
+            DRNE:=  U
+            YDIR:=  N
+          NEW POINSP 1 of SPINE 1 of GENSEC 8 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3413
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3412
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 8 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3414
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3412
+                     POS:=  E 0mm N 0mm D 2650mm
+       END
+      END
+     END
+      NEW GENSEC 9 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1049
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JOIS:=  =2013286704/1055
+                  JOIE:=  =2013286704/1061
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 50mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 9 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3416
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1049
+            DRNS:=  N
+            DRNE:=  S
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 9 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3417
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3416
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 9 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3418
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3416
+                     POS:=  E 0mm N 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 10 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1050
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 1000mm N 50mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 10 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3420
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1050
+            DRNS:=  N
+            DRNE:=  S
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 10 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3421
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3420
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 10 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3422
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3420
+                     POS:=  E 0mm N 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 11 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1051
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JOIS:=  =2013286704/1058
+                  JOIE:=  =2013286704/1063
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 2300mm N 50mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 11 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3424
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1051
+            DRNS:=  N
+            DRNE:=  S
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 11 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3425
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3424
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 11 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3426
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3424
+                     POS:=  E 0mm N 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 12 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1052
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  CTYS:=  NULL
+                  CTYE:=  NULL
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 1300mm N 50mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 12 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3428
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1052
+            DRNS:=  N
+            DRNE:=  S
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 12 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3429
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3428
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 12 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3430
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3428
+                     POS:=  E 0mm N 900mm U 0mm
+       END
+      END
+     END
+      NEW GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1053
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 0mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3437
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1053
+            DRNS:=  E
+            DRNE:=  W
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3438
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3437
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3439
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3437
+                     POS:=  E 2300mm N 0mm U 0mm
+       END
+      END
+        NEW JLDATUM 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1054
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1053
+             NUMB:=  0
+             ZDIS:=  0mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3440
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/1054
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  RMID
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 1 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1055
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3440
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       CREF:=  =2013286704/1049
+                       FIRE:=  0
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+        NEW JLDATUM 2 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1056
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1053
+             NUMB:=  0
+             ZDIS:=  2300mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 2 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3442
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/1056
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  RMID
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 2 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1058
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3442
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       CREF:=  =2013286704/1051
+                       FIRE:=  0
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+          NEW PLDATUM 2 of JLDATUM 2 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3441
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/1056
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  CBOT
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 2 of JLDATUM 2 of GENSEC 13 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1057
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3441
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       CREF:=  =2013286704/1045
+                       FIRE:=  0
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+     END
+      NEW GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                  NAME:=  =2013286704/1059
+                  TYPE:=  GENSEC
+                  LOCK:=  false
+                 OWNER:=  =2013286704/1036
+                  GTYP:=  RTUB
+                  NUMB:=  0
+                  BUIL:=  false
+                  SHOP:=  false
+                  BANG:=  0degree
+                 LMIRR:=  false
+                  JLNS:=  NA
+                  JLNE:=  NA
+                  JUSL:=  NA
+                  FIRE:=  0
+                WELDDP:=  0mm
+                 POSNO:=  0
+                  SPRE:=  /BS-SHS100x100x4.0
+                  MEML:=  NA
+                   POS:=  E 0mm N 1000mm U 1300mm
+                   ORI:=  Y is N and Z is U
+                REPCOU:=  0
+                 :SSTX:=  0mm
+                 :SENX:=  0mm
+            :FABSTATUS:=  AVEVA
+           :FABEXCLUDE:=  false
+             :FABMODNR:=  1
+            :FABTRRVNO:=  _.0
+             :FABTRANO:=  1
+             :FABREVNO:=  0
+             :FABCLASS:=  0
+              :FABHOLD:=  0
+              :MDSONUM:=  0
+         :MDSSPLADJUST:=  -1
+             :MDSSPOOL:=  1
+             :SDNFFEND:=  0
+           :SDNFFSTART:=  0
+            :SDNFFDESC:=  0
+           :SDNFFTHICK:=  0
+            :SDNFMODNR:=  1
+             :SDNFHOLD:=  0
+            :SDNFPSPEC:=  0
+            :SDNFREVNO:=  0
+            :SDNFTRANO:=  1
+           :SDNFTRRVNO:=  _.0
+          :SDNFEXCLUDE:=  false
+           :SDNFSTATUS:=  PDMS
+        NEW SPINE 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+            NAME:=  =2013286704/3448
+            TYPE:=  SPINE
+            LOCK:=  false
+           OWNER:=  =2013286704/1059
+            DRNS:=  E
+            DRNE:=  W
+            YDIR:=  U
+          NEW POINSP 1 of SPINE 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3449
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3448
+                     POS:=  E 0mm N 0mm U 0mm
+          END
+          NEW POINSP 2 of SPINE 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                    NAME:=  =2013286704/3450
+                    TYPE:=  POINSP
+                    LOCK:=  false
+                   OWNER:=  =2013286704/3448
+                     POS:=  E 2300mm N 0mm U 0mm
+       END
+      END
+        NEW JLDATUM 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1060
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1059
+             NUMB:=  0
+             ZDIS:=  0mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3451
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/1060
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  LMID
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 1 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1061
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3451
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       CREF:=  =2013286704/1049
+                       FIRE:=  0
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+        NEW JLDATUM 2 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1062
+             TYPE:=  JLDATU
+             LOCK:=  false
+            OWNER:=  =2013286704/1059
+             NUMB:=  0
+             ZDIS:=  2300mm
+             PKDI:=  0
+             LEVE:=  0 10
+             FIXT:=  FREE
+           REPCOU:=  0
+          NEW PLDATUM 1 of JLDATUM 2 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+              NAME:=  =2013286704/3452
+              TYPE:=  PLDATU
+              LOCK:=  false
+             OWNER:=  =2013286704/1062
+             PLOCK:=  false
+              NUMB:=  0
+              POSL:=  LMID
+              YDIR:=  U
+              LEVE:=  0 10
+            NEW FIXING 1 of PLDATUM 1 of JLDATUM 2 of GENSEC 14 of FRMWORK 1 of STRUCTURE /03SKID3/STEEL
+                       NAME:=  =2013286704/1063
+                       TYPE:=  FIXING
+                       LOCK:=  false
+                      OWNER:=  =2013286704/3452
+                       BANG:=  0degree
+                       NUMB:=  0
+                        POS:=  E 0mm N 0mm U 0mm
+                        ORI:=  Y is N and Z is U
+                       CUTB:=  0mm
+                       CUTP:=  U
+                       JFRE:=  false
+                       BUIL:=  false
+                       SHOP:=  false
+                       CREF:=  =2013286704/1051
+                       FIRE:=  0
+                     EXCESS:=  0mm
+               :MDSWELDSIZE:=  0
+        END
+       END
+      END
+     END
+    END
+    NEW BOX 1 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1064
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 0mm N 0mm U 0mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  200mm
+             YLEN:=  200mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 2 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1065
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 2300mm N 0mm U 0mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  200mm
+             YLEN:=  200mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 3 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1066
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 0mm N 1000mm U 0mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  200mm
+             YLEN:=  200mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 4 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1067
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 2300mm N 1000mm U 0mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  200mm
+             YLEN:=  200mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 5 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1068
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 0mm N 0mm U 2650mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  120mm
+             YLEN:=  120mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 6 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1069
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 2300mm N 0mm U 2650mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  120mm
+             YLEN:=  120mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 7 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1070
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 0mm N 1000mm U 2650mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  120mm
+             YLEN:=  120mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+    NEW BOX 8 of STRUCTURE /03SKID3/STEEL
+             NAME:=  =2013286704/1071
+             TYPE:=  BOX
+             LOCK:=  false
+            OWNER:=  /03SKID3/STEEL
+              POS:=  E 2300mm N 1000mm U 2650mm
+              ORI:=  Y is N and Z is U
+             LEVE:=  0 10
+             OBST:=  2
+             XLEN:=  120mm
+             YLEN:=  120mm
+             ZLEN:=  10mm
+           REPCOU:=  0
+    END
+  END
+END

@@ -19,6 +19,9 @@ use aios_database::options::DbOptionExt;
 use aios_database::perf_timer::{PerfReport, PerfTimer};
 use parry3d::bounding_volume::BoundingVolume;
 // use aios_database::fast_model::export_xkt::XktExporter;
+use aios_database::fast_model::gen_model::model_record_id::{
+    model_refno_id, model_refno_sesno_range,
+};
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
     ObjExportConfig, XktExportConfig, collect_export_refnos,
@@ -1634,7 +1637,7 @@ async fn rebuild_room_compute_panel_spatial_index(
     if !pe_keys.is_empty() {
         let noun_sql = format!(
             r#"
-            SELECT id as refno, noun, type::record('inst_relate_aabb', id).aabb_id.d as aabb
+            SELECT id as refno, noun, type::record('inst_relate_aabb', record::id(id)).aabb_id.d as aabb
             FROM [{}]
             "#,
             pe_keys.join(",")
@@ -1655,7 +1658,7 @@ async fn rebuild_room_compute_panel_spatial_index(
 
     let refno_strs: Vec<String> = expanded_refnos
         .iter()
-        .map(|r| format!("inst_relate_aabb:`{}`", r))
+        .map(|r| model_refno_id("inst_relate_aabb", *r))
         .collect();
     let mut items = Vec::<(i64, String, i64, f64, f64, f64, f64, f64, f64)>::new();
     if !refno_strs.is_empty() {
@@ -1699,8 +1702,8 @@ async fn rebuild_room_compute_panel_spatial_index(
         .any(|(id, _, _, _, _, _, _, _, _)| *id == panel_id);
     if !has_panel_entry {
         let panel_sql = format!(
-            "SELECT in as refno, in.noun as noun, aabb_id.d as aabb FROM inst_relate_aabb:`{}`",
-            root_refnos[0]
+            "SELECT refno, refno.noun as noun, aabb_id.d as aabb FROM {}",
+            model_refno_id("inst_relate_aabb", root_refnos[0])
         );
         let rows: Vec<InstRelateAabbQuery> = model_primary_db()
             .query_take(&panel_sql, 0)
@@ -3143,21 +3146,22 @@ pub async fn export_dbnum_instances_json_mode(
                     .unwrap_or_default();
                 let owner_type = owner_att.get_type_str().to_string();
 
-                // 注意：tubi_relate 的复合 ID 为 [owner_refno, index]；
+                // 注意：tubi_relate 的复合 ID 为 [ref0, ref1, sesno, index]；
                 // in/out 对应 leave/arrive；refno 导出侧以 leave_refno 为主键。
-                let pe_key = owner.to_pe_key();
+                let owner_key = owner.to_pe_key();
+                let tubi_range = model_refno_sesno_range("tubi_relate", *owner);
                 let sql = format!(
                     r#"
                     SELECT
-                        id[0] as owner_refno,
+                        {owner_key} as owner_refno,
                         in as leave_refno,
                         out as arrive_refno,
                         world_trans.d as world_trans,
                         aabb.d as world_aabb,
                         start_pt.d as start_pt,
                         end_pt.d as end_pt,
-                        id[1] as index
-                    FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                        id[3] as index
+                    FROM {tubi_range};
                     "#
                 );
                 let rows: Vec<TubiRelateRow> = project_primary_db().query_take(&sql, 0).await?;
@@ -4030,6 +4034,11 @@ pub async fn import_rvm_mode(
     println!("   - Group 节点: {}", stats.group_nodes);
     println!("   - Geometry 记录: {}", stats.geometry_records);
     println!("   - 清理旧记录数: {}", stats.cleaned_records);
+    println!("   - ATT section 总数: {}", stats.att_sections);
+    println!("   - ATT 属性 section: {}", stats.att_attr_sections);
+    println!("   - ATT 重复 section: {}", stats.att_duplicate_sections);
+    println!("   - ATT 匹配 section: {}", stats.att_matched_sections);
+    println!("   - ATT 未匹配 section: {}", stats.att_unmatched_sections);
     println!("   - 身份解析成功: {}", stats.resolved_records);
     println!("   - 身份未解析(stable_hash): {}", stats.unresolved_records);
 

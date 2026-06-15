@@ -173,9 +173,8 @@ impl ModelRelationStore {
         }
 
         let conn = self.get_conn(dbnum)?;
-        let mut stmt = conn.prepare_cached(
-            "DELETE FROM inst_relate WHERE dbnum = ?1 AND name = ?2",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("DELETE FROM inst_relate WHERE dbnum = ?1 AND name = ?2")?;
         let mut total_deleted = 0usize;
         for name in names {
             total_deleted += stmt.execute(params![dbnum, name])?;
@@ -312,8 +311,8 @@ impl ModelRelationStore {
         let conn = self.get_conn(dbnum)?;
         let attrs_json: Option<String> = conn
             .query_row(
-                "SELECT attrs_json FROM inst_relate WHERE refno = ?1 AND attrs_json IS NOT NULL LIMIT 1",
-                [refno.refno().0],
+                "SELECT attrs_json FROM inst_relate WHERE dbnum = ?1 AND refno = ?2 AND attrs_json IS NOT NULL LIMIT 1",
+                params![dbnum, refno.refno().0],
                 |row| row.get(0),
             )
             .optional()?;

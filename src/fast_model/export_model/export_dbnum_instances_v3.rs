@@ -29,6 +29,7 @@ use surrealdb::types::SurrealValue;
 
 use super::InstRelateRow;
 use super::export_transform_config::ExportTransformConfig;
+use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_sesno_range};
 use crate::fast_model::unit_converter::UnitConverter;
 
 // =============================================================================
@@ -150,7 +151,10 @@ pub async fn export_dbnum_instances_v3(
         if verbose {
             println!("🔍 查询 {} 的可见实例节点...", root);
         }
-        let sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        let mut sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        sub_refnos.push(root);
+        sub_refnos.sort();
+        sub_refnos.dedup();
         if verbose {
             println!("   ✅ 子树 refno 数量: {}", sub_refnos.len());
         }
@@ -668,7 +672,7 @@ async fn query_export_insts(
         if enable_holes {
             let bool_keys = chunk
                 .iter()
-                .map(|r| format!("inst_relate_bool:{r}"))
+                .map(|r| model_refno_id("inst_relate_bool", *r))
                 .collect::<Vec<_>>();
             let bool_keys_str = bool_keys.join(",");
 
@@ -677,8 +681,8 @@ async fn query_export_insts(
                 SELECT
                     refno,
                     refno.owner as owner,
-                    (if refno != NONE && type::record("inst_relate_aabb", record::id(refno)).aabb_id != NONE {{
-                        record::id(type::record("inst_relate_aabb", record::id(refno)).aabb_id)
+                    (if type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                        record::id(type::record("inst_relate_aabb", id).aabb_id)
                     }} else {{ None }}) as world_aabb_hash,
                     (if refno != NONE && type::record("pe_transform", record::id(refno)).world_trans != NONE {{
                         record::id(type::record("pe_transform", record::id(refno)).world_trans)
@@ -700,92 +704,97 @@ async fn query_export_insts(
             let bool_refnos: HashSet<RefnoEnum> = bool_results.iter().map(|r| r.refno).collect();
             results.append(&mut bool_results);
 
-            let non_bool_keys = chunk
+            let non_bool_refnos = chunk
                 .iter()
                 .filter(|r| !bool_refnos.contains(*r))
-                .map(|r| r.to_inst_relate_key())
+                .copied()
                 .collect::<Vec<_>>();
 
-            if !non_bool_keys.is_empty() {
-                let non_bool_keys_str = non_bool_keys.join(",");
-                let geo_sql = format!(
+            if !non_bool_refnos.is_empty() {
+                let mut geo_sql_batch = String::new();
+                for r in &non_bool_refnos {
+                    let inst_relate_key = model_refno_id("inst_relate", *r);
+                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    geo_sql_batch.push_str(&format!(
+                        r#"
+                        SELECT
+                            in as refno,
+                            in.owner ?? in as owner,
+                            (if id != NONE && type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                                record::id(type::record("inst_relate_aabb", id).aabb_id)
+                            }} else {{ None }}) as world_aabb_hash,
+                            (if in != NONE && type::record("pe_transform", record::id(in)).world_trans != NONE {{
+                                record::id(type::record("pe_transform", record::id(in)).world_trans)
+                            }} else {{ None }}) as world_trans_hash,
+                            (
+                                SELECT
+                                    (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
+                                    (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
+                                    out.unit_flag ?? false as unit_flag
+                                FROM {geo_range}
+                                WHERE visible
+                                  && (trans.d ?? NONE) != NONE
+                                  && out != NONE
+                                  && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
+                            ) as insts,
+                            false as has_neg
+                        FROM [{inst_relate_key}]
+                        WHERE in != NONE;
+                        "#
+                    ));
+                }
+
+                let mut resp = aios_core::project_primary_db()
+                    .query_response(&geo_sql_batch)
+                    .await
+                    .with_context(|| "query_export_insts geo SQL failed")?;
+                for (stmt_idx, _) in non_bool_refnos.iter().enumerate() {
+                    let mut geo_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                    results.append(&mut geo_results);
+                }
+            }
+        } else {
+            let mut sql_batch = String::new();
+            for r in chunk {
+                let inst_relate_key = model_refno_id("inst_relate", *r);
+                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                sql_batch.push_str(&format!(
                     r#"
                     SELECT
                         in as refno,
                         in.owner ?? in as owner,
-                        (if id != NONE && type::record("inst_relate_aabb", record::id(id)).aabb_id != NONE {{
-                            record::id(type::record("inst_relate_aabb", record::id(id)).aabb_id)
+                        (if id != NONE && type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                            record::id(type::record("inst_relate_aabb", id).aabb_id)
                         }} else {{ None }}) as world_aabb_hash,
-                        (if id != NONE && type::record("pe_transform", record::id(id)).world_trans != NONE {{
-                            record::id(type::record("pe_transform", record::id(id)).world_trans)
+                        (if in != NONE && type::record("pe_transform", record::id(in)).world_trans != NONE {{
+                            record::id(type::record("pe_transform", record::id(in)).world_trans)
                         }} else {{ None }}) as world_trans_hash,
                         (
                             SELECT
                                 (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
                                 (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
                                 out.unit_flag ?? false as unit_flag
-                            FROM $parent.out->geo_relate
+                            FROM {geo_range}
                             WHERE visible
                               && (trans.d ?? NONE) != NONE
-                              && (out.d ?? NONE) != NONE
-                              && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
+                              && out != NONE
+                              && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
                         ) as insts,
                         false as has_neg
-                    FROM [{non_bool_keys}]
-                    WHERE in != NONE
-                    "#,
-                    non_bool_keys = non_bool_keys_str
-                );
-
-                let mut geo_results: Vec<aios_core::ExportInstQuery> =
-                    aios_core::project_primary_db()
-                        .query_take(&geo_sql, 0)
-                        .await
-                        .with_context(|| "query_export_insts geo SQL failed")?;
-                results.append(&mut geo_results);
+                    FROM [{inst_relate_key}]
+                    WHERE in != NONE;
+                    "#
+                ));
             }
-        } else {
-            let keys = chunk
-                .iter()
-                .map(|r| r.to_inst_relate_key())
-                .collect::<Vec<_>>();
-            let keys_str = keys.join(",");
 
-            let sql = format!(
-                r#"
-                SELECT
-                    in as refno,
-                    in.owner ?? in as owner,
-                    (if id != NONE && type::record("inst_relate_aabb", record::id(id)).aabb_id != NONE {{
-                        record::id(type::record("inst_relate_aabb", record::id(id)).aabb_id)
-                    }} else {{ None }}) as world_aabb_hash,
-                    (if id != NONE && type::record("pe_transform", record::id(id)).world_trans != NONE {{
-                        record::id(type::record("pe_transform", record::id(id)).world_trans)
-                    }} else {{ None }}) as world_trans_hash,
-                    (
-                        SELECT
-                            (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
-                            (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
-                            out.unit_flag ?? false as unit_flag
-                        FROM $parent.out->geo_relate
-                        WHERE visible
-                          && (trans.d ?? NONE) != NONE
-                          && (out.d ?? NONE) != NONE
-                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
-                    ) as insts,
-                    false as has_neg
-                FROM [{keys}]
-                WHERE in != NONE
-                "#,
-                keys = keys_str
-            );
-
-            let mut chunk_results: Vec<aios_core::ExportInstQuery> =
-                aios_core::project_primary_db()
-                    .query_take(&sql, 0)
-                    .await
-                    .with_context(|| "query_export_insts SQL failed")?;
-            results.append(&mut chunk_results);
+            let mut resp = aios_core::project_primary_db()
+                .query_response(&sql_batch)
+                .await
+                .with_context(|| "query_export_insts SQL failed")?;
+            for (stmt_idx, _) in chunk.iter().enumerate() {
+                let mut chunk_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                results.append(&mut chunk_results);
+            }
         }
     }
 
@@ -805,22 +814,23 @@ async fn query_tubi_relate(
     for owners_chunk in owner_refnos.chunks(200) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let pe_key = owner_refno.to_pe_key();
+            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
-                    id[0] as refno,
-                    id[1] as index,
+                    {owner_refno} as refno,
+                    id[3] as index,
                     in as leave,
                     record::id(aabb) as world_aabb_hash,
                     record::id(world_trans) as world_trans_hash,
                     record::id(geo) as geo_hash,
                     spec_value
-                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]
+                FROM {tubi_range}
                 WHERE aabb != NONE
                   AND world_trans != NONE
                   AND geo != NONE;
                 "#,
+                owner_refno = owner_refno.to_pe_key()
             ));
         }
 

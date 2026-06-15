@@ -42,6 +42,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
+use super::model_record_id::{model_refno_id, model_refno_sesno_range};
+
 #[derive(Serialize, Deserialize, Debug, SurrealValue)]
 struct TubiQueryResult {
     pub refno: RefnoEnum,
@@ -95,7 +97,7 @@ pub async fn query_insts_with_batch(
             // 使用 FROM [ids] 语法直接指定要查询的记录
             let bool_keys: Vec<String> = chunk
                 .iter()
-                .map(|r| r.to_table_key("inst_relate_bool"))
+                .map(|r| model_refno_id("inst_relate_bool", *r))
                 .collect();
             let bool_keys_str = bool_keys.join(",");
 
@@ -130,19 +132,58 @@ pub async fn query_insts_with_batch(
             // inst_relate 记录里可能出现 `in = NONE`（例如数据写入/迁移中断或旧数据残留），
             // 这会导致后续 `record::id(in)` 报错：Expected `record` but found `NONE`。
             // 因此这里必须显式过滤掉 in 为 NONE 的记录。
-            let non_bool_keys: Vec<String> = chunk
+            let non_bool_refnos: Vec<RefnoEnum> = chunk
                 .iter()
                 .filter(|r| !bool_refnos.contains(*r))
-                .map(|r| r.to_inst_relate_key())
+                .copied()
                 .collect();
 
-            if !non_bool_keys.is_empty() {
-                let non_bool_keys_str = non_bool_keys.join(",");
-                // 直接从 pe_transform 表获取 world_trans（pe.world_trans 已废弃）
-                // 注意：这里不能再依赖 out.meshed 过滤。
-                // BRAN/CATA 里存在“GLB 已生成，但 inst_geo.meshed 尚未回写”的旧数据，
-                // 导出阶段后面还会按真实 mesh 文件存在性再次过滤，提前卡掉会导致实例缺失。
-                let geo_sql = format!(
+            if !non_bool_refnos.is_empty() {
+                let mut geo_sql_batch = String::new();
+                for r in &non_bool_refnos {
+                    let inst_relate_key = model_refno_id("inst_relate", *r);
+                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    // 直接从 pe_transform 表获取 world_trans（pe.world_trans 已废弃）。
+                    // geo_relate 必须按同版本 range 查询，避免共享 inst_info 时串读其它 sesno。
+                    geo_sql_batch.push_str(&format!(
+                        r#"
+                        SELECT
+                            in.id as refno,
+                            in.owner ?? in as owner,
+                            type::record("pe_transform", record::id(in)).world_trans.d as world_trans,
+                            in.world_aabb as world_aabb,
+                            (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
+                             FROM {geo_range}
+                             WHERE visible
+                               && (trans.d ?? NONE) != NONE
+                               && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
+                            false as has_neg
+                        FROM [{inst_relate_key}]
+                        WHERE in != NONE
+                          AND type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                        "#
+                    ));
+                }
+
+                let mut resp = model_primary_db()
+                    .query_response(&geo_sql_batch)
+                    .await
+                    .with_context(|| {
+                        format!("query_insts_with_batch geo SQL: {}", geo_sql_batch)
+                    })?;
+                for (stmt_idx, _) in non_bool_refnos.iter().enumerate() {
+                    let mut geo_results: Vec<GeomInstQuery> = resp.take(stmt_idx)?;
+                    results.append(&mut geo_results);
+                }
+            }
+        } else {
+            // ========== enable_holes=false：始终返回原始几何 ==========
+            let mut sql_batch = String::new();
+            for r in chunk {
+                let inst_relate_key = model_refno_id("inst_relate", *r);
+                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                // 利用 pe 表的计算字段简化查询；geo_relate 按目标版本 range 读取。
+                sql_batch.push_str(&format!(
                     r#"
                     SELECT
                         in.id as refno,
@@ -150,77 +191,47 @@ pub async fn query_insts_with_batch(
                         type::record("pe_transform", record::id(in)).world_trans.d as world_trans,
                         in.world_aabb as world_aabb,
                         (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
-                         FROM $parent.out->geo_relate
+                         FROM {geo_range}
                          WHERE visible
                            && (trans.d ?? NONE) != NONE
-                           && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
+                           && geo_type IN ['Pos', 'Compound']) as insts,
                         false as has_neg
-                    FROM [{non_bool_keys}]
+                    FROM [{inst_relate_key}]
                     WHERE in != NONE
-                      AND type::record("pe_transform", record::id(in)).world_trans.d != NONE
-                    "#,
-                    non_bool_keys = non_bool_keys_str
-                );
-
-                let mut geo_results: Vec<GeomInstQuery> = model_primary_db()
-                    .query_take(&geo_sql, 0)
-                    .await
-                    .with_context(|| format!("query_insts_with_batch geo SQL: {}", geo_sql))?;
-                results.append(&mut geo_results);
+                      AND type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                    "#
+                ));
             }
-        } else {
-            // ========== enable_holes=false：始终返回原始几何 ==========
-            let inst_relate_keys: Vec<String> =
-                chunk.iter().map(|r| r.to_inst_relate_key()).collect();
-            let inst_relate_keys_str = inst_relate_keys.join(",");
 
-            // 利用 pe 表的计算字段简化查询
-            // 仍然需要检查 inst_relate_bool 来设置 has_neg 标志
-            let sql = format!(
-                r#"
-                SELECT
-                    in.id as refno,
-                    in.owner ?? in as owner,
-                    type::record("pe_transform", record::id(in)).world_trans.d as world_trans,
-                    in.world_aabb as world_aabb,
-                    (SELECT trans.d as geo_transform, record::id(out) as geo_hash, false as is_tubi, out.unit_flag ?? false as unit_flag
-                     FROM $parent.out->geo_relate
-                     WHERE visible
-                       && (trans.d ?? NONE) != NONE
-                       && geo_type IN ['Pos', 'Compound']) as insts,
-                    false as has_neg
-                FROM [{inst_relate_keys}]
-                WHERE in != NONE
-                  AND type::record("pe_transform", record::id(in)).world_trans.d != NONE
-                "#,
-                inst_relate_keys = inst_relate_keys_str
-            );
-
-            let mut chunk_result: Vec<GeomInstQuery> = model_primary_db()
-                .query_take(&sql, 0)
+            let mut resp = model_primary_db()
+                .query_response(&sql_batch)
                 .await
-                .with_context(|| format!("query_insts_with_batch SQL: {}", sql))?;
-            results.append(&mut chunk_result);
+                .with_context(|| format!("query_insts_with_batch SQL: {}", sql_batch))?;
+            for (stmt_idx, _) in chunk.iter().enumerate() {
+                let mut chunk_result: Vec<GeomInstQuery> = resp.take(stmt_idx)?;
+                results.append(&mut chunk_result);
+            }
         }
 
         // ========== TUBI 查询 ==========
         // tubi_relate 使用复合 ID（pe, index）；这里为每个 refno 发起 range 查询并合并为 is_tubi 实例。
         let mut tubi_sql_batch = String::new();
         for r in chunk {
-            let pe_key = r.to_pe_key();
+            let tubi_range = model_refno_sesno_range("tubi_relate", *r);
             tubi_sql_batch.push_str(&format!(
                 r#"
                 SELECT
-                    id[0] as refno,
+                    {owner_refno} as refno,
                     in as owner,
                     world_trans.d as world_trans,
                     aabb.d as world_aabb,
                     start_pt.d as start_pt,
                     end_pt.d as end_pt,
                     record::id(geo) as geo_hash,
-                    id[1] as index
-                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
-                "#
+                    id[3] as index
+                FROM {tubi_range};
+                "#,
+                owner_refno = r.to_pe_key()
             ));
         }
 

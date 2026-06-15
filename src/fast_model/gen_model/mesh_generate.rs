@@ -8,8 +8,10 @@
 
 use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
 use crate::fast_model::gen_model::mesh_state::{
-    flush_aabb_cache, get_cached_or_local_aabb, mesh_exists, use_file_mesh_state,
+    flush_aabb_cache, get_cached_or_local_aabb, mesh_exists, mesh_file_exists_in_dir,
+    use_file_mesh_state,
 };
+use crate::fast_model::gen_model::model_record_id::model_refno_id;
 use crate::fast_model::manifold_bool::{
     apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
 };
@@ -188,16 +190,20 @@ impl RecentGeoDeduper {
 /// 不再扫描磁盘上的 glb 文件。
 pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
     let start = std::time::Instant::now();
+    let mesh_dir = aios_core::get_db_option().get_meshes_path();
     let mut ids: Vec<u64> = EXIST_MESH_GEO_HASHES
         .iter()
-        .filter_map(|kv| kv.key().parse::<u64>().ok())
+        .filter_map(|kv| {
+            let geo_hash = kv.key().parse::<u64>().ok()?;
+            mesh_file_exists_in_dir(&mesh_dir, geo_hash).then_some(geo_hash)
+        })
         .collect();
 
     ids.sort_unstable();
     ids.dedup();
 
     debug_model!(
-        "📂 从 AABB 缓存预加载完成: {} 个唯一 geo hash, 耗时 {} ms",
+        "📂 从 AABB 缓存预加载完成: {} 个当前磁盘存在的唯一 geo hash, 耗时 {} ms",
         ids.len(),
         start.elapsed().as_millis(),
     );
@@ -585,7 +591,38 @@ pub async fn gen_meshes_in_db(
 async fn query_pending_cata_boolean(
     limit: usize,
     replace_exist: bool,
+    scope_refnos: Option<&[RefnoEnum]>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
+    if let Some(scope_refnos) = scope_refnos {
+        if scope_refnos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pending = Vec::new();
+        for chunk in scope_refnos.chunks(200) {
+            if pending.len() >= limit {
+                break;
+            }
+            let pe_keys = chunk.iter().map(|r| r.to_pe_key()).join(",");
+            let filter_booled = if replace_exist {
+                String::new()
+            } else {
+                "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = []"
+                    .to_string()
+            };
+            let sql = format!(
+                r#"SELECT VALUE in
+FROM [{pe_keys}]->inst_relate
+WHERE has_cata_neg = true
+  {filter_booled}
+LIMIT {limit};"#,
+            );
+            let rows: Vec<RefnoEnum> = model_primary_db().query_take(&sql, 0).await?;
+            pending.extend(rows);
+        }
+        pending.truncate(limit);
+        return Ok(pending);
+    }
+
     let filter_booled = if replace_exist {
         String::new()
     } else {
@@ -634,6 +671,22 @@ async fn query_relation_targets_combined() -> anyhow::Result<HashSet<RefnoEnum>>
     );
 
     Ok(candidates)
+}
+
+fn apply_boolean_scope_filter(
+    candidates: &mut HashSet<RefnoEnum>,
+    scope_refnos: Option<&[RefnoEnum]>,
+) {
+    let Some(scope_refnos) = scope_refnos else {
+        return;
+    };
+    let scope: HashSet<RefnoEnum> = scope_refnos.iter().copied().collect();
+    candidates.retain(|refno| scope.contains(refno));
+    println!(
+        "[boolean_worker] scoped relation filter: scope={} remaining_targets={}",
+        scope.len(),
+        candidates.len()
+    );
 }
 
 /// 查询需要执行实例级布尔运算的实例列表
@@ -803,7 +856,7 @@ async fn query_candidate_inst_geo_ids_for_refnos(
     for chunk in refnos.chunks(CHUNK_SIZE) {
         let inst_relate_keys = chunk
             .iter()
-            .map(|refno| refno.to_inst_relate_key())
+            .map(|refno| model_refno_id("inst_relate", *refno))
             .join(",");
         let sql = format!(
             r#"
@@ -1280,15 +1333,20 @@ pub async fn run_mesh_worker_from_channel(
 /// 扫描需要布尔运算的实例（catalog & 实例级），只执行一次。
 /// 注意：此函数应在 mesh_worker 完成后调用，确保所有 mesh 已生成。
 /// file 模式以本地 GLB + aabb_cache.rkyv 为前置状态源；db 模式仍兼容历史查询口径。
-pub async fn run_boolean_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
+pub async fn run_boolean_worker(
+    db_option: Arc<DbOption>,
+    batch_size: usize,
+    scope_refnos: Option<&[RefnoEnum]>,
+) -> anyhow::Result<()> {
     let batch_size = batch_size.max(1);
     let replace_exist = false; // replace_exist 已废弃
-    let relation_targets = query_relation_targets_combined().await?;
+    let mut relation_targets = query_relation_targets_combined().await?;
+    apply_boolean_scope_filter(&mut relation_targets, scope_refnos);
 
     let start = std::time::Instant::now();
 
     // 查询所有待处理的布尔任务
-    let cata_refnos = query_pending_cata_boolean(batch_size, replace_exist).await?;
+    let cata_refnos = query_pending_cata_boolean(batch_size, replace_exist, scope_refnos).await?;
     let inst_refnos =
         query_pending_inst_boolean(batch_size, replace_exist, &relation_targets).await?;
 
@@ -2106,7 +2164,7 @@ async fn query_unmeshed_inst_geo_ids_for_refnos(
     for chunk in refnos.chunks(CHUNK_SIZE) {
         let inst_relate_keys = chunk
             .iter()
-            .map(|refno| refno.to_inst_relate_key())
+            .map(|refno| model_refno_id("inst_relate", *refno))
             .join(",");
         let sql = format!(
             r#"

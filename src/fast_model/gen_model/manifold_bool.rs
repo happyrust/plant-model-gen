@@ -13,7 +13,9 @@ use aios_core::SurrealQueryExt;
 
 use aios_core::csg::manifold::ManifoldRust;
 
-use aios_core::geometry::csg::{unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh};
+use aios_core::geometry::csg::{
+    generate_csg_mesh, unit_box_mesh, unit_cylinder_mesh, unit_sphere_mesh,
+};
 
 use aios_core::get_db_option;
 
@@ -33,10 +35,12 @@ use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 use aios_core::geometry::csg::UNIT_MESH_SCALE;
 
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::shape::pdms_shape::VerifiedShape;
 
 use crate::fast_model::gen_model::boolean_task::{
     BooleanTask, BooleanTaskType, CataNegBoolTask, InstNegBoolTask, NegEntityData,
 };
+use crate::fast_model::gen_model::model_record_id::{geo_relate_id, model_refno_id};
 use crate::fast_model::gen_model::sql_file_writer::SqlFileWriter;
 use aios_core::shape::pdms_shape::BrepShapeTrait;
 use async_trait::async_trait;
@@ -55,6 +59,7 @@ use std::{fs, io};
 /// 负实体膨胀量（mm）：消除布尔运算中共面薄片的 epsilon
 /// 每边扩展此值，使负实体略微超出正实体表面，产生干净切割
 const NEG_INFLATE_EPSILON_MM: f64 = 0.5;
+const BOOL_CATE_POS_GEO_INDEX: usize = 1_000_000_000;
 
 async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
     if refnos.is_empty() {
@@ -306,6 +311,67 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
     validate_manifold_result(manifold, id)
 }
 
+async fn query_inst_geo_param(mesh_id: &str) -> anyhow::Result<Option<PdmsGeoParam>> {
+    let escaped_id = mesh_id.replace('`', "\\`");
+    let sql = format!(
+        "SELECT VALUE param FROM inst_geo:`{}` WHERE param != NONE AND bad != true LIMIT 1",
+        escaped_id
+    );
+
+    let mut response = model_primary_db().query(&sql).await?;
+    let mut params: Vec<PdmsGeoParam> = response.take(0).unwrap_or_default();
+    Ok(params.pop())
+}
+
+async fn load_manifold_with_db_param_fallback(
+    id: &str,
+    mat: DMat4,
+    more_precision: bool,
+) -> anyhow::Result<ManifoldRust> {
+    match load_manifold(id, mat, more_precision) {
+        Ok(manifold) => Ok(manifold),
+        Err(load_err) => {
+            if !is_source_level_manifold_error(&load_err) {
+                return Err(load_err);
+            }
+
+            let geo_hash = id.parse::<u64>().unwrap_or(0);
+            if geo_hash == 0 {
+                return Err(load_err);
+            }
+
+            match query_inst_geo_param(id).await {
+                Ok(Some(param)) => {
+                    eprintln!(
+                        "[Manifold] 文件加载失败后尝试 inst_geo.param 兜底: id={} err={}",
+                        id, load_err
+                    );
+
+                    load_manifold_from_geo_param(&param, geo_hash, mat, more_precision).map_err(
+                        |param_err| {
+                            anyhow::anyhow!(
+                                "文件加载失败且 param 兜底失败: id={} file_err={} param_err={}",
+                                id,
+                                load_err,
+                                param_err
+                            )
+                        },
+                    )
+                }
+
+                Ok(None) => Err(load_err),
+
+                Err(param_query_err) => Err(anyhow::anyhow!(
+                    "文件加载失败且查询 inst_geo.param 失败: id={} file_err={} query_err={}",
+                    id,
+                    load_err,
+                    param_query_err
+                )),
+            }
+        }
+    }
+}
+
 /// 直接从几何参数生成 Manifold 模型
 
 ///
@@ -379,27 +445,44 @@ pub(crate) fn load_manifold_from_geo_param(
 
     // 尝试从 geo_param 直接生成 mesh
 
-    let plant_mesh = match geo_param {
+    let normalized_geo_param = if geo_param.is_reuse_unit() {
+        geo_param.to_unit_param()
+    } else {
+        geo_param.clone()
+    };
+
+    let plant_mesh = match &normalized_geo_param {
         PdmsGeoParam::Unknown | PdmsGeoParam::CompoundShape => {
             return Err(anyhow::anyhow!(
                 "geo_param 不支持直接生成 manifold: geo_hash={} type={:?}",
                 geo_hash,
-                geo_param.type_name()
+                normalized_geo_param.type_name()
             ));
         }
 
         _ => {
-            // 尝试使用 gen_csg_shape 生成
+            if let Some(generated) = generate_csg_mesh(
+                &normalized_geo_param,
+                &LodMeshSettings::default(),
+                false,
+                true,
+                None,
+            ) {
+                generated.mesh
+            } else {
+                // 兼容旧路径：部分几何只实现了 BrepShapeTrait 的 CSG shape 生成。
+                match normalized_geo_param.gen_csg_shape_compat() {
+                    Ok(csg_mesh) => (*csg_mesh.0).clone(),
 
-            match geo_param.gen_csg_shape_compat() {
-                Ok(csg_mesh) => (*csg_mesh.0).clone(),
-
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "gen_csg_shape 失败: geo_hash={} err={}",
-                        geo_hash,
-                        e
-                    ));
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "generate_csg_mesh/gen_csg_shape 均失败: geo_hash={} type={} check_valid={} err={}",
+                            geo_hash,
+                            normalized_geo_param.type_name(),
+                            normalized_geo_param.check_valid(),
+                            e
+                        ));
+                    }
                 }
             }
         }
@@ -409,7 +492,7 @@ pub(crate) fn load_manifold_from_geo_param(
         return Err(anyhow::anyhow!(
             "从 geo_param 生成的 mesh 为空: geo_hash={} type={}",
             geo_hash,
-            geo_param.type_name()
+            normalized_geo_param.type_name()
         ));
     }
 
@@ -894,20 +977,17 @@ pub async fn apply_cata_neg_boolean_manifold(
                 // - 为每个 boolean_group 生成一条 CatePos，会导致同一 inst_geo 被重复导出（OBJ 翻倍）。
                 //
                 // 这里固定为“每实例一个 CatePos id”，后续循环内覆盖更新，最终仅保留最新结果。
-                let relation_id = g.refno.to_string();
+                let relation_id = geo_relate_id(g.refno, BOOL_CATE_POS_GEO_INDEX);
 
-                // 先删除该实例下全部旧 CatePos（兼容历史 id 规则，且避免同实例重复导出）
-                update_sql.push_str(&format!(
-                    "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
-                    &g.inst_info_id.to_raw(),
-                ));
+                // 先删除该实例下本架构的 CatePos，避免同实例重复导出。
+                update_sql.push_str(&format!("DELETE {relation_id};"));
 
                 // 建立 inst_info -> geo_relate -> inst_geo 的关系
 
                 // geo_type='CatePos' 表示这是布尔运算后的结果（应该导出）
 
                 let relate_sql = format!(
-                    "INSERT RELATION INTO geo_relate {{ in: {}, id: '{rel_id}', out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
+                    "INSERT RELATION INTO geo_relate {{ in: {}, id: {rel_id}, out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
                     &g.inst_info_id.to_raw(),
                     rel_id = relation_id,
                     mesh_id = mesh_id,
@@ -1024,8 +1104,8 @@ async fn apply_boolean_for_query(
 
     if !replace_exist {
         let check_sql = format!(
-            "select value status from inst_relate_bool:{} limit 1",
-            query.refno.to_string()
+            "select value status from {} limit 1",
+            model_refno_id("inst_relate_bool", query.refno)
         );
 
         let existing_status: Vec<Option<String>> =
@@ -1087,7 +1167,7 @@ async fn apply_boolean_for_query(
 
         debug_model_debug!("加载正实体 mesh: {} (应用局部变换)", pos_mesh_id);
 
-        match load_manifold(&pos_mesh_id, pos_local_mat, false) {
+        match load_manifold_with_db_param_fallback(&pos_mesh_id, pos_local_mat, false).await {
             Ok(manifold) => pos_manifolds.push(manifold),
 
             Err(e) => log_load_manifold_failed("inst_pos", query.refno, &pos_mesh_id, &e),
@@ -1222,7 +1302,7 @@ async fn apply_boolean_for_query(
 
             debug_model_debug!("加载负实体 mesh: {} (相对于正实体坐标系)", neg_mesh_id);
 
-            match load_manifold(&neg_mesh_id, relative_mat, true) {
+            match load_manifold_with_db_param_fallback(&neg_mesh_id, relative_mat, true).await {
                 Ok(manifold) => {
                     if let Some(neg_aabb) = manifold.get_mesh().cal_aabb() {
                         println!(
@@ -1257,13 +1337,11 @@ async fn apply_boolean_for_query(
     }
 
     if neg_manifolds.is_empty() {
-        println!(
-            "布尔运算失败: 未找到负实体 manifold，refno: {}, neg 载体数={}",
+        eprintln!(
+            "[bool][inst] 跳过布尔：未找到可用负实体 manifold，refno: {}, neg 载体数={}",
             query.refno,
             query.neg_ts.len()
         );
-
-        mark_bool_failed(query.refno).await?;
 
         return Ok(());
     }
@@ -1388,7 +1466,9 @@ async fn apply_boolean_for_query(
 
             let pos_local_mat = pos.trans.0.to_matrix().as_dmat4();
 
-            if let Ok(m) = load_manifold(&pos_mesh_id, pos_local_mat, true) {
+            if let Ok(m) =
+                load_manifold_with_db_param_fallback(&pos_mesh_id, pos_local_mat, true).await
+            {
                 pos_hi_manifolds.push(m);
             }
         }
@@ -1634,6 +1714,7 @@ pub struct BoolWorkerReport {
 enum TaskExecOutcome {
     Success,
     Failed,
+    Skipped(&'static str),
 }
 
 #[async_trait]
@@ -1777,9 +1858,8 @@ fn build_inst_relate_bool_upsert_sql(
     status: &str,
     source: &str,
 ) -> String {
-    let refno_str = refno.to_string();
-    let id_key = format!("inst_relate_bool:⟨{}⟩", refno_str);
-    let refno_key = format!("pe:⟨{}⟩", refno_str);
+    let id_key = model_refno_id("inst_relate_bool", refno);
+    let refno_key = refno.to_pe_key();
     let mesh_str = mesh_id
         .map(|m| format!("'{}'", m))
         .unwrap_or_else(|| "NONE".to_string());
@@ -1795,15 +1875,15 @@ fn build_cata_status_sql(
     source: &str,
 ) -> String {
     let refno_key = refno.to_pe_key();
+    let cata_bool_id = model_refno_id("inst_relate_cata_bool", refno);
     let mut sql =
         format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
-    sql.push_str(
-        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
-    );
+    sql.push_str(&format!("DELETE {cata_bool_id};"));
+    sql.push_str("IF $inst_info != NONE {");
     if let Some(mesh_id) = mesh_id {
         let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
         sql.push_str(&format!(
-            "INSERT RELATION INTO inst_relate_cata_bool [{{ in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
+            "INSERT RELATION INTO inst_relate_cata_bool [{{ id: {cata_bool_id}, in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
         ));
     }
     sql.push_str("};");
@@ -1860,13 +1940,10 @@ fn append_cata_update_sql(
         sql.push_str(&format!("create inst_geo:⟨{}⟩ set meshed = true;", mesh_id));
     }
 
-    let relation_id = refno.to_string();
+    let relation_id = geo_relate_id(refno, BOOL_CATE_POS_GEO_INDEX);
+    sql.push_str(&format!("DELETE {relation_id};"));
     sql.push_str(&format!(
-        "LET $old_geo_ids = SELECT VALUE id FROM {}->geo_relate WHERE geo_type = 'CatePos'; DELETE $old_geo_ids;",
-        inst_info_record,
-    ));
-    sql.push_str(&format!(
-        "INSERT RELATION INTO geo_relate {{ in: {}, id: '{rel_id}', out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
+        "INSERT RELATION INTO geo_relate {{ in: {}, id: {rel_id}, out: inst_geo:⟨{mesh_id}⟩, geom_refno: pe:⟨{geom_refno}⟩, geo_type: 'CatePos', trans: trans:⟨0⟩, visible: true }};",
         inst_info_record,
         rel_id = relation_id,
         mesh_id = mesh_id,
@@ -2092,7 +2169,7 @@ async fn process_inst_task(
     let mut pos_manifolds = Vec::new();
     for pos in &task.pos_geos {
         let pos_local_mat = pos.local_transform.to_matrix().as_dmat4();
-        match load_manifold(&pos.geo_hash, pos_local_mat, false) {
+        match load_manifold_with_db_param_fallback(&pos.geo_hash, pos_local_mat, false).await {
             Ok(manifold) => pos_manifolds.push(manifold),
             Err(e) => log_load_manifold_failed("inst_pos", refno, &pos.geo_hash, &e),
         }
@@ -2129,7 +2206,8 @@ async fn process_inst_task(
             let neg_world_mat = carrier_world_mat * geo_tf.to_matrix().as_dmat4();
             let relative_mat = inverse_pos_world * neg_world_mat;
 
-            match load_manifold(&neg_geo.geo_hash, relative_mat, true) {
+            match load_manifold_with_db_param_fallback(&neg_geo.geo_hash, relative_mat, true).await
+            {
                 Ok(manifold) => {
                     neg_manifolds.push(manifold.inflate_from_center(NEG_INFLATE_EPSILON_MM))
                 }
@@ -2138,8 +2216,11 @@ async fn process_inst_task(
         }
     }
     if neg_manifolds.is_empty() {
-        writer.write_inst_failed(refno).await?;
-        return Ok(TaskExecOutcome::Failed);
+        eprintln!(
+            "[bool][inst] 跳过布尔：没有可用负实体 manifold，refno={}",
+            refno
+        );
+        return Ok(TaskExecOutcome::Skipped("no_valid_neg_manifold"));
     }
 
     let mut final_manifold = subtract_neg_with_fallback(pos_manifold, &neg_manifolds);
@@ -2147,7 +2228,9 @@ async fn process_inst_task(
         let mut pos_hi_manifolds = Vec::new();
         for pos in &task.pos_geos {
             let pos_local_mat = pos.local_transform.to_matrix().as_dmat4();
-            if let Ok(m) = load_manifold(&pos.geo_hash, pos_local_mat, true) {
+            if let Ok(m) =
+                load_manifold_with_db_param_fallback(&pos.geo_hash, pos_local_mat, true).await
+            {
                 pos_hi_manifolds.push(m);
             }
         }
@@ -2202,7 +2285,7 @@ async fn batch_query_bool_success_refnos(
     for chunk in refnos.chunks(200) {
         let ids: Vec<String> = chunk
             .iter()
-            .map(|r| format!("inst_relate_bool:⟨{}⟩", r))
+            .map(|r| model_refno_id("inst_relate_bool", *r))
             .collect();
         let sql = format!(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
@@ -2223,7 +2306,7 @@ async fn batch_query_bool_success_refnos(
         // 同时查 cata_bool 表
         let cata_ids: Vec<String> = chunk
             .iter()
-            .map(|r| format!("inst_relate_cata_bool:⟨{}⟩", r))
+            .map(|r| model_refno_id("inst_relate_cata_bool", *r))
             .collect();
         let cata_sql = format!(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
@@ -2379,6 +2462,10 @@ pub async fn run_bool_worker_from_tasks(
                 }
                 Ok(TaskExecOutcome::Failed) => {
                     report.failed += 1;
+                }
+                Ok(TaskExecOutcome::Skipped(reason)) => {
+                    report.skipped += 1;
+                    *report.skip_reasons.entry(reason.to_string()).or_insert(0) += 1;
                 }
                 Err(e) => {
                     report.failed += 1;

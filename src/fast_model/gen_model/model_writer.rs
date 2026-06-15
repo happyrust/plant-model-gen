@@ -145,6 +145,7 @@ pub struct BooleanBridgeRequest {
     pub use_surrealdb: bool,
     pub defer_db_write: bool,
     pub enable_db_backfill: bool,
+    pub scope_refnos: Vec<RefnoEnum>,
     pub bool_tasks: Vec<BooleanTask>,
 }
 
@@ -452,7 +453,12 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         match request.mode {
             BooleanPipelineMode::DbLegacy => {
                 if request.use_surrealdb && !request.defer_db_write {
-                    run_boolean_worker(request.db_option, 100).await?;
+                    let scope_refnos = if request.scope_refnos.is_empty() {
+                        None
+                    } else {
+                        Some(request.scope_refnos.as_slice())
+                    };
+                    run_boolean_worker(request.db_option, 100, scope_refnos).await?;
                     Ok(BooleanBridgeReport {
                         total: 0,
                         success: 0,

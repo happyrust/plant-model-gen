@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::types::SurrealValue;
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
@@ -293,18 +294,19 @@ async fn query_tubi_relate_web(
     for owners_chunk in owner_refnos.chunks(50) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let pe_key = owner_refno.to_pe_key();
+            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
-                    id[0] as refno,
-                    id[1] as index,
+                    {owner_refno} as refno,
+                    id[3] as index,
                     in as leave,
                     record::id(world_trans) as world_trans_hash,
                     record::id(geo) as geo_hash,
                     spec_value
-                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                FROM {tubi_range};
                 "#,
+                owner_refno = owner_refno.to_pe_key()
             ));
         }
 

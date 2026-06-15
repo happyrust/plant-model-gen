@@ -1728,6 +1728,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prim_noun_names_include_datum_marker_nouns() {
+        let nouns = prim_noun_names();
+
+        assert!(nouns.contains(&"JLDATU"));
+        assert!(nouns.contains(&"PLDATU"));
+    }
+
+    #[test]
     fn test_validate_sjus_map_empty_warning() {
         let sjus_map = DashMap::new();
         let config = IndexTreeConfig::default();

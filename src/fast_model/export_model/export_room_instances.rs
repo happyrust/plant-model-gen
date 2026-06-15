@@ -23,6 +23,8 @@ use serde_json::json;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 use tracing::{debug, info, warn};
 
+use crate::fast_model::gen_model::model_record_id::model_refno_id;
+
 /// Shared JSON fixture contract for post-compute room validation.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RoomComputeValidationFixture {
@@ -269,7 +271,7 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
                 WHERE id = type::record('pe_transform', record::id(in))
                 LIMIT 1
             )[0] as world_trans,
-            type::record('inst_relate_aabb', record::id(in)).aabb_id.d as world_aabb
+            type::record('inst_relate_aabb', record::id(id)).aabb_id.d as world_aabb
         FROM [{}]->inst_relate
         "#,
         pe_list
@@ -288,25 +290,45 @@ async fn query_core_snapshot_aabbs(refnos: &[RefnoEnum]) -> Result<Vec<CoreRoomA
 
     let mut records = Vec::new();
     for chunk in refnos.chunks(BATCH_SIZE) {
-        let pe_keys = chunk.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>();
-        let pe_list = pe_keys.join(",");
+        let aabb_ids = chunk
+            .iter()
+            .map(|r| model_refno_id("inst_relate_aabb", *r))
+            .collect::<Vec<_>>();
+        let booled_aabb_ids = chunk
+            .iter()
+            .map(|r| model_refno_id("inst_relate_booled_aabb", *r))
+            .collect::<Vec<_>>();
+        let aabb_list = aabb_ids.join(",");
+        let booled_aabb_list = booled_aabb_ids.join(",");
         let sql = format!(
             r#"
             SELECT
-                id as refno,
-                type::record('inst_relate_booled_aabb', record::id(id)).aabb_id.d
-                    ?? type::record('inst_relate_aabb', record::id(id)).aabb_id.d
-                    ?? type::record('inst_relate_agg_aabb', record::id(id)).aabb_id.d
-                    as world_aabb
-            FROM [{pe_list}]
+                refno,
+                aabb_id.d as world_aabb
+            FROM [{booled_aabb_list}]
+            WHERE aabb_id != NONE;
+            SELECT
+                refno,
+                aabb_id.d as world_aabb
+            FROM [{aabb_list}]
+            WHERE aabb_id != NONE;
             "#
         );
-        let rows: Vec<CoreSnapshotAabbQueryRow> = model_primary_db()
-            .query_take(&sql, 0)
+        let mut resp = model_primary_db()
+            .query_response(&sql)
             .await
             .with_context(|| "查询 core room snapshot AABB 失败")?;
+        let mut rows: Vec<CoreSnapshotAabbQueryRow> = resp.take(0).unwrap_or_default();
+        rows.extend(
+            resp.take::<Vec<CoreSnapshotAabbQueryRow>>(1)
+                .unwrap_or_default(),
+        );
 
+        let mut seen = std::collections::HashSet::new();
         for row in rows {
+            if !seen.insert(row.refno.refno()) {
+                continue;
+            }
             let Some(plant_aabb) = row.world_aabb else {
                 continue;
             };

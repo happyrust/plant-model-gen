@@ -458,7 +458,7 @@ pub async fn export_instanced_bundle_for_refnos(
                           WHERE id = type::record('pe_transform', record::id(in)) 
                           LIMIT 1
                          )[0] != NONE 
-                     AND record::exists(type::record('inst_relate_aabb', record::id(in)))
+                     AND record::exists(type::record('inst_relate_aabb', record::id(id)))
                    GROUP ALL;"#,
                 pe_list
             );
@@ -491,7 +491,7 @@ pub async fn export_instanced_bundle_for_refnos(
                         WHERE id = type::record('pe_transform', record::id(in)) 
                         LIMIT 1
                        )[0] as world_trans,
-                       record::exists(type::record('inst_relate_aabb', record::id(in))) as has_aabb
+                       record::exists(type::record('inst_relate_aabb', record::id(id))) as has_aabb
                    FROM [{}]->inst_relate
                    LIMIT 5;"#,
                 pe_list

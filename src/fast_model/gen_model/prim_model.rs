@@ -253,6 +253,25 @@ fn apply_template_inst_adjustments(attr: &NamedAttrMap, inst: &mut EleInstGeo) {
     }
 }
 
+fn template_pyra_rotation_from_ori(attr: &NamedAttrMap) -> Option<f32> {
+    let ori = attr.get_as_string("ORI")?.to_ascii_uppercase();
+    if !ori.contains("Z IS U") {
+        return None;
+    }
+
+    if ori.contains("Y IS N") {
+        Some(0.0)
+    } else if ori.contains("Y IS E") {
+        Some(90.0)
+    } else if ori.contains("Y IS S") {
+        Some(180.0)
+    } else if ori.contains("Y IS W") {
+        Some(-90.0)
+    } else {
+        None
+    }
+}
+
 fn attr_refno(attr: &NamedAttrMap, key: &str) -> Option<RefnoEnum> {
     match attr.map.get(key)? {
         NamedAttrValue::RefU64Type(value) => Some(RefnoEnum::Refno(*value)),
@@ -265,6 +284,39 @@ async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAt
     if cur_type != "PYRA" {
         return;
     }
+    if let Some(rotation_deg) = template_pyra_rotation_from_ori(attr) {
+        set_template_adjustment(attr, "_AIOS_TEMPLATE_ROT_Z", rotation_deg);
+        return;
+    }
+
+    let current_refno = attr
+        .get_refno_or_default()
+        .is_valid()
+        .then(|| attr.get_refno_or_default());
+    let owner_refno = attr.get_owner();
+    if owner_refno.is_valid() {
+        let siblings = crate::fast_model::query_provider::get_children(owner_refno)
+            .await
+            .unwrap_or_default();
+        let mut same_type = Vec::new();
+        for sibling in siblings {
+            let sibling_type = aios_core::get_type_name(sibling).await.unwrap_or_default();
+            if sibling_type == cur_type {
+                same_type.push(sibling);
+            }
+        }
+        if let Some(current_refno) = current_refno {
+            if let Some(index) = same_type
+                .iter()
+                .position(|candidate| *candidate == current_refno)
+            {
+                let rotation_deg = if index % 2 == 0 { 0.0 } else { 90.0 };
+                set_template_adjustment(attr, "_AIOS_TEMPLATE_ROT_Z", rotation_deg);
+                return;
+            }
+        }
+    }
+
     let Some(origin_refno) = attr_refno(attr, "ORRF") else {
         return;
     };

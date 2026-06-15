@@ -67,6 +67,8 @@ use serde_json::json;
 
 use sha2::{Digest, Sha256};
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+
 use crate::fast_model::export_model::export_common::{ExportData, TubiRecord, collect_export_data};
 
 use crate::fast_model::export_model::export_unit_mesh_glb::{
@@ -2372,7 +2374,7 @@ pub async fn export_all_relates_prepack_lod(
     // 4. 再次扫描 inst_relate，收集需要导出的实体（不按 owner_type 过滤，仅排除 EQUI）
 
     let sql_all = format!(
-        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
+        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(id)))",
         db_filter
     );
     let mut query = aios_core::model_primary_db()
@@ -2672,7 +2674,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
     let equi_set: HashSet<RefnoEnum> = equi_refnos.into_iter().collect();
 
     let sql_all = format!(
-        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(in)))",
+        "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(id)))",
         db_filter
     );
     let mut query = aios_core::model_primary_db()
@@ -3871,20 +3873,21 @@ pub async fn export_dbnum_instances_json(
             let mut sql_batch = String::new();
 
             for owner_refno in owners_chunk {
-                let pe_key = owner_refno.to_pe_key();
+                let owner_key = owner_refno.to_pe_key();
+                let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
 
                 sql_batch.push_str(&format!(
                     r#"
 
                     SELECT
 
-                        id[0] as refno,
+                        {owner_key} as refno,
 
-                        id[1] as index,
+                        id[3] as index,
 
                         in as leave,
 
-                        id[0].owner.noun as generic,
+                        {owner_key}.owner.noun as generic,
 
                         aabb.d as world_aabb,
 
@@ -3896,11 +3899,11 @@ pub async fn export_dbnum_instances_json(
 
                         record::id(geo) as geo_hash,
 
-                        id[0].dt as date,
+                        {owner_key}.dt as date,
 
                         spec_value
 
-                    FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                    FROM {tubi_range};
 
                     "#,
                 ));

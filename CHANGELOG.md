@@ -2,6 +2,29 @@
 
 ## 2026-06-15
 
+### Added — 模型产物版本化 array record id（versioned-model-record-id）
+
+> 将 `inst_relate`、`geo_relate`、`tubi_relate` 等模型产物表迁移到 SurrealDB 3.1 range-friendly array record id，以 `sesno` 作为版本维度，支持同一 `pe` 下 current 与历史模型数据并存、可查询、可按 range cleanup。
+
+- 新增 `model_record_id.rs`：统一生成 `inst_relate:[ref0,ref1,sesno]`、`geo_relate:[ref0,ref1,sesno,geo_index]`、`neg_relate/ngmr_relate`（target-owned 八元组）、`tubi_relate:[ref0,ref1,sesno,index]`，以及 `model_ref0_range` / `model_refno_range` / `model_refno_sesno_range`；`geo_relate_id_for_inst` 对 `inst_info` 哈希做 i64 安全掩码，避免 SurrealDB 数组 id 溢出。
+- CLI 新增 `model-record-id-verify`（`--refno` + 可选 `--sesno` + `--json`），输出各表 ID 样例、range 与 cleanup 证据，供重构验收。
+- `pdms_inst.rs` 在线写入全链路改用版本化 ID；`geo_relate` 不再以 `gen_string_hash(relate_json)` 作主键；`neg_relate/ngmr_relate` 保存完整 `geo_relate` record id 并通过 helper 生成自身 ID。
+- `inst_query.rs`、导出模块（parquet/v3/web/prepack_lod/room/rvm_semantic_debug/instanced_bundle/glb）、`manifold_bool.rs`、`utils.rs`、`pdms_inst_surreal.rs`、`model_writer.rs`、`cli_modes.rs`、`room_model.rs` 等查询与写入对齐新 ID 契约；`tubi_relate` 查询改为 `[ref0,ref1,sesno,index]` 四维 id。
+- `resource/surreal/common.surql`：`inst_relate_aabb` / `inst_relate_booled_aabb` 去掉 `refno` 唯一索引以允许多 `sesno`；`fn::query_bran_first_tubi` 改为从 `pe->tubi_relate` 取首条，不再硬编码 `tubi_relate:[pe,0]`。
+- `goals/versioned-model-record-id/` 记录目标、事实与实施计划；`specs/013-bran-scoped-generation/` 定义 BRAN scoped 快速测试规格（草稿）。
+
+### Changed — RVM ATT 导入、MBD 成员发现与 mesh 存在性检查
+
+- `rvm_import.rs`：ATT 索引结构增强，导入统计增加 section 匹配/重复/未匹配计数；`--import-rvm` 无显式 ATT 时自动发现同名 `.att.txt`。
+- `mdb_candidates.rs`：MBD 成员 DB 改为从 SYST children 关系枚举，不再依赖 `CURD` 属性向量。
+- `mesh_state.rs`：`mesh_exists` / `get_cached_or_local_aabb_in_dir` 先校验 lod GLB 文件是否存在，避免仅有内存缓存条目时误判已 meshed。
+
+### Fixed — NOZZ 管嘴端点、模板 PRIM 与 datum marker
+
+- `cata_model.rs`：按 BRAN 端点查询 NOZZ 分支几何（位置/方向/bore），修复管嘴与分支衔接求解。
+- `prim_model.rs`：PYRA 模板按 `ORI` 含 `Z IS U` 补旋转；datum marker 写入链扩展。
+- `index_tree_mode.rs`：将 `JLDATU/PLDATU` 纳入 PRIM noun 发现集合（单测覆盖）。
+
 ### Added — SQLite 空间最近净距查询接口
 
 > 新增 `/api/sqlite-spatial/nearest-clearance`，用于按源 refno、坐标点或 BRAN 中心线走廊查询到墙/柱等目标构件的最近 AABB 净距。

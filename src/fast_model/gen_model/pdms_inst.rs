@@ -26,6 +26,10 @@ use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
+use super::model_record_id::{
+    geo_relate_id, geo_relate_id_for_inst, model_refno_id, model_refno_sesno_range, neg_relate_id,
+    ngmr_relate_id,
+};
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
 use crate::fast_model::shared::aabb_apply_transform;
@@ -205,7 +209,7 @@ async fn delete_boolean_relations_by_carriers(
 ///
 /// 典型症状：
 /// - 当前轮生成/关系扫描显示 neg/ngmr=0（不会触发布尔 worker），
-/// - 但 `inst_relate_bool:⟨refno⟩` 仍残留 status=Success，导致导出优先使用旧的 booled mesh，
+/// - 但旧 `inst_relate_bool` 仍残留 status=Success，导致导出优先使用旧的 booled mesh，
 ///   表现为模型出现莫名缺口/截面不对。
 async fn delete_inst_relate_bool_records(
     refnos: &[RefnoEnum],
@@ -226,7 +230,7 @@ async fn delete_inst_relate_bool_records(
 /// 典型症状：
 /// - BRAN/HANG 重新生成后，新世界坐标直段已写入；
 /// - 但旧的局部坐标 tubi_relate 仍残留在同一 branch range 下；
-/// - 导出阶段按 `tubi_relate:[bran,0]..[bran,..]` 全量读取时，会把新旧两套直段一起带出。
+/// - 导出阶段按 BRAN/sesno 前缀全量读取时，会把新旧两套直段一起带出。
 pub(crate) async fn delete_tubi_relate_by_branch_refnos(
     branch_refnos: &[RefnoEnum],
     chunk_size: usize,
@@ -253,7 +257,7 @@ fn build_delete_inst_relate_bool_records_sql(
     for chunk in refnos.chunks(chunk_size.max(1)) {
         let bool_ids = chunk
             .iter()
-            .map(|r| format!("inst_relate_bool:⟨{}⟩", r))
+            .map(|r| model_refno_id("inst_relate_bool", *r))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -275,14 +279,34 @@ fn build_delete_tubi_relate_by_branch_refnos_sql(
     for chunk in branch_refnos.chunks(chunk_size.max(1)) {
         let mut statements = Vec::with_capacity(chunk.len());
         for branch_refno in chunk {
-            let pe_key = branch_refno.to_pe_key();
             statements.push(format!(
-                "LET $ids = SELECT VALUE id FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]; DELETE $ids;"
+                "LET $ids = SELECT VALUE id FROM {}; DELETE $ids;",
+                model_refno_sesno_range("tubi_relate", *branch_refno)
             ));
         }
         out.push(statements.join("\n"));
     }
     out
+}
+
+fn build_delete_model_records_by_refno_sql(refno: RefnoEnum) -> String {
+    let mut sql = String::new();
+    for table in [
+        "inst_relate",
+        "inst_relate_aabb",
+        "inst_relate_bool",
+        "inst_relate_cata_bool",
+        "refno_relations",
+    ] {
+        sql.push_str(&format!("DELETE {};\n", model_refno_id(table, refno)));
+    }
+    for table in ["neg_relate", "ngmr_relate", "geo_relate"] {
+        let range = model_refno_sesno_range(table, refno);
+        sql.push_str(&format!(
+            "LET $ids = SELECT VALUE id FROM {range}; DELETE $ids;\n"
+        ));
+    }
+    sql
 }
 
 #[cfg(test)]
@@ -307,8 +331,7 @@ mod tests {
         let sqls = build_delete_tubi_relate_by_branch_refnos_sql(&refnos, 100);
         assert_eq!(sqls.len(), 1);
         for refno in refnos {
-            let pe_key = refno.to_pe_key();
-            assert!(sqls[0].contains(&format!("tubi_relate:[{pe_key}, 0]..[{pe_key}, ..]")));
+            assert!(sqls[0].contains(&model_refno_sesno_range("tubi_relate", refno)));
         }
     }
 
@@ -370,36 +393,23 @@ fn parse_inst_geo_hash(raw: &str) -> Option<u64> {
 fn build_delete_inst_relate_by_in_sql(
     refnos: &[RefnoEnum],
     chunk_size: usize,
-    dbnum: Option<u32>,
+    _dbnum: Option<u32>,
 ) -> Vec<String> {
     if refnos.is_empty() {
         return Vec::new();
     }
     let mut sqls = Vec::new();
     for chunk in refnos.chunks(chunk_size.max(1)) {
-        let in_keys = chunk
-            .iter()
-            .map(|r| r.to_pe_key())
-            .collect::<Vec<_>>()
-            .join(",");
         let relation_ids = chunk
             .iter()
-            .map(|r| r.to_inst_relate_key())
+            .map(|r| model_refno_id("inst_relate", *r))
             .collect::<Vec<_>>();
         let delete_by_id_sql = relation_ids
             .iter()
             .map(|id| format!("DELETE {id};"))
             .collect::<Vec<_>>()
             .join("\n");
-        if let Some(dbnum) = dbnum {
-            sqls.push(format!(
-                "{delete_by_id_sql}\nLET $ids = SELECT VALUE id FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{in_keys}];\nDELETE $ids;"
-            ));
-        } else {
-            sqls.push(format!(
-                "{delete_by_id_sql}\nLET $ids = SELECT VALUE id FROM [{in_keys}]->inst_relate;\nDELETE $ids;"
-            ));
-        }
+        sqls.push(delete_by_id_sql);
     }
     sqls
 }
@@ -555,12 +565,15 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     const CHUNK_SIZE: usize = 200;
 
     // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
-    let all_refnos =
-        aios_core::collect_descendant_filter_ids_with_self(seed_refnos, &[], None, true).await?;
-    let bran_refnos = aios_core::collect_descendant_filter_ids_with_self(
+    let all_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
+        seed_refnos,
+        &[],
+        true,
+    )
+    .await?;
+    let bran_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
         seed_refnos,
         &["BRAN", "HANG"],
-        None,
         true,
     )
     .await?;
@@ -578,20 +591,8 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     let t = std::time::Instant::now();
 
-    let refno_dbnum_map = query_refno_dbnum_map(&all_refnos, CHUNK_SIZE).await;
-    let mut refnos_by_dbnum: HashMap<u32, Vec<RefnoEnum>> = HashMap::new();
-    for &refno in &all_refnos {
-        let dbnum = *refno_dbnum_map.get(&refno).unwrap_or(&0);
-        refnos_by_dbnum.entry(dbnum).or_default().push(refno);
-    }
-    println!(
-        "[pre_cleanup_for_regen] dbnum 分组完成: groups={}",
-        refnos_by_dbnum.len()
-    );
-
-    // 2. 降级使用分批高并发扫描删除 (Legacy 模式)
-
-    // 限制最大并发数，以防止对单一 SurrealDB 底层施加过大连接压力
+    // 使用 SurrealDB 3.1 array record id range 作为模型产物主清理路径。
+    // inst_geo 不是 range-id 模型产物表，因此先从待删 geo_relate.out 收集 hash，再跳过内置 hash < 10 删除。
     use futures::stream::{self, StreamExt};
     let limit_concurrency =
         if get_db_option().effective_surrealdb().mode == aios_core::options::DbConnMode::Ws {
@@ -600,46 +601,42 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
             16
         };
 
-    let mut chunks: Vec<(u32, Vec<RefnoEnum>)> = Vec::new();
-    for (dbnum, refs) in refnos_by_dbnum {
-        for chunk in refs.chunks(CHUNK_SIZE) {
-            chunks.push((dbnum, chunk.to_vec()));
-        }
-    }
+    let chunks = all_refnos
+        .chunks(CHUNK_SIZE)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
     let mut chunk_stream = stream::iter(chunks)
-        .map(|(dbnum, chunk_vec)| {
+        .map(|chunk_vec| {
             tokio::spawn(async move {
-                let pe_keys = chunk_vec.iter().map(|r| r.to_pe_key()).collect::<Vec<_>>().join(",");
+                let mut cleanup_sql = String::new();
+                let mut geo_query_sql = String::new();
+                for refno in &chunk_vec {
+                    let geo_range = model_refno_sesno_range("geo_relate", *refno);
+                    geo_query_sql
+                        .push_str(&format!("SELECT VALUE record::id(out) FROM {geo_range};\n"));
+                    cleanup_sql.push_str(&build_delete_model_records_by_refno_sql(*refno));
+                }
 
-                // 步骤 a: 获取关联的 geo_relate -> inst_geo (如果需要删除的话)
-                let sql = format!(
-                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{pe_keys}];\
-                     SELECT VALUE record::id(out) FROM geo_relate WHERE in IN $inst_ids;"
-                );
+                let mut geo_hashes = Vec::new();
+                if !geo_query_sql.trim().is_empty() {
+                    let mut resp = model_primary_db().query_response(&geo_query_sql).await?;
+                    for stmt_idx in 0..chunk_vec.len() {
+                        let rows: Vec<String> = resp.take(stmt_idx).unwrap_or_default();
+                        geo_hashes.extend(rows);
+                    }
+                }
 
-                let geo_hashes: Vec<String> = model_primary_db()
-                    .query_take(&sql, 1)
-                    .await
-                    .unwrap_or_default();
-
-                let hashes: Vec<u64> = geo_hashes
+                let hashes = geo_hashes
                     .iter()
                     .filter_map(|s| parse_inst_geo_hash(s))
-                    .collect();
-
+                    .collect::<Vec<_>>();
                 if !hashes.is_empty() {
                     let _ = delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await;
                 }
 
-                // 步骤 b: 删除 geo_relate
-                let sql_relate = format!(
-                    "LET $inst_ids = SELECT VALUE out FROM inst_relate WHERE dbnum = {dbnum} AND in IN [{pe_keys}];\
-                     DELETE FROM geo_relate WHERE in IN $inst_ids;"
-                );
-                let _ = model_query_response(&sql_relate).await;
-
-                // 步骤 c: 删除 inst_relate
-                let _ = delete_inst_relate_by_in_with_dbnum(&chunk_vec, CHUNK_SIZE, dbnum).await;
+                if !cleanup_sql.trim().is_empty() {
+                    let _ = model_query_response(&cleanup_sql).await;
+                }
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -648,29 +645,8 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
     while let Some(res) = chunk_stream.next().await {
         match res {
-            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] chunk 处理失败返回: {}", e),
-            Err(e) => eprintln!("[pre_cleanup_for_regen] chunk tokio 任务崩溃: {}", e),
-            _ => {}
-        }
-    }
-
-    // 处理独立的记录（bool 记录、负实体关系等）
-    let bool_sqls = build_delete_inst_relate_bool_records_sql(&all_refnos, CHUNK_SIZE);
-    let neg_sqls = build_delete_boolean_relations_by_carriers_sql(&all_refnos, CHUNK_SIZE);
-
-    let mut misc_stream = stream::iter(bool_sqls.into_iter().chain(neg_sqls.into_iter()))
-        .map(|sql| {
-            tokio::spawn(async move {
-                let _ = model_query_response(&sql).await;
-                Ok::<(), anyhow::Error>(())
-            })
-        })
-        .buffer_unordered(limit_concurrency);
-
-    while let Some(res) = misc_stream.next().await {
-        match res {
-            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] misc 独立处理失败: {}", e),
-            Err(e) => eprintln!("[pre_cleanup_for_regen] misc tokio 任务崩溃: {}", e),
+            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] range chunk 处理失败返回: {}", e),
+            Err(e) => eprintln!("[pre_cleanup_for_regen] range chunk tokio 任务崩溃: {}", e),
             _ => {}
         }
     }
@@ -680,7 +656,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     }
 
     println!(
-        "[pre_cleanup_for_regen] 清理完成 (Legacy 并发模式)，耗时 {} ms",
+        "[pre_cleanup_for_regen] 清理完成 (array record-id range 模式)，耗时 {} ms",
         t.elapsed().as_millis()
     );
 
@@ -719,6 +695,25 @@ pub async fn save_instance_data_with_options(
     )
     .await?;
     Ok(())
+}
+
+fn build_inst_key_carrier_map(
+    inst_mgr: &ShapeInstancesData,
+) -> HashMap<String, Vec<(RefnoEnum, String)>> {
+    let mut carriers_by_inst_key: HashMap<String, Vec<(RefnoEnum, String)>> = HashMap::new();
+    for (refno, info) in &inst_mgr.inst_info_map {
+        carriers_by_inst_key
+            .entry(info.get_inst_key())
+            .or_default()
+            .push((*refno, info.id_str()));
+    }
+
+    for carriers in carriers_by_inst_key.values_mut() {
+        carriers.sort_unstable_by_key(|(refno, _)| *refno);
+        carriers.dedup_by_key(|(refno, _)| *refno);
+    }
+
+    carriers_by_inst_key
 }
 
 pub async fn save_instance_data_with_report(
@@ -794,12 +789,14 @@ pub async fn save_instance_data_with_report(
     let mut vec3_map: HashMap<u64, String> = HashMap::new();
 
     // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
-    // neg_geo_by_carrier: key=carrier_refno -> value=Vec<geo_relate_id>
+    // neg_geo_by_carrier: key=carrier_refno -> value=Vec<(geo_index, geo_relate_id)>
     //   用于 neg_relate: 通过负实体 refno 找到其所有 Neg 类型的 geo_relate
-    // cata_cross_neg_geo_map: key=(carrier_refno, geom_refno) -> value=Vec<geo_relate_id>
+    // cata_cross_neg_geo_map: key=(carrier_refno, geom_refno) -> value=Vec<(geo_index, geo_relate_id)>
     //   用于 ngmr_relate: 通过 (负载体, ngmr_geom_refno) 找到对应的 CataCrossNeg geo_relate
-    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
-    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
+    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<(usize, String)>> = HashMap::new();
+    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<(usize, String)>> =
+        HashMap::new();
+    let inst_key_carriers = build_inst_key_carrier_map(inst_mgr);
 
     // inst_geo & geo_relate
     let mut geo_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
@@ -807,7 +804,7 @@ pub async fn save_instance_data_with_report(
     let mut geo_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
     for inst_geo_data in inst_mgr.inst_geos_map.values() {
-        for inst in &inst_geo_data.insts {
+        for (geo_index, inst) in inst_geo_data.insts.iter().enumerate() {
             if inst.geo_transform.translation.is_nan()
                 || inst.geo_transform.rotation.is_nan()
                 || inst.geo_transform.scale.is_nan()
@@ -844,41 +841,52 @@ pub async fn save_instance_data_with_report(
                 String::new()
             };
 
-            let relate_json = format!(
-                r#"in: inst_info:⟨{0}⟩, out: inst_geo:⟨{1}⟩, trans: trans:⟨{2}⟩, geom_refno: pe:{3}, pts: [{4}], geo_type: '{5}', visible: {6} {7}"#,
-                inst_geo_data.id(),
-                inst.geo_hash,
-                transform_hash,
-                inst.refno,
-                pt_hashes.join(","),
-                inst.geo_type.to_string(),
-                inst.visible,
-                cat_negs_str
-            );
-            let relate_id = gen_string_hash(&relate_json);
-            geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
-            // 收集 Neg 和 CataCrossNeg 类型的 geo_relate 映射
-            // carrier_refno: 拥有这个 geo_relate 的实体
-            // geom_refno: inst.refno (geo_relate 中的 geom_refno 字段)
             use aios_core::geometry::GeoBasicType;
-            let carrier_refno = inst_geo_data.refno;
             let geom_refno = inst.refno;
-            match inst.geo_type {
-                GeoBasicType::Neg => {
-                    // neg_relate: 按 carrier_refno 收集所有 Neg geo_relate
-                    neg_geo_by_carrier
-                        .entry(carrier_refno)
-                        .or_insert_with(Vec::new)
-                        .push(relate_id);
+            let carriers = inst_key_carriers
+                .get(&inst_geo_data.id())
+                .cloned()
+                .unwrap_or_else(|| vec![(inst_geo_data.refno, inst_geo_data.id())]);
+            for (carrier_refno, inst_info_id) in carriers {
+                let relate_id = geo_relate_id_for_inst(carrier_refno, geo_index, &inst_info_id);
+                let relate_json = format!(
+                    r#"in: inst_info:⟨{0}⟩, out: inst_geo:⟨{1}⟩, trans: trans:⟨{2}⟩, geom_refno: pe:{3}, pts: [{4}], geo_type: '{5}', visible: {6} {7}"#,
+                    inst_info_id,
+                    inst.geo_hash,
+                    transform_hash,
+                    inst.refno,
+                    pt_hashes.join(","),
+                    inst.geo_type.to_string(),
+                    inst.visible,
+                    cat_negs_str
+                );
+                geo_relate_buffer.push(format!("{{ {relate_json}, id: {relate_id} }}"));
+                match inst.geo_type {
+                    GeoBasicType::Neg => {
+                        // neg_relate: 按 carrier_refno 收集所有 Neg geo_relate
+                        neg_geo_by_carrier
+                            .entry(carrier_refno)
+                            .or_insert_with(Vec::new)
+                            .push((geo_index, relate_id));
+                    }
+                    GeoBasicType::CataCrossNeg => {
+                        // ngmr_relate: 按 (carrier_refno, geom_refno) 收集 CataCrossNeg geo_relate
+                        cata_cross_neg_geo_map
+                            .entry((carrier_refno, geom_refno))
+                            .or_insert_with(Vec::new)
+                            .push((geo_index, relate_id));
+                    }
+                    _ => {}
                 }
-                GeoBasicType::CataCrossNeg => {
-                    // ngmr_relate: 按 (carrier_refno, geom_refno) 收集 CataCrossNeg geo_relate
-                    cata_cross_neg_geo_map
-                        .entry((carrier_refno, geom_refno))
-                        .or_insert_with(Vec::new)
-                        .push(relate_id);
+
+                if geo_relate_buffer.len() >= CHUNK_SIZE {
+                    let statement = format!(
+                        "INSERT RELATION IGNORE INTO geo_relate [{}];",
+                        geo_relate_buffer.join(",")
+                    );
+                    geo_batcher.push(statement).await?;
+                    geo_relate_buffer.clear();
                 }
-                _ => {}
             }
 
             inst_geo_buffer.push(inst.gen_unit_geo_sur_json());
@@ -891,15 +899,6 @@ pub async fn save_instance_data_with_report(
                 );
                 geo_batcher.push(statement).await?;
                 inst_geo_buffer.clear();
-            }
-
-            if geo_relate_buffer.len() >= CHUNK_SIZE {
-                let statement = format!(
-                    "INSERT RELATION IGNORE INTO geo_relate [{}];",
-                    geo_relate_buffer.join(",")
-                );
-                geo_batcher.push(statement).await?;
-                geo_relate_buffer.clear();
             }
         }
     }
@@ -963,45 +962,39 @@ pub async fn save_instance_data_with_report(
             }
         }
         if !missing_carriers.is_empty() {
-            let carrier_list = missing_carriers
-                .iter()
-                .map(|r| r.to_pe_key())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                r#"SELECT
-                    record::id(geom_refno) AS carrier,
-                    record::id(id) AS gr_id
-                FROM geo_relate
-                WHERE geo_type IN ['Neg', 'CataNeg']
-                  AND geom_refno IN [{carrier_list}]"#
-            );
-            let mut resp = model_primary_db().query_response(&sql).await?;
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+            const NEG_RECONCILE_RANGE_QUERY_CHUNK: usize = 16;
+            let mut missing_carriers_vec = missing_carriers.iter().copied().collect::<Vec<_>>();
+            missing_carriers_vec.sort_unstable();
             let mut loaded = 0usize;
-            for row in rows {
-                let carrier = row
-                    .get("carrier")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let gr_id = row
-                    .get("gr_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if carrier.is_empty() || gr_id.is_empty() {
-                    continue;
+
+            for carrier_chunk in missing_carriers_vec.chunks(NEG_RECONCILE_RANGE_QUERY_CHUNK) {
+                let sql = carrier_chunk
+                    .iter()
+                    .map(|carrier_refno| {
+                        let range = model_refno_sesno_range("geo_relate", *carrier_refno);
+                        format!(
+                            "SELECT id AS gr_id FROM {range} WHERE geo_type IN ['Neg', 'CataNeg'];"
+                        )
+                    })
+                    .join("\n");
+                let mut resp = model_primary_db().query_response(&sql).await?;
+                for (query_idx, carrier_refno) in carrier_chunk.iter().enumerate() {
+                    let rows: Vec<serde_json::Value> = resp.take(query_idx).unwrap_or_default();
+                    for row in rows {
+                        let gr_id = row
+                            .get("gr_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if gr_id.is_empty() {
+                            continue;
+                        }
+                        neg_geo_by_carrier
+                            .entry(*carrier_refno)
+                            .or_insert_with(Vec::new)
+                            .push((0, gr_id.to_string()));
+                        loaded += 1;
+                    }
                 }
-                let Ok(carrier_refno) = carrier.parse::<RefnoEnum>() else {
-                    continue;
-                };
-                let Ok(gr_id_u64) = gr_id.parse::<u64>() else {
-                    continue;
-                };
-                neg_geo_by_carrier
-                    .entry(carrier_refno)
-                    .or_insert_with(Vec::new)
-                    .push(gr_id_u64);
-                loaded += 1;
             }
             debug_model_debug!(
                 "neg_relate DB回查: missing_carriers={}, loaded_geo_relate_ids={}",
@@ -1020,17 +1013,19 @@ pub async fn save_instance_data_with_report(
         let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
         for (target, neg_refnos) in &inst_mgr.neg_relate_map {
-            let target_inst = format!("inst_relate:⟨{}⟩", target);
             for neg_refno in neg_refnos.iter() {
                 // 首先尝试从当前 batch 的 neg_geo_by_carrier 查找
                 if let Some(geo_relate_ids) = neg_geo_by_carrier.get(neg_refno) {
-                    for geo_relate_id in geo_relate_ids.iter() {
-                        // ID 简化：[geo_relate_id, target_pe] 唯一确定一条关系
+                    for (relation_index, (geo_index, geo_relate_id)) in
+                        geo_relate_ids.iter().enumerate()
+                    {
+                        let neg_id = neg_relate_id(*target, *neg_refno, *geo_index, relation_index);
                         neg_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
+                            "{{ in: {0}, id: {3}, out: {2}, pe: {1} }}",
                             geo_relate_id,         // 切割几何
                             neg_refno.to_pe_key(), // 负载体
                             target.to_pe_key(),    // 正实体（被减实体）
+                            neg_id,
                         ));
                         if should_debug_neg_write(neg_refno, target) {
                             println!(
@@ -1118,22 +1113,25 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         let mut ngmr_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
         for (target_k, refnos) in &inst_mgr.ngmr_neg_relate_map {
-            let target_pe = target_k.to_pe_key();
-            let target_inst = format!("inst_relate:⟨{}⟩", target_k);
             for (ele_refno, ngmr_geom_refno) in refnos {
                 // 查找该 (负载体, ngmr_geom_refno) 的 CataCrossNeg geo_relate
                 let key = (*ele_refno, *ngmr_geom_refno);
                 if let Some(geo_relate_ids) = cata_cross_neg_geo_map.get(&key) {
-                    for geo_relate_id in geo_relate_ids.iter() {
+                    for (relation_index, (geo_index, geo_relate_id)) in
+                        geo_relate_ids.iter().enumerate()
+                    {
                         let ele_pe = ele_refno.to_pe_key();
+                        let target_pe = target_k.to_pe_key();
                         let ngmr_pe = ngmr_geom_refno.to_pe_key();
-                        // ID 简化：[geo_relate_id, target_pe] 唯一确定一条关系
+                        let ngmr_id =
+                            ngmr_relate_id(*target_k, *ele_refno, *geo_index, relation_index);
                         ngmr_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
-                            geo_relate_id,  // 切割几何
-                            ele_pe,         // 负载体
-                            target_pe,      // 正实体（目标）
-                            ngmr_pe         // NGMR 几何引用
+                            "{{ in: {0}, id: {4}, out: {2}, pe: {1}, ngmr: {3} }}",
+                            geo_relate_id, // 切割几何
+                            ele_pe,        // 负载体
+                            target_pe,     // 正实体（目标）
+                            ngmr_pe,       // NGMR 几何引用
+                            ngmr_id
                         ));
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             let statement = if replace_exist {
@@ -1224,12 +1222,12 @@ FROM neg_relate WHERE out = {} AND pe = {}",
 
             let aabb_row_sql = format!(
                 "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                model_refno_id("inst_relate_aabb", *key),
                 key.to_pe_key(),
                 aabb_hash
             );
             inst_relate_aabb_buffer.push(aabb_row_sql);
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(model_refno_id("inst_relate_aabb", *key));
         }
 
         // inst_relate 不再保存 world_trans；世界变换统一从 pe_transform 获取。
@@ -1241,7 +1239,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         let dt = inst_relate_precomputed.dt(key);
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: {4}, has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
-            key.to_inst_relate_key(),
+            model_refno_id("inst_relate", *key),
             key.to_pe_key(),
             info.id_str(),
             dbnum,
@@ -1678,11 +1676,11 @@ pub fn build_inst_relate_aabb_rows(
 
             inst_relate_aabb_rows.push(format!(
                 "{{id: {0}, refno: {1}, aabb: aabb:⟨{2}⟩, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                model_refno_id("inst_relate_aabb", *key),
                 key.to_pe_key(),
                 aabb_hash
             ));
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(model_refno_id("inst_relate_aabb", *key));
         }
     }
 
@@ -1881,7 +1879,7 @@ impl TransactionBatcher {
                                 "⚠️ [DEBUG] 检测到 inst_relate_aabb 唯一索引冲突，尝试重建索引并重试..."
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
-DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno UNIQUE;";
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno;";
                             let _ = model_query_response(repair_sql).await;
                             continue;
                         }
@@ -2130,7 +2128,7 @@ pub async fn reconcile_missing_neg_relate(
             .join(",");
         let sql = format!(
             r#"SELECT
-                record::id(id) as gr_id,
+                id as gr_id,
                 record::id(geom_refno) as neg_carrier
             FROM geo_relate
             WHERE geo_type IN ['Neg', 'CataNeg']
@@ -2277,7 +2275,7 @@ pub async fn reconcile_missing_neg_relate(
     for (chunk_idx, info_chunk) in infos.chunks(CHECK_CHUNK_SIZE).enumerate() {
         let gr_id_list = info_chunk
             .iter()
-            .map(|r| format!("geo_relate:⟨{}⟩", r.gr_id))
+            .map(|r| r.gr_id.clone())
             .collect::<Vec<_>>()
             .join(",");
         let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
@@ -2330,9 +2328,16 @@ pub async fn reconcile_missing_neg_relate(
             continue;
         }
 
+        let target_refno = target;
+        let carrier_refno: RefnoEnum = match info.neg_carrier.parse() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let relation_index = neg_buffer.len();
+        let neg_id = neg_relate_id(target_refno, carrier_refno, relation_index, 0);
         neg_buffer.push(format!(
-            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', pe:⟨{2}⟩], out: pe:⟨{2}⟩, pe: pe:⟨{1}⟩ }}",
-            info.gr_id, info.neg_carrier, info.parent_id,
+            "{{ in: {0}, id: {3}, out: pe:⟨{2}⟩, pe: pe:⟨{1}⟩ }}",
+            info.gr_id, info.neg_carrier, info.parent_id, neg_id,
         ));
         if should_debug_reconcile(&info.neg_carrier, Some(&info.parent_id)) {
             println!(
@@ -2597,8 +2602,10 @@ pub async fn save_instance_data_to_sql_file(
         entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
     }
     let mut vec3_map: HashMap<u64, String> = HashMap::new();
-    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<u64>> = HashMap::new();
-    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<u64>> = HashMap::new();
+    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<(usize, String)>> = HashMap::new();
+    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<(usize, String)>> =
+        HashMap::new();
+    let inst_key_carriers = build_inst_key_carrier_map(inst_mgr);
 
     // DELETE（replace_exist=true 时）
     // 统一写入 .surql 文件，不直接执行到 DB（pre_cleanup_for_regen 已在前置阶段完成清理）
@@ -2644,7 +2651,7 @@ pub async fn save_instance_data_to_sql_file(
     let mut geo_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
     for inst_geo_data in inst_mgr.inst_geos_map.values() {
-        for inst in &inst_geo_data.insts {
+        for (geo_index, inst) in inst_geo_data.insts.iter().enumerate() {
             if inst.geo_transform.translation.is_nan()
                 || inst.geo_transform.rotation.is_nan()
                 || inst.geo_transform.scale.is_nan()
@@ -2676,37 +2683,49 @@ pub async fn save_instance_data_to_sql_file(
                 String::new()
             };
 
-            let relate_json = format!(
-                r#"in: inst_info:⟨{0}⟩, out: inst_geo:⟨{1}⟩, trans: trans:⟨{2}⟩, geom_refno: pe:{3}, pts: [{4}], geo_type: '{5}', visible: {6} {7}"#,
-                inst_geo_data.id(),
-                inst.geo_hash,
-                transform_hash,
-                inst.refno,
-                pt_hashes.join(","),
-                inst.geo_type.to_string(),
-                inst.visible,
-                cat_negs_str
-            );
-            let relate_id = gen_string_hash(&relate_json);
-            geo_relate_buffer.push(format!("{{ {relate_json}, id: '{relate_id}' }}"));
-
             use aios_core::geometry::GeoBasicType;
-            let carrier_refno = inst_geo_data.refno;
             let geom_refno = inst.refno;
-            match inst.geo_type {
-                GeoBasicType::Neg => {
-                    neg_geo_by_carrier
-                        .entry(carrier_refno)
-                        .or_insert_with(Vec::new)
-                        .push(relate_id);
+            let carriers = inst_key_carriers
+                .get(&inst_geo_data.id())
+                .cloned()
+                .unwrap_or_else(|| vec![(inst_geo_data.refno, inst_geo_data.id())]);
+            for (carrier_refno, inst_info_id) in carriers {
+                let relate_id = geo_relate_id_for_inst(carrier_refno, geo_index, &inst_info_id);
+                let relate_json = format!(
+                    r#"in: inst_info:⟨{0}⟩, out: inst_geo:⟨{1}⟩, trans: trans:⟨{2}⟩, geom_refno: pe:{3}, pts: [{4}], geo_type: '{5}', visible: {6} {7}"#,
+                    inst_info_id,
+                    inst.geo_hash,
+                    transform_hash,
+                    inst.refno,
+                    pt_hashes.join(","),
+                    inst.geo_type.to_string(),
+                    inst.visible,
+                    cat_negs_str
+                );
+                geo_relate_buffer.push(format!("{{ {relate_json}, id: {relate_id} }}"));
+                match inst.geo_type {
+                    GeoBasicType::Neg => {
+                        neg_geo_by_carrier
+                            .entry(carrier_refno)
+                            .or_insert_with(Vec::new)
+                            .push((geo_index, relate_id));
+                    }
+                    GeoBasicType::CataCrossNeg => {
+                        cata_cross_neg_geo_map
+                            .entry((carrier_refno, geom_refno))
+                            .or_insert_with(Vec::new)
+                            .push((geo_index, relate_id));
+                    }
+                    _ => {}
                 }
-                GeoBasicType::CataCrossNeg => {
-                    cata_cross_neg_geo_map
-                        .entry((carrier_refno, geom_refno))
-                        .or_insert_with(Vec::new)
-                        .push(relate_id);
+
+                if geo_relate_buffer.len() >= CHUNK_SIZE {
+                    writer.write_statement(&format!(
+                        "INSERT RELATION INTO geo_relate [{}]",
+                        geo_relate_buffer.join(",")
+                    ))?;
+                    geo_relate_buffer.clear();
                 }
-                _ => {}
             }
 
             let mut geo_json = inst.gen_unit_geo_sur_json();
@@ -2725,14 +2744,6 @@ pub async fn save_instance_data_to_sql_file(
                     inst_geo_buffer.join(",")
                 ))?;
                 inst_geo_buffer.clear();
-            }
-
-            if geo_relate_buffer.len() >= CHUNK_SIZE {
-                writer.write_statement(&format!(
-                    "INSERT RELATION INTO geo_relate [{}]",
-                    geo_relate_buffer.join(",")
-                ))?;
-                geo_relate_buffer.clear();
             }
         }
     }
@@ -2766,12 +2777,16 @@ pub async fn save_instance_data_to_sql_file(
         for (target, neg_refnos) in &inst_mgr.neg_relate_map {
             for neg_refno in neg_refnos.iter() {
                 if let Some(geo_relate_ids) = neg_geo_by_carrier.get(neg_refno) {
-                    for geo_relate_id in geo_relate_ids.iter() {
+                    for (relation_index, (geo_index, geo_relate_id)) in
+                        geo_relate_ids.iter().enumerate()
+                    {
+                        let neg_id = neg_relate_id(*target, *neg_refno, *geo_index, relation_index);
                         neg_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1} }}",
+                            "{{ in: {0}, id: {3}, out: {2}, pe: {1} }}",
                             geo_relate_id,
                             neg_refno.to_pe_key(),
                             target.to_pe_key(),
+                            neg_id,
                         ));
                         if neg_buffer.len() >= CHUNK_SIZE {
                             writer.write_statement(&format!(
@@ -2800,12 +2815,16 @@ pub async fn save_instance_data_to_sql_file(
             for (ele_refno, ngmr_geom_refno) in refnos {
                 let key = (*ele_refno, *ngmr_geom_refno);
                 if let Some(geo_relate_ids) = cata_cross_neg_geo_map.get(&key) {
-                    for geo_relate_id in geo_relate_ids.iter() {
+                    for (relation_index, (geo_index, geo_relate_id)) in
+                        geo_relate_ids.iter().enumerate()
+                    {
                         let ele_pe = ele_refno.to_pe_key();
                         let ngmr_pe = ngmr_geom_refno.to_pe_key();
+                        let ngmr_id =
+                            ngmr_relate_id(*target_k, *ele_refno, *geo_index, relation_index);
                         ngmr_buffer.push(format!(
-                            "{{ in: geo_relate:⟨{0}⟩, id: ['{0}', {2}], out: {2}, pe: {1}, ngmr: {3} }}",
-                            geo_relate_id, ele_pe, target_pe, ngmr_pe
+                            "{{ in: {0}, id: {4}, out: {2}, pe: {1}, ngmr: {3} }}",
+                            geo_relate_id, ele_pe, target_pe, ngmr_pe, ngmr_id
                         ));
                         if ngmr_buffer.len() >= CHUNK_SIZE {
                             writer.write_statement(&format!(
@@ -2863,11 +2882,11 @@ pub async fn save_instance_data_to_sql_file(
             }
             inst_relate_aabb_buffer.push(format!(
                 "{{id: {0}, refno: {1}, aabb_id: aabb:⟨{2}⟩}}",
-                key.to_table_key("inst_relate_aabb"),
+                model_refno_id("inst_relate_aabb", *key),
                 key.to_pe_key(),
                 aabb_hash
             ));
-            inst_relate_aabb_ids.push(key.to_table_key("inst_relate_aabb"));
+            inst_relate_aabb_ids.push(model_refno_id("inst_relate_aabb", *key));
         }
 
         // inst_relate: 使用预计算值替代 fn::find_ancestor_type / fn::ses_date
@@ -2878,7 +2897,7 @@ pub async fn save_instance_data_to_sql_file(
 
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: {4}, spec_value: {5}, dt: {6}, has_cata_neg: {7}, solid: {8}, owner_refno: {9}, owner_type: '{10}'}}",
-            key.to_inst_relate_key(),
+            model_refno_id("inst_relate", *key),
             key.to_pe_key(),
             info.id_str(),
             dbnum,

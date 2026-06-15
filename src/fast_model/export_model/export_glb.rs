@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use glam::Vec3;
 use serde_json::{Value, json};
 
+use crate::fast_model::gen_model::model_record_id::model_refno_id;
 use crate::fast_model::material_config::MaterialLibrary;
 use crate::fast_model::query_provider;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
@@ -210,11 +211,10 @@ async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoE
         return Vec::new();
     }
 
-    // 按约定：inst_relate_aabb 的 id = inst_relate_aabb:⟨refno⟩，因此可以直接用 FROM [ids] 批量取值，
-    // 避免写 `WHERE ... IN [...]` 的过滤查询。
+    // inst_relate_aabb 使用版本化 array record id，与 inst_relate:[ref0,ref1,sesno] 对齐。
     let ids = refnos
         .iter()
-        .map(|r| format!("inst_relate_aabb:⟨{}⟩", r))
+        .map(|r| model_refno_id("inst_relate_aabb", *r))
         .collect::<Vec<_>>()
         .join(",");
 

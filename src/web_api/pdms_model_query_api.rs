@@ -17,6 +17,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+
 pub fn create_pdms_model_query_routes() -> Router {
     Router::new()
         .route("/api/pdms/type-info", get(get_type_info))
@@ -205,13 +207,13 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
                     pub index: Option<i64>,
                 }
 
-                let pe_key = refno_enum.to_pe_key();
+                let tubi_range = model_refno_sesno_range("tubi_relate", refno_enum);
                 let sql = format!(
                     r#"
                     SELECT
                         in as leave_refno,
-                        id[1] as index
-                    FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                        id[3] as index
+                    FROM {tubi_range};
                     "#
                 );
 

@@ -112,10 +112,10 @@ pub async fn save_inst_relate_bool(
     source: &str,
 ) -> anyhow::Result<()> {
     // SurrealQL：使用 UPSERT 保证幂等写入（SurrealDB 不支持 "INSERT OR REPLACE"）
-    let refno_str = refno.to_string();
-    let id_key = format!("inst_relate_bool:⟨{}⟩", refno_str);
+    let id_key =
+        crate::fast_model::gen_model::model_record_id::model_refno_id("inst_relate_bool", refno);
     // inst_relate_bool.refno 约定为 pe 记录引用（与 surreal_schema.sql 一致）
-    let refno_key = format!("pe:⟨{}⟩", refno_str);
+    let refno_key = refno.to_pe_key();
     let mesh_str = mesh_id
         .map(|m| format!("'{}'", m))
         .unwrap_or_else(|| "NONE".to_string());
@@ -139,17 +139,20 @@ pub async fn save_inst_relate_cata_bool(
     source: &str,
 ) {
     let refno_key = refno.to_pe_key();
+    let cata_bool_id = crate::fast_model::gen_model::model_record_id::model_refno_id(
+        "inst_relate_cata_bool",
+        refno,
+    );
     let mut sql =
         format!("LET $inst_info = (SELECT VALUE out FROM {refno_key}->inst_relate LIMIT 1)[0];");
 
     // 始终先删除旧记录，保证每个 inst_info 仅保留一条最新状态关系。
-    sql.push_str(
-        "IF $inst_info != NONE { LET $old_ids = SELECT VALUE id FROM inst_relate_cata_bool WHERE in = $inst_info; DELETE $old_ids;",
-    );
+    sql.push_str(&format!("DELETE {cata_bool_id};"));
+    sql.push_str("IF $inst_info != NONE {");
     if let Some(mesh_id) = mesh_id {
         let mesh_key = format!("inst_geo:⟨{}⟩", mesh_id);
         sql.push_str(&format!(
-            "INSERT RELATION INTO inst_relate_cata_bool [{{ in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
+            "INSERT RELATION INTO inst_relate_cata_bool [{{ id: {cata_bool_id}, in: $inst_info, out: {mesh_key}, status: '{status}', source: '{source}', updated_at: time::now() }}];"
         ));
     }
     sql.push_str("};");
@@ -167,6 +170,8 @@ async fn batch_insert_aabb_table(
     table: &str,
     inst_aabb_map: &DashMap<RefnoEnum, String>,
 ) -> anyhow::Result<()> {
+    use crate::fast_model::gen_model::model_record_id::model_refno_id;
+
     if inst_aabb_map.is_empty() {
         return Ok(());
     }
@@ -180,7 +185,6 @@ async fn batch_insert_aabb_table(
             let Some(aabb_hash) = inst_aabb_map.get(refno) else {
                 continue;
             };
-            let refno_str = refno.to_string();
             let refno_key = refno.to_pe_key();
             let aabb_key = {
                 let v = aabb_hash.value();
@@ -190,8 +194,9 @@ async fn batch_insert_aabb_table(
                     format!("aabb:⟨{}⟩", v)
                 }
             };
+            let row_id = model_refno_id(table, *refno);
             rows.push(format!(
-                "UPSERT {table}:⟨{refno_str}⟩ SET refno = {refno_key}, aabb_id = {aabb_key}"
+                "UPSERT {row_id} SET refno = {refno_key}, aabb_id = {aabb_key}"
             ));
         }
 

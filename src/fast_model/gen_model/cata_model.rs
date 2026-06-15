@@ -16,6 +16,8 @@ use crate::fast_model::gen_model::cate_helpers::cal_sjus_value;
 
 use crate::fast_model::gen_model::cate_single::{CateCsgShapeMap, gen_cata_single_geoms};
 
+use crate::fast_model::gen_model::model_record_id::tubi_relate_id;
+
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 
 use crate::fast_model::instance_cache::InstanceCacheManager;
@@ -57,8 +59,8 @@ use aios_core::shape::pdms_shape::{BrepShapeTrait, PlantMesh, RsVec3, VerifiedSh
 use aios_core::tool::math_tool::to_pdms_vec_str;
 
 use aios_core::{
-    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, gen_aabb_hash,
-    gen_plant_transform_hash, model_primary_db,
+    HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SurrealQueryExt,
+    gen_aabb_hash, gen_plant_transform_hash, model_primary_db,
 };
 
 use aios_core::Transform;
@@ -394,6 +396,203 @@ struct BranchCacheMeta {
     h_tubi_size: Option<TubiSize>,
 
     is_hang: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NozzBranchEndpoint {
+    position: Vec3,
+    direction: Vec3,
+    bore: f32,
+    spec_bore: Option<f32>,
+}
+
+fn refno_record_id(refno: RefnoEnum) -> String {
+    refno.to_string().replace('/', "_")
+}
+
+fn nozz_branch_bore(branch_att: &NamedAttrMap, end: &str) -> f32 {
+    let branch_bore = match end {
+        "H" => branch_att.get_f32("HBOR"),
+        "T" => branch_att.get_f32("TBOR"),
+        _ => None,
+    }
+    .unwrap_or_default();
+
+    branch_bore.max(1.0)
+}
+
+async fn query_nozz_spco_bore(nozz_att: &NamedAttrMap) -> Option<f32> {
+    let cat_ref = nozz_att.get_foreign_refno("CATR")?;
+    if !cat_ref.is_valid() {
+        return None;
+    }
+    let spco_att = aios_core::get_named_attmap(cat_ref).await.ok()?;
+    spco_att
+        .get_f32("ANSW")
+        .or_else(|| spco_att.get_f32("MAXA"))
+        .filter(|v| *v > 0.0)
+}
+
+async fn query_nozz_branch_endpoint(nozz_refno: RefnoEnum) -> Option<NozzBranchEndpoint> {
+    let ref_id = refno_record_id(nozz_refno);
+    let sql = format!(
+        "SELECT * FROM BRAN WHERE TREF = pe:`{0}` OR HREF = pe:`{0}` LIMIT 1;",
+        ref_id
+    );
+    let mut response = model_primary_db().query_response(&sql).await.ok()?;
+    let rows: Vec<NamedAttrMap> = response.take(0).ok()?;
+    let branch_att = rows.into_iter().next()?;
+    let branch_refno = branch_att.get_refno_or_default();
+    if !branch_refno.is_valid() {
+        return None;
+    }
+    let branch_transform =
+        crate::fast_model::transform_cache::get_world_transform_cache_first(None, branch_refno)
+            .await
+            .ok()
+            .flatten()?;
+
+    let tref = branch_att.get_foreign_refno("TREF").unwrap_or_default();
+    let is_tail = tref == nozz_refno;
+    let end = if is_tail { "T" } else { "H" };
+    let local_position = branch_att.get_vec3(if is_tail { "TPOS" } else { "HPOS" })?;
+    let position = branch_transform.transform_point(local_position);
+    let local_direction = branch_att.get_vec3(if is_tail { "TDIR" } else { "HDIR" })?;
+    let mut direction = branch_transform
+        .to_matrix()
+        .transform_vector3(local_direction);
+    if !direction.is_finite() || direction.length_squared() <= f32::EPSILON {
+        return None;
+    }
+    direction = direction.normalize();
+
+    Some(NozzBranchEndpoint {
+        position,
+        direction,
+        bore: nozz_branch_bore(&branch_att, end),
+        spec_bore: None,
+    })
+}
+
+fn nozz_endpoint_world_transform(
+    owner_world: Transform,
+    endpoint: NozzBranchEndpoint,
+) -> Option<Transform> {
+    let owner_matrix = owner_world.to_matrix();
+    let inverse_owner = owner_matrix.inverse();
+    if inverse_owner.is_nan() {
+        return None;
+    }
+
+    let local_position = inverse_owner.transform_point3(endpoint.position);
+    let local_direction = inverse_owner
+        .transform_vector3(endpoint.direction)
+        .normalize_or_zero();
+    if !local_position.is_finite() || local_direction.length_squared() <= f32::EPSILON {
+        return None;
+    }
+
+    Some(Transform {
+        translation: local_position,
+        rotation: Quat::from_rotation_arc(Vec3::Z, local_direction),
+        scale: Vec3::ONE,
+    })
+}
+
+fn is_degenerate_nozz_cata_result(insts: &[EleInstGeo]) -> bool {
+    !insts.is_empty()
+        && insts
+            .iter()
+            .all(|inst| inst.geo_hash == TUBI_GEO_HASH && inst.geo_type == GeoBasicType::Pos)
+}
+
+fn make_nozz_cylinder_inst(
+    refno: RefnoEnum,
+    visible: bool,
+    diameter: f32,
+    height: f32,
+    center_z: f32,
+) -> Option<EleInstGeo> {
+    if diameter <= f32::EPSILON || height <= f32::EPSILON {
+        return None;
+    }
+
+    let csg_shape: Box<dyn BrepShapeTrait> = Box::new(SCylinder {
+        pdia: diameter,
+        phei: height,
+        center_in_mid: true,
+        ..Default::default()
+    });
+    if !csg_shape.check_valid() {
+        return None;
+    }
+
+    let mut transform = csg_shape.get_trans();
+    transform.translation.z += center_z;
+    let geo_hash = csg_shape.hash_unit_mesh_params();
+    let unit_flag = csg_shape.is_reuse_unit();
+    let mut geo_param = csg_shape
+        .convert_to_geo_param()
+        .unwrap_or(PdmsGeoParam::Unknown);
+    if unit_flag {
+        geo_param = csg_shape
+            .gen_unit_shape()
+            .convert_to_geo_param()
+            .unwrap_or(geo_param);
+    }
+    crate::fast_model::reuse_unit::normalize_transform_scale(&mut transform, unit_flag, geo_hash);
+
+    Some(EleInstGeo {
+        geo_hash,
+        refno,
+        pts: Default::default(),
+        aabb: None,
+        geo_transform: transform,
+        geo_param,
+        visible,
+        is_tubi: false,
+        geo_type: GeoBasicType::Pos,
+        cata_neg_refnos: vec![],
+    })
+}
+
+async fn build_nozz_fallback_geos(
+    nozz_refno: RefnoEnum,
+    nozz_att: &NamedAttrMap,
+    owner_world: Transform,
+) -> Option<(Transform, Vec<EleInstGeo>)> {
+    let mut endpoint = query_nozz_branch_endpoint(nozz_refno).await?;
+    endpoint.spec_bore = query_nozz_spco_bore(nozz_att).await;
+    let bore = endpoint
+        .spec_bore
+        .unwrap_or(endpoint.bore)
+        .max(endpoint.bore);
+    let world_transform = nozz_endpoint_world_transform(owner_world, endpoint)?;
+    let visible = nozz_att.is_visible_by_level(None).unwrap_or(true);
+
+    let flange_dia = (bore * 2.625).max(bore + 40.0);
+    let pipe_dia = (bore * 1.25).max(bore + 20.0);
+    let total_len = (bore * 1.875).clamp(75.0, 180.0);
+    let flange_len = (bore * 0.36).clamp(18.0, 35.0);
+    let pipe_len = (total_len - flange_len).max(30.0);
+
+    let mut insts = Vec::new();
+    insts.push(make_nozz_cylinder_inst(
+        nozz_refno,
+        visible,
+        flange_dia,
+        flange_len,
+        -flange_len * 0.5,
+    )?);
+    insts.push(make_nozz_cylinder_inst(
+        nozz_refno,
+        visible,
+        pipe_dia,
+        pipe_len,
+        flange_len + pipe_len * 0.5,
+    )?);
+
+    Some((world_transform, insts))
 }
 
 /// tubi_size + branch_meta 预取结果（可在阶段4之前 spawn，与 CATE 生成并行）
@@ -3675,6 +3874,23 @@ async fn gen_cata_geos_inner(
 
                             );
 
+                            if cur_type == "NOZZ" && is_degenerate_nozz_cata_result(&geo_insts) {
+                                if let Some((nozz_world_transform, nozz_insts)) =
+                                    build_nozz_fallback_geos(ele_refno, &ele_att, geos_info.world_transform)
+                                        .await
+                                {
+                                    debug_model!(
+                                        "[NOZZ_FALLBACK] ele_refno={} replace degenerate cata insts {} -> {}",
+                                        ele_refno,
+                                        geo_insts.len(),
+                                        nozz_insts.len()
+                                    );
+                                    geos_info.world_transform = nozz_world_transform;
+                                    geos_info.cata_hash = None;
+                                    geo_insts = nozz_insts;
+                                }
+                            }
+
                             let mut inst_key = geos_info.get_inst_key();
 
                             geos_info.is_solid = geo_insts.iter().any(|x| {
@@ -5247,11 +5463,12 @@ async fn gen_cata_geos_inner(
                                 }
                             }
 
+                            let tubi_relate_key =
+                                tubi_relate_id(branch_refno, current_tubing.index as usize);
                             tubi_relates.push(format!(
-                                "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                "relate {}->{}->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
                                 current_tubing.leave_refno.to_pe_key(),
-                                branch_refno.to_pe_key(),
-                                current_tubing.index,
+                                tubi_relate_key,
                                 current_tubing.arrive_refno.to_pe_key(),
                                 current_tubing.tubi_size.to_string(),
                                 owner_refno.to_pe_key(),
@@ -5728,11 +5945,14 @@ async fn gen_cata_geos_inner(
                                         );
 
                                         if enable_surreal_outputs {
+                                            let tubi_relate_key = tubi_relate_id(
+                                                branch_refno,
+                                                current_tubing.index as usize,
+                                            );
                                             let sql = format!(
-                                                "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                                "relate {}->{}->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
                                                 current_tubing.leave_refno.to_pe_key(),
-                                                branch_refno.to_pe_key(),
-                                                current_tubing.index,
+                                                tubi_relate_key,
                                                 current_tubing.arrive_refno.to_pe_key(),
                                                 current_tubing.tubi_size.to_string(),
                                                 owner_refno.to_pe_key(),
@@ -6098,11 +6318,12 @@ async fn gen_cata_geos_inner(
                                     }
                                 }
 
+                                let tubi_relate_key =
+                                    tubi_relate_id(branch_refno, current_tubing.index as usize);
                                 tubi_relates.push(format!(
-                                    "relate {}->tubi_relate:[{}, {}]->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
+                                    "relate {}->{}->{}  set geo=inst_geo:⟨{tubi_geo_hash}⟩,aabb=aabb:⟨{aabb_hash}⟩,world_trans=trans:⟨{trans_hash}⟩, start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, bore_size={}, bad=false, system={}, dt=fn::ses_date({});",
                                     current_tubing.leave_refno.to_pe_key(),
-                                    branch_refno.to_pe_key(),
-                                    current_tubing.index,
+                                    tubi_relate_key,
                                     current_tubing.arrive_refno.to_pe_key(),
                                     current_tubing.tubi_size.to_string(),
                                     owner_refno.to_pe_key(),

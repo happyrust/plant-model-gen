@@ -1090,6 +1090,20 @@ async fn process_index_tree_generation(
             Some(roots)
         }
     };
+    let is_boolean_scoped_generation = matches!(
+        scope,
+        GenerationScope::Debug { .. } | GenerationScope::Incremental { .. }
+    ) || db_option
+        .inner
+        .debug_model_refnos
+        .as_ref()
+        .map(|refnos| !refnos.is_empty())
+        .unwrap_or(false);
+    if seed_roots.is_some() && !is_boolean_scoped_generation {
+        println!(
+            "[gen_model] boolean scope disabled: seed roots come from dbnum/full generation, not explicit refno scope"
+        );
+    }
     let full_start = Instant::now();
     perf.mark("categorize_and_inst_relate");
 
@@ -1476,6 +1490,11 @@ async fn process_index_tree_generation(
                     use_surrealdb,
                     defer_db_write,
                     enable_db_backfill: db_option.enable_db_backfill,
+                    scope_refnos: if is_boolean_scoped_generation {
+                        all_refnos.clone()
+                    } else {
+                        Vec::new()
+                    },
                     bool_tasks: std::mem::take(&mut bool_tasks),
                 })
                 .await

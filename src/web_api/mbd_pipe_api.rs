@@ -20,6 +20,8 @@ use axum::{
 use glam::Vec3;
 use serde::{Deserialize, Serialize};
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MbdPipeSource {
@@ -2251,14 +2253,14 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     let mut debug = MbdPipeDebugInfo::default();
     debug.notes.push("source=db".to_string());
 
-    let pe_key = branch_refno.to_pe_key();
+    let tubi_range = model_refno_sesno_range("tubi_relate", branch_refno);
     // Stage B.2: 顺便试探 TUBI 元件的外径。tubi_relate.in 是 record reference (pe:...),
     // 直接 `in.aod` 走 record join，O(1) 命中，pe 不存在该字段时返回 NONE → Option<f32>=None。
     // 不命中时由 `compute_branch_layout_result` 的 default_od=229 兜住。
     let sql = format!(
         r#"
         SELECT
-            id[0] as owner_refno,
+            {owner_refno} as owner_refno,
             in as leave_refno,
             out as arrive_refno,
             world_trans.d as world_trans,
@@ -2266,10 +2268,11 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             end_pt.d as end_pt,
             arrive_axis.d as arrive_axis,
             leave_axis.d as leave_axis,
-            id[1] as index,
+            id[3] as index,
             in.aod as aod
-        FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
-        "#
+        FROM {tubi_range};
+        "#,
+        owner_refno = branch_refno.to_pe_key()
     );
 
     let rows: Vec<TubiRelateRow> = mbd_query_take(&sql, 0).await?;
@@ -2277,7 +2280,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
         anyhow::bail!(
             "tubi_relate 无结果（branch_refno={} pe_key={}）",
             branch_refno,
-            pe_key
+            branch_refno.to_pe_key()
         );
     }
 

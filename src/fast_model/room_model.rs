@@ -44,6 +44,8 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 use crate::fast_model::export_model::{InstRelateRow, query_inst_relate_batch};
 
@@ -854,19 +856,20 @@ async fn query_branch_tubi_aggregate_aabbs(
     let mut estimated_rows = 0usize;
 
     for branch_refno in branch_refnos {
-        let pe_key = branch_refno.to_pe_key();
+        let tubi_range = model_refno_sesno_range("tubi_relate", *branch_refno);
         let sql = format!(
             r#"
             SELECT
-                id[0] as owner_refno,
+                {owner_refno} as owner_refno,
                 in as leave_refno,
                 aabb.d as aabb,
                 world_trans.d as world_trans,
                 start_pt.d as start_pt,
                 end_pt.d as end_pt,
                 in.aod as aod
-            FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
-            "#
+            FROM {tubi_range};
+            "#,
+            owner_refno = branch_refno.to_pe_key()
         );
 
         let rows: Vec<TubiAabbRow> = match model_primary_db().query_take(&sql, 0).await {

@@ -34,6 +34,7 @@ use parquet::file::properties::WriterProperties;
 use serde_json::json;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
+use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_sesno_range};
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
@@ -883,6 +884,77 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
     Ok(batch)
 }
 
+fn append_owner_chain_rows(
+    instance_rows: &mut Vec<InstanceRow>,
+    tree_manager: &TreeIndexManager,
+    spec_info_map: &HashMap<u64, i64>,
+    dbnum: u32,
+    root_refno: Option<RefnoEnum>,
+    verbose: bool,
+) {
+    let mut present_refnos = instance_rows
+        .iter()
+        .map(|row| row.refno_u64)
+        .collect::<HashSet<_>>();
+    let mut pending = instance_rows
+        .iter()
+        .filter_map(|row| row.owner_refno_u64)
+        .collect::<Vec<_>>();
+    let mut appended = 0usize;
+
+    while let Some(owner_u64) = pending.pop() {
+        if present_refnos.contains(&owner_u64) {
+            continue;
+        }
+
+        let owner_refno = RefnoEnum::from(aios_core::RefU64(owner_u64));
+        let Some(meta) = tree_manager.get_node_meta(owner_refno) else {
+            continue;
+        };
+        let parent_refno = if meta.owner.0 == 0 {
+            None
+        } else {
+            Some(RefnoEnum::from(meta.owner))
+        };
+        let parent_u64 = parent_refno.as_ref().map(refno_to_u64);
+        let noun = tree_manager.get_noun(owner_refno).unwrap_or_default();
+        let owner_noun = parent_refno
+            .and_then(|parent| tree_manager.get_noun(parent))
+            .unwrap_or_default();
+        let spec_value = *spec_info_map.get(&owner_u64).unwrap_or(&0);
+
+        present_refnos.insert(owner_u64);
+        if let Some(parent_u64) = parent_u64 {
+            if root_refno.map(|root| refno_to_u64(&root)) != Some(owner_u64) {
+                pending.push(parent_u64);
+            }
+        }
+
+        instance_rows.push(InstanceRow {
+            refno_str: owner_refno.to_string(),
+            refno_u64: owner_u64,
+            noun,
+            owner_refno_str: parent_refno.map(|r| r.to_string()),
+            owner_refno_u64: parent_u64,
+            owner_noun,
+            cata_hash: None,
+            trans_hash: String::new(),
+            aabb_hash: String::new(),
+            spec_value,
+            has_neg: false,
+            dbnum,
+        });
+        appended += 1;
+    }
+
+    if verbose && appended > 0 {
+        println!(
+            "   ✅ instances.parquet 补齐 owner 链语义节点: {} 行",
+            appended
+        );
+    }
+}
+
 // =============================================================================
 // SurrealDB 查询结构体
 // =============================================================================
@@ -1431,7 +1503,7 @@ async fn query_export_insts_local(
         if enable_holes {
             let bool_keys = chunk
                 .iter()
-                .map(|r| format!("inst_relate_bool:{r}"))
+                .map(|r| model_refno_id("inst_relate_bool", *r))
                 .collect::<Vec<_>>();
             let bool_keys_str = bool_keys.join(",");
 
@@ -1440,8 +1512,8 @@ async fn query_export_insts_local(
                 SELECT
                     refno,
                     refno.owner as owner,
-                    (if type::record("inst_relate_aabb", record::id(refno)).aabb_id != NONE {{
-                        record::id(type::record("inst_relate_aabb", record::id(refno)).aabb_id)
+                    (if type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                        record::id(type::record("inst_relate_aabb", id).aabb_id)
                     }} else {{ None }}) as world_aabb_hash,
                     (if type::record("pe_transform", record::id(refno)).world_trans != NONE {{
                         record::id(type::record("pe_transform", record::id(refno)).world_trans)
@@ -1463,90 +1535,95 @@ async fn query_export_insts_local(
             let bool_refnos: HashSet<RefnoEnum> = bool_results.iter().map(|r| r.refno).collect();
             results.append(&mut bool_results);
 
-            let non_bool_keys = chunk
+            let non_bool_refnos = chunk
                 .iter()
                 .filter(|r| !bool_refnos.contains(*r))
-                .map(|r| r.to_inst_relate_key())
+                .copied()
                 .collect::<Vec<_>>();
 
-            if !non_bool_keys.is_empty() {
-                let non_bool_keys_str = non_bool_keys.join(",");
-                let geo_sql = format!(
+            if !non_bool_refnos.is_empty() {
+                let mut geo_sql_batch = String::new();
+                for r in &non_bool_refnos {
+                    let inst_relate_key = model_refno_id("inst_relate", *r);
+                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    geo_sql_batch.push_str(&format!(
+                        r#"
+                        SELECT
+                            in as refno,
+                            in.owner ?? in as owner,
+                            (if type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                                record::id(type::record("inst_relate_aabb", id).aabb_id)
+                            }} else {{ None }}) as world_aabb_hash,
+                            (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
+                                record::id(type::record("pe_transform", record::id(in)).world_trans)
+                            }} else {{ None }}) as world_trans_hash,
+                            (SELECT
+                                record::id(trans) as trans_hash,
+                                record::id(out) as geo_hash,
+                                out.unit_flag ?? false as unit_flag
+                             FROM {geo_range}
+                             WHERE visible
+                               && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                               && (trans.d ?? NONE) != NONE
+                               && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
+                            false as has_neg
+                        FROM [{inst_relate_key}]
+                        WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                        "#
+                    ));
+                }
+
+                let mut resp = aios_core::project_primary_db()
+                    .query_response(&geo_sql_batch)
+                    .await
+                    .with_context(|| {
+                        format!("query_export_insts_local geo SQL: {geo_sql_batch}")
+                    })?;
+                for (stmt_idx, _) in non_bool_refnos.iter().enumerate() {
+                    let mut geo_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                    results.append(&mut geo_results);
+                }
+            }
+        } else {
+            let mut sql_batch = String::new();
+            for r in chunk {
+                let inst_relate_key = model_refno_id("inst_relate", *r);
+                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                sql_batch.push_str(&format!(
                     r#"
                     SELECT
                         in as refno,
                         in.owner ?? in as owner,
-                        (if type::record("inst_relate_aabb", record::id(in)).aabb_id != NONE {{
-                            record::id(type::record("inst_relate_aabb", record::id(in)).aabb_id)
+                        (if type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                            record::id(type::record("inst_relate_aabb", id).aabb_id)
                         }} else {{ None }}) as world_aabb_hash,
                         (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
                             record::id(type::record("pe_transform", record::id(in)).world_trans)
                         }} else {{ None }}) as world_trans_hash,
-                        out->geo_relate[
-                            WHERE visible
-                              && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
-                              && (trans.d ?? NONE) != NONE
-                              && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
-                        ].{{
-                            trans_hash: record::id(trans),
-                            geo_hash: record::id(out),
-                            unit_flag: out.unit_flag ?? false
-                        }} as insts,
+                        (SELECT
+                            record::id(trans) as trans_hash,
+                            record::id(out) as geo_hash,
+                            out.unit_flag ?? false as unit_flag
+                         FROM {geo_range}
+                         WHERE visible
+                           && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
+                           && (trans.d ?? NONE) != NONE
+                           && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                         false as has_neg
-                    FROM [{non_bool_keys}]
-                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
-                    "#,
-                    non_bool_keys = non_bool_keys_str
-                );
-
-                let mut geo_results: Vec<aios_core::ExportInstQuery> =
-                    aios_core::project_primary_db()
-                        .query_take(&geo_sql, 0)
-                        .await
-                        .with_context(|| format!("query_export_insts_local geo SQL: {geo_sql}"))?;
-                results.append(&mut geo_results);
+                    FROM [{inst_relate_key}]
+                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                    "#
+                ));
             }
-        } else {
-            let inst_relate_keys = chunk
-                .iter()
-                .map(|r| r.to_inst_relate_key())
-                .collect::<Vec<_>>();
-            let inst_relate_keys_str = inst_relate_keys.join(",");
 
-            let sql = format!(
-                r#"
-                SELECT
-                    in as refno,
-                    in.owner ?? in as owner,
-                    (if type::record("inst_relate_aabb", record::id(in)).aabb_id != NONE {{
-                        record::id(type::record("inst_relate_aabb", record::id(in)).aabb_id)
-                    }} else {{ None }}) as world_aabb_hash,
-                    (if type::record("pe_transform", record::id(in)).world_trans != NONE {{
-                        record::id(type::record("pe_transform", record::id(in)).world_trans)
-                    }} else {{ None }}) as world_trans_hash,
-                    out->geo_relate[
-                        WHERE visible
-                          && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
-                          && (trans.d ?? NONE) != NONE
-                          && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']
-                    ].{{
-                        trans_hash: record::id(trans),
-                        geo_hash: record::id(out),
-                        unit_flag: out.unit_flag ?? false
-                    }} as insts,
-                    false as has_neg
-                FROM [{inst_relate_keys}]
-                WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE
-                "#,
-                inst_relate_keys = inst_relate_keys_str
-            );
-
-            let mut chunk_results: Vec<aios_core::ExportInstQuery> =
-                aios_core::project_primary_db()
-                    .query_take(&sql, 0)
-                    .await
-                    .with_context(|| format!("query_export_insts_local SQL: {sql}"))?;
-            results.append(&mut chunk_results);
+            let mut resp = aios_core::project_primary_db()
+                .query_response(&sql_batch)
+                .await
+                .with_context(|| format!("query_export_insts_local SQL: {sql_batch}"))?;
+            for (stmt_idx, _) in chunk.iter().enumerate() {
+                let mut chunk_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                results.append(&mut chunk_results);
+            }
         }
     }
 
@@ -1567,19 +1644,20 @@ async fn query_tubi_relate(
     for owners_chunk in owner_refnos.chunks(200) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let pe_key = owner_refno.to_pe_key();
+            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
-                    id[0] as refno,
-                    id[1] as index,
+                    {owner_refno} as refno,
+                    id[3] as index,
                     in as leave,
                     record::id(aabb) as world_aabb_hash,
                     record::id(world_trans) as world_trans_hash,
                     record::id(geo) as geo_hash,
                     spec_value
-                FROM tubi_relate:[{pe_key}, 0]..[{pe_key}, ..];
+                FROM {tubi_range};
                 "#,
+                owner_refno = owner_refno.to_pe_key()
             ));
         }
 
@@ -1852,7 +1930,10 @@ pub async fn export_dbnum_instances_parquet(
         if verbose {
             println!("🔍 查询 {} 的可见实例节点...", root);
         }
-        let sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        let mut sub_refnos = query_deep_visible_inst_refnos(root).await?;
+        sub_refnos.push(root);
+        sub_refnos.sort();
+        sub_refnos.dedup();
         if verbose {
             println!("✅ 子树 refno 数量: {}", sub_refnos.len());
         }
@@ -1915,6 +1996,59 @@ pub async fn export_dbnum_instances_parquet(
         }
     }
 
+    let mut tree_visible_added = 0usize;
+    for refno in tree_manager.query_visible_geo_refnos() {
+        if !in_refno_set.insert(refno) {
+            continue;
+        }
+
+        let Some(meta) = tree_manager.get_node_meta(refno) else {
+            continue;
+        };
+        let owner_refno = if meta.owner.0 == 0 {
+            None
+        } else {
+            Some(RefnoEnum::from(meta.owner))
+        };
+        let owner_type = owner_refno
+            .and_then(|owner| tree_manager.get_noun(owner))
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let mut spec_value = *spec_info_map.get(&refno_to_u64(&refno)).unwrap_or(&0);
+        if spec_value == 0 {
+            if let Some(owner) = owner_refno {
+                spec_value = *spec_info_map.get(&refno_to_u64(&owner)).unwrap_or(&0);
+            }
+        }
+
+        let child = ChildInfo {
+            refno,
+            noun: tree_manager.get_noun(refno).unwrap_or_default(),
+            spec_value,
+            owner_refno,
+            owner_type: owner_type.clone(),
+        };
+
+        in_refnos.push(refno);
+        if matches!(owner_type.as_str(), "BRAN" | "HANG" | "EQUI") {
+            if let Some(owner) = owner_refno {
+                grouped_children.entry(owner).or_default().push(child);
+            } else {
+                ungrouped.push(child);
+            }
+        } else {
+            ungrouped.push(child);
+        }
+        tree_visible_added += 1;
+    }
+
+    if verbose && tree_visible_added > 0 {
+        println!(
+            "   ✅ 从 TreeIndex 补齐 visible geo 语义节点: {} 行",
+            tree_visible_added
+        );
+    }
+
     // =========================================================================
     // 3. 查询几何体实例 hash（geo_relate / inst_relate_bool）
     // =========================================================================
@@ -1969,13 +2103,14 @@ pub async fn export_dbnum_instances_parquet(
     // =========================================================================
     // 3.5 查询 inst_info cata_hash / ptset（供 instances 与 ptsets.parquet 复用）
     // =========================================================================
+    let ptset_refnos = export_inst_map.keys().copied().collect::<Vec<_>>();
     if verbose {
         println!(
-            "🔍 查询 {} 个 refno 的 cata_hash / ptset...",
-            in_refnos.len()
+            "🔍 查询 {} 个有几何实例的 refno 的 cata_hash / ptset...",
+            ptset_refnos.len()
         );
     }
-    let ptset_export_data = query_ptset_export_data(&in_refnos, verbose).await?;
+    let ptset_export_data = query_ptset_export_data(&ptset_refnos, verbose).await?;
 
     // =========================================================================
     // 4. 查询 tubi_relate
@@ -2021,6 +2156,7 @@ pub async fn export_dbnum_instances_parquet(
     let mut row_count_by_hash: HashMap<String, usize> = HashMap::new();
 
     let mut emitted_tubing_owners: HashSet<RefnoEnum> = HashSet::new();
+    let mut emitted_instance_refnos: HashSet<RefnoEnum> = HashSet::new();
 
     // 处理 grouped children
     for (owner_refno, children) in &grouped_children {
@@ -2031,16 +2167,13 @@ pub async fn export_dbnum_instances_parquet(
 
         for child in children {
             let export_inst = export_inst_map.get(&child.refno);
-            let Some(export_inst) = export_inst else {
-                continue;
-            };
-            if export_inst.insts.is_empty() {
-                continue;
-            }
-
-            let child_aabb_hash = export_inst.world_aabb_hash.clone().unwrap_or_default();
-
-            let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
+            let child_aabb_hash = export_inst
+                .and_then(|inst| inst.world_aabb_hash.clone())
+                .unwrap_or_default();
+            let trans_hash = export_inst
+                .and_then(|inst| inst.world_trans_hash.clone())
+                .unwrap_or_default();
+            let has_neg = export_inst.map(|inst| inst.has_neg).unwrap_or(false);
 
             // 收集 hash
             if !child_aabb_hash.is_empty() {
@@ -2049,44 +2182,50 @@ pub async fn export_dbnum_instances_parquet(
             if !trans_hash.is_empty() {
                 trans_hashes.insert(trans_hash.clone());
             }
-            for inst in &export_inst.insts {
-                if let Some(ref th) = inst.trans_hash {
-                    if !th.is_empty() {
-                        trans_hashes.insert(th.clone());
+            if let Some(export_inst) = export_inst {
+                for inst in &export_inst.insts {
+                    if let Some(ref th) = inst.trans_hash {
+                        if !th.is_empty() {
+                            trans_hashes.insert(th.clone());
+                        }
                     }
                 }
             }
 
-            instance_rows.push(InstanceRow {
-                refno_str: child.refno.to_string(),
-                refno_u64: refno_to_u64(&child.refno),
-                noun: child.noun.clone(),
-                owner_refno_str: Some(owner_refno.to_string()),
-                owner_refno_u64: Some(refno_to_u64(owner_refno)),
-                owner_noun: owner_type.to_string(),
-                cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
-                trans_hash: trans_hash.clone(),
-                aabb_hash: child_aabb_hash,
-                spec_value: child.spec_value,
-                has_neg: export_inst.has_neg,
-                dbnum,
-            });
-
-            // geo_instances
-            for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
-                geo_instance_rows.push(GeoInstanceRow {
+            if emitted_instance_refnos.insert(child.refno) {
+                instance_rows.push(InstanceRow {
                     refno_str: child.refno.to_string(),
                     refno_u64: refno_to_u64(&child.refno),
-                    geo_index: geo_idx as u32,
-                    geo_hash: inst.geo_hash.clone(),
-                    geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
+                    noun: child.noun.clone(),
+                    owner_refno_str: Some(owner_refno.to_string()),
+                    owner_refno_u64: Some(refno_to_u64(owner_refno)),
+                    owner_noun: owner_type.to_string(),
+                    cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
+                    trans_hash: trans_hash.clone(),
+                    aabb_hash: child_aabb_hash,
+                    spec_value: child.spec_value,
+                    has_neg,
+                    dbnum,
                 });
-                record_geo_hash_usage(
-                    &inst.geo_hash,
-                    &child.refno.to_string(),
-                    &mut owner_refnos_by_hash,
-                    &mut row_count_by_hash,
-                );
+            }
+
+            // geo_instances
+            if let Some(export_inst) = export_inst {
+                for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
+                    geo_instance_rows.push(GeoInstanceRow {
+                        refno_str: child.refno.to_string(),
+                        refno_u64: refno_to_u64(&child.refno),
+                        geo_index: geo_idx as u32,
+                        geo_hash: inst.geo_hash.clone(),
+                        geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
+                    });
+                    record_geo_hash_usage(
+                        &inst.geo_hash,
+                        &child.refno.to_string(),
+                        &mut owner_refnos_by_hash,
+                        &mut row_count_by_hash,
+                    );
+                }
             }
         }
 
@@ -2129,16 +2268,13 @@ pub async fn export_dbnum_instances_parquet(
     // 处理 ungrouped instances
     for child in &ungrouped {
         let export_inst = export_inst_map.get(&child.refno);
-        let Some(export_inst) = export_inst else {
-            continue;
-        };
-        if export_inst.insts.is_empty() {
-            continue;
-        }
-
-        let child_aabb_hash = export_inst.world_aabb_hash.clone().unwrap_or_default();
-
-        let trans_hash = export_inst.world_trans_hash.clone().unwrap_or_default();
+        let child_aabb_hash = export_inst
+            .and_then(|inst| inst.world_aabb_hash.clone())
+            .unwrap_or_default();
+        let trans_hash = export_inst
+            .and_then(|inst| inst.world_trans_hash.clone())
+            .unwrap_or_default();
+        let has_neg = export_inst.map(|inst| inst.has_neg).unwrap_or(false);
 
         if !child_aabb_hash.is_empty() {
             aabb_hashes.insert(child_aabb_hash.clone());
@@ -2146,43 +2282,49 @@ pub async fn export_dbnum_instances_parquet(
         if !trans_hash.is_empty() {
             trans_hashes.insert(trans_hash.clone());
         }
-        for inst in &export_inst.insts {
-            if let Some(ref th) = inst.trans_hash {
-                if !th.is_empty() {
-                    trans_hashes.insert(th.clone());
+        if let Some(export_inst) = export_inst {
+            for inst in &export_inst.insts {
+                if let Some(ref th) = inst.trans_hash {
+                    if !th.is_empty() {
+                        trans_hashes.insert(th.clone());
+                    }
                 }
             }
         }
 
-        instance_rows.push(InstanceRow {
-            refno_str: child.refno.to_string(),
-            refno_u64: refno_to_u64(&child.refno),
-            noun: child.noun.clone(),
-            owner_refno_str: child.owner_refno.map(|r| r.to_string()),
-            owner_refno_u64: child.owner_refno.map(|r| refno_to_u64(&r)),
-            owner_noun: child.owner_type.clone(),
-            cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
-            trans_hash: trans_hash.clone(),
-            aabb_hash: child_aabb_hash,
-            spec_value: child.spec_value,
-            has_neg: export_inst.has_neg,
-            dbnum,
-        });
-
-        for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
-            geo_instance_rows.push(GeoInstanceRow {
+        if emitted_instance_refnos.insert(child.refno) {
+            instance_rows.push(InstanceRow {
                 refno_str: child.refno.to_string(),
                 refno_u64: refno_to_u64(&child.refno),
-                geo_index: geo_idx as u32,
-                geo_hash: inst.geo_hash.clone(),
-                geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
+                noun: child.noun.clone(),
+                owner_refno_str: child.owner_refno.map(|r| r.to_string()),
+                owner_refno_u64: child.owner_refno.map(|r| refno_to_u64(&r)),
+                owner_noun: child.owner_type.clone(),
+                cata_hash: ptset_export_data.refno_cata_hash.get(&child.refno).cloned(),
+                trans_hash: trans_hash.clone(),
+                aabb_hash: child_aabb_hash,
+                spec_value: child.spec_value,
+                has_neg,
+                dbnum,
             });
-            record_geo_hash_usage(
-                &inst.geo_hash,
-                &child.refno.to_string(),
-                &mut owner_refnos_by_hash,
-                &mut row_count_by_hash,
-            );
+        }
+
+        if let Some(export_inst) = export_inst {
+            for (geo_idx, inst) in export_inst.insts.iter().enumerate() {
+                geo_instance_rows.push(GeoInstanceRow {
+                    refno_str: child.refno.to_string(),
+                    refno_u64: refno_to_u64(&child.refno),
+                    geo_index: geo_idx as u32,
+                    geo_hash: inst.geo_hash.clone(),
+                    geo_trans_hash: inst.trans_hash.clone().unwrap_or_default(),
+                });
+                record_geo_hash_usage(
+                    &inst.geo_hash,
+                    &child.refno.to_string(),
+                    &mut owner_refnos_by_hash,
+                    &mut row_count_by_hash,
+                );
+            }
         }
     }
 
@@ -2196,7 +2338,16 @@ pub async fn export_dbnum_instances_parquet(
         verbose,
     )?;
 
-    if !missing_mesh_report.missing_geo_hash_values.is_empty() {
+    let drop_missing_mesh_rows = std::env::var("AIOS_PARQUET_DROP_MISSING_MESH_ROWS")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if drop_missing_mesh_rows && !missing_mesh_report.missing_geo_hash_values.is_empty() {
         let before_geo_rows = geo_instance_rows.len();
         let before_tubing_rows = tubing_rows.len();
         let before_instance_rows = instance_rows.len();
@@ -2230,7 +2381,21 @@ pub async fn export_dbnum_instances_parquet(
                 instance_rows.len()
             );
         }
+    } else if !missing_mesh_report.missing_geo_hash_values.is_empty() && verbose {
+        println!(
+            "   ⚠️ 检测到缺失 GLB，但保留 Parquet 语义行: geo_hashes={}, owner_refnos={} (设置 AIOS_PARQUET_DROP_MISSING_MESH_ROWS=1 可恢复过滤)",
+            missing_mesh_report.missing_geo_hashes, missing_mesh_report.missing_owner_refnos
+        );
     }
+
+    append_owner_chain_rows(
+        &mut instance_rows,
+        &tree_manager,
+        &spec_info_map,
+        dbnum,
+        root_refno,
+        verbose,
+    );
 
     let used_cata_hashes = instance_rows
         .iter()

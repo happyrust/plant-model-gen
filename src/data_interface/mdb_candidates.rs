@@ -1,6 +1,6 @@
 //! MBD 部署前候选发现（.planning/2026-06-12-mbd-deploy-preflight Phase 2/4）
 //!
-//! 离线读取工程根下的 SYST 库文件，枚举 MDB 元素及其成员 DB（CURD 列表），
+//! 离线读取工程根下的 SYST 库文件，枚举 MDB 元素及其成员 DB（children 成员关系），
 //! 并把成员 dbnum 映射到当前 `projects[]` 可定位的 db 文件，输出
 //! `available / missing / ambiguous` 状态，供站点部署前依赖完整性检查。
 //!
@@ -94,7 +94,7 @@ struct DbFileEntry {
 ///
 /// 1. 扫描全部 db 文件头建立 dbnum -> 文件清单；
 /// 2. 解析每个工程的 SYST 库（同 dbnum 多副本取 ses_pgno 最大者）；
-/// 3. 枚举 MDB 元素与 CURD 成员，逐个成员定位文件并标注状态。
+/// 3. 枚举 MDB 元素与成员 DB，逐个成员定位文件并标注状态。
 pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidatesResult {
     let mut result = MdbCandidatesResult::default();
     let inventory = collect_db_file_inventory(roots, &mut result.warnings);
@@ -161,11 +161,11 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
             if !seen_mdb_keys.insert((project.clone(), mdb_name.clone())) {
                 continue;
             }
-            let members = mdb_attr.get_refu64_vec("CURD").unwrap_or_default();
+            let members = mdb_member_refnos(&data, mdb_refno, &mdb_attr);
             if members.is_empty() {
                 result
                     .warnings
-                    .push(format!("MDB {mdb_name}（{project}）没有 CURD 成员，已跳过"));
+                    .push(format!("MDB {mdb_name}（{project}）没有成员 DB，已跳过"));
                 continue;
             }
 
@@ -191,9 +191,9 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
                     ));
                     continue;
                 };
-                let Some(dbnum) = member_attr.get_i32("NUMBDB").filter(|v| *v > 0) else {
+                let Some(dbnum) = member_dbnum(&member_attr).filter(|v| *v > 0) else {
                     result.warnings.push(format!(
-                        "MDB {}（{}）成员 {} 缺少 NUMBDB，已跳过该成员",
+                        "MDB {}（{}）成员 {} 缺少 NUMBDB/DBNO，已跳过该成员",
                         candidate.mdb_name, project, member
                     ));
                     continue;
@@ -225,6 +225,29 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
         .candidates
         .sort_by(|a, b| a.mdb_name.cmp(&b.mdb_name).then(a.project.cmp(&b.project)));
     result
+}
+
+/// 当前 pdms-io 语法会把元素成员块解析为 children_map；历史入库口径中也可能
+/// 把 MDB 的成员列表放在 CURD 属性里，所以这里保留 CURD 作为兼容兜底。
+fn mdb_member_refnos(
+    data: &parse_pdms_db::parse::PdmsDbData,
+    mdb_refno: aios_core::types::RefU64,
+    mdb_attr: &aios_core::NamedAttrMap,
+) -> Vec<aios_core::types::RefU64> {
+    if let Some(children) = data.children_map.get(&mdb_refno) {
+        let members = children.0.clone();
+        if !members.is_empty() {
+            return members;
+        }
+    }
+    mdb_attr.get_refu64_vec("CURD").unwrap_or_default()
+}
+
+/// SYST DB 元素在不同解析路径/历史数据中可能暴露为 NUMBDB 或 DBNO。
+fn member_dbnum(member_attr: &aios_core::NamedAttrMap) -> Option<i32> {
+    member_attr
+        .get_i32("NUMBDB")
+        .or_else(|| member_attr.get_i32("DBNO"))
 }
 
 /// 给单个成员 dbnum 定位文件并生成状态行。

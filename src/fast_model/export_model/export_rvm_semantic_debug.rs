@@ -50,9 +50,11 @@ struct SemanticDebugSummary {
 struct SemanticDebugComponent {
     stable_id: String,
     refno: String,
-    identity_source: &'static str,
+    identity_source: Option<String>,
+    resolved: bool,
     name: Option<String>,
     noun: Option<String>,
+    attrs: Option<serde_json::Value>,
     owner_refno: Option<String>,
     owner_noun: Option<String>,
     owner_linkage_status: &'static str,
@@ -172,9 +174,11 @@ pub fn export_rvm_semantic_debug(
         components.push(SemanticDebugComponent {
             stable_id,
             refno: RefnoEnum::Refno(refno).to_string(),
-            identity_source: "stable_refno(dbnum, group_path, kind)",
+            identity_source: row.identity_source.clone(),
+            resolved: row.resolved,
             name: row.name.clone(),
             noun: row.noun.clone(),
+            attrs: row.attrs.clone(),
             owner_refno,
             owner_noun,
             owner_linkage_status,
@@ -243,6 +247,9 @@ struct ComponentRow {
     parent_refno: Option<RefU64>,
     noun: Option<String>,
     name: Option<String>,
+    identity_source: Option<String>,
+    resolved: bool,
+    attrs: Option<serde_json::Value>,
 }
 
 fn collect_scoped_refnos(
@@ -321,19 +328,29 @@ impl RelationStoreReader for ModelRelationStore {
             .with_context(|| format!("打开关系库失败: {}", db_path.display()))?;
 
         let mut stmt = conn.prepare(
-            "SELECT refno, inst_id, parent_refno, noun, name FROM inst_relate ORDER BY refno",
+            "SELECT refno, inst_id, parent_refno, noun, name, identity_source, resolved, attrs_json
+             FROM inst_relate
+             WHERE dbnum = ?1
+             ORDER BY refno",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let refno_raw: String = row.get(0)?;
-            let parent_raw: Option<String> = row.get(2)?;
+        let rows = stmt.query_map([dbnum], |row| {
+            let refno_raw: u64 = row.get(0)?;
+            let parent_raw: Option<u64> = row.get(2)?;
+            let attrs_json: Option<String> = row.get(7)?;
             Ok(ComponentRow {
-                refno: RefnoEnum::from(refno_raw.as_str()),
+                refno: RefnoEnum::from(RefU64::from(refno_raw)),
                 inst_id: row.get(1)?,
-                parent_refno: parent_raw.as_deref().and_then(parse_refu64),
+                parent_refno: parent_raw.map(RefU64::from),
                 noun: row.get(3)?,
                 name: row
                     .get::<_, Option<String>>(4)?
                     .and_then(normalize_optional_string),
+                identity_source: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(normalize_optional_string),
+                resolved: row.get::<_, i64>(6)? != 0,
+                attrs: attrs_json
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()),
             })
         })?;
 
@@ -380,17 +397,6 @@ impl RelationStoreReader for ModelRelationStore {
 fn relation_db_path(store: &ModelRelationStore, dbnum: u32) -> std::path::PathBuf {
     let _ = store;
     store.db_dir(dbnum).join("relations.db")
-}
-
-fn parse_refu64(raw: &str) -> Option<RefU64> {
-    let trimmed = raw.trim();
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let high = parts[0].parse::<u32>().ok()?;
-    let low = parts[1].parse::<u32>().ok()?;
-    Some(RefU64::from(((high as u64) << 32) | low as u64))
 }
 
 fn normalize_optional_string(value: String) -> Option<String> {

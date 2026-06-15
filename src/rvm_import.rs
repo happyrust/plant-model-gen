@@ -8,8 +8,7 @@ use rvm_rs::store::geometry::{Geometry, GeometryKind, GeometryType};
 use rvm_rs::store::node::{NodeId, NodeKind};
 use rvm_rs::{parse_att, parse_rvm};
 use serde_json::json;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
@@ -35,6 +34,11 @@ pub struct RvmImportStats {
     pub group_nodes: usize,
     pub geometry_records: usize,
     pub cleaned_records: usize,
+    pub att_sections: usize,
+    pub att_attr_sections: usize,
+    pub att_duplicate_sections: usize,
+    pub att_matched_sections: usize,
+    pub att_unmatched_sections: usize,
     /// spec 009:身份解析成功(真实 refno)的 inst_relate 数。
     pub resolved_records: usize,
     /// spec 009:仍使用 stable_hash 伪 refno 的 inst_relate 数。
@@ -59,6 +63,10 @@ pub async fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImpor
     let root_name_hint = infer_root_name_from_att_index(&att_index);
     let mut builder = RelationBuilder::new(options.dbnum, options.verbose, att_index);
     builder.build(&store)?;
+    if options.verbose {
+        builder.print_att_summary();
+    }
+    let att_stats = builder.att_stats();
 
     let (resolved_records, unresolved_records) = if options.resolve_identity {
         let root_refno_hint = infer_root_refno_from_rvm_path(&options.rvm_path);
@@ -98,6 +106,11 @@ pub async fn import_rvm_to_sqlite(options: &RvmImportOptions) -> Result<RvmImpor
         group_nodes: builder.stats.group_nodes,
         geometry_records: builder.stats.geometry_records,
         cleaned_records,
+        att_sections: att_stats.sections,
+        att_attr_sections: att_stats.attr_sections,
+        att_duplicate_sections: att_stats.duplicate_sections,
+        att_matched_sections: att_stats.matched_sections,
+        att_unmatched_sections: att_stats.unmatched_sections,
         resolved_records,
         unresolved_records,
     })
@@ -210,12 +223,100 @@ fn infer_root_refno_from_rvm_path(path: &Path) -> Option<RefnoEnum> {
     refno_from_pe_key(stem)
 }
 
-fn infer_root_name_from_att_index(
-    att_index: &HashMap<String, serde_json::Map<String, serde_json::Value>>,
-) -> Option<String> {
-    let value = att_index.get("Header Information")?.get("Element")?.as_str()?;
+fn infer_root_name_from_att_index(att_index: &AttAttrIndex) -> Option<String> {
+    let value = att_index
+        .get("Header Information")?
+        .get("Element")?
+        .as_str()?;
     let name = value.trim();
     (!name.is_empty()).then(|| name.to_string())
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct AttImportStats {
+    sections: usize,
+    attr_sections: usize,
+    duplicate_sections: usize,
+    matched_sections: usize,
+    unmatched_sections: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AttAttrIndex {
+    sections: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    section_count: usize,
+    duplicate_sections: usize,
+    matched_sections: HashSet<String>,
+}
+
+impl AttAttrIndex {
+    fn get(&self, name: &str) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.sections.get(name)
+    }
+
+    fn entry(&mut self, name: &str) -> &mut serde_json::Map<String, serde_json::Value> {
+        self.sections.entry(name.to_string()).or_default()
+    }
+
+    fn start_section(&mut self, name: &str) {
+        self.section_count += 1;
+        if self.sections.contains_key(name) {
+            self.duplicate_sections += 1;
+        }
+        self.sections.entry(name.to_string()).or_default();
+    }
+
+    fn attrs_for_group(&mut self, name: &str) -> serde_json::Map<String, serde_json::Value> {
+        let Some(attrs) = self.sections.get(name) else {
+            return serde_json::Map::new();
+        };
+        self.matched_sections.insert(name.to_string());
+        attrs.clone()
+    }
+
+    fn retain_non_empty(&mut self) {
+        self.sections.retain(|_, attrs| !attrs.is_empty());
+    }
+
+    fn stats(&self) -> AttImportStats {
+        let matchable_names = self
+            .sections
+            .keys()
+            .filter(|name| is_matchable_att_section(name));
+        let matched_sections = self
+            .matched_sections
+            .iter()
+            .filter(|name| is_matchable_att_section(name))
+            .count();
+        let unmatched_sections = matchable_names
+            .filter(|name| !self.matched_sections.contains(*name))
+            .count();
+        AttImportStats {
+            sections: self.section_count,
+            attr_sections: self
+                .sections
+                .keys()
+                .filter(|name| is_matchable_att_section(name))
+                .count(),
+            duplicate_sections: self.duplicate_sections,
+            matched_sections,
+            unmatched_sections,
+        }
+    }
+
+    fn unmatched_samples(&self, limit: usize) -> Vec<String> {
+        self.sections
+            .keys()
+            .filter(|name| is_matchable_att_section(name))
+            .filter(|name| !self.matched_sections.contains(*name))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+fn is_matchable_att_section(name: &str) -> bool {
+    name != "Header Information"
 }
 
 fn previous_refno(refno: RefnoEnum) -> Option<RefnoEnum> {
@@ -293,11 +394,6 @@ async fn resolve_identities(
 ) -> Result<(usize, usize)> {
     use std::collections::HashMap;
 
-    if let Err(e) = crate::fast_model::utils::ensure_surreal_init().await {
-        eprintln!("[rvm-import] 身份解析跳过(SurrealDB 不可用,全部回退 stable_hash): {e}");
-        return Ok((0, builder.inst_relates.len()));
-    }
-
     // old(stable_hash) refno -> (真实 refno, noun, identity_source)
     let mut mapping: HashMap<RefnoEnum, (RefnoEnum, Option<String>, &'static str)> = HashMap::new();
     // 名称 -> 真实 refno(供默认命名 owner 查找;含本批已解析的命名元素)
@@ -323,6 +419,35 @@ async fn resolve_identities(
         })
         .collect();
 
+    let needs_surreal_lookup = records_snapshot.iter().any(|(_, _, name, attrs)| {
+        let Some(name) = name.as_deref() else {
+            return false;
+        };
+        direct_refno_from_attrs(attrs.as_ref()).is_none()
+            && (name.starts_with('/') || parse_default_name(name).is_some())
+    });
+    let use_surreal_lookup = std::env::var("AIOS_RVM_IMPORT_USE_SURREAL_LOOKUP")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let surreal_lookup_enabled = if needs_surreal_lookup && use_surreal_lookup {
+        match crate::fast_model::utils::ensure_surreal_init().await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "[rvm-import] SurrealDB 身份辅助查询不可用，将仅使用 ATT 直接 refno/序列回退: {e}"
+                );
+                false
+            }
+        }
+    } else {
+        if verbose && needs_surreal_lookup {
+            println!(
+                "[rvm-import] 跳过 SurrealDB 身份辅助查询；如需启用请设置 AIOS_RVM_IMPORT_USE_SURREAL_LOOKUP=1"
+            );
+        }
+        false
+    };
+
     for (old_refno, _old_parent, name, attrs) in &records_snapshot {
         let Some(name) = name.as_deref() else {
             continue;
@@ -333,17 +458,21 @@ async fn resolve_identities(
         {
             Some((refno, noun_from_attrs(attrs.as_ref()), "att_name_refno"))
         } else if name.starts_with('/') {
-            query_pe_by_name(dbnum, name)
-                .await?
-                .map(|(refno, noun)| (refno, noun, "surreal_name"))
-                .or_else(|| {
-                    if root_name_hint == Some(name) {
-                        root_refno_hint
-                            .map(|refno| (refno, noun_from_attrs(attrs.as_ref()), "rvm_filename_root"))
-                    } else {
-                        None
-                    }
-                })
+            if surreal_lookup_enabled {
+                query_pe_by_name(dbnum, name)
+                    .await?
+                    .map(|(refno, noun)| (refno, noun, "surreal_name"))
+            } else {
+                None
+            }
+            .or_else(|| {
+                if root_name_hint == Some(name) {
+                    root_refno_hint
+                        .map(|refno| (refno, noun_from_attrs(attrs.as_ref()), "rvm_filename_root"))
+                } else {
+                    None
+                }
+            })
         } else if let Some(parts) = parse_default_name(name) {
             // owner 查找:① 本批缓存按 owner 完整描述命中(覆盖嵌套默认命名,
             // 如 `TMPLATE 1 of EQUIPMENT /x`——遍历序父先子,owner 已解析过);
@@ -353,46 +482,51 @@ async fn resolve_identities(
                 None => match named_owner_from_desc(parts.owner_desc) {
                     Some(owner_name) => match by_name.get(owner_name) {
                         Some(r) => Some(*r),
-                        None => query_pe_by_name(dbnum, owner_name)
+                        None if surreal_lookup_enabled => query_pe_by_name(dbnum, owner_name)
                             .await?
                             .map(|(r, _)| r)
                             .inspect(|r| {
                                 by_name.insert(owner_name.to_string(), *r);
                             }),
+                        None => None,
                     },
                     None => None,
                 },
             };
             if let Some(owner) = owner {
-                if !children_cache.contains_key(&owner) {
-                    children_cache.insert(owner, query_owner_children(owner).await?);
+                if !surreal_lookup_enabled {
+                    None
+                } else {
+                    if !children_cache.contains_key(&owner) {
+                        children_cache.insert(owner, query_owner_children(owner).await?);
+                    }
+                    // 站点库 noun 是 PDMS 截断名,长度不定:TMPL/SUBE(4)、
+                    // GENSEC/JLDATU(6)、SPINE(5,全名)——按 {映射短名, 全名,
+                    // 截6, 截4} 多候选匹配(实测 851/1036 子序列)。
+                    let short = full_noun_to_short(parts.noun_full);
+                    let full_upper = parts.noun_full.to_ascii_uppercase();
+                    let take6: String = full_upper.chars().take(6).collect();
+                    let take4: String = full_upper.chars().take(4).collect();
+                    let children = &children_cache[&owner];
+                    let matched_child = children
+                        .iter()
+                        .filter(|c| {
+                            let Some(n) = c.noun.as_deref() else {
+                                return false;
+                            };
+                            n == short || n == full_upper || n == take6 || n == take4
+                        })
+                        .nth(parts.ordinal - 1);
+                    matched_child
+                        .and_then(|c| {
+                            let noun = c.noun.clone();
+                            c.key
+                                .as_deref()
+                                .and_then(refno_from_pe_key)
+                                .map(|refno| (refno, noun))
+                        })
+                        .map(|(refno, noun)| (refno, noun, "default_name_rule"))
                 }
-                // 站点库 noun 是 PDMS 截断名,长度不定:TMPL/SUBE(4)、
-                // GENSEC/JLDATU(6)、SPINE(5,全名)——按 {映射短名, 全名,
-                // 截6, 截4} 多候选匹配(实测 851/1036 子序列)。
-                let short = full_noun_to_short(parts.noun_full);
-                let full_upper = parts.noun_full.to_ascii_uppercase();
-                let take6: String = full_upper.chars().take(6).collect();
-                let take4: String = full_upper.chars().take(4).collect();
-                let children = &children_cache[&owner];
-                let matched_child = children
-                    .iter()
-                    .filter(|c| {
-                        let Some(n) = c.noun.as_deref() else {
-                            return false;
-                        };
-                        n == short || n == full_upper || n == take6 || n == take4
-                    })
-                    .nth(parts.ordinal - 1);
-                matched_child
-                    .and_then(|c| {
-                        let noun = c.noun.clone();
-                        c.key
-                            .as_deref()
-                            .and_then(refno_from_pe_key)
-                            .map(|refno| (refno, noun))
-                    })
-                    .map(|(refno, noun)| (refno, noun, "default_name_rule"))
             } else {
                 None
             }
@@ -443,14 +577,16 @@ async fn resolve_identities(
             };
 
             if verbose {
-                println!(
-                    "[rvm-import] resolve {name} -> {candidate} (source=att_owner_sequence)"
-                );
+                println!("[rvm-import] resolve {name} -> {candidate} (source=att_owner_sequence)");
             }
             by_name.insert(name.to_string(), candidate);
             mapping.insert(
                 *old_refno,
-                (candidate, noun_from_attrs(attrs.as_ref()), "att_owner_sequence"),
+                (
+                    candidate,
+                    noun_from_attrs(attrs.as_ref()),
+                    "att_owner_sequence",
+                ),
             );
             changed = true;
         }
@@ -493,16 +629,12 @@ struct RelationBuilder {
     inst_relates: Vec<InstRelateRecord>,
     inst_geos: Vec<InstGeoRecord>,
     geo_relates: Vec<(u64, u64)>,
-    att_index: HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    att_index: AttAttrIndex,
     stats: RvmImportStats,
 }
 
 impl RelationBuilder {
-    fn new(
-        dbnum: u32,
-        verbose: bool,
-        att_index: HashMap<String, serde_json::Map<String, serde_json::Value>>,
-    ) -> Self {
+    fn new(dbnum: u32, verbose: bool, att_index: AttAttrIndex) -> Self {
         Self {
             dbnum,
             verbose,
@@ -519,6 +651,33 @@ impl RelationBuilder {
             self.walk_node(store, root, &mut VecDeque::new(), None, Vec3::ZERO)?;
         }
         Ok(())
+    }
+
+    fn att_stats(&self) -> AttImportStats {
+        self.att_index.stats()
+    }
+
+    fn print_att_summary(&self) {
+        let stats = self.att_stats();
+        if stats.sections == 0 {
+            println!("[rvm-import] ATT 属性索引: 未加载 ATT 文件");
+            return;
+        }
+        println!(
+            "[rvm-import] ATT 属性索引: sections={} attr_sections={} duplicates={} matched={} unmatched={}",
+            stats.sections,
+            stats.attr_sections,
+            stats.duplicate_sections,
+            stats.matched_sections,
+            stats.unmatched_sections
+        );
+        let samples = self.att_index.unmatched_samples(5);
+        if !samples.is_empty() {
+            println!(
+                "[rvm-import] ATT 未匹配 section 示例: {}",
+                samples.join(", ")
+            );
+        }
     }
 
     fn walk_node(
@@ -574,6 +733,7 @@ impl RelationBuilder {
                     );
                 }
 
+                let attrs_json = self.group_attrs_json(store, group, &name)?;
                 self.inst_relates.push(InstRelateRecord {
                     refno: RefnoEnum::from(refno),
                     inst_id,
@@ -585,7 +745,7 @@ impl RelationBuilder {
                     noun: None,
                     identity_source: Some("stable_hash".to_string()),
                     resolved: false,
-                    attrs_json: self.group_attrs_json(store, group, &name)?,
+                    attrs_json,
                 });
 
                 let mut geometry_link = group.first_geometry;
@@ -671,12 +831,12 @@ impl RelationBuilder {
     }
 
     fn group_attrs_json(
-        &self,
+        &mut self,
         store: &Store,
         group: &rvm_rs::store::node::GroupNode,
         name: &str,
     ) -> Result<Option<String>> {
-        let mut map = self.att_index.get(name).cloned().unwrap_or_default();
+        let mut map = self.att_index.attrs_for_group(name);
 
         for attr in &group.attributes {
             let key = store.get_string(attr.key).trim();
@@ -763,10 +923,8 @@ fn count_group_geometries(
     count
 }
 
-fn load_att_attr_index(
-    att_paths: &[PathBuf],
-) -> Result<HashMap<String, serde_json::Map<String, serde_json::Value>>> {
-    let mut index = HashMap::new();
+fn load_att_attr_index(att_paths: &[PathBuf]) -> Result<AttAttrIndex> {
+    let mut index = AttAttrIndex::default();
     for att_path in att_paths {
         let att_text = fs::read_to_string(att_path)
             .with_context(|| format!("读取 ATT 文件失败: {}", att_path.display()))?;
@@ -775,10 +933,7 @@ fn load_att_attr_index(
     Ok(index)
 }
 
-fn merge_att_attr_index(
-    att_text: &str,
-    index: &mut HashMap<String, serde_json::Map<String, serde_json::Value>>,
-) {
+fn merge_att_attr_index(att_text: &str, index: &mut AttAttrIndex) {
     let mut current_name: Option<String> = None;
 
     for line in att_text.lines() {
@@ -791,7 +946,7 @@ fn merge_att_attr_index(
             let name = name.trim().trim_matches(|c| c == '\'' || c == '"');
             current_name = (!name.is_empty()).then(|| name.to_string());
             if let Some(name) = current_name.as_ref() {
-                index.entry(name.clone()).or_default();
+                index.start_section(name);
             }
             continue;
         }
@@ -814,14 +969,14 @@ fn merge_att_attr_index(
                 continue;
             }
             let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
-            index.entry(name.clone()).or_default().insert(
+            index.entry(name).insert(
                 key.to_string(),
                 serde_json::Value::String(value.to_string()),
             );
         }
     }
 
-    index.retain(|_, attrs| !attrs.is_empty());
+    index.retain_non_empty();
 }
 
 fn stable_refno(dbnum: u32, path: &str, kind: &str) -> RefU64 {

@@ -81,6 +81,21 @@ fn format_cli_refno(refno: aios_core::pdms_types::RefnoEnum) -> String {
 }
 
 #[cfg(not(feature = "gui"))]
+fn parse_cli_model_record_refno(
+    refno: &str,
+    sesno: Option<u32>,
+) -> anyhow::Result<aios_core::pdms_types::RefnoEnum> {
+    let parsed = parse_cli_refno(refno)?;
+    Ok(match sesno {
+        Some(sesno) => {
+            let base = parsed.refno();
+            aios_core::pdms_types::RefnoEnum::from((base, sesno))
+        }
+        None => parsed,
+    })
+}
+
+#[cfg(not(feature = "gui"))]
 async fn promote_generation_refnos_to_bran_hang_roots(
     refnos: &[String],
     verbose: bool,
@@ -995,6 +1010,30 @@ async fn main() -> anyhow::Result<()> {
                         .long("out")
                         .help("覆盖报告输出路径（默认 <output>/<项目>/cata_closure_verify.json）")
                         .value_name("PATH"),
+                ),
+        )
+        .subcommand(
+            Command::new("model-record-id-verify")
+                .about("输出模型产物版本化 array record id 样例，用于 versioned-model-record-id 重构验证")
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .help("基础 refno，例如 24381/145569 或 24381_145569")
+                        .required(true)
+                        .value_name("REFNO"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .help("模型数据版本号；省略时按 current/latest sesno=0")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("SESNO"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .help("以 pretty JSON 输出")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
         .subcommand(
@@ -2592,10 +2631,23 @@ async fn main() -> anyhow::Result<()> {
             .get_one::<u32>("dbnum")
             .copied()
             .ok_or_else(|| anyhow::anyhow!("--import-rvm 需要同时指定 --dbnum"))?;
-        let att_paths: Vec<PathBuf> = matches
+        let mut att_paths: Vec<PathBuf> = matches
             .get_many::<String>("import-att")
             .map(|vals| vals.map(PathBuf::from).collect())
             .unwrap_or_default();
+        if att_paths.is_empty() {
+            let rvm_path = Path::new(rvm_path);
+            let auto_att_path = rvm_path.with_extension("att.txt");
+            if auto_att_path.exists() {
+                if verbose {
+                    println!(
+                        "[rvm-import] 自动发现 ATT 文件: {}",
+                        auto_att_path.display()
+                    );
+                }
+                att_paths.push(auto_att_path);
+            }
+        }
         let relation_store_root = matches
             .get_one::<String>("relation-store-output")
             .map(PathBuf::from)
@@ -2815,6 +2867,36 @@ async fn main() -> anyhow::Result<()> {
             let _ = (rescan_index, out_override, seed_refno_strs);
             anyhow::bail!("gen-cata-closure 需要 sqlite-index feature（默认/web_server 构建已含）");
         }
+    }
+
+    if let Some(record_id_matches) = matches.subcommand_matches("model-record-id-verify") {
+        let refno = record_id_matches
+            .get_one::<String>("refno")
+            .expect("required by clap");
+        let sesno = record_id_matches.get_one::<u32>("sesno").copied();
+        let refno = parse_cli_model_record_refno(refno, sesno)?;
+        let evidence =
+            aios_database::fast_model::gen_model::model_record_id::build_model_record_id_evidence(
+                refno,
+            );
+        if record_id_matches.get_flag("json") {
+            println!("{}", serde_json::to_string_pretty(&evidence)?);
+        } else {
+            println!("input_refno: {}", evidence.input_refno);
+            println!(
+                "parts: ref0={} ref1={} sesno={}",
+                evidence.parts.ref0, evidence.parts.ref1, evidence.parts.sesno
+            );
+            println!("inst_relate: {}", evidence.inst_relate);
+            println!("inst_relate_aabb: {}", evidence.inst_relate_aabb);
+            println!("geo_relate_0: {}", evidence.geo_relate_0);
+            println!(
+                "neg_relate_target_owned_0_0: {}",
+                evidence.neg_relate_target_owned_0_0
+            );
+            println!("tubi_relate_0: {}", evidence.tubi_relate_0);
+        }
+        return Ok(());
     }
 
     // ========== 处理 verify-cata-closure 子命令（T008 离线校验）==========

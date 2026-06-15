@@ -1,3 +1,4 @@
+use crate::fast_model::gen_model::model_record_id::model_refno_id;
 use aios_core::{RefnoEnum, model_primary_db};
 /// SurrealDB 极简版：单表存储所有关联数据
 use anyhow::Result;
@@ -29,8 +30,12 @@ pub async fn pre_cleanup_for_regen_surreal(seed_refnos: &[RefnoEnum]) -> Result<
     let t = std::time::Instant::now();
 
     // 1. 展开后代
-    let all_refnos =
-        aios_core::collect_descendant_filter_ids_with_self(seed_refnos, &[], None, true).await?;
+    let all_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
+        seed_refnos,
+        &[],
+        true,
+    )
+    .await?;
 
     if all_refnos.is_empty() {
         return Ok(());
@@ -43,7 +48,7 @@ pub async fn pre_cleanup_for_regen_surreal(seed_refnos: &[RefnoEnum]) -> Result<
     for chunk in all_refnos.chunks(CHUNK_SIZE) {
         let sql = chunk
             .iter()
-            .map(|r| format!("DELETE refno_relations:⟨{}⟩;", r.to_pe_key()))
+            .map(|r| format!("DELETE {};", model_refno_id("refno_relations", *r)))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -73,8 +78,8 @@ pub async fn save_refno_relations_surreal(relations: &[RefnoRelations]) -> Resul
     for rel in relations {
         let json = serde_json::to_string(rel)?;
         sqls.push(format!(
-            "UPSERT refno_relations:⟨{}⟩ CONTENT {};",
-            rel.refno.to_pe_key(),
+            "UPSERT {} CONTENT {};",
+            model_refno_id("refno_relations", rel.refno),
             json
         ));
     }
@@ -91,7 +96,7 @@ pub async fn load_refno_relations_surreal(refnos: &[RefnoEnum]) -> Result<Vec<Re
 
     let refno_ids = refnos
         .iter()
-        .map(|r| format!("refno_relations:{}", r.to_pe_key()))
+        .map(|r| model_refno_id("refno_relations", *r))
         .collect::<Vec<_>>()
         .join(",");
 

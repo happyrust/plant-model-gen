@@ -489,7 +489,7 @@ DEFINE FUNCTION OVERWRITE fn::query_bran_first_tubi($pe:record) {
     if $pe.noun != 'BRAN' {
         return none;
     };
-    return tubi_relate:[$pe, 0].id;
+    return (select value id from $pe->tubi_relate order by id limit 1)[0];
 };
 
 -- 获取前一个节点的类型
@@ -974,12 +974,12 @@ DEFINE FUNCTION OVERWRITE fn::collect_descendants_filter_inst(
 DEFINE TABLE inst_relate_aabb SCHEMALESS;
 DEFINE FIELD refno ON TABLE inst_relate_aabb TYPE record<pe>;
 DEFINE FIELD aabb_id ON TABLE inst_relate_aabb TYPE record<aabb>;
-DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb COLUMNS refno UNIQUE;
+DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb COLUMNS refno;
 
 DEFINE TABLE inst_relate_booled_aabb SCHEMALESS;
 DEFINE FIELD refno ON TABLE inst_relate_booled_aabb TYPE record<pe>;
 DEFINE FIELD aabb_id ON TABLE inst_relate_booled_aabb TYPE record<aabb>;
-DEFINE INDEX idx_inst_relate_booled_aabb_refno ON TABLE inst_relate_booled_aabb COLUMNS refno UNIQUE;
+DEFINE INDEX idx_inst_relate_booled_aabb_refno ON TABLE inst_relate_booled_aabb COLUMNS refno;
 
 DEFINE TABLE inst_relate_bool SCHEMALESS;
 DEFINE FIELD refno ON TABLE inst_relate_bool TYPE record<pe>;

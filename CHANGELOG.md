@@ -2,6 +2,15 @@
 
 ## 2026-06-15
 
+### Changed — SurrealDB 站点数据目录隔离与 quick deploy 快测默认收窄
+
+> 新建/快速部署站点的 SurrealDB RocksDB 目录按站点名 slug 落到站点专属目录，并让 quick deploy/API 省略 `auto_parse_related_dbnums` 时默认走单 DB 快测路径。
+
+- `managed_project_sites.rs` 将新站点 `db_data_path` 派生为 `runtime/admin_sites/<site_id>/projects/<site_slug>/data/surreal.db`，`create_site` 和预览新站点路径均使用站点名称而非项目名称生成目录。
+- quick deploy/API 请求继续用 `auto_parse_related_dbnums: Option<bool>` 表达显式开关；省略时保持 `false`，显式 `true` 时仍保留依赖 DB 解析能力。
+- 新增 `specs/013-surrealdb-site-data-isolation/`，包含 spec、plan、research、data-model、quickstart 与 quick deploy 请求契约。
+- 验证：`cargo fmt --check`、`cargo check --bin web_server --features web_server` 通过；HTTP `POST /api/admin/quick-deploy-test` 省略 `auto_parse_related_dbnums` 创建 `avevaplantsample-8081`，metadata/TOML 均指向 `projects/avevaplantsample/data/surreal.db`，`parse-plan-manifest.json` 中 `auto_related_db_files=[]`。
+
 ### Added — 模型产物版本化 array record id helper
 
 > `versioned-model-record-id` 实施进入独立 worktree，先落地 `[ref0, ref1, sesno]` 模型产物 ID helper，并锁定 `neg_relate/ngmr_relate` 的 target-first range cleanup 前缀。

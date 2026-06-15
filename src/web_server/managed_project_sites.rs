@@ -394,8 +394,12 @@ fn generation_config_path(site_id: &str) -> PathBuf {
     site_runtime_dir(site_id).join("DbOption-generate.toml")
 }
 
-fn db_data_path(site_id: &str) -> PathBuf {
-    site_runtime_dir(site_id).join("data").join("surreal.db")
+fn site_db_data_path(site_id: &str, site_name: &str) -> PathBuf {
+    site_runtime_dir(site_id)
+        .join("projects")
+        .join(slugify(site_name))
+        .join("data")
+        .join("surreal.db")
 }
 
 // ─── Slug / id helpers ──────────────────────────────────────────────────────
@@ -800,9 +804,13 @@ fn parse_status_from_str(raw: &str) -> ManagedSiteParseStatus {
 
 // ─── Filesystem helpers ─────────────────────────────────────────────────────
 
-fn ensure_runtime_dirs(site_id: &str) -> Result<()> {
-    fs::create_dir_all(site_logs_dir(site_id))?;
-    fs::create_dir_all(site_runtime_dir(site_id).join("data"))?;
+fn ensure_runtime_dirs(site: &ManagedProjectSite) -> Result<()> {
+    fs::create_dir_all(site_logs_dir(&site.site_id))?;
+    let db_parent = Path::new(&site.db_data_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| site_runtime_dir(&site.site_id).join("data"));
+    fs::create_dir_all(db_parent)?;
     Ok(())
 }
 
@@ -1865,7 +1873,7 @@ fn write_site_files_with_parse_plan(
     db_password: &str,
     parse_plan: Option<&ManagedSiteParsePlan>,
 ) -> Result<()> {
-    ensure_runtime_dirs(&site.site_id)?;
+    ensure_runtime_dirs(site)?;
     let content = build_site_config(site, db_user, db_password)?;
     write_file_atomic(Path::new(&site.config_path), &content)?;
     let included_db_files = parse_plan
@@ -1899,6 +1907,7 @@ fn write_site_files_with_parse_plan(
         "export_parquet": site.export_parquet,
         "pipeline_db_mode": managed_db_mode_to_str(site.pipeline_db_mode),
         "runtime_db_mode": managed_db_mode_to_str(site.runtime_db_mode),
+        "db_data_path": site.db_data_path,
         "db_port": site.db_port,
         "web_port": site.web_port,
         "entry_url": site.entry_url,
@@ -3527,7 +3536,9 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         runtime_db_mode: ManagedSiteDbMode::Ws,
         config_path: config_path(&site_id).to_string_lossy().to_string(),
         runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
-        db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
+        db_data_path: site_db_data_path(&site_id, &site_name)
+            .to_string_lossy()
+            .to_string(),
         db_port,
         web_port,
         viewer_port: None,
@@ -3667,6 +3678,37 @@ fn quick_deploy_basename(raw: &str) -> String {
         .to_string()
 }
 
+fn normalize_quick_deploy_path(raw: &str) -> String {
+    raw.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn quick_deploy_same_path(lhs: &str, rhs: &str) -> bool {
+    let lhs = normalize_quick_deploy_path(lhs);
+    let rhs = normalize_quick_deploy_path(rhs);
+    !lhs.is_empty() && lhs == rhs
+}
+
+fn quick_deploy_project_matches_name(project: &SiteProject, name: &str) -> bool {
+    let wanted = name.trim();
+    if wanted.is_empty() {
+        return false;
+    }
+    project.name.eq_ignore_ascii_case(wanted)
+        || quick_deploy_basename(&project.path).eq_ignore_ascii_case(wanted)
+}
+
+fn quick_deploy_project_contains_file(project: &SiteProject, file_path: &str) -> bool {
+    let project_path = normalize_quick_deploy_path(&project.path);
+    let file_path = normalize_quick_deploy_path(file_path);
+    if project_path.is_empty() || file_path.is_empty() {
+        return false;
+    }
+    file_path == project_path || file_path.starts_with(&format!("{project_path}/"))
+}
+
 fn quick_deploy_db_file_matches(status: &QuickDeployMdbDbFileStatus, db_file: &str) -> bool {
     let wanted = quick_deploy_basename(db_file);
     status.file_name.eq_ignore_ascii_case(&wanted)
@@ -3738,6 +3780,93 @@ fn normalize_quick_deploy_projects(projects: &mut [SiteProject]) {
     }
 }
 
+fn normalize_quick_deploy_projects_for_primary(
+    projects: &mut [SiteProject],
+    primary_name: &str,
+    primary_path: &str,
+) {
+    if projects.is_empty() {
+        return;
+    }
+    let primary_idx = projects
+        .iter()
+        .position(|project| {
+            quick_deploy_project_matches_name(project, primary_name)
+                || quick_deploy_same_path(&project.path, primary_path)
+        })
+        .or_else(|| {
+            projects
+                .iter()
+                .position(|project| matches!(project.role, ProjectRole::Design))
+        })
+        .unwrap_or(0);
+    for (idx, project) in projects.iter_mut().enumerate() {
+        project.is_primary = idx == primary_idx;
+        project.sort_order = idx as u32;
+    }
+}
+
+fn quick_deploy_primary_project_for_mbd<'a>(
+    projects: &'a [SiteProject],
+    candidate: &QuickDeployMdbCandidate,
+    target: &QuickDeployMdbDbFileStatus,
+) -> Option<&'a SiteProject> {
+    projects
+        .iter()
+        .find(|project| quick_deploy_project_matches_name(project, &candidate.project))
+        .or_else(|| {
+            projects
+                .iter()
+                .find(|project| quick_deploy_project_contains_file(project, &target.file_path))
+        })
+        .or_else(|| {
+            projects.iter().find(|project| {
+                candidate
+                    .db_files
+                    .iter()
+                    .any(|status| quick_deploy_project_contains_file(project, &status.file_path))
+            })
+        })
+}
+
+fn quick_deploy_dependent_projects_for_mbd(
+    projects: &[SiteProject],
+    candidate: &QuickDeployMdbCandidate,
+    target: &QuickDeployMdbDbFileStatus,
+) -> Result<Vec<SiteProject>> {
+    let primary =
+        quick_deploy_primary_project_for_mbd(projects, candidate, target).ok_or_else(|| {
+            anyhow!(
+                "MBD {} 指向工程 {}，但未能在扫描结果中定位对应 project_path",
+                candidate.mdb_name,
+                candidate.project
+            )
+        })?;
+
+    let mut selected = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for project in projects {
+        let used_by_candidate = quick_deploy_project_matches_name(project, &candidate.project)
+            || candidate
+                .db_files
+                .iter()
+                .any(|status| quick_deploy_project_contains_file(project, &status.file_path));
+        if used_by_candidate && seen_paths.insert(normalize_quick_deploy_path(&project.path)) {
+            selected.push(project.clone());
+        }
+    }
+    if selected.is_empty() {
+        selected.push(primary.clone());
+    } else if !selected
+        .iter()
+        .any(|project| quick_deploy_same_path(&project.path, &primary.path))
+    {
+        selected.push(primary.clone());
+    }
+    normalize_quick_deploy_projects_for_primary(&mut selected, &primary.name, &primary.path);
+    Ok(selected)
+}
+
 async fn discover_quick_deploy_projects(req: &QuickDeployTestRequest) -> Result<Vec<SiteProject>> {
     if !req.projects.is_empty() {
         let mut projects = req.projects.clone();
@@ -3761,7 +3890,16 @@ async fn discover_quick_deploy_projects(req: &QuickDeployTestRequest) -> Result<
         roots.push(project_path.to_string());
     }
     if roots.is_empty() {
-        bail!("按 MBD 名称快速部署时必须提供 search_roots 或 project_path");
+        roots.extend(
+            admin_allowed_project_roots()
+                .into_iter()
+                .map(|root| root.to_string_lossy().to_string()),
+        );
+    }
+    if roots.is_empty() {
+        bail!(
+            "按 MBD 名称快速部署时必须提供 search_roots/project_path，或配置 admin_allowed_project_roots"
+        );
     }
 
     let mut projects = Vec::new();
@@ -3787,6 +3925,96 @@ async fn discover_quick_deploy_projects(req: &QuickDeployTestRequest) -> Result<
     Ok(projects)
 }
 
+async fn resolve_quick_deploy_db_file_project_request(
+    mut req: QuickDeployTestRequest,
+) -> Result<(QuickDeployTestRequest, Vec<String>)> {
+    if !req.project_path.trim().is_empty() || !req.projects.is_empty() {
+        return Ok((req, Vec::new()));
+    }
+    let Some(db_file) = req
+        .db_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok((req, Vec::new()));
+    };
+    if Path::new(&db_file).is_absolute() {
+        return Ok((req, Vec::new()));
+    }
+
+    let projects = discover_quick_deploy_projects(&req).await?;
+    let mut matches = Vec::new();
+    let wanted_dbnum = req.dbnum.filter(|value| *value > 0);
+    for project in &projects {
+        let root = PathBuf::from(&project.path);
+        match resolve_db_file_via_sidecar(std::slice::from_ref(&root), &db_file).await {
+            Ok((dbnum, resolved_db_file)) => {
+                if wanted_dbnum == Some(dbnum) || wanted_dbnum.is_none() {
+                    matches.push((project.clone(), dbnum, resolved_db_file));
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    project = %project.name,
+                    path = %project.path,
+                    db_file = %db_file,
+                    "快速部署按文件名探测工程失败: {err}"
+                );
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        bail!(
+            "未能根据 db_file={} 在 search_roots/admin_allowed_project_roots 中定位工程路径",
+            db_file
+        );
+    }
+    if matches.len() > 1 {
+        let details = matches
+            .iter()
+            .map(|(project, dbnum, resolved)| format!("{}:{}:{}", project.name, dbnum, resolved))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "db_file={} 匹配到多个工程，请传 project_path 或 dbnum 缩小范围: {details}",
+            db_file
+        );
+    }
+
+    let (project, dbnum, resolved_db_file) = matches.remove(0);
+    let mut selected_projects = vec![project.clone()];
+    normalize_quick_deploy_projects_for_primary(
+        &mut selected_projects,
+        &project.name,
+        &project.path,
+    );
+
+    req.project_path = project.path.clone();
+    req.projects = selected_projects;
+    req.dbnum = Some(dbnum);
+    req.db_file = Some(resolved_db_file.clone());
+    if req
+        .project_name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        req.project_name = Some(project.name.clone());
+    }
+
+    Ok((
+        req,
+        vec![format!(
+            "db_file {} 已解析为工程 {}，目标 DB {} ({})",
+            db_file, project.name, dbnum, resolved_db_file
+        )],
+    ))
+}
+
 async fn resolve_quick_deploy_mbd_request(
     mut req: QuickDeployTestRequest,
 ) -> Result<(QuickDeployTestRequest, Vec<String>)> {
@@ -3807,7 +4035,6 @@ async fn resolve_quick_deploy_mbd_request(
         .or_else(|| projects.first())
         .ok_or_else(|| anyhow!("未发现可作为主工程的项目路径"))?;
     let primary_path = primary.path.clone();
-    let primary_name = primary.name.clone();
 
     let value = crate::web_server::parse_sidecar_client::mdb_candidates(MdbCandidatesRequest {
         site_id: None,
@@ -3873,7 +4100,16 @@ async fn resolve_quick_deploy_mbd_request(
         );
     }
 
-    req.projects = projects;
+    let dependent_projects = quick_deploy_dependent_projects_for_mbd(&projects, candidate, target)?;
+    let primary = dependent_projects
+        .iter()
+        .find(|project| project.is_primary)
+        .or_else(|| dependent_projects.first())
+        .ok_or_else(|| anyhow!("MBD {} 未解析出可部署工程路径", candidate.mdb_name))?;
+    let primary_path = primary.path.clone();
+    let primary_name = primary.name.clone();
+
+    req.projects = dependent_projects;
     req.project_path = primary_path;
     req.dbnum = Some(target.dbnum);
     req.db_file = Some(if target.file_name.is_empty() {
@@ -3970,6 +4206,8 @@ async fn quick_create_deploy_config(
 ) -> Result<QuickDeployTestResponse> {
     let started = Instant::now();
     let (req, mut discovery_warnings) = resolve_quick_deploy_mbd_request(req).await?;
+    let (req, db_file_warnings) = resolve_quick_deploy_db_file_project_request(req).await?;
+    discovery_warnings.extend(db_file_warnings);
 
     let project_path = req.project_path.trim().to_string();
     let canonical = if project_path.is_empty() {
@@ -4099,7 +4337,9 @@ async fn quick_deploy(
     profile: QuickDeployProfile,
 ) -> Result<QuickDeployTestResponse> {
     let started = Instant::now();
-    let (req, discovery_warnings) = resolve_quick_deploy_mbd_request(req).await?;
+    let (req, mut discovery_warnings) = resolve_quick_deploy_mbd_request(req).await?;
+    let (req, db_file_warnings) = resolve_quick_deploy_db_file_project_request(req).await?;
+    discovery_warnings.extend(db_file_warnings);
 
     let project_path = req.project_path.trim().to_string();
     let canonical = if project_path.is_empty() {
@@ -4367,7 +4607,14 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
     {
         get_site(site_id)?.ok_or_else(|| anyhow!("站点不存在: {}", site_id))?
     } else {
-        let site_id = infer_site_id(project_name, req.web_port);
+        let site_name = req
+            .site_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| project_name.to_string());
+        let site_id = infer_site_id(&site_name, req.web_port);
         let bind_host = normalize_host_or(req.bind_host.clone(), &default_web_bind_host());
         let public_base_url = req
             .public_base_url
@@ -4387,13 +4634,7 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
 
         ManagedProjectSite {
             site_id: site_id.clone(),
-            site_name: req
-                .site_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| project_name.to_string()),
+            site_name: site_name.clone(),
             project_name: project_name.to_string(),
             project_code: 0,
             project_path: canonical_path.to_string_lossy().to_string(),
@@ -4415,7 +4656,9 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             runtime_db_mode: ManagedSiteDbMode::Ws,
             config_path: config_path(&site_id).to_string_lossy().to_string(),
             runtime_dir: site_runtime_dir(&site_id).to_string_lossy().to_string(),
-            db_data_path: db_data_path(&site_id).to_string_lossy().to_string(),
+            db_data_path: site_db_data_path(&site_id, &site_name)
+                .to_string_lossy()
+                .to_string(),
             db_port: 0,
             web_port: req.web_port,
             viewer_port: None,

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-06-15
+
+### Added — SQLite 空间最近净距查询接口
+
+> 新增 `/api/sqlite-spatial/nearest-clearance`，用于按源 refno、坐标点或 BRAN 中心线走廊查询到墙/柱等目标构件的最近 AABB 净距。
+
+- `sqlite_spatial_api.rs` 新增 nearest-clearance 查询参数与响应结构，支持 `source_refno`、`x/y/z`、`target_nouns`、`target_groups`、`radius`、`scope`、`dbnums`、`max_per_group`、`include_self` 与 `debug`。
+- 默认目标分组支持 `wall -> WALL/PANE`、`column -> COLU/SCTN`，并按 NOUN 过滤候选，返回每组最近构件、距离、相交状态和查询 bbox。
+- `source_mode=bran_centerline` 可从 `tubi_relate` 读取 BRAN/TUBI 中心线，按线段扩张走廊查询候选，并用 `centerline_aabb_clearance_mm` 计算中心线到目标 AABB 的最近净距。
+- `mod.rs` 注册 `/api/sqlite-spatial/nearest-clearance` 路由；新增 focused 单测覆盖 refno/point 源、半径变化、NOUN 过滤、scope/dbnums、相交距离为 0，以及 BRAN 中心线走廊排除远离线段的整体 AABB 命中。
+- 验证：`cargo test --no-default-features --features review --lib sqlite_spatial_api -j 1` 通过，14 个 `sqlite_spatial_api` 单测通过。
+
 ## 2026-06-14
 
 ### Added — MBD 名称驱动的一键快速部署测试接口

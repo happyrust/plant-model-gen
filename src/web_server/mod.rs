@@ -1138,6 +1138,10 @@ pub async fn start_web_server_with_config(
             "/api/sqlite-spatial/query",
             get(sqlite_spatial_api::api_sqlite_spatial_query),
         )
+        .route(
+            "/api/sqlite-spatial/nearest-clearance",
+            get(sqlite_spatial_api::api_sqlite_spatial_nearest_clearance),
+        )
         // SQLite 空间索引：统计与健康检查（诊断索引是否构建正确）
         .route(
             "/api/sqlite-spatial/stats",

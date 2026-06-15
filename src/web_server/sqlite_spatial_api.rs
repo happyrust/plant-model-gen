@@ -10,10 +10,12 @@
 //!
 //! ## Endpoints
 //! - `GET /api/sqlite-spatial/query` - 按 refno 或 bbox 查询周边构件
+//! - `GET /api/sqlite-spatial/nearest-clearance` - 按 refno 或点查询最近净距
 //! - `GET /api/sqlite-spatial/stats` - 获取索引统计与健康信息
 
 use aios_core::RefnoEnum;
 use axum::{extract::Query, response::Json};
+use glam::Vec3;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -22,11 +24,16 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
+use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
 use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
 
 const DEFAULT_DISTANCE: f32 = 0.0;
 const DEFAULT_MAX_HITS: usize = 5000;
 const HARD_MAX_HITS: usize = 10_000;
+const DEFAULT_CLEARANCE_RADIUS_MM: f32 = 5_000.0;
+const MAX_CLEARANCE_RADIUS_MM: f32 = 100_000.0;
+const DEFAULT_CLEARANCE_MAX_PER_GROUP: usize = 1;
+const MAX_CLEARANCE_MAX_PER_GROUP: usize = 100;
 
 // ============================================================================
 // 全局惰性初始化索引（避免每次请求重新打开文件）
@@ -161,6 +168,127 @@ pub struct SpatialStatsResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct NearestClearanceQueryParams {
+    /// Source mode: aabb/default, point, bran_centerline.
+    pub source_mode: Option<String>,
+    /// Source refno, accepts "dbnum/refno" and "dbnum_refno".
+    pub source_refno: Option<String>,
+    /// Point source coordinates in mm. Used only when source_refno is absent.
+    pub x: Option<f32>,
+    pub y: Option<f32>,
+    pub z: Option<f32>,
+    /// Comma-separated target NOUN filters.
+    pub target_nouns: Option<String>,
+    /// Comma-separated shortcut groups. MVP: wall -> WALL,PANE; column -> COLU,SCTN.
+    pub target_groups: Option<String>,
+    /// Search radius in mm. Default 5000. Valid range: 0 < radius <= 100000.
+    pub radius: Option<f32>,
+    /// same_dbnum | all_loaded | explicit_dbnums
+    pub scope: Option<String>,
+    /// Comma-separated u32 dbnums when scope=explicit_dbnums.
+    pub dbnums: Option<String>,
+    /// Per resolved group result limit. Default 1, clamped to 1..100.
+    pub max_per_group: Option<usize>,
+    /// Include the source refno itself when it also matches target filters. Default false.
+    pub include_self: Option<bool>,
+    /// Include diagnostic counters.
+    pub debug: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NearestClearanceResponse {
+    pub success: bool,
+    pub source: Option<NearestClearanceSource>,
+    pub distance_method: &'static str,
+    pub unit: &'static str,
+    pub query_bbox: Option<AabbDto>,
+    pub resolved_filters: Option<NearestClearanceResolvedFilters>,
+    pub nearest_by_group: Vec<NearestClearanceGroupResult>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<NearestClearanceDebug>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NearestClearanceSource {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refno: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dbnum: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point: Option<Vec3Dto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aabb: Option<AabbDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub centerline_bbox: Option<AabbDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NearestClearanceResolvedFilters {
+    pub target_nouns: Vec<String>,
+    pub target_groups: Vec<ResolvedTargetGroup>,
+    pub scope: String,
+    pub dbnums: Option<Vec<u32>>,
+    pub radius: f32,
+    pub max_per_group: usize,
+    pub include_self: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ResolvedTargetGroup {
+    pub name: String,
+    pub nouns: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NearestClearanceGroupResult {
+    pub group: String,
+    pub nouns: Vec<String>,
+    pub candidates: Vec<NearestClearanceCandidate>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NearestClearanceCandidate {
+    pub refno: String,
+    pub noun: String,
+    pub spec_value: i64,
+    pub distance_mm: f32,
+    pub intersects: bool,
+    pub aabb: AabbDto,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct NearestClearanceDebug {
+    pub candidate_ids: usize,
+    pub rows_examined: usize,
+    pub rows_missing_items: usize,
+    pub rows_missing_aabb: usize,
+    pub scope_filtered: usize,
+    pub noun_filtered: usize,
+    pub distance_filtered: usize,
+    pub groups_with_hits: usize,
+    pub returned_candidates: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BranCenterlineSegment {
+    refno: RefnoEnum,
+    order: Option<u32>,
+    start: Vec3,
+    end: Vec3,
+}
+
+enum ClearanceSourceGeometry {
+    Aabb(Aabb),
+    BranCenterline(Vec<BranCenterlineSegment>),
+}
+
 // ============================================================================
 // 辅助函数
 // ============================================================================
@@ -183,6 +311,119 @@ fn sqlite_index_path() -> PathBuf {
         }
     }
     PathBuf::from("output").join("spatial_index.sqlite")
+}
+
+async fn ensure_sqlite_spatial_surreal_context() -> anyhow::Result<()> {
+    let db_option = aios_core::get_db_option();
+    if aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await
+    .is_ok()
+    {
+        return Ok(());
+    }
+    match aios_core::connect_surdb(
+        &db_option.surrealdb_conn_str(),
+        &db_option.surreal_ns,
+        &db_option.project_name,
+        &db_option.surreal_user,
+        &db_option.surreal_password,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("Already connected") => {}
+        Err(e) => return Err(e.into()),
+    }
+    aios_core::use_ns_db_compat(
+        &aios_core::SUL_DB,
+        &db_option.surreal_ns,
+        &db_option.project_name,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn fetch_bran_centerline_segments(
+    branch_refno: RefnoEnum,
+) -> anyhow::Result<Vec<BranCenterlineSegment>> {
+    use aios_core::rs_surreal::geometry_query::PlantTransform;
+    use aios_core::shape::pdms_shape::RsVec3;
+    use aios_core::{SUL_DB, SurrealQueryExt};
+    use serde::{Deserialize, Serialize};
+    use surrealdb::types::SurrealValue;
+
+    #[derive(Debug, Serialize, Deserialize, SurrealValue)]
+    struct TubiRelateRow {
+        pub leave_refno: RefnoEnum,
+        #[serde(default)]
+        pub world_trans: Option<PlantTransform>,
+        #[serde(default)]
+        pub start_pt: Option<RsVec3>,
+        #[serde(default)]
+        pub end_pt: Option<RsVec3>,
+        #[serde(default)]
+        pub index: Option<i64>,
+    }
+
+    ensure_sqlite_spatial_surreal_context().await?;
+
+    let tubi_range = model_refno_sesno_range("tubi_relate", branch_refno);
+    let sql = format!(
+        r#"
+        SELECT
+            in as leave_refno,
+            world_trans.d as world_trans,
+            start_pt.d as start_pt,
+            end_pt.d as end_pt,
+            id[3] as index
+        FROM {tubi_range};
+        "#
+    );
+    let db_option = aios_core::get_db_option();
+    let sql = format!(
+        "USE NS `{}` DB `{}`;\n{}",
+        db_option.surreal_ns, db_option.project_name, sql
+    );
+    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 1).await?;
+    if rows.is_empty() {
+        anyhow::bail!(
+            "tubi_relate returned no segments for branch_refno={} pe_key={}",
+            branch_refno,
+            branch_refno.to_pe_key()
+        );
+    }
+
+    let mut segments = Vec::with_capacity(rows.len());
+    for row in rows {
+        let wt = row.world_trans.unwrap_or_default();
+        let matrix = wt.to_matrix();
+        let start = row
+            .start_pt
+            .map(|p| p.0)
+            .unwrap_or_else(|| matrix.transform_point3(Vec3::new(0.0, 0.0, 0.0)));
+        let end = row
+            .end_pt
+            .map(|p| p.0)
+            .unwrap_or_else(|| matrix.transform_point3(Vec3::new(0.0, 0.0, 1.0)));
+        segments.push(BranCenterlineSegment {
+            refno: row.leave_refno,
+            order: row.index.and_then(|i| u32::try_from(i).ok()),
+            start,
+            end,
+        });
+    }
+    segments.sort_by(|a, b| {
+        a.order
+            .unwrap_or(u32::MAX)
+            .cmp(&b.order.unwrap_or(u32::MAX))
+            .then_with(|| a.refno.to_string().cmp(&b.refno.to_string()))
+    });
+
+    Ok(segments)
 }
 
 fn expand_aabb(mut aabb: Aabb, distance: f32) -> Aabb {
@@ -353,9 +594,502 @@ fn success_spatial_query_result(
     }
 }
 
+fn error_nearest_clearance_response(
+    error: impl Into<String>,
+    source: Option<NearestClearanceSource>,
+    query_bbox: Option<AabbDto>,
+    resolved_filters: Option<NearestClearanceResolvedFilters>,
+    debug: Option<NearestClearanceDebug>,
+    distance_method: &'static str,
+) -> NearestClearanceResponse {
+    NearestClearanceResponse {
+        success: false,
+        source,
+        distance_method,
+        unit: "mm",
+        query_bbox,
+        resolved_filters,
+        nearest_by_group: vec![],
+        warnings: vec![],
+        debug,
+        error: Some(error.into()),
+    }
+}
+
+fn success_nearest_clearance_response(
+    source: NearestClearanceSource,
+    query_bbox: AabbDto,
+    resolved_filters: NearestClearanceResolvedFilters,
+    nearest_by_group: Vec<NearestClearanceGroupResult>,
+    warnings: Vec<String>,
+    debug: Option<NearestClearanceDebug>,
+    distance_method: &'static str,
+) -> NearestClearanceResponse {
+    NearestClearanceResponse {
+        success: true,
+        source: Some(source),
+        distance_method,
+        unit: "mm",
+        query_bbox: Some(query_bbox),
+        resolved_filters: Some(resolved_filters),
+        nearest_by_group,
+        warnings,
+        debug,
+        error: None,
+    }
+}
+
+fn parse_csv_upper(value: &Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|item| item.trim().to_uppercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn parse_csv_dbnums(value: &Option<String>) -> Result<Vec<u32>, String> {
+    let mut out = Vec::new();
+    for raw in value.as_deref().unwrap_or("").split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let dbnum = raw
+            .parse::<u32>()
+            .map_err(|_| format!("invalid dbnum `{}`", raw))?;
+        out.push(dbnum);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+fn dbnum_from_refno_id(id: i64) -> u32 {
+    ((id as u64) >> 32) as u32
+}
+
+fn normalize_refno_string(refno: &str) -> Option<String> {
+    refno_str_to_i64(refno).map(i64_to_refno_str)
+}
+
+fn parse_clearance_source_mode(params: &NearestClearanceQueryParams) -> &'static str {
+    let mode = params
+        .source_mode
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "point" => "point",
+        "bran_centerline" | "branch_centerline" | "centerline" => "bran_centerline",
+        "aabb" | "refno" | "" => {
+            if params
+                .source_refno
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                "aabb"
+            } else {
+                "point"
+            }
+        }
+        _ => "invalid",
+    }
+}
+
+fn parse_refno_enum_for_source(refno: &str) -> Result<RefnoEnum, String> {
+    RefnoEnum::from_str(&refno.trim().replace('_', "/")).map_err(|e| {
+        format!("invalid source_refno format (expected dbnum_refno or dbnum/refno): {e}")
+    })
+}
+
+fn resolve_target_groups(
+    params: &NearestClearanceQueryParams,
+) -> Result<Vec<ResolvedTargetGroup>, String> {
+    let mut groups = Vec::new();
+    let mut seen = HashSet::new();
+
+    for group in parse_csv_upper(&params.target_groups) {
+        let (name, nouns): (String, Vec<String>) = match group.as_str() {
+            "WALL" => (
+                "wall".to_string(),
+                vec!["WALL".to_string(), "PANE".to_string()],
+            ),
+            "COLUMN" => (
+                "column".to_string(),
+                vec!["COLU".to_string(), "SCTN".to_string()],
+            ),
+            _ => {
+                return Err(format!("unknown target_group `{}`", group));
+            }
+        };
+        if seen.insert(name.clone()) {
+            groups.push(ResolvedTargetGroup { name, nouns });
+        }
+    }
+
+    let target_nouns = parse_csv_upper(&params.target_nouns);
+    if !target_nouns.is_empty() {
+        let mut nouns = target_nouns;
+        nouns.sort();
+        nouns.dedup();
+        if seen.insert("target_nouns".to_string()) {
+            groups.push(ResolvedTargetGroup {
+                name: "target_nouns".to_string(),
+                nouns,
+            });
+        }
+    }
+
+    if groups.is_empty() {
+        return Err(
+            "at least one of target_nouns or target_groups must resolve to NOUN filters"
+                .to_string(),
+        );
+    }
+
+    Ok(groups)
+}
+
+fn resolve_clearance_radius(radius: Option<f32>) -> Result<f32, String> {
+    let radius = radius.unwrap_or(DEFAULT_CLEARANCE_RADIUS_MM);
+    if radius.is_finite() && radius > 0.0 && radius <= MAX_CLEARANCE_RADIUS_MM {
+        Ok(radius)
+    } else {
+        Err(format!(
+            "invalid radius (must be finite and 0 < radius <= {} mm)",
+            MAX_CLEARANCE_RADIUS_MM
+        ))
+    }
+}
+
+fn resolve_clearance_max_per_group(max_per_group: Option<usize>) -> usize {
+    max_per_group
+        .unwrap_or(DEFAULT_CLEARANCE_MAX_PER_GROUP)
+        .clamp(1, MAX_CLEARANCE_MAX_PER_GROUP)
+}
+
+fn resolve_scope(
+    params: &NearestClearanceQueryParams,
+    source_dbnum: Option<u32>,
+) -> Result<(String, Option<Vec<u32>>), String> {
+    let default_scope = if source_dbnum.is_some() {
+        "same_dbnum"
+    } else {
+        "all_loaded"
+    };
+    let scope = params
+        .scope
+        .as_deref()
+        .unwrap_or(default_scope)
+        .trim()
+        .to_lowercase();
+
+    match scope.as_str() {
+        "same_dbnum" => {
+            let dbnum =
+                source_dbnum.ok_or_else(|| "scope=same_dbnum requires source_refno".to_string())?;
+            Ok((scope, Some(vec![dbnum])))
+        }
+        "all_loaded" => Ok((scope, None)),
+        "explicit_dbnums" => {
+            let dbnums = parse_csv_dbnums(&params.dbnums)?;
+            if dbnums.is_empty() {
+                Err("scope=explicit_dbnums requires non-empty dbnums".to_string())
+            } else {
+                Ok((scope, Some(dbnums)))
+            }
+        }
+        _ => Err("invalid scope (expected same_dbnum, all_loaded, or explicit_dbnums)".to_string()),
+    }
+}
+
+fn union_group_nouns(groups: &[ResolvedTargetGroup]) -> HashSet<String> {
+    groups
+        .iter()
+        .flat_map(|group| group.nouns.iter().cloned())
+        .collect()
+}
+
+fn dbnum_matches_scope(dbnum: Option<u32>, scope_dbnums: &Option<Vec<u32>>) -> bool {
+    match scope_dbnums {
+        Some(allowed) => dbnum.is_some_and(|dbnum| allowed.contains(&dbnum)),
+        None => true,
+    }
+}
+
+fn item_dbnum_or_id_dbnum(item_dbnum: Option<u32>, id: i64) -> u32 {
+    item_dbnum.unwrap_or_else(|| dbnum_from_refno_id(id))
+}
+
+fn query_item_row(
+    stmt: &mut rusqlite::Statement<'_>,
+    id: i64,
+) -> rusqlite::Result<Option<(String, i64, Option<u32>)>> {
+    stmt.query_row([id], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?
+                .unwrap_or_else(|| "UNKNOWN".to_string()),
+            r.get::<_, i64>(1).unwrap_or(0),
+            r.get::<_, Option<u32>>(2).unwrap_or(None),
+        ))
+    })
+    .optional()
+}
+
+fn query_aabb_row_dto(
+    stmt: &mut rusqlite::Statement<'_>,
+    id: i64,
+) -> rusqlite::Result<Option<(Aabb, AabbDto)>> {
+    stmt.query_row([id], |r| {
+        let minx: f32 = r.get(0)?;
+        let miny: f32 = r.get(1)?;
+        let minz: f32 = r.get(2)?;
+        let maxx: f32 = r.get(3)?;
+        let maxy: f32 = r.get(4)?;
+        let maxz: f32 = r.get(5)?;
+        Ok((
+            aabb_from_row(minx, miny, minz, maxx, maxy, maxz),
+            aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz),
+        ))
+    })
+    .optional()
+}
+
+fn candidate_sort_key_scope_rank(
+    candidate: &NearestClearanceCandidate,
+    scope_dbnums: &Option<Vec<u32>>,
+) -> usize {
+    let candidate_dbnum = refno_str_to_i64(&candidate.refno).map(dbnum_from_refno_id);
+    match scope_dbnums {
+        Some(dbnums) => candidate_dbnum
+            .and_then(|dbnum| dbnums.iter().position(|allowed| *allowed == dbnum))
+            .unwrap_or(usize::MAX),
+        None => 0,
+    }
+}
+
+fn centerline_segment_aabb(segment: &BranCenterlineSegment) -> Aabb {
+    Aabb::new(
+        [
+            segment.start.x.min(segment.end.x),
+            segment.start.y.min(segment.end.y),
+            segment.start.z.min(segment.end.z),
+        ]
+        .into(),
+        [
+            segment.start.x.max(segment.end.x),
+            segment.start.y.max(segment.end.y),
+            segment.start.z.max(segment.end.z),
+        ]
+        .into(),
+    )
+}
+
+fn centerline_bbox(segments: &[BranCenterlineSegment]) -> Option<Aabb> {
+    let mut iter = segments.iter();
+    let first = iter.next()?;
+    let mut bbox = centerline_segment_aabb(first);
+    for segment in iter {
+        bbox.merge(&centerline_segment_aabb(segment));
+    }
+    Some(bbox)
+}
+
+fn point_aabb_distance(point: Vec3, aabb: &Aabb) -> f32 {
+    let dx = if point.x < aabb.mins.x {
+        aabb.mins.x - point.x
+    } else if point.x > aabb.maxs.x {
+        point.x - aabb.maxs.x
+    } else {
+        0.0
+    };
+    let dy = if point.y < aabb.mins.y {
+        aabb.mins.y - point.y
+    } else if point.y > aabb.maxs.y {
+        point.y - aabb.maxs.y
+    } else {
+        0.0
+    };
+    let dz = if point.z < aabb.mins.z {
+        aabb.mins.z - point.z
+    } else if point.z > aabb.maxs.z {
+        point.z - aabb.maxs.z
+    } else {
+        0.0
+    };
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn segment_intersects_aabb(start: Vec3, end: Vec3, aabb: &Aabb) -> bool {
+    let dir = end - start;
+    let mut t_min = 0.0_f32;
+    let mut t_max = 1.0_f32;
+    for (origin, delta, min, max) in [
+        (start.x, dir.x, aabb.mins.x, aabb.maxs.x),
+        (start.y, dir.y, aabb.mins.y, aabb.maxs.y),
+        (start.z, dir.z, aabb.mins.z, aabb.maxs.z),
+    ] {
+        if delta.abs() <= f32::EPSILON {
+            if origin < min || origin > max {
+                return false;
+            }
+            continue;
+        }
+        let inv = 1.0 / delta;
+        let mut t1 = (min - origin) * inv;
+        let mut t2 = (max - origin) * inv;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return false;
+        }
+    }
+    true
+}
+
+fn segment_aabb_distance(segment: &BranCenterlineSegment, aabb: &Aabb) -> f32 {
+    if segment_intersects_aabb(segment.start, segment.end, aabb) {
+        return 0.0;
+    }
+
+    let axis = segment.end - segment.start;
+    let len_sq = axis.length_squared();
+    if len_sq <= f32::EPSILON {
+        return point_aabb_distance(segment.start, aabb);
+    }
+
+    // Deterministic MVP approximation: sample endpoints, AABB corners projected onto the
+    // segment, and segment points closest to box face coordinates. This is tighter than using
+    // the whole BRAN AABB while staying cheap for per-candidate filtering.
+    let mut best =
+        point_aabb_distance(segment.start, aabb).min(point_aabb_distance(segment.end, aabb));
+
+    let corners = [
+        Vec3::new(aabb.mins.x, aabb.mins.y, aabb.mins.z),
+        Vec3::new(aabb.mins.x, aabb.mins.y, aabb.maxs.z),
+        Vec3::new(aabb.mins.x, aabb.maxs.y, aabb.mins.z),
+        Vec3::new(aabb.mins.x, aabb.maxs.y, aabb.maxs.z),
+        Vec3::new(aabb.maxs.x, aabb.mins.y, aabb.mins.z),
+        Vec3::new(aabb.maxs.x, aabb.mins.y, aabb.maxs.z),
+        Vec3::new(aabb.maxs.x, aabb.maxs.y, aabb.mins.z),
+        Vec3::new(aabb.maxs.x, aabb.maxs.y, aabb.maxs.z),
+    ];
+    for corner in corners {
+        let t = ((corner - segment.start).dot(axis) / len_sq).clamp(0.0, 1.0);
+        best = best.min(point_aabb_distance(segment.start + axis * t, aabb));
+    }
+
+    for (start_axis, delta_axis, min_axis, max_axis) in [
+        (segment.start.x, axis.x, aabb.mins.x, aabb.maxs.x),
+        (segment.start.y, axis.y, aabb.mins.y, aabb.maxs.y),
+        (segment.start.z, axis.z, aabb.mins.z, aabb.maxs.z),
+    ] {
+        if delta_axis.abs() <= f32::EPSILON {
+            continue;
+        }
+        for plane in [min_axis, max_axis] {
+            let t = (plane - start_axis) / delta_axis;
+            if (0.0..=1.0).contains(&t) {
+                best = best.min(point_aabb_distance(segment.start + axis * t, aabb));
+            }
+        }
+    }
+
+    best
+}
+
+fn min_distance_to_centerline(candidate: &Aabb, centerline: &[BranCenterlineSegment]) -> f32 {
+    centerline
+        .iter()
+        .map(|segment| segment_aabb_distance(segment, candidate))
+        .fold(f32::INFINITY, f32::min)
+}
+
 // ============================================================================
 // Handler：GET /api/sqlite-spatial/query
 // ============================================================================
+
+/// GET /api/sqlite-spatial/nearest-clearance
+pub async fn api_sqlite_spatial_nearest_clearance(
+    Query(params): Query<NearestClearanceQueryParams>,
+) -> Json<NearestClearanceResponse> {
+    let include_debug = params.debug.unwrap_or(false);
+    let prepared_centerline = if parse_clearance_source_mode(&params) == "bran_centerline" {
+        match params
+            .source_refno
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(source_refno) => match parse_refno_enum_for_source(source_refno) {
+                Ok(branch_refno) => match fetch_bran_centerline_segments(branch_refno).await {
+                    Ok(segments) => Some(segments),
+                    Err(e) => {
+                        return Json(error_nearest_clearance_response(
+                            format!("fetch BRAN centerline failed: {e}"),
+                            Some(NearestClearanceSource {
+                                kind: "bran_centerline".to_string(),
+                                refno: normalize_refno_string(source_refno),
+                                dbnum: refno_str_to_i64(source_refno).map(dbnum_from_refno_id),
+                                point: None,
+                                aabb: None,
+                                segment_count: None,
+                                centerline_bbox: None,
+                            }),
+                            None,
+                            None,
+                            include_debug.then(NearestClearanceDebug::default),
+                            "centerline_aabb_clearance_mm",
+                        ));
+                    }
+                },
+                Err(e) => {
+                    return Json(error_nearest_clearance_response(
+                        e,
+                        None,
+                        None,
+                        None,
+                        include_debug.then(NearestClearanceDebug::default),
+                        "centerline_aabb_clearance_mm",
+                    ));
+                }
+            },
+            None => {
+                return Json(error_nearest_clearance_response(
+                    "source_mode=bran_centerline requires source_refno",
+                    None,
+                    None,
+                    None,
+                    include_debug.then(NearestClearanceDebug::default),
+                    "centerline_aabb_clearance_mm",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        do_nearest_clearance_query(params, prepared_centerline)
+    })
+    .await;
+    match result {
+        Ok(r) => Json(r),
+        Err(e) => Json(error_nearest_clearance_response(
+            format!("internal error: {}", e),
+            None,
+            None,
+            None,
+            None,
+            "aabb_clearance_mm",
+        )),
+    }
+}
 
 /// GET /api/sqlite-spatial/query
 pub async fn api_sqlite_spatial_query(
@@ -378,6 +1112,467 @@ pub async fn api_sqlite_spatial_query(
             None,
         )),
     }
+}
+
+fn do_nearest_clearance_query(
+    params: NearestClearanceQueryParams,
+    prepared_centerline: Option<Vec<BranCenterlineSegment>>,
+) -> NearestClearanceResponse {
+    let include_debug = params.debug.unwrap_or(false);
+    let source_mode = parse_clearance_source_mode(&params);
+    let distance_method = if source_mode == "bran_centerline" {
+        "centerline_aabb_clearance_mm"
+    } else {
+        "aabb_clearance_mm"
+    };
+    if source_mode == "invalid" {
+        return error_nearest_clearance_response(
+            "invalid source_mode (expected aabb, point, or bran_centerline)",
+            None,
+            None,
+            None,
+            include_debug.then(NearestClearanceDebug::default),
+            distance_method,
+        );
+    }
+    let groups = match resolve_target_groups(&params) {
+        Ok(groups) => groups,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                e,
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+    let all_target_nouns = union_group_nouns(&groups);
+    let radius = match resolve_clearance_radius(params.radius) {
+        Ok(radius) => radius,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                e,
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+    let max_per_group = resolve_clearance_max_per_group(params.max_per_group);
+    let include_self = params.include_self.unwrap_or(false);
+
+    let cached = match get_cached_index() {
+        Ok(c) => c,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                format!("{}. 请先运行 import-spatial-index 构建索引。", e),
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+
+    let conn = match Connection::open(&cached.path) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                format!("open sqlite connection failed: {}", e),
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+
+    let source_refno = params
+        .source_refno
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut self_id = None;
+    let (source, source_geometry, source_dbnum) = if source_mode == "bran_centerline" {
+        let Some(source_refno) = source_refno else {
+            return error_nearest_clearance_response(
+                "source_mode=bran_centerline requires source_refno",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        let Some(id) = refno_str_to_i64(source_refno) else {
+            return error_nearest_clearance_response(
+                "invalid source_refno format (expected dbnum_refno or dbnum/refno)",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        self_id = Some(id);
+        let Some(centerline) = prepared_centerline else {
+            return error_nearest_clearance_response(
+                "BRAN centerline was not prepared",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        if centerline.is_empty() {
+            return error_nearest_clearance_response(
+                "BRAN centerline has no segments",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+        let bbox = centerline_bbox(&centerline).expect("non-empty centerline has bbox");
+        let source = NearestClearanceSource {
+            kind: "bran_centerline".to_string(),
+            refno: Some(i64_to_refno_str(id)),
+            dbnum: Some(dbnum_from_refno_id(id)),
+            point: None,
+            aabb: None,
+            segment_count: Some(centerline.len()),
+            centerline_bbox: Some(aabb_to_dto(&bbox)),
+        };
+        (
+            source,
+            ClearanceSourceGeometry::BranCenterline(centerline),
+            Some(dbnum_from_refno_id(id)),
+        )
+    } else if source_mode == "aabb" {
+        let Some(source_refno) = source_refno else {
+            return error_nearest_clearance_response(
+                "source_mode=aabb requires source_refno",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        let Some(id) = refno_str_to_i64(source_refno) else {
+            return error_nearest_clearance_response(
+                "invalid source_refno format (expected dbnum_refno or dbnum/refno)",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        self_id = Some(id);
+        let row = match query_aabb_row(&conn, id) {
+            Ok(row) => row,
+            Err(e) => {
+                return error_nearest_clearance_response(
+                    format!("query source refno aabb failed: {}", e),
+                    None,
+                    None,
+                    None,
+                    include_debug.then(NearestClearanceDebug::default),
+                    distance_method,
+                );
+            }
+        };
+        let Some((minx, miny, minz, maxx, maxy, maxz)) = row else {
+            return error_nearest_clearance_response(
+                "source_refno not found in aabb_index",
+                Some(NearestClearanceSource {
+                    kind: "refno".to_string(),
+                    refno: normalize_refno_string(source_refno),
+                    dbnum: Some(dbnum_from_refno_id(id)),
+                    point: None,
+                    aabb: None,
+                    segment_count: None,
+                    centerline_bbox: None,
+                }),
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        let aabb = aabb_from_row(minx, miny, minz, maxx, maxy, maxz);
+        let source = NearestClearanceSource {
+            kind: "refno".to_string(),
+            refno: Some(i64_to_refno_str(id)),
+            dbnum: Some(dbnum_from_refno_id(id)),
+            point: None,
+            aabb: Some(aabb_to_dto(&aabb)),
+            segment_count: None,
+            centerline_bbox: None,
+        };
+        (
+            source,
+            ClearanceSourceGeometry::Aabb(aabb),
+            Some(dbnum_from_refno_id(id)),
+        )
+    } else {
+        let (Some(x), Some(y), Some(z)) = (params.x, params.y, params.z) else {
+            return error_nearest_clearance_response(
+                "missing source_refno or point source parameters (x, y, z)",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        };
+        if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+            return error_nearest_clearance_response(
+                "point source contains non-finite value",
+                None,
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+        let aabb = Aabb::new([x, y, z].into(), [x, y, z].into());
+        let source = NearestClearanceSource {
+            kind: "point".to_string(),
+            refno: None,
+            dbnum: None,
+            point: Some(Vec3Dto { x, y, z }),
+            aabb: Some(aabb_to_dto(&aabb)),
+            segment_count: None,
+            centerline_bbox: None,
+        };
+        (source, ClearanceSourceGeometry::Aabb(aabb), None)
+    };
+
+    let (scope, scope_dbnums) = match resolve_scope(&params, source_dbnum) {
+        Ok(scope) => scope,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                e,
+                Some(source),
+                None,
+                None,
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+
+    let resolved_filters = NearestClearanceResolvedFilters {
+        target_nouns: {
+            let mut nouns = all_target_nouns.iter().cloned().collect::<Vec<_>>();
+            nouns.sort();
+            nouns
+        },
+        target_groups: groups.clone(),
+        scope: scope.clone(),
+        dbnums: scope_dbnums.clone(),
+        radius,
+        max_per_group,
+        include_self,
+    };
+
+    let query_result = match &source_geometry {
+        ClearanceSourceGeometry::Aabb(source_aabb) => {
+            let query_aabb = expand_aabb(source_aabb.clone(), radius);
+            cached
+                .idx
+                .query_intersect(
+                    query_aabb.mins.x as f64,
+                    query_aabb.maxs.x as f64,
+                    query_aabb.mins.y as f64,
+                    query_aabb.maxs.y as f64,
+                    query_aabb.mins.z as f64,
+                    query_aabb.maxs.z as f64,
+                )
+                .map(|ids| (ids, query_aabb))
+                .map_err(|e| format!("query_intersect failed: {e}"))
+        }
+        ClearanceSourceGeometry::BranCenterline(centerline) => {
+            let segment_aabbs = centerline
+                .iter()
+                .map(centerline_segment_aabb)
+                .collect::<Vec<_>>();
+            query_ids_for_regions(cached, &segment_aabbs, radius)
+                .map(|(ids, bbox)| (ids, bbox.expect("non-empty centerline query has bbox")))
+        }
+    };
+    let (ids, query_aabb) = match query_result {
+        Ok(value) => value,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                e,
+                Some(source),
+                None,
+                Some(resolved_filters),
+                include_debug.then(NearestClearanceDebug::default),
+                distance_method,
+            );
+        }
+    };
+    let query_bbox = aabb_to_dto(&query_aabb);
+
+    let mut debug = NearestClearanceDebug {
+        candidate_ids: ids.len(),
+        ..Default::default()
+    };
+    let mut stmt_item =
+        match conn.prepare("SELECT noun, spec_value, dbnum FROM items WHERE id = ?1") {
+            Ok(s) => s,
+            Err(e) => {
+                return error_nearest_clearance_response(
+                    format!("prepare item stmt failed: {}", e),
+                    Some(source),
+                    Some(query_bbox),
+                    Some(resolved_filters),
+                    include_debug.then_some(debug),
+                    distance_method,
+                );
+            }
+        };
+    let mut stmt_aabb = match conn
+        .prepare("SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1")
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return error_nearest_clearance_response(
+                format!("prepare aabb stmt failed: {}", e),
+                Some(source),
+                Some(query_bbox),
+                Some(resolved_filters),
+                include_debug.then_some(debug),
+                distance_method,
+            );
+        }
+    };
+
+    let mut candidates = Vec::new();
+    for id in ids {
+        debug.rows_examined += 1;
+
+        if !include_self && self_id.is_some_and(|source_id| source_id == id) {
+            continue;
+        }
+
+        let item_row = match query_item_row(&mut stmt_item, id) {
+            Ok(row) => row,
+            Err(_) => None,
+        };
+        let Some((noun, spec_value, item_dbnum)) = item_row else {
+            debug.rows_missing_items += 1;
+            continue;
+        };
+        let noun_upper = noun.to_uppercase();
+        let dbnum = item_dbnum_or_id_dbnum(item_dbnum, id);
+        if !dbnum_matches_scope(Some(dbnum), &scope_dbnums) {
+            debug.scope_filtered += 1;
+            continue;
+        }
+        if !all_target_nouns.contains(&noun_upper) {
+            debug.noun_filtered += 1;
+            continue;
+        }
+
+        let aabb_row = match query_aabb_row_dto(&mut stmt_aabb, id) {
+            Ok(row) => row,
+            Err(_) => None,
+        };
+        let Some((candidate_aabb, candidate_aabb_dto)) = aabb_row else {
+            debug.rows_missing_aabb += 1;
+            continue;
+        };
+
+        let distance = match &source_geometry {
+            ClearanceSourceGeometry::Aabb(source_aabb) => {
+                aabb_min_distance(source_aabb, &candidate_aabb)
+            }
+            ClearanceSourceGeometry::BranCenterline(centerline) => {
+                min_distance_to_centerline(&candidate_aabb, centerline)
+            }
+        };
+        if distance > radius {
+            debug.distance_filtered += 1;
+            continue;
+        }
+
+        candidates.push((
+            noun_upper,
+            NearestClearanceCandidate {
+                refno: i64_to_refno_str(id),
+                noun,
+                spec_value,
+                distance_mm: distance,
+                intersects: distance == 0.0,
+                aabb: candidate_aabb_dto,
+            },
+        ));
+    }
+
+    let mut nearest_by_group = Vec::new();
+    let mut warnings = Vec::new();
+    for (group_priority, group) in groups.iter().enumerate() {
+        let group_nouns: HashSet<String> = group.nouns.iter().cloned().collect();
+        let mut group_candidates = candidates
+            .iter()
+            .filter(|(noun, _candidate)| group_nouns.contains(noun))
+            .map(|(_noun, candidate)| candidate.clone())
+            .collect::<Vec<_>>();
+
+        group_candidates.sort_by(|a, b| {
+            a.distance_mm
+                .partial_cmp(&b.distance_mm)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    candidate_sort_key_scope_rank(a, &scope_dbnums)
+                        .cmp(&candidate_sort_key_scope_rank(b, &scope_dbnums))
+                })
+                .then_with(|| group_priority.cmp(&group_priority))
+                .then_with(|| a.refno.cmp(&b.refno))
+        });
+        if group_candidates.is_empty() {
+            warnings.push(format!("no targets found for group `{}`", group.name));
+        }
+        group_candidates.truncate(max_per_group);
+        debug.returned_candidates += group_candidates.len();
+        if !group_candidates.is_empty() {
+            debug.groups_with_hits += 1;
+        }
+        nearest_by_group.push(NearestClearanceGroupResult {
+            group: group.name.clone(),
+            nouns: group.nouns.clone(),
+            candidates: group_candidates,
+        });
+    }
+    if nearest_by_group
+        .iter()
+        .all(|group| group.candidates.is_empty())
+    {
+        warnings.push("no targets found for any group".to_string());
+    }
+
+    success_nearest_clearance_response(
+        source,
+        query_bbox,
+        resolved_filters,
+        nearest_by_group,
+        warnings,
+        include_debug.then_some(debug),
+        distance_method,
+    )
 }
 
 async fn query_refno_visible_inst_ids_for_fallback(
@@ -931,6 +2126,204 @@ mod tests {
         *test_index_override().lock().unwrap() = None;
     }
 
+    fn rid(dbnum: u32, refno: u32) -> i64 {
+        ((dbnum as u64) << 32 | refno as u64) as i64
+    }
+
+    fn base_nearest_params() -> NearestClearanceQueryParams {
+        NearestClearanceQueryParams {
+            source_mode: None,
+            source_refno: None,
+            x: None,
+            y: None,
+            z: None,
+            target_nouns: None,
+            target_groups: None,
+            radius: None,
+            scope: None,
+            dbnums: None,
+            max_per_group: None,
+            include_self: None,
+            debug: None,
+        }
+    }
+
+    fn create_nearest_test_index(path: &std::path::Path) {
+        let idx = SqliteAabbIndex::open(path).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "EQUI".to_string(),
+                0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(1, 2),
+                "PIPE".to_string(),
+                7,
+                11.0,
+                12.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(1, 3),
+                "WALL".to_string(),
+                11,
+                20.0,
+                30.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(1, 4),
+                "COLU".to_string(),
+                13,
+                50.0,
+                60.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(1, 5),
+                "PANE".to_string(),
+                17,
+                40.0,
+                45.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(2, 3),
+                "WALL".to_string(),
+                19,
+                13.0,
+                14.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(2, 4),
+                "COLU".to_string(),
+                23,
+                15.0,
+                16.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+            (
+                rid(1, 6),
+                "WALL".to_string(),
+                29,
+                5.0,
+                15.0,
+                0.0,
+                10.0,
+                0.0,
+                10.0,
+            ),
+        ])
+        .unwrap();
+    }
+
+    fn create_centerline_corridor_test_index(path: &std::path::Path) {
+        let idx = SqliteAabbIndex::open(path).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 100),
+                "BRAN".to_string(),
+                0,
+                -1.0,
+                101.0,
+                -1.0,
+                101.0,
+                -1.0,
+                1.0,
+            ),
+            (
+                rid(1, 201),
+                "WALL".to_string(),
+                11,
+                20.0,
+                22.0,
+                4.0,
+                6.0,
+                -1.0,
+                1.0,
+            ),
+            (
+                rid(1, 202),
+                "COLU".to_string(),
+                13,
+                94.0,
+                96.0,
+                80.0,
+                82.0,
+                -1.0,
+                1.0,
+            ),
+            (
+                rid(1, 203),
+                "WALL".to_string(),
+                17,
+                50.0,
+                52.0,
+                50.0,
+                52.0,
+                -1.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+    }
+
+    fn centerline_fixture() -> Vec<BranCenterlineSegment> {
+        vec![
+            BranCenterlineSegment {
+                refno: RefnoEnum::from("1/301"),
+                order: Some(0),
+                start: Vec3::new(0.0, 0.0, 0.0),
+                end: Vec3::new(100.0, 0.0, 0.0),
+            },
+            BranCenterlineSegment {
+                refno: RefnoEnum::from("1/302"),
+                order: Some(1),
+                start: Vec3::new(100.0, 0.0, 0.0),
+                end: Vec3::new(100.0, 100.0, 0.0),
+            },
+        ]
+    }
+
+    fn candidates_for_group<'a>(
+        resp: &'a NearestClearanceResponse,
+        group: &str,
+    ) -> &'a [NearestClearanceCandidate] {
+        resp.nearest_by_group
+            .iter()
+            .find(|item| item.group == group)
+            .map(|item| item.candidates.as_slice())
+            .unwrap_or(&[])
+    }
+
     #[test]
     fn bbox_query_returns_refno_strings() {
         let dir = tempdir().unwrap();
@@ -1186,5 +2579,261 @@ mod tests {
         let items = resp.results.unwrap_or_default();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].refno, "1_2");
+    }
+
+    #[test]
+    fn nearest_clearance_refno_source_returns_wall_and_column_groups() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1/1".to_string());
+            params.target_groups = Some("wall,column".to_string());
+            params.radius = Some(100.0);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(resp.success);
+        assert_eq!(resp.distance_method, "aabb_clearance_mm");
+        assert_eq!(resp.unit, "mm");
+        let wall = candidates_for_group(&resp, "wall");
+        let column = candidates_for_group(&resp, "column");
+        assert_eq!(wall.len(), 1);
+        assert_eq!(wall[0].refno, "1_6");
+        assert_eq!(wall[0].distance_mm, 0.0);
+        assert!(wall[0].intersects);
+        assert_eq!(column.len(), 1);
+        assert_eq!(column[0].refno, "1_4");
+        assert_eq!(column[0].distance_mm, 40.0);
+    }
+
+    #[test]
+    fn nearest_clearance_point_source_returns_nearest_targets() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.x = Some(0.0);
+            params.y = Some(0.0);
+            params.z = Some(0.0);
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(25.0);
+            params.max_per_group = Some(2);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(resp.success);
+        let candidates = candidates_for_group(&resp, "target_nouns");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].refno, "1_6");
+        assert_eq!(candidates[1].refno, "2_3");
+    }
+
+    #[test]
+    fn nearest_clearance_radius_changes_returned_set() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let small = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(5.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, None)
+        });
+        let large = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(25.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(small.success);
+        assert!(large.success);
+        assert_eq!(candidates_for_group(&small, "target_nouns").len(), 1);
+        assert_eq!(candidates_for_group(&large, "target_nouns").len(), 2);
+    }
+
+    #[test]
+    fn nearest_clearance_noun_filter_excludes_nearer_wrong_noun() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(20.0);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(resp.success);
+        let candidates = candidates_for_group(&resp, "target_nouns");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].noun, "WALL");
+        assert_eq!(candidates[0].refno, "1_6");
+        assert_ne!(candidates[0].refno, "1_2");
+    }
+
+    #[test]
+    fn nearest_clearance_honors_same_dbnum_and_explicit_dbnums_scope() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let same_db = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("COLU".to_string());
+            params.radius = Some(100.0);
+            do_nearest_clearance_query(params, None)
+        });
+        let explicit_db = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("COLU".to_string());
+            params.radius = Some(100.0);
+            params.scope = Some("explicit_dbnums".to_string());
+            params.dbnums = Some("2".to_string());
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(same_db.success);
+        assert!(explicit_db.success);
+        assert_eq!(
+            candidates_for_group(&same_db, "target_nouns")[0].refno,
+            "1_4"
+        );
+        assert_eq!(
+            candidates_for_group(&explicit_db, "target_nouns")[0].refno,
+            "2_4"
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_source_refno_not_found_returns_false() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_999".to_string());
+            params.target_groups = Some("wall".to_string());
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("source_refno not found in aabb_index")
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_intersecting_aabb_distance_zero_and_intersects_true() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(1.0);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(resp.success);
+        let candidates = candidates_for_group(&resp, "target_nouns");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].refno, "1_6");
+        assert_eq!(candidates[0].distance_mm, 0.0);
+        assert!(candidates[0].intersects);
+    }
+
+    #[test]
+    fn segment_aabb_distance_handles_intersecting_near_and_far() {
+        let segment = BranCenterlineSegment {
+            refno: RefnoEnum::from("1/301"),
+            order: Some(0),
+            start: Vec3::new(0.0, 0.0, 0.0),
+            end: Vec3::new(10.0, 0.0, 0.0),
+        };
+
+        let intersecting = Aabb::new([4.0, -1.0, -1.0].into(), [6.0, 1.0, 1.0].into());
+        let near = Aabb::new([4.0, 3.0, -1.0].into(), [6.0, 5.0, 1.0].into());
+        let far = Aabb::new([20.0, 0.0, 0.0].into(), [21.0, 1.0, 1.0].into());
+
+        assert_eq!(segment_aabb_distance(&segment, &intersecting), 0.0);
+        assert_eq!(segment_aabb_distance(&segment, &near), 3.0);
+        assert_eq!(segment_aabb_distance(&segment, &far), 10.0);
+    }
+
+    #[test]
+    fn nearest_clearance_bran_centerline_corridor_excludes_far_whole_aabb_hit() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_centerline_corridor_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.target_nouns = Some("WALL".to_string());
+            params.radius = Some(8.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, Some(centerline_fixture()))
+        });
+
+        assert!(resp.success);
+        assert_eq!(resp.distance_method, "centerline_aabb_clearance_mm");
+        let source = resp.source.as_ref().unwrap();
+        assert_eq!(source.kind, "bran_centerline");
+        assert_eq!(source.segment_count, Some(2));
+
+        let candidates = candidates_for_group(&resp, "target_nouns");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].refno, "1_201");
+        assert_eq!(candidates[0].distance_mm, 4.0);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.refno != "1_203"),
+            "candidate inside whole BRAN AABB but far from centerline must be excluded"
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_bran_centerline_supports_wall_and_column_groups() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_centerline_corridor_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.target_groups = Some("wall,column".to_string());
+            params.radius = Some(8.0);
+            do_nearest_clearance_query(params, Some(centerline_fixture()))
+        });
+
+        assert!(resp.success);
+        let wall = candidates_for_group(&resp, "wall");
+        let column = candidates_for_group(&resp, "column");
+        assert_eq!(wall.len(), 1);
+        assert_eq!(wall[0].refno, "1_201");
+        assert_eq!(column.len(), 1);
+        assert_eq!(column[0].refno, "1_202");
     }
 }

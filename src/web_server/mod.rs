@@ -1029,6 +1029,10 @@ pub async fn start_web_server_with_config(
                 .put(handlers::api_update_project)
                 .delete(handlers::api_delete_project),
         )
+        .route(
+            "/api/projects/{project_name}/e3d-projects",
+            get(handlers::api_get_project_e3d_projects),
+        )
         .route("/api/projects/demo", post(handlers::api_projects_demo))
         .route(
             "/api/projects/{id}/healthcheck",

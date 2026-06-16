@@ -1,6 +1,10 @@
 //! Embed URL handler — external systems request an embeddable review page URL.
 
-use axum::{extract::Json, http::StatusCode, response::IntoResponse};
+use axum::{
+    extract::Json,
+    http::{HeaderMap, StatusCode, header},
+    response::IntoResponse,
+};
 use tracing::{info, warn};
 
 #[cfg(feature = "review-internal-workflow")]
@@ -14,7 +18,10 @@ use super::types::{
     EmbedLineage, EmbedUrlData, EmbedUrlQuery, EmbedUrlRequest, EmbedUrlResponse, ReviewFormSummary,
 };
 
-pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoResponse {
+pub async fn get_embed_url(
+    headers: HeaderMap,
+    Json(request): Json<EmbedUrlRequest>,
+) -> impl IntoResponse {
     let request_form_id = request
         .form_id
         .as_ref()
@@ -197,19 +204,20 @@ pub async fn get_embed_url(Json(request): Json<EmbedUrlRequest>) -> impl IntoRes
                 }
             }
 
+            let frontend_base_url = resolve_embed_frontend_base_url(&request, &headers);
             let full_url = build_embed_url(
-                PLATFORM_CONFIG.frontend_base_url.as_str(),
+                frontend_base_url.as_deref().unwrap_or_default(),
                 PLATFORM_CONFIG.frontend_relative_path.as_str(),
                 token.as_str(),
                 request.project_id.as_str(),
             );
             info!(
-                "Embed URL response ready: request_form_id={:?}, response_query_form_id={}, lineage_form_id={}, relative_path={}, has_frontend_base_url={}, url={}",
+                "Embed URL response ready: request_form_id={:?}, response_query_form_id={}, lineage_form_id={}, relative_path={}, frontend_base_url={}, url={}",
                 request_form_id,
                 form_id,
                 form_id,
                 PLATFORM_CONFIG.frontend_relative_path,
-                !PLATFORM_CONFIG.frontend_base_url.trim().is_empty(),
+                frontend_base_url.as_deref().unwrap_or("<empty>"),
                 summarize_url_for_log(full_url.as_deref()).unwrap_or_else(|| "<none>".to_string())
             );
 
@@ -419,6 +427,131 @@ fn summarize_url_for_log(url: Option<&str>) -> Option<String> {
     }
 
     Some(summarized)
+}
+
+fn resolve_embed_frontend_base_url(
+    request: &EmbedUrlRequest,
+    headers: &HeaderMap,
+) -> Option<String> {
+    frontend_base_url_from_extra_parameters(request)
+        .or_else(managed_site_viewer_base_url)
+        .or_else(|| frontend_origin_from_headers(headers))
+        .or_else(|| normalize_frontend_base_url(PLATFORM_CONFIG.frontend_base_url.as_str()))
+}
+
+fn frontend_base_url_from_extra_parameters(request: &EmbedUrlRequest) -> Option<String> {
+    let map = request.extra_parameters.as_ref()?.as_object()?;
+
+    for key in ["frontend_base_url", "frontendBaseUrl"] {
+        if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+            if let Some(base) = normalize_frontend_base_url(value) {
+                return Some(base);
+            }
+        }
+    }
+
+    for key in ["viewer_url", "viewerUrl", "frontend_url", "frontendUrl"] {
+        if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+            if let Some(base) = normalize_frontend_origin(value) {
+                return Some(base);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "web_server")]
+fn managed_site_viewer_base_url() -> Option<String> {
+    let site_id = PLATFORM_CONFIG.site_id.as_deref()?;
+    match crate::web_server::managed_project_sites::get_site(site_id) {
+        Ok(Some(site)) => site
+            .viewer_url
+            .as_deref()
+            .and_then(normalize_frontend_origin),
+        Ok(None) => {
+            warn!(
+                "Embed URL configured site_id={} but managed site was not found",
+                site_id
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                "Embed URL failed to load managed site {} for viewer_url: {}",
+                site_id, error
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "web_server"))]
+fn managed_site_viewer_base_url() -> Option<String> {
+    None
+}
+
+fn frontend_origin_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_frontend_origin)
+        .or_else(|| {
+            headers
+                .get(header::REFERER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(normalize_frontend_origin)
+        })
+}
+
+fn normalize_frontend_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed).trim();
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
+        .trim();
+
+    if without_query.is_empty() {
+        return None;
+    }
+
+    if let Ok(mut url) = reqwest::Url::parse(without_query) {
+        url.set_query(None);
+        url.set_fragment(None);
+        if url.path() == "/" {
+            url.set_path("");
+        }
+        return Some(url.as_str().trim_end_matches('/').to_string());
+    }
+
+    Some(without_query.trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
+}
+
+fn normalize_frontend_origin(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else if trimmed.starts_with("//") {
+        format!("http:{}", trimmed)
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    let mut url = reqwest::Url::parse(&candidate).ok()?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string())
 }
 
 fn build_embed_url(

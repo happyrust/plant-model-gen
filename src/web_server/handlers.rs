@@ -367,53 +367,6 @@ fn json_to_opt_record_id_string(v: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// `table:record_id` 形态（如 `projects:d8o84vhej37zdvt96ag0`），用于识别误写入 `name` 的 Surreal 记录 id。
-fn looks_like_surreal_table_record_id(s: &str) -> bool {
-    let s = s.trim();
-    let Some((table, rest)) = s.split_once(':') else {
-        return false;
-    };
-    if table.is_empty() || rest.is_empty() {
-        return false;
-    }
-    if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        || !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return false;
-    }
-    true
-}
-
-/// 前端 `output_project` / `/files/output/<name>/` 必须使用人类可读工程名。
-/// 若 DB 误将 `name` 存成记录 id 或与 `id` 相同，则用 DbOption 的 `project_name` / `included_projects` 兜底。
-fn normalize_project_item_output_name(raw_name: &str, record_id: Option<&str>) -> String {
-    let raw_name = raw_name.trim();
-    if raw_name.is_empty() {
-        return String::new();
-    }
-    let mistaken = looks_like_surreal_table_record_id(raw_name)
-        || record_id.is_some_and(|rid| rid == raw_name);
-    if !mistaken {
-        return raw_name.to_string();
-    }
-    let opt = aios_core::get_db_option();
-    let pn = opt.project_name.trim();
-    if !pn.is_empty() {
-        return pn.to_string();
-    }
-    for p in &opt.included_projects {
-        let p = p.trim();
-        if p.is_empty() || looks_like_surreal_table_record_id(p) {
-            continue;
-        }
-        return p.to_string();
-    }
-    if let Some(first) = opt.included_projects.first() {
-        return first.trim().to_string();
-    }
-    raw_name.to_string()
-}
-
 /// 初始化 projects 表结构（若存在则忽略错误）
 pub async fn ensure_projects_schema() {
     let defines = r#"
@@ -427,116 +380,186 @@ DEFINE INDEX idx_projects_name ON TABLE projects COLUMNS name UNIQUE;
 pub async fn api_get_projects(
     Query(params): Query<ProjectQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 先尝试：从本地 SQLite 读取（由 DbOption.toml 配置）
-    if let Some(mut items) = try_load_projects_from_sqlite() {
-        println!("📋 [projects] SQLite 分支: 查到 {} 条项目", items.len());
-        // Fallback: 如果 SQLite 表为空，则从 DbOption.toml 的 included_projects 读取
-        if items.is_empty() {
-            items = load_projects_from_config();
-            println!(
-                "📋 [projects] SQLite fallback -> config: {} 条项目",
-                items.len()
-            );
-        }
-        // 过滤
-        if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
-            let ql = q.to_lowercase();
-            items.retain(|p| {
-                p.name.to_lowercase().contains(&ql)
-                    || p.owner
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&ql)
-            });
-        }
-        if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
-            items.retain(|p| matches_status(&p.status, status));
-        }
-        if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
-            items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
-        }
-
-        // 排序（默认按 updated_at desc，如果存在）
-        let (sort_field, sort_dir) = match params.sort.as_deref() {
-            Some(s) if s.contains(":") => {
-                let mut it = s.splitn(2, ":");
-                (
-                    it.next().unwrap_or("updated_at"),
-                    it.next().unwrap_or("desc"),
-                )
-            }
-            Some(s) => (s, "desc"),
-            None => ("updated_at", "desc"),
-        };
-        let desc = !sort_dir.eq_ignore_ascii_case("asc");
-        items.sort_by(|a, b| {
-            let ord = match sort_field {
-                "name" => a.name.cmp(&b.name),
-                "env" => a.env.cmp(&b.env),
-                "version" => a.version.cmp(&b.version),
-                "updated_at" => a.updated_at.cmp(&b.updated_at),
-                _ => a.updated_at.cmp(&b.updated_at),
-            };
-            if desc { ord.reverse() } else { ord }
-        });
-
-        // 分页
-        let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
-        let page = params.page.unwrap_or(1).max(1) as usize;
-        let total = items.len();
-        let start = (page - 1) * per_page;
-        let end = (start + per_page).min(total);
-        let page_items = if start < total {
-            items[start..end].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        return Ok(Json(serde_json::json!({
-            "items": page_items,
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-            "source": "sqlite",
-        })));
-    }
-
-    let mut filters: Vec<String> = Vec::new();
-    if let Some(q) = params
-        .q
-        .as_ref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
-        let q = q.replace("'", "\\'");
-        filters.push(format!("name CONTAINS '{}' OR owner CONTAINS '{}'", q, q));
-    }
-    if let Some(status) = params
-        .status
-        .as_ref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
-        filters.push(format!("status = '{}'", status.replace("'", "\\'")));
-    }
-    if let Some(owner) = params
-        .owner
-        .as_ref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
-    {
-        filters.push(format!("owner = '{}'", owner.replace("'", "\\'")));
-    }
-
-    let where_clause = if filters.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", filters.join(" AND "))
-    };
+    let mut items = load_deployed_project_items();
+    filter_project_items(&mut items, &params);
+    sort_project_items(&mut items, params.sort.as_deref());
 
     let per_page = params.per_page.unwrap_or(20).max(1).min(100) as usize;
     let page = params.page.unwrap_or(1).max(1) as usize;
+    let total = items.len();
     let start = (page - 1) * per_page;
+    let end = (start + per_page).min(total);
+    let page_items = if start < total {
+        items[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
 
-    let (sort_field, sort_dir) = match params.sort.as_deref() {
+    Ok(Json(json!({
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "source": "deployed_project_names",
+    })))
+}
+
+fn load_deployed_project_items() -> Vec<ProjectItem> {
+    let mut items = Vec::new();
+
+    if let Some(site_id) = crate::web_server::web_listen::current_site_id() {
+        match crate::web_server::managed_project_sites::get_site(&site_id) {
+            Ok(Some(site)) => {
+                push_unique_project_item(&mut items, project_item_from_managed_site(site));
+            }
+            Ok(None) => {
+                items.extend(load_projects_from_config());
+            }
+            Err(error) => warn!("读取当前受管站点项目名失败: {}", error),
+        }
+        if !items.is_empty() {
+            return items;
+        }
+    }
+
+    match crate::web_server::managed_project_sites::list_sites() {
+        Ok(sites) => {
+            for site in sites {
+                push_unique_project_item(&mut items, project_item_from_managed_site(site));
+            }
+        }
+        Err(error) => warn!("读取受管站点项目名列表失败: {}", error),
+    }
+
+    if items.is_empty() {
+        match crate::web_server::site_registry::list_sites(None) {
+            Ok(sites) => {
+                for site in sites {
+                    push_unique_project_item(&mut items, project_item_from_registry_site(site));
+                }
+            }
+            Err(error) => warn!("读取中心注册表项目名列表失败: {}", error),
+        }
+    }
+
+    if items.is_empty() {
+        items.extend(load_projects_from_config());
+    }
+
+    items
+}
+
+fn push_unique_project_item(items: &mut Vec<ProjectItem>, item: Option<ProjectItem>) {
+    let Some(item) = item else {
+        return;
+    };
+    if items.iter().any(|existing| existing.name == item.name) {
+        return;
+    }
+    items.push(item);
+}
+
+fn project_item_from_managed_site(site: ManagedProjectSite) -> Option<ProjectItem> {
+    let project_name = site.project_name.trim();
+    if project_name.is_empty() {
+        return None;
+    }
+    let url = site
+        .viewer_url
+        .clone()
+        .or(site.public_entry_url.clone())
+        .or(site.entry_url.clone())
+        .or(site.local_entry_url.clone());
+    let status = match site.status {
+        ManagedSiteStatus::Starting => ProjectStatus::Deploying,
+        ManagedSiteStatus::Running => ProjectStatus::Running,
+        ManagedSiteStatus::Failed => ProjectStatus::Failed,
+        ManagedSiteStatus::Stopping | ManagedSiteStatus::Stopped => ProjectStatus::Stopped,
+        ManagedSiteStatus::Draft | ManagedSiteStatus::Parsed => ProjectStatus::Stopped,
+    };
+    Some(ProjectItem {
+        id: Some(project_name.to_string()),
+        name: project_name.to_string(),
+        version: None,
+        url,
+        env: Some("managed".to_string()),
+        status,
+        owner: None,
+        tags: Some(json!({
+            "site_id": site.site_id,
+            "site_name": site.site_name,
+        })),
+        notes: None,
+        health_url: site
+            .entry_url
+            .map(|url| format!("{}/api/health", url.trim_end_matches('/'))),
+        last_health_check: None,
+        created_at: Some(site.created_at),
+        updated_at: Some(site.updated_at),
+        show_dbnum: site.manual_db_nums.first().copied(),
+    })
+}
+
+fn project_item_from_registry_site(site: DeploymentSite) -> Option<ProjectItem> {
+    let project_name = site.project_name.trim();
+    if project_name.is_empty() {
+        return None;
+    }
+    let status = match site.status {
+        DeploymentSiteStatus::Configuring | DeploymentSiteStatus::Deploying => {
+            ProjectStatus::Deploying
+        }
+        DeploymentSiteStatus::Running => ProjectStatus::Running,
+        DeploymentSiteStatus::Failed => ProjectStatus::Failed,
+        DeploymentSiteStatus::Stopped | DeploymentSiteStatus::Offline => ProjectStatus::Stopped,
+    };
+    Some(ProjectItem {
+        id: Some(project_name.to_string()),
+        name: project_name.to_string(),
+        version: None,
+        url: site.frontend_url.or(site.url).or(site.backend_url),
+        env: site.env.or(site.region),
+        status,
+        owner: site.owner,
+        tags: Some(json!({
+            "site_id": site.site_id,
+            "site_name": site.name,
+        })),
+        notes: site.notes,
+        health_url: site.health_url,
+        last_health_check: site.last_health_check,
+        created_at: site
+            .created_at
+            .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339()),
+        updated_at: site
+            .updated_at
+            .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339()),
+        show_dbnum: site.config.manual_db_nums.first().copied(),
+    })
+}
+
+fn filter_project_items(items: &mut Vec<ProjectItem>, params: &ProjectQuery) {
+    if let Some(q) = params.q.as_ref().filter(|s| !s.is_empty()) {
+        let ql = q.to_lowercase();
+        items.retain(|p| {
+            p.name.to_lowercase().contains(&ql)
+                || p.owner
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&ql)
+        });
+    }
+    if let Some(status) = params.status.as_ref().filter(|s| !s.is_empty()) {
+        items.retain(|p| matches_status(&p.status, status));
+    }
+    if let Some(owner) = params.owner.as_ref().filter(|s| !s.is_empty()) {
+        items.retain(|p| p.owner.as_deref() == Some(owner.as_str()));
+    }
+}
+
+fn sort_project_items(items: &mut [ProjectItem], sort: Option<&str>) {
+    let (sort_field, sort_dir) = match sort {
         Some(s) if s.contains(":") => {
             let mut it = s.splitn(2, ":");
             (
@@ -547,134 +570,154 @@ pub async fn api_get_projects(
         Some(s) => (s, "desc"),
         None => ("updated_at", "desc"),
     };
-
-    let sql = format!(
-        "SELECT *, id as id FROM projects {} ORDER BY {} {} LIMIT {} START {}",
-        where_clause,
-        sort_field,
-        if sort_dir.eq_ignore_ascii_case("asc") {
-            "ASC"
-        } else {
-            "DESC"
-        },
-        per_page,
-        start
-    );
-    let count_sql = format!("SELECT count() as total FROM projects {}", where_clause);
-
-    let mut items: Vec<ProjectItem> = Vec::new();
-    let mut total: usize = 0;
-
-    match project_primary_db().query_response(&sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            for row in rows {
-                let id = json_to_opt_record_id_string(&row["id"]);
-                let raw_name = row["name"].as_str().unwrap_or("").to_string();
-                let name = normalize_project_item_output_name(&raw_name, id.as_deref());
-                let show_dbnum = project_show_dbnum(&name);
-                let item = ProjectItem {
-                    id,
-                    name,
-                    version: row["version"].as_str().map(|s| s.to_string()),
-                    url: row["url"].as_str().map(|s| s.to_string()),
-                    env: row["env"].as_str().map(|s| s.to_string()),
-                    status: match row["status"].as_str().unwrap_or("Running") {
-                        "Deploying" => ProjectStatus::Deploying,
-                        "Failed" => ProjectStatus::Failed,
-                        "Stopped" => ProjectStatus::Stopped,
-                        _ => ProjectStatus::Running,
-                    },
-                    owner: row["owner"].as_str().map(|s| s.to_string()),
-                    tags: row.get("tags").cloned(),
-                    notes: row["notes"].as_str().map(|s| s.to_string()),
-                    health_url: row["health_url"].as_str().map(|s| s.to_string()),
-                    last_health_check: row["last_health_check"].as_str().map(|s| s.to_string()),
-                    created_at: row["created_at"].as_str().map(|s| s.to_string()),
-                    updated_at: row["updated_at"].as_str().map(|s| s.to_string()),
-                    show_dbnum,
-                };
-                if !item.name.is_empty() {
-                    items.push(item);
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("[projects] SurrealDB 查询失败 (将走 config fallback): {e}");
-        }
-    }
-
-    match project_primary_db().query_response(&count_sql).await {
-        Ok(mut resp) => {
-            let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
-            total = rows.get(0).and_then(|r| r["total"].as_u64()).unwrap_or(0) as usize;
-        }
-        Err(e) => {
-            log::warn!("[projects] SurrealDB 计数查询失败: {e}");
-        }
-    }
-
-    println!(
-        "📋 [projects] SurrealDB 分支: 查到 {} 条项目, total={}",
-        items.len(),
-        total
-    );
-    // Fallback: 如果 SQLite 和 SurrealDB 都没有数据，则从 DbOption.toml 的 included_projects 读取
-    if items.is_empty() {
-        items = load_projects_from_config();
-        total = items.len();
-        println!(
-            "📋 [projects] SurrealDB fallback -> config: {} 条项目",
-            items.len()
-        );
-    }
-
-    Ok(Json(json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page,
-    })))
+    let desc = !sort_dir.eq_ignore_ascii_case("asc");
+    items.sort_by(|a, b| {
+        let ord = match sort_field {
+            "name" => a.name.cmp(&b.name),
+            "env" => a.env.cmp(&b.env),
+            "version" => a.version.cmp(&b.version),
+            "updated_at" => a.updated_at.cmp(&b.updated_at),
+            _ => a.updated_at.cmp(&b.updated_at),
+        };
+        if desc { ord.reverse() } else { ord }
+    });
 }
 
-/// 从 DbOption.toml 的 included_projects 读取项目列表作为 fallback
+/// 从 DbOption.toml 读取当前部署项目作为 fallback。
+///
+/// `project_name` 是当前 web_server/Viewer 对应的部署项目与 output 目录名；
+/// `included_projects` 是源 E3D 工程集合，不能作为 `/api/projects` 的项目列表返回。
 fn load_projects_from_config() -> Vec<ProjectItem> {
     let opt = aios_core::get_db_option();
-    let included = &opt.included_projects;
-    if included.is_empty() {
+    let project_name = opt.project_name.trim().to_string();
+    if project_name.is_empty() {
         return Vec::new();
     }
-    let project_name = &opt.project_name;
+
+    let runtime = crate::web_server::web_listen::current_site_runtime()
+        .unwrap_or_else(|| crate::web_server::site_registry::load_web_server_runtime_config(0));
     let show_dbnum = opt.manual_db_nums.as_ref().and_then(|v| v.first().copied());
-    included
-        .iter()
-        .map(|name| {
-            let notes = if name == project_name {
-                Some(match show_dbnum {
-                    Some(dbnum) => format!("当前活动项目 (dbnum: {})", dbnum),
-                    None => "当前活动项目".to_string(),
-                })
-            } else {
-                None
-            };
-            ProjectItem {
-                id: Some(name.clone()),
-                name: name.clone(),
-                version: None,
-                url: None,
-                env: Some("local".to_string()),
-                status: ProjectStatus::Running,
-                owner: None,
-                tags: None,
-                notes,
-                health_url: None,
-                last_health_check: None,
-                created_at: None,
-                updated_at: None,
-                show_dbnum: project_show_dbnum(name),
+    let frontend_url = runtime
+        .frontend_url
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let backend_url = if runtime.backend_url.trim().is_empty() {
+        None
+    } else {
+        Some(runtime.backend_url.trim().trim_end_matches('/').to_string())
+    };
+
+    vec![ProjectItem {
+        id: Some(project_name.clone()),
+        name: project_name.clone(),
+        version: None,
+        url: frontend_url.or_else(|| backend_url.clone()),
+        env: runtime.region.or_else(|| Some("local".to_string())),
+        status: ProjectStatus::Running,
+        owner: None,
+        tags: Some(json!({
+            "site_id": runtime.site_id.clone(),
+            "site_name": runtime.site_name.clone(),
+        })),
+        notes: Some(format!("部署站点: {}", runtime.site_name)),
+        health_url: backend_url.map(|url| format!("{}/api/health", url)),
+        last_health_check: None,
+        created_at: None,
+        updated_at: None,
+        show_dbnum,
+    }]
+}
+
+pub async fn api_get_project_e3d_projects(
+    Path(project_name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let project_name = project_name.trim();
+    if project_name.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match load_e3d_project_names_for_deployed_project(project_name) {
+        Ok(Some((matched_project_name, e3d_project_names))) => Ok(Json(json!({
+            "project_name": matched_project_name,
+            "e3d_project_names": e3d_project_names,
+            "total": e3d_project_names.len(),
+        }))),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            warn!(
+                "查询部署项目 {} 的 E3D 工程列表失败: {}",
+                project_name, error
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn load_e3d_project_names_for_deployed_project(
+    project_name: &str,
+) -> anyhow::Result<Option<(String, Vec<String>)>> {
+    let normalize_names = |names: Vec<String>| -> Vec<String> {
+        let mut result = Vec::new();
+        for name in names {
+            let trimmed = name.trim();
+            if trimmed.is_empty()
+                || result
+                    .iter()
+                    .any(|existing: &String| existing.as_str() == trimmed)
+            {
+                continue;
             }
-        })
-        .collect()
+            result.push(trimmed.to_string());
+        }
+        result
+    };
+
+    if let Ok(sites) = crate::web_server::managed_project_sites::list_sites() {
+        if let Some(site) = sites.into_iter().find(|site| {
+            site.project_name == project_name
+                || site.site_id == project_name
+                || (!site.site_name.trim().is_empty() && site.site_name == project_name)
+        }) {
+            let mut raw_names: Vec<String> = site
+                .projects
+                .into_iter()
+                .map(|project| project.name)
+                .collect();
+            if raw_names.is_empty() {
+                if let Some(associated_project) = site.associated_project {
+                    raw_names.push(associated_project);
+                }
+            }
+            let names = normalize_names(raw_names);
+            return Ok(Some((site.project_name, names)));
+        }
+    }
+
+    if let Ok(sites) = crate::web_server::site_registry::list_sites(None) {
+        if let Some(site) = sites.into_iter().find(|site| {
+            site.project_name == project_name
+                || site.site_id == project_name
+                || site.name == project_name
+        }) {
+            let names = normalize_names(
+                site.e3d_projects
+                    .into_iter()
+                    .map(|project| project.name)
+                    .collect(),
+            );
+            return Ok(Some((site.project_name, names)));
+        }
+    }
+
+    let opt = aios_core::get_db_option();
+    if opt.project_name == project_name {
+        return Ok(Some((
+            opt.project_name.clone(),
+            normalize_names(opt.included_projects.clone()),
+        )));
+    }
+
+    Ok(None)
 }
 
 fn project_show_dbnum(project_name: &str) -> Option<u32> {

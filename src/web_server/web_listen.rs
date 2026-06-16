@@ -24,6 +24,10 @@ pub fn current_site_id() -> Option<String> {
     SITE_RUNTIME.get().map(|runtime| runtime.site_id.clone())
 }
 
+pub fn current_site_runtime() -> Option<WebServerRuntimeConfig> {
+    SITE_RUNTIME.get().cloned()
+}
+
 /// `GET /api/site/identity` 返回体：便于网关/前端区分「当前是哪个站点的 web_server」。
 pub fn site_identity_json() -> serde_json::Value {
     let (host, port) = get_web_listen().unwrap_or(("0.0.0.0", 0));

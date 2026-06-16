@@ -1615,6 +1615,34 @@ fn ensure_table<'a>(table: &'a mut toml::value::Table, key: &str) -> &'a mut tom
 
 // ─── Config builders ────────────────────────────────────────────────────────
 
+fn frontend_base_url_for_site_config(site: &ManagedProjectSite, fallback: &str) -> String {
+    site.viewer_url
+        .as_deref()
+        .and_then(viewer_url_origin)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn viewer_url_origin(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else if trimmed.starts_with("//") {
+        format!("http:{}", trimmed)
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    let mut url = reqwest::Url::parse(&candidate).ok()?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.as_str().trim_end_matches('/').to_string()).filter(|value| !value.is_empty())
+}
+
 fn build_site_config(
     site: &ManagedProjectSite,
     db_user: &str,
@@ -1727,7 +1755,8 @@ fn build_site_config(
         derive_entry_urls(site.web_port, &site.bind_host, &site.public_base_url);
     let effective = effective_url.unwrap_or_else(|| local_url.clone().unwrap_or_default());
     let local = local_url.unwrap_or_default();
-    set_toml_string(web_server, "frontend_url", effective.clone());
+    let frontend_base_url = frontend_base_url_for_site_config(site, &effective);
+    set_toml_string(web_server, "frontend_url", frontend_base_url.clone());
     set_toml_string(web_server, "public_base_url", effective.clone());
     set_toml_string(web_server, "backend_url", local);
     set_toml_bool(web_server, "auto_start_surreal", false);
@@ -1740,7 +1769,7 @@ fn build_site_config(
     );
 
     let model_center = ensure_table(table, "model_center");
-    set_toml_string(model_center, "frontend_base_url", effective);
+    set_toml_string(model_center, "frontend_base_url", frontend_base_url);
 
     apply_site_db_mode_config(table, site, db_user, db_password, ManagedSiteDbMode::Ws);
 
@@ -4796,8 +4825,9 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         last_parse_finished_at,
         last_parse_duration_ms,
     } = update;
+    let should_rewrite_site_files = viewer_url.is_some();
 
-    let updated_site = with_tx(|conn| {
+    let (updated_site, db_user, db_password) = with_tx(|conn| {
         let mut site = load_site_with_conn(conn, site_id)?.ok_or_else(|| anyhow!("站点不存在"))?;
         if let Some(value) = status {
             site.status = value;
@@ -4841,8 +4871,12 @@ pub fn update_runtime(site_id: &str, update: RuntimeUpdate) -> Result<()> {
         site.updated_at = now_rfc3339();
         let (db_user, db_password) = load_credentials_with_conn(conn, site_id)?;
         persist_site_with_conn(conn, &site, &db_user, &db_password)?;
-        Ok(site)
+        Ok((site, db_user, db_password))
     })?;
+
+    if should_rewrite_site_files {
+        write_site_files(&updated_site, &db_user, &db_password)?;
+    }
 
     // D1 / Sprint D · 修 G7/G8：事务 commit 成功后立即广播 admin 站点快照事件
     // 覆盖 start/stop/parse/restart 全路径（这些 action 都最终走 update_runtime）

@@ -7,6 +7,8 @@ pub struct PlatformConfig {
     pub frontend_relative_path: String,
     /// 前端基地址（用于拼接完整 URL），为空时不返回 url 字段
     pub frontend_base_url: String,
+    /// 受管站点 ID。存在时 embed-url 可动态读取站点真实 Viewer 地址。
+    pub site_id: Option<String>,
 }
 
 impl Default for PlatformConfig {
@@ -14,6 +16,7 @@ impl Default for PlatformConfig {
         Self {
             frontend_relative_path: "/review/3d-view".to_string(),
             frontend_base_url: String::new(),
+            site_id: None,
         }
     }
 }
@@ -23,6 +26,7 @@ impl PlatformConfig {
         if let Some(config) = super::super::jwt_auth::load_config() {
             return Self {
                 frontend_base_url: resolve_frontend_base_url(&config),
+                site_id: get_nonempty_config_string(&config, "web_server.site_id"),
                 ..Self::default()
             };
         }

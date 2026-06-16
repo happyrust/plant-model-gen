@@ -4,7 +4,7 @@ param(
     [string]$BundleName = "Plant3D-AIOS-win-x64",
     [ValidateSet("release", "debug", "both")]
     [string]$BuildProfile = "both",
-    [string]$SurrealVersion = "3.1.0-alpha",
+    [string]$SurrealVersion = "3.2.0-nightly",
     [string]$SurrealExePath = "",
     [string]$SurrealSha256 = "",
     [ValidateSet("cranelift", "llvm")]
@@ -38,7 +38,7 @@ $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $NginxCacheExe = Join-Path $RepoRoot "tools/nginx/windows/nginx.exe"
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
-$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import,kv-rocksdb"
+$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import,mbd-pipe"
 if ($BuildProfile -eq "both") {
     $RequestedProfiles = @("release", "debug")
 } else {
@@ -382,7 +382,8 @@ function Update-PackageDbOption([string]$Path) {
         "surrealdb.user" = '"root"'
         "surrealdb.password" = '"root"'
         "surrealdb.path" = '"runtime/surrealdb"'
-        "surrealkv.mode" = '"file"'
+        "surrealkv.enabled" = "false"
+        "surrealkv.mode" = '"ws"'
         "surrealkv.path" = '"runtime/surrealkv"'
     }
     $sectionOrder = @("__root__", "web_server", "surrealdb", "surrealkv")
@@ -390,7 +391,7 @@ function Update-PackageDbOption([string]$Path) {
         "__root__" = @("meshes_path", "surreal_script_dir", "surreal_ip", "surreal_port", "surreal_user", "surreal_password")
         "web_server" = @("port", "bind_host", "auto_start_surreal", "surreal_bin", "surreal_data_path", "surreal_bind", "surreal_user", "surreal_password")
         "surrealdb" = @("mode", "ip", "port", "user", "password", "path")
-        "surrealkv" = @("mode", "path")
+        "surrealkv" = @("enabled", "mode", "path")
     }
     $section = "__root__"
     $seen = @{}
@@ -463,7 +464,19 @@ if (-not (Test-Path -LiteralPath $WebStaticDist -PathType Container)) {
 }
 if (-not $SkipBackendBuild) {
     Step "Build backend web_server, offline_deployer and aios-database ($($RequestedProfiles -join ', '))"
-    $env:CARGO_INCREMENTAL = "1"
+    if ($env:AIOS_PACKAGE_CARGO_INCREMENTAL) {
+        $env:CARGO_INCREMENTAL = $env:AIOS_PACKAGE_CARGO_INCREMENTAL
+    } else {
+        $env:CARGO_INCREMENTAL = "1"
+    }
+    if ($env:AIOS_PACKAGE_CARGO_BUILD_JOBS) {
+        $env:CARGO_BUILD_JOBS = $env:AIOS_PACKAGE_CARGO_BUILD_JOBS
+    } else {
+        Remove-Item Env:\CARGO_BUILD_JOBS -ErrorAction SilentlyContinue
+    }
+    if ($env:AIOS_PACKAGE_RUSTFLAGS) {
+        $env:RUSTFLAGS = $env:AIOS_PACKAGE_RUSTFLAGS
+    }
     if ($RequestedProfiles -contains "release") {
         Assert-NasmAvailable
     }
@@ -519,7 +532,7 @@ if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
 }
 foreach ($profile in $RequestedProfiles) {
     $profilePackageRoot = Join-Path $PackageRoot $profile
-    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/surrealkv", "output", "assets/meshes", "logs")) {
+    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static", "db_options", "resource/surreal", "runtime/surrealdb", "output", "assets/meshes", "logs")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $profilePackageRoot $dir) | Out-Null
     }
 
@@ -562,7 +575,8 @@ foreach ($profile in $RequestedProfiles) {
         builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         target = $TargetTriple
         rustCodegenBackend = Get-ProfileCodegenBackend $profile
-        cargoIncremental = $true
+        cargoIncremental = $env:CARGO_INCREMENTAL -ne "0"
+        cargoBuildJobs = if ($env:CARGO_BUILD_JOBS) { $env:CARGO_BUILD_JOBS } else { "default" }
         backendCommit = Get-GitCommit $RepoRoot
         frontendCommit = Get-GitCommit $FrontendRoot
         surrealVersion = $SurrealVersion
@@ -698,7 +712,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-offline-viewer.
 - `src/web_server/static/admin/`：站点部署管理后台，挂载在 `/admin`。
 - `db_options/DbOption.toml`：默认运行配置。
 - `runtime/surrealdb/`：目标电脑首次启动时创建的新 SurrealDB 数据目录；安装包不包含本机数据库数据。
-- `runtime/surrealkv/`：预留的空运行目录；安装包不复制本机数据库数据。
 - `output/`、`assets/meshes/`：模型输出与网格资源目录。
 - `logs/`：启动日志。
 

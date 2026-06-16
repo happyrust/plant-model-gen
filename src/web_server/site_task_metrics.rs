@@ -14,6 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::perf_metrics::{TASK_METRICS_PATH_ENV, TASK_METRICS_SCHEMA_VERSION};
 use crate::web_server::admin_response;
@@ -27,15 +28,30 @@ const TABLE: &str = "site_task_metrics";
 // ─── 产物路径与 env 注入 ─────────────────────────────────────────────────────
 
 /// 站点指标产物目录：`runtime/admin_sites/<site_id>/metrics`。
+///
+/// 这是旧版目录，用于读取历史站点指标。新部署任务应优先使用
+/// `metrics_env_for_runtime_dir`，让指标跟随站点的 project-name scoped
+/// runtime_dir 一起迁移。
 pub fn metrics_dir(site_id: &str) -> PathBuf {
     PathBuf::from("runtime/admin_sites")
         .join(site_id)
         .join("metrics")
 }
 
+pub fn metrics_dir_for_runtime_dir(runtime_dir: impl Into<PathBuf>) -> PathBuf {
+    runtime_dir.into().join("metrics")
+}
+
 /// 指标产物文件路径（文件名 stem 即 task_id）。
 pub fn metrics_file_path(site_id: &str, task_id: &str) -> PathBuf {
     metrics_dir(site_id).join(format!("{task_id}.json"))
+}
+
+pub fn metrics_file_path_for_runtime_dir(
+    runtime_dir: impl Into<PathBuf>,
+    task_id: &str,
+) -> PathBuf {
+    metrics_dir_for_runtime_dir(runtime_dir).join(format!("{task_id}.json"))
 }
 
 /// 为 sidecar CLI job 构造指标采集 env（路径 + 任务类型）。
@@ -54,12 +70,32 @@ pub fn metrics_env(site_id: &str, task_id: &str, job_kind: &str) -> Vec<(String,
     ]
 }
 
-/// 生成一个对人类可读、站内唯一的 task_id（kind + 本地时间戳）。
+pub fn metrics_env_for_runtime_dir(
+    runtime_dir: impl Into<PathBuf>,
+    task_id: &str,
+    job_kind: &str,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            TASK_METRICS_PATH_ENV.to_string(),
+            metrics_file_path_for_runtime_dir(runtime_dir, task_id)
+                .to_string_lossy()
+                .to_string(),
+        ),
+        (
+            crate::perf_metrics::TASK_METRICS_KIND_ENV.to_string(),
+            job_kind.to_string(),
+        ),
+    ]
+}
+
+/// 生成一个对人类可读、全局唯一的 task_id（kind + 本地时间戳 + UUID）。
 pub fn new_metrics_task_id(job_kind: &str) -> String {
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         job_kind,
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        Uuid::new_v4().simple()
     )
 }
 
@@ -87,6 +123,20 @@ fn ensure_metrics_schema(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 /// sidecar job 完成钩子：读取产物文件入库；缺失/损坏只告警不阻塞任务状态流转。
 pub fn ingest_task_metrics(site_id: &str, task_id: &str, job_success: bool) {
     let path = metrics_file_path(site_id, task_id);
+    ingest_task_metrics_from_path(site_id, task_id, job_success, path);
+}
+
+pub fn ingest_task_metrics_for_runtime_dir(
+    site_id: &str,
+    runtime_dir: impl Into<PathBuf>,
+    task_id: &str,
+    job_success: bool,
+) {
+    let path = metrics_file_path_for_runtime_dir(runtime_dir, task_id);
+    ingest_task_metrics_from_path(site_id, task_id, job_success, path);
+}
+
+fn ingest_task_metrics_from_path(site_id: &str, task_id: &str, job_success: bool, path: PathBuf) {
     let content = match std::fs::read_to_string(&path) {
         Ok(v) => v,
         Err(err) => {

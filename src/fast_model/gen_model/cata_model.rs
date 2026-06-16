@@ -1824,7 +1824,7 @@ async fn gen_cata_geos_inner(
                                 "threshold",
                             )
                             .await
-                            .expect("send cate shape_insts_data error");
+                            ?;
 
                         }
 
@@ -2667,7 +2667,7 @@ async fn gen_cata_geos_inner(
                                         "threshold",
                                     )
                                     .await
-                                    .expect("send cate shape_insts_data error");
+                                    ?;
 
                                 }
 
@@ -4166,7 +4166,7 @@ async fn gen_cata_geos_inner(
                         "threshold",
                     )
                     .await
-                    .expect("send cate shape_insts_data error");
+                    ?;
 
                 }
 
@@ -4224,7 +4224,7 @@ async fn gen_cata_geos_inner(
                     "final",
                 )
                 .await
-                .expect("send cate shape_insts_data error");
+                ?;
 
             } else {
 
@@ -4243,6 +4243,8 @@ async fn gen_cata_geos_inner(
                 done, total_worker_cnt, t_worker.elapsed().as_millis(), pct
             );
 
+            Ok::<(), anyhow::Error>(())
+
             })); // end tokio::spawn + batch_handles.push
         }
 
@@ -4254,7 +4256,7 @@ async fn gen_cata_geos_inner(
             let t_all_workers = Instant::now();
 
             for h in batch_handles {
-                let _ = h.await;
+                h.await.map_err(|e| anyhow::anyhow!(e))??;
             }
 
             println!(

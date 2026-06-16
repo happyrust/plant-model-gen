@@ -3,6 +3,8 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import tailwindcss from '@tailwindcss/vite'
 
+const adminApiProxyTarget = process.env.ADMIN_API_PROXY_TARGET ?? 'http://localhost:8020'
+
 export default defineConfig({
   base: '/admin/static/',
   plugins: [vue(), tailwindcss()],
@@ -18,7 +20,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:8020',
+      '/api': adminApiProxyTarget,
     },
   },
 })

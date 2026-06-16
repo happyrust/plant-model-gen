@@ -15,7 +15,7 @@ import type {
   SiteProject,
 } from '@/types/site'
 import {
-  DEFAULT_PARSE_DB_TYPES,
+  DEFAULT_MANAGED_SITE_PARSE_DB_TYPES,
   MODEL_PARSE_DB_TYPE_OPTIONS,
   PARSE_PRESET_OPTIONS,
   SYSTEM_PARSE_DB_TYPE_OPTIONS,
@@ -161,7 +161,7 @@ const form = ref<CreateManagedSiteRequest>({
   manual_db_files: [],
   generate_db_nums: [],
   generate_db_files: [],
-  parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
+  parse_db_types: [...DEFAULT_MANAGED_SITE_PARSE_DB_TYPES],
   force_rebuild_system_db: false,
   // 默认启用按需解析：自动生成 CATA 闭包 manifest 并按 manifest 部分解析依赖库
   auto_parse_related_dbnums: true,
@@ -200,6 +200,126 @@ const scanRoot = ref('')
 const scanLoading = ref(false)
 const scanError = ref('')
 const scanConflicts = ref<ScannedDbnumConflict[]>([])
+const PROJECT_LOOKUP_DEFAULT_ROOT = 'D:\\AVEVA\\Projects\\E3D2.1'
+const projectLookupRoot = ref(PROJECT_LOOKUP_DEFAULT_ROOT)
+const projectLookupName = ref('')
+const projectLookupMessage = ref('')
+const mbdName = ref('')
+const mbdSearchRootsStr = ref('')
+const mbdAutoConfigMessage = ref('')
+
+function trimPathSeparators(value: string) {
+  return value.trim().replace(/^[\\/]+/, '').replace(/[\\/]+$/, '')
+}
+
+function basenameFromPath(path: string) {
+  const normalized = trimPathSeparators(path)
+  const idx = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized
+}
+
+function dirnameFromPath(path: string) {
+  const normalized = trimPathSeparators(path)
+  const idx = Math.max(normalized.lastIndexOf('\\'), normalized.lastIndexOf('/'))
+  return idx > 0 ? normalized.slice(0, idx) : ''
+}
+
+function joinProjectPath(root: string, name: string) {
+  const normalizedRoot = root.trim().replace(/[\\/]+$/, '')
+  const normalizedName = trimPathSeparators(name)
+  if (!normalizedRoot) return normalizedName
+  if (!normalizedName) return normalizedRoot
+  return `${normalizedRoot}\\${normalizedName}`
+}
+
+function resetProjectLookup(site: ManagedProjectSite | null) {
+  const path = site?.project_path ? formatDisplayPath(site.project_path) : ''
+  projectLookupRoot.value = dirnameFromPath(path) || PROJECT_LOOKUP_DEFAULT_ROOT
+  projectLookupName.value = site?.associated_project || basenameFromPath(path) || ''
+  projectLookupMessage.value = ''
+  mbdName.value = site ? '' : 'ALL'
+  mbdSearchRootsStr.value = ''
+  mbdAutoConfigMessage.value = ''
+}
+
+function applyProjectLookup() {
+  const name = trimPathSeparators(projectLookupName.value)
+  const root = projectLookupRoot.value.trim()
+  if (!name) {
+    projectLookupMessage.value = '请输入工程/MDB 名称'
+    return
+  }
+  const path = joinProjectPath(root, name)
+  form.value.project_path = path
+  if (!form.value.project_name.trim()) {
+    form.value.project_name = name
+  }
+  if (!form.value.associated_project?.trim()) {
+    form.value.associated_project = name
+  }
+  if (root) {
+    scanRoot.value = root
+  }
+  projectLookupMessage.value = `已填入项目路径：${path}`
+  schedulePreview()
+}
+
+function looksLikeDbFolder(path: string) {
+  const name = basenameFromPath(path)
+  return /^[A-Za-z]{3}\d+$/.test(name)
+}
+
+function looksLikeDbFilePath(path: string) {
+  const name = basenameFromPath(path)
+  return /^[A-Za-z]{3}\d+_\d+$/.test(name)
+}
+
+function inferMbdSearchRootFromPath(path: string) {
+  const normalized = trimPathSeparators(path)
+  if (!normalized) return ''
+  const parent = dirnameFromPath(normalized)
+  if (!parent) return ''
+  if (looksLikeDbFolder(parent)) {
+    const projectRoot = dirnameFromPath(parent)
+    return dirnameFromPath(projectRoot) || projectRoot
+  }
+  return parent
+}
+
+function parseMbdSearchRoots(value: string) {
+  return value
+    .split(/[\r\n,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function buildMbdSearchRoots() {
+  const roots = parseMbdSearchRoots(mbdSearchRootsStr.value)
+  const seen = new Set<string>()
+  return roots.filter((root) => {
+    const key = root.toLowerCase()
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function prepareMbdAutoConfig() {
+  if (!mbdName.value.trim()) {
+    mbdName.value = 'ALL'
+  }
+  if (!mbdSearchRootsStr.value.trim()) {
+    const inferred = inferMbdSearchRootFromPath(form.value.project_path) || projectLookupRoot.value.trim() || scanRoot.value.trim()
+    if (inferred) {
+      mbdSearchRootsStr.value = inferred
+    }
+  }
+  if (!mbdSearchRootsStr.value.trim()) {
+    mbdAutoConfigMessage.value = '请输入搜索根目录，或把项目路径填成目标 DB 文件路径'
+    return
+  }
+  mbdAutoConfigMessage.value = '保存时会按 MDB 名称自动发现关联工程，并把目标 DB 合并到解析范围。'
+}
 
 function resetMultiProjectState(site: ManagedProjectSite | null, cloning: boolean) {
   siteName.value = site && !cloning ? (site.site_name ?? '') : ''
@@ -413,9 +533,11 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
         manual_db_files: [],
         generate_db_nums: s.generate_db_nums ?? [],
         generate_db_files: [],
-        parse_db_types: s.parse_db_types?.length ? [...s.parse_db_types] : [...DEFAULT_PARSE_DB_TYPES],
+        parse_db_types: Array.isArray(s.parse_db_types)
+          ? [...s.parse_db_types]
+          : [...DEFAULT_MANAGED_SITE_PARSE_DB_TYPES],
         force_rebuild_system_db: s.force_rebuild_system_db ?? false,
-        auto_parse_related_dbnums: s.auto_parse_related_dbnums ?? false,
+        auto_parse_related_dbnums: s.auto_parse_related_dbnums ?? true,
         cata_partial_parse: s.cata_partial_parse ?? true,
         gen_model: s.gen_model ?? true,
         gen_mesh: s.gen_mesh ?? false,
@@ -439,6 +561,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       generateDbNumsStr.value = (s.generate_db_nums ?? []).join(', ')
       generateDbFilesStr.value = ''
       resetMultiProjectState(s, cloning)
+      resetProjectLookup(s)
       // 克隆模式下不保留 existingSite，避免抽屉展示「正在编辑某 site」徽标
       if (cloning) {
         existingSite.value = null
@@ -459,7 +582,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
       manual_db_files: [],
       generate_db_nums: [],
       generate_db_files: [],
-      parse_db_types: [...DEFAULT_PARSE_DB_TYPES],
+      parse_db_types: [...DEFAULT_MANAGED_SITE_PARSE_DB_TYPES],
       force_rebuild_system_db: false,
       // 默认启用按需解析（CATA 闭包 manifest 部分解析）
       auto_parse_related_dbnums: true,
@@ -487,6 +610,7 @@ watch([() => props.open, () => props.siteId], async ([open, siteId]) => {
     generateDbFilesStr.value = ''
     autoAllocatePorts.value = true
     resetMultiProjectState(null, false)
+    resetProjectLookup(null)
   }
   schedulePreview()
 })
@@ -631,8 +755,14 @@ const duplicateProjectNameSite = computed<ManagedProjectSite | null>(() => {
   ) ?? null
 })
 
+const requiresMbdContext = computed(() => {
+  if (looksLikeDbFilePath(form.value.project_path)) return true
+  return parseManualDbFilesInput(manualDbFilesStr.value).length > 0
+})
+
 const canSubmit = computed(() => {
   if (!form.value.project_name || !form.value.project_path) return false
+  if (requiresMbdContext.value && !mbdName.value.trim()) return false
   if (duplicateProjectNameSite.value) return false
   if (multiProjectError.value) return false
   if (!isEditing.value && (!form.value.db_user?.trim() || !form.value.db_password?.trim())) return false
@@ -682,6 +812,10 @@ async function handleSubmit(autoDeploy = false) {
   }
   try {
     if (!ensureProjectNameUnique()) return
+    if (requiresMbdContext.value && !mbdName.value.trim()) {
+      error.value = '当前指定的是目标 DB 文件，必须填写 MBD 名称；依赖工程路径会从该 MBD 配置中解析。'
+      return
+    }
     if (!await ensureSubmitPortsAvailable()) return
     // 克隆模式走 create 路径（不是 update），保持新建语义
     const siteNameTrimmed = siteName.value.trim()
@@ -691,6 +825,8 @@ async function handleSubmit(autoDeploy = false) {
         ...form.value,
         site_name: siteNameTrimmed || undefined,
         projects: projectsPayload,
+        mbd_name: mbdName.value.trim() || undefined,
+        search_roots: buildMbdSearchRoots(),
         db_user: form.value.db_user?.trim() ? form.value.db_user.trim() : undefined,
         db_password: form.value.db_password?.trim() ? form.value.db_password.trim() : undefined,
       }
@@ -700,6 +836,8 @@ async function handleSubmit(autoDeploy = false) {
         ...form.value,
         site_name: siteNameTrimmed || undefined,
         projects: projectsPayload,
+        mbd_name: mbdName.value.trim() || undefined,
+        search_roots: buildMbdSearchRoots(),
         auto_deploy: autoDeploy,
         db_user: form.value.db_user?.trim() || '',
         db_password: form.value.db_password?.trim() || '',
@@ -789,6 +927,80 @@ const inputClass = 'flex h-9 w-full rounded-md border border-input bg-transparen
               <div class="space-y-2">
                 <label class="text-sm font-medium">项目路径 *</label>
                 <input v-model="form.project_path" type="text" required placeholder="/path/to/e3d_models" :class="inputClass" />
+              </div>
+              <div class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-2">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <div class="text-sm font-medium">按工程/MDB 名称补全路径</div>
+                    <p class="mt-1 text-xs text-muted-foreground">
+                      填写工程父目录和名称后自动拼出项目路径，例如 {{ PROJECT_LOOKUP_DEFAULT_ROOT }}\AvevaCatalogue。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    class="inline-flex h-8 shrink-0 items-center rounded-md border border-input bg-background px-3 text-xs font-medium hover:bg-accent transition-colors"
+                    @click="applyProjectLookup"
+                  >
+                    填入路径
+                  </button>
+                </div>
+                <div class="grid gap-2 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+                  <input
+                    v-model="projectLookupRoot"
+                    type="text"
+                    :placeholder="PROJECT_LOOKUP_DEFAULT_ROOT"
+                    :class="inputClass"
+                  />
+                  <input
+                    v-model="projectLookupName"
+                    type="text"
+                    placeholder="AvevaCatalogue"
+                    :class="inputClass"
+                    @keydown.enter.prevent="applyProjectLookup"
+                  />
+                </div>
+                <p class="text-xs" :class="projectLookupMessage.startsWith('已') ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'">
+                  {{ projectLookupMessage || '会同步填充关联工程名，并把工程父目录写入下方扫描根目录，方便继续发现依赖工程。' }}
+                </p>
+              </div>
+              <div class="rounded-lg border border-border/60 bg-background p-3 space-y-3">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <div class="text-sm font-medium">
+                      MBD 自动配置
+                      <span v-if="requiresMbdContext" class="text-destructive">*</span>
+                    </div>
+                    <p class="mt-1 text-xs text-muted-foreground">
+                      例如项目路径填 D:/AVEVA/Projects/E3D2.1/AvevaPlantSample/aps000/aps250160_0001，MBD 名称填 ALL，保存时会自动发现同级关联工程。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    class="inline-flex h-8 shrink-0 items-center rounded-md border border-input bg-background px-3 text-xs font-medium hover:bg-accent transition-colors"
+                    @click="prepareMbdAutoConfig"
+                  >
+                    准备配置
+                  </button>
+                </div>
+                <div class="grid gap-2 sm:grid-cols-[minmax(0,0.45fr)_minmax(0,1fr)]">
+                  <input
+                    v-model="mbdName"
+                    type="text"
+                    placeholder="ALL"
+                    :class="inputClass"
+                    @keydown.enter.prevent="prepareMbdAutoConfig"
+                  />
+                  <input
+                    v-model="mbdSearchRootsStr"
+                    type="text"
+                    :placeholder="PROJECT_LOOKUP_DEFAULT_ROOT"
+                    :class="inputClass"
+                    @keydown.enter.prevent="prepareMbdAutoConfig"
+                  />
+                </div>
+                <p class="text-xs" :class="mbdAutoConfigMessage.startsWith('保存') ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'">
+                  {{ mbdAutoConfigMessage || (requiresMbdContext ? '当前指定了目标 DB 文件，MBD 名称必填；搜索根目录可留空，由后端从目标 DB 推断。' : '搜索根目录可留空；后端会优先从目标 DB 文件或项目路径推断父级工程目录。') }}
+                </p>
               </div>
               <div class="space-y-2">
                 <label class="text-sm font-medium">项目代码 *</label>

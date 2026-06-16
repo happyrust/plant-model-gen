@@ -868,7 +868,7 @@ pub async fn scan_projects(Query(params): Query<ProjectScanQuery>) -> impl IntoR
     }
 }
 
-/// MBD 部署前候选发现（只读）：离线读 SYST 枚举 MDB 候选，并对成员 DB
+/// MBD 部署前候选发现（只读）：离线读 SYST/GLOB/GLB 枚举 MDB 候选，并对成员 DB
 /// 做文件定位检查（available/missing/ambiguous）。实际读取由 sidecar 完成。
 pub async fn mdb_candidates(
     Json(payload): Json<crate::web_server::models::MdbCandidatesRequest>,
@@ -1004,6 +1004,9 @@ fn sidecar_proxy_error(
 
 pub async fn create_site(Json(mut payload): Json<CreateManagedSiteRequest>) -> impl IntoResponse {
     let auto_deploy = payload.auto_deploy;
+    if let Err(err) = managed_sites::resolve_create_site_mbd_request(&mut payload).await {
+        return admin_response::managed_error(err.to_string());
+    }
     if let Err(err) = resolve_create_site_db_files(&mut payload).await {
         return admin_response::response(err.status, false, err.message, Some(err.body));
     }
@@ -1216,10 +1219,13 @@ pub async fn update_site(
     Path(site_id): Path<String>,
     Json(mut payload): Json<UpdateManagedSiteRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = managed_sites::resolve_update_site_mbd_request(&site_id, &mut payload).await {
+        return admin_response::managed_error(err.to_string());
+    }
     if let Err(err) = resolve_update_site_db_files(&site_id, &mut payload).await {
         return admin_response::response(err.status, false, err.message, Some(err.body));
     }
-    match managed_sites::update_site(&site_id, payload) {
+    match managed_sites::update_site_allowing_project_rename(&site_id, payload).await {
         Ok(site) => admin_response::ok("更新站点成功", site),
         Err(err) => admin_response::managed_error(err.to_string()),
     }

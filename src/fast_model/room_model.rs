@@ -2147,7 +2147,8 @@ pub async fn build_room_relations(
 
     refno_root: Option<RefnoEnum>,
 ) -> anyhow::Result<RoomBuildStats> {
-    build_room_relations_with_overrides(db_option, db_nums, refno_root, None, true).await
+    let force_rebuild = db_nums.is_none() && refno_root.is_none();
+    build_room_relations_with_overrides(db_option, db_nums, refno_root, None, force_rebuild).await
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
@@ -2156,8 +2157,16 @@ pub async fn build_room_relations_with_model_generation(
     db_nums: Option<&[u32]>,
     refno_root: Option<RefnoEnum>,
 ) -> anyhow::Result<RoomBuildStats> {
+    let force_rebuild = db_nums.is_none() && refno_root.is_none();
     build_room_relations_with_cancel_and_overrides(
-        db_option, db_nums, refno_root, None, true, true, None, None,
+        db_option,
+        db_nums,
+        refno_root,
+        None,
+        force_rebuild,
+        true,
+        None,
+        None,
     )
     .await
 }
@@ -2198,12 +2207,13 @@ pub async fn build_room_relations_with_cancel(
 
     progress_callback: Option<Box<dyn Fn(f32, &str) + Send + Sync>>,
 ) -> anyhow::Result<RoomBuildStats> {
+    let force_rebuild = db_nums.is_none() && refno_root.is_none();
     build_room_relations_with_cancel_and_overrides(
         db_option,
         db_nums,
         refno_root,
         None,
-        true,
+        force_rebuild,
         false,
         cancel_token,
         progress_callback,

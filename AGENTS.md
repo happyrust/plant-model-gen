@@ -2467,3 +2467,9 @@ Select the model tier based on the task complexity and the files involved.
 
 > **Tip:** Run `node gen-context.js --routing` to regenerate routing hints.
 > See `docs/MODEL_ROUTING.md` for full routing guide and cost optimisation tips.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+`specs/019-system-mdb-dependency-discovery/plan.md`
+<!-- SPECKIT END -->

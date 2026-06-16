@@ -19,6 +19,21 @@ const orderedProjects = computed(() =>
   [...(props.site.projects ?? [])].sort((a, b) => a.sort_order - b.sort_order),
 )
 
+// 部署项目名是唯一对外身份（DB/目录/对外访问名）；E3D 源工程名仅用于源数据定位。
+const e3dSourceNames = computed(() => {
+  const names = (props.site.projects ?? [])
+    .map((p) => (p.name ?? '').trim())
+    .filter((name) => name.length > 0)
+  if (names.length) return names
+  const associated = (props.site.associated_project ?? '').trim()
+  return associated ? [associated] : []
+})
+const deploymentNameCollision = computed(() => {
+  const deployment = (props.site.project_name ?? '').trim().toLowerCase()
+  if (!deployment) return false
+  return e3dSourceNames.value.some((name) => name.toLowerCase() === deployment)
+})
+
 function formatTime(value?: string | null) {
   if (!value) return '-'
   const d = new Date(value)
@@ -39,16 +54,27 @@ function yesNo(value: boolean | undefined) {
     <div class="rounded-lg border border-border bg-card p-5">
       <h4 class="text-sm font-medium text-muted-foreground mb-3">项目信息</h4>
       <div class="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
-        <span class="text-muted-foreground">项目名称</span><span>{{ site.project_name }}</span>
+        <span class="text-muted-foreground">部署项目名</span>
+        <span>
+          {{ site.project_name }}
+          <span class="ml-1 text-xs text-muted-foreground">（对外身份：数据库 / 目录 / 对外访问名）</span>
+        </span>
         <span class="text-muted-foreground">项目代码</span><span>{{ site.project_code }}</span>
         <span class="text-muted-foreground">项目路径</span><span class="break-all">{{ formatDisplayPath(site.project_path) || '-' }}</span>
         <span class="text-muted-foreground">关联工程</span>
         <span>{{ site.associated_project || site.project_name }} <span v-if="!site.associated_project" class="text-xs text-muted-foreground">(默认)</span></span>
       </div>
+      <p
+        v-if="deploymentNameCollision"
+        class="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400"
+      >
+        部署项目名与某个 E3D 源工程名同值：二者为独立命名空间、功能上不冲突，但建议改名以免混淆。
+      </p>
     </div>
 
     <div v-if="hasMultiProjects" class="rounded-lg border border-border bg-card p-5">
-      <h4 class="text-sm font-medium text-muted-foreground mb-3">工程组成（多工程）</h4>
+      <h4 class="text-sm font-medium text-muted-foreground mb-1">工程组成（多工程）</h4>
+      <p class="mb-3 text-xs text-muted-foreground">E3D 源工程集合，仅用于源数据定位；与上方部署项目名相互独立。</p>
       <div v-if="site.site_name" class="mb-3 grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
         <span class="text-muted-foreground">站点名称</span><span>{{ site.site_name }}</span>
       </div>
@@ -109,6 +135,11 @@ function yesNo(value: boolean | undefined) {
         <span class="text-muted-foreground">系统库策略</span>
         <span>
           {{ site.force_rebuild_system_db ? '强制重建 SYST' : '优先复用已解析 SYST' }}
+        </span>
+        <span class="text-muted-foreground">自动解析依赖库</span><span>{{ yesNo(site.auto_parse_related_dbnums ?? true) }}</span>
+        <span class="text-muted-foreground">CATA 部分解析</span>
+        <span>
+          {{ site.auto_parse_related_dbnums === false ? '未启用（依赖库自动解析关闭）' : (site.cata_partial_parse === false ? '关闭（关联 CATA 全量解析）' : '开启（按引用闭包部分解析）') }}
         </span>
         <span class="text-muted-foreground">常用预设</span>
         <span>

@@ -571,7 +571,8 @@ async fn dispatch_admin_task(task_id: String) {
         (TaskType::DeployManagedSite, Some(sid)) => {
             mark_task_running(&mut stored.task, "已提交完整部署任务，等待预检与流水线启动", 10.0);
             let _ = save_task(&stored.task, stored.site_id.as_deref());
-            match crate::web_server::managed_project_sites::deploy_site(sid.to_string()).await {
+            match crate::web_server::managed_project_sites::deploy_site_inline(sid.to_string()).await
+            {
                 Ok(()) => Ok(()),
                 Err(e) => Err(e.to_string()),
             }
@@ -830,6 +831,8 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                 mark_task_failed(task, &runtime_step, &message);
             } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
                 mark_task_completed(task, &runtime_step);
+            } else if runtime.current_stage == "room_computing" {
+                mark_task_running(task, &runtime_step, 75.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Parsed
                 && runtime.status == ManagedSiteStatus::Parsed
                 && !runtime.parse_running
@@ -869,6 +872,8 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                 mark_task_failed(task, &runtime_step, &message);
             } else if runtime.status == ManagedSiteStatus::Running && runtime.web_running {
                 mark_task_running(task, "Web 已启动，等待业务连通性验收", 90.0);
+            } else if runtime.current_stage == "room_computing" {
+                mark_task_running(task, &runtime_step, 75.0);
             } else if runtime.current_stage == "generating" {
                 mark_task_running(task, &runtime_step, 45.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {
@@ -922,6 +927,8 @@ fn apply_runtime_to_task(task: &mut TaskInfo, runtime: &ManagedSiteRuntimeStatus
                     .clone()
                     .unwrap_or_else(|| "站点部署失败".to_string());
                 mark_task_failed(task, &runtime_step, &message);
+            } else if runtime.current_stage == "room_computing" {
+                mark_task_running(task, &runtime_step, 75.0);
             } else if runtime.current_stage == "generating" {
                 mark_task_running(task, &runtime_step, 45.0);
             } else if runtime.parse_status == ManagedSiteParseStatus::Running {

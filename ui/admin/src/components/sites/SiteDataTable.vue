@@ -26,6 +26,7 @@ const props = defineProps<{
   sites: ManagedProjectSite[]
   loading: boolean
   selected?: string[]
+  highlightSiteId?: string
 }>()
 
 // D6 / Sprint D · 修 G15：表头点击排序
@@ -266,6 +267,7 @@ function riskSummary(site: ManagedProjectSite) {
 }
 function riskLogKind(site: ManagedProjectSite): ManagedSiteLogKind {
   const text = [site.last_error, ...site.risk_reasons].filter(Boolean).join(' ')
+  if (/room[-_\s]?compute|房间计算/i.test(text)) return 'room-compute'
   if (site.parse_status === 'Failed' || /parse|解析/i.test(text)) return 'parse'
   if (/viewer/i.test(text)) return 'viewer'
   if (/db|surreal|数据库/i.test(text)) return 'db'
@@ -437,8 +439,12 @@ async function ensureSitePortsClear(site: ManagedProjectSite, context: string) {
         <tr
           v-for="site in sortedSites"
           :key="site.site_id"
+          :data-site-id="site.site_id"
           class="border-b border-border last:border-0 hover:bg-muted/30 transition-colors cursor-pointer"
-          :class="selectedSet.has(site.site_id) ? 'bg-accent/20' : ''"
+          :class="[
+            selectedSet.has(site.site_id) ? 'bg-accent/20' : '',
+            props.highlightSiteId === site.site_id ? 'bg-primary/10 ring-1 ring-inset ring-primary/40' : '',
+          ]"
           @click="openDetail(site.site_id)"
         >
           <td class="w-10 px-3 py-3 align-top" @click.stop>

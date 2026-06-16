@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Skill
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Validate SKILL.md frontmatter
+        run: |
+          echo "Checking SKILL.md exists and has frontmatter..."
+          if [ ! -f SKILL.md ]; then
+            echo "ERROR: SKILL.md not found"
+            exit 1
+          fi
+          head -1 SKILL.md | grep -q "^---" || { echo "ERROR: SKILL.md missing frontmatter delimiter"; exit 1; }
+          grep -q "^name:" SKILL.md || { echo "ERROR: SKILL.md missing 'name' field"; exit 1; }
+          grep -q "^description:" SKILL.md || { echo "ERROR: SKILL.md missing 'description' field"; exit 1; }
+          echo "SKILL.md frontmatter is valid."
+
+      - name: Python syntax check
+        run: |
+          echo "Checking Python script syntax..."
+          for script in scripts/*.py; do
+            echo "  Checking $script"
+            python3 -m py_compile "$script"
+          done
+          echo "All Python scripts compile successfully."
+
+      - name: Smoke test onboard script
+        run: |
+          uv run scripts/onboard.py --help
+
+      - name: Validate version consistency
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          version_re = re.compile(r'(?m)^  version:\s*"([^"]+)"$')
+
+          def extract_version(path: Path) -> str:
+              match = version_re.search(path.read_text())
+              if not match:
+                  raise SystemExit(f"missing metadata.version in {path}")
+              return match.group(1)
+
+          root_version = extract_version(Path("SKILL.md"))
+
+          for path in sorted(Path("skills").glob("*/SKILL.md")):
+              subskill_version = extract_version(path)
+              if subskill_version != root_version:
+                  raise SystemExit(f"{path} version {subskill_version} != root version {root_version}")
+
+          sources = json.loads(Path("SOURCES.json").read_text())
+          if sources.get("skill_version") != root_version:
+              raise SystemExit(
+                  f"SOURCES.json skill_version {sources.get('skill_version')} != root version {root_version}"
+              )
+          PY
+
+      - name: Smoke test script entrypoints
+        run: |
+          uv run scripts/onboard.py --agent >/tmp/onboard.json
+          uv run scripts/schema.py --help >/dev/null
+          uv run scripts/doctor.py --help >/dev/null
+
+      - name: Verify rule files exist
+        run: |
+          echo "Checking required rule files..."
+          expected_rules=(
+            "rules/surrealql.md"
+            "rules/data-modeling.md"
+            "rules/graph-queries.md"
+            "rules/vector-search.md"
+            "rules/security.md"
+            "rules/performance.md"
+            "rules/sdks.md"
+            "rules/deployment.md"
+            "rules/surrealism.md"
+            "rules/surreal-sync.md"
+            "rules/surrealist.md"
+            "rules/surrealfs.md"
+            "rules/surrealkit.md"
+            "rules/surrealml.md"
+            "rules/surrealmcp.md"
+            "rules/editor-tooling.md"
+            "rules/langchain.md"
+            "rules/ecosystem-integrations.md"
+          )
+          missing=0
+          for rule in "${expected_rules[@]}"; do
+            if [ ! -f "$rule" ]; then
+              echo "  MISSING: $rule"
+              missing=$((missing + 1))
+            else
+              echo "  OK: $rule"
+            fi
+          done
+          if [ $missing -gt 0 ]; then
+            echo "ERROR: $missing rule file(s) missing"
+            exit 1
+          fi
+          echo "All rule files present."
+
+      - name: Verify community files
+        run: |
+          echo "Checking community files..."
+          for file in CHANGELOG.md CONTRIBUTING.md LICENSE SECURITY.md; do
+            if [ ! -f "$file" ]; then
+              echo "  MISSING: $file"
+              exit 1
+            else
+              echo "  OK: $file"
+            fi
+          done
+          echo "All community files present."
+
+      - name: Validate sub-skill manifests
+        run: |
+          echo "Checking sub-skill SKILL.md files..."
+          for subskill in skills/*/SKILL.md; do
+            echo "  Checking $subskill"
+            head -1 "$subskill" | grep -q "^---" || { echo "ERROR: $subskill missing frontmatter"; exit 1; }
+          done
+          echo "All sub-skill manifests valid."
+
+      - name: Version consistency
+        run: |
+          python3 scripts/check_version_consistency.py

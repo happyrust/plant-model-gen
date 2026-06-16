@@ -1414,6 +1414,12 @@ pub async fn start_web_server_with_config(
         }
     });
     admin_auth_handlers::start_session_cleanup_timer();
+    // 启动期 reaper：清理上一轮本实例残留的 aios-database serve sidecar（孤儿进程）。
+    let reaped_orphans =
+        crate::web_server::parse_sidecar_client::reap_orphan_sidecars_on_startup().await;
+    if reaped_orphans > 0 {
+        println!("🧹 启动期已清理上一轮残留 aios-database sidecar: {reaped_orphans}");
+    }
     maybe_print_registered_routes();
     println!("🚀 Web UI服务器启动成功！");
     println!("📱 访问地址: {}", runtime_site_config.backend_url);
@@ -1453,6 +1459,11 @@ pub async fn start_web_server_with_config(
             println!(
                 "📴 收到 graceful shutdown 信号，停止接受新请求；in-flight 请求处理完成后进程退出"
             );
+            // 退出期回收：尽力终止内存注册表中的全部 sidecar（覆盖所有 key 类型）。
+            let reaped = crate::web_server::parse_sidecar_client::shutdown_all_sidecars().await;
+            if reaped > 0 {
+                println!("🧹 退出期已回收 aios-database sidecar: {reaped}");
+            }
         })
         .await;
     heartbeat_handle.abort();

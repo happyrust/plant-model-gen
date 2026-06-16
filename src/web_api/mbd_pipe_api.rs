@@ -55,7 +55,7 @@ impl Default for MbdPipeMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MbdPipeQuery {
-    /// 语义模式：layout_first=排版优先（与 construction 默认开关一致），construction=施工表达，inspection=几何校核
+    /// 语义模式：layout_first=排版优先（默认聚焦 BRAN 长度尺寸），construction=施工表达，inspection=几何校核
     pub mode: Option<MbdPipeMode>,
     /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=model cache
     pub source: MbdPipeSource,
@@ -90,6 +90,16 @@ pub struct MbdPipeQuery {
     pub include_fittings: Option<bool>,
     /// 是否输出类型化标签
     pub include_tags: Option<bool>,
+    /// 是否输出端点/连接点坐标标签（X/Y/PE 文本块）
+    pub include_position_tags: Option<bool>,
+    /// 是否输出关键点标高标签（PE 文本）
+    pub include_elevation_marks: Option<bool>,
+    /// 是否输出 BRAN/管线名标签
+    pub include_branch_label: Option<bool>,
+    /// 是否输出材料件号气泡
+    pub include_material_balloons: Option<bool>,
+    /// 是否输出材料/切管清单数据
+    pub include_material_table: Option<bool>,
     /// 是否输出布局提示（内嵌到各类标注对象）
     pub include_layout_hints: Option<bool>,
     /// 是否尝试填充分支属性（失败则忽略，不影响 success）
@@ -127,6 +137,11 @@ impl Default for MbdPipeQuery {
             include_cut_tubis: None,
             include_fittings: None,
             include_tags: None,
+            include_position_tags: None,
+            include_elevation_marks: None,
+            include_branch_label: None,
+            include_material_balloons: None,
+            include_material_table: None,
             include_layout_hints: None,
             include_branch_attrs: true,
             include_weld_nouns: false,
@@ -149,14 +164,36 @@ struct MbdPipeModeDefaults {
     include_cut_tubis: bool,
     include_fittings: bool,
     include_tags: bool,
+    include_position_tags: bool,
+    include_elevation_marks: bool,
+    include_branch_label: bool,
+    include_material_balloons: bool,
+    include_material_table: bool,
     include_layout_hints: bool,
 }
 
 impl MbdPipeModeDefaults {
     fn for_mode(mode: MbdPipeMode) -> Self {
         match mode {
-            // layout_first 与 construction 使用同一套几何/标注默认；layout 结果由前端或其它查询参数控制
-            MbdPipeMode::LayoutFirst | MbdPipeMode::Construction => Self {
+            MbdPipeMode::LayoutFirst => Self {
+                include_dims: false,
+                include_chain_dims: true,
+                include_overall_dim: false,
+                include_port_dims: true,
+                include_welds: false,
+                include_slopes: false,
+                include_bends: false,
+                include_cut_tubis: true,
+                include_fittings: false,
+                include_tags: false,
+                include_position_tags: false,
+                include_elevation_marks: false,
+                include_branch_label: false,
+                include_material_balloons: false,
+                include_material_table: false,
+                include_layout_hints: true,
+            },
+            MbdPipeMode::Construction => Self {
                 include_dims: true,
                 include_chain_dims: true,
                 include_overall_dim: false,
@@ -167,6 +204,11 @@ impl MbdPipeModeDefaults {
                 include_cut_tubis: true,
                 include_fittings: true,
                 include_tags: true,
+                include_position_tags: true,
+                include_elevation_marks: true,
+                include_branch_label: true,
+                include_material_balloons: true,
+                include_material_table: true,
                 include_layout_hints: true,
             },
             MbdPipeMode::Inspection => Self {
@@ -180,6 +222,11 @@ impl MbdPipeModeDefaults {
                 include_cut_tubis: false,
                 include_fittings: false,
                 include_tags: false,
+                include_position_tags: false,
+                include_elevation_marks: false,
+                include_branch_label: false,
+                include_material_balloons: false,
+                include_material_table: false,
                 include_layout_hints: false,
             },
         }
@@ -207,6 +254,11 @@ struct ResolvedMbdPipeQuery {
     include_cut_tubis: bool,
     include_fittings: bool,
     include_tags: bool,
+    include_position_tags: bool,
+    include_elevation_marks: bool,
+    include_branch_label: bool,
+    include_material_balloons: bool,
+    include_material_table: bool,
     include_layout_hints: bool,
     include_branch_attrs: bool,
     include_weld_nouns: bool,
@@ -218,6 +270,27 @@ impl MbdPipeQuery {
     fn resolve(&self) -> ResolvedMbdPipeQuery {
         let mode = self.mode.unwrap_or_default();
         let defaults = MbdPipeModeDefaults::for_mode(mode);
+        let include_position_tags = self
+            .include_position_tags
+            .unwrap_or(defaults.include_position_tags);
+        let include_elevation_marks = self
+            .include_elevation_marks
+            .unwrap_or(defaults.include_elevation_marks);
+        let include_branch_label = self
+            .include_branch_label
+            .unwrap_or(defaults.include_branch_label);
+        let include_material_balloons = self
+            .include_material_balloons
+            .unwrap_or(defaults.include_material_balloons);
+        let include_material_table = self
+            .include_material_table
+            .unwrap_or(defaults.include_material_table);
+        let include_tags = self.include_tags.unwrap_or(defaults.include_tags)
+            || include_position_tags
+            || include_elevation_marks
+            || include_branch_label
+            || include_material_balloons;
+
         ResolvedMbdPipeQuery {
             mode,
             source: self.source,
@@ -241,7 +314,12 @@ impl MbdPipeQuery {
             include_slopes: self.include_slopes.unwrap_or(defaults.include_slopes),
             include_cut_tubis: self.include_cut_tubis.unwrap_or(defaults.include_cut_tubis),
             include_fittings: self.include_fittings.unwrap_or(defaults.include_fittings),
-            include_tags: self.include_tags.unwrap_or(defaults.include_tags),
+            include_tags,
+            include_position_tags,
+            include_elevation_marks,
+            include_branch_label,
+            include_material_balloons,
+            include_material_table,
             include_layout_hints: self
                 .include_layout_hints
                 .unwrap_or(defaults.include_layout_hints),
@@ -273,6 +351,7 @@ pub struct MbdPipeData {
     pub slopes: Vec<MbdSlopeDto>,
     pub fittings: Vec<MbdFittingDto>,
     pub tags: Vec<MbdTagDto>,
+    pub material_rows: Vec<MbdMaterialRowDto>,
     pub bends: Vec<MbdBendDto>,
     pub stats: MbdPipeStats,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -292,6 +371,7 @@ pub struct MbdPipeStats {
     pub slopes_count: usize,
     pub fittings_count: usize,
     pub tags_count: usize,
+    pub material_rows_count: usize,
     pub bends_count: usize,
 }
 
@@ -456,6 +536,19 @@ pub struct MbdTagDto {
     pub position: [f32; 3],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout_hint: Option<MbdLayoutHint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MbdMaterialRowDto {
+    pub item_no: u32,
+    pub ns: String,
+    pub item_code: String,
+    pub description: String,
+    pub quantity: f32,
+    pub unit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit_weight: Option<f32>,
+    pub refnos: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -717,26 +810,32 @@ async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: Refno
 fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
     query.mode = Some(MbdPipeMode::LayoutFirst);
     query.source = MbdPipeSource::Db;
-    // V2 的 layout_first 只把“链式尺寸”作为主尺寸输出。
+    // V2 layout_first 的首期目标是 BRAN 长度尺寸标注：
+    // 只默认输出 chain/port/cut-tubi 这些长度类 linear_dim。
     //
     // PML isoDim 的 mainDim 会跳过 TUBI 本体，只按 Head/Tail/管件/焊口等关键点生成
     // 链式尺寸；这里的 `include_dims=true` 会把每段 tubi 几何长度也作为普通尺寸输出，
     // 与链式尺寸和切管长度重复，真实页面会叠成一团。
-    query.include_dims = Some(false);
-    query.include_chain_dims = Some(true);
+    query.include_dims = query.include_dims.or(Some(false));
+    query.include_chain_dims = query.include_chain_dims.or(Some(true));
     // 当前 LayoutResult 只能表达单条直线尺寸；折线 BRAN 的 overall 是路径总长，
     // 不能用“首尾直连”的一条 linear_dim 表达，先关闭，避免显示 43135 但几何跨度很短。
-    query.include_overall_dim = Some(false);
-    query.include_port_dims = Some(true);
-    query.include_welds = Some(true);
-    query.include_slopes = Some(true);
-    query.include_bends = Some(true);
-    query.include_cut_tubis = Some(true);
-    query.include_fittings = Some(true);
-    query.include_tags = Some(true);
-    query.include_layout_hints = Some(true);
+    query.include_overall_dim = query.include_overall_dim.or(Some(false));
+    query.include_port_dims = query.include_port_dims.or(Some(true));
+    query.include_welds = query.include_welds.or(Some(false));
+    query.include_slopes = query.include_slopes.or(Some(false));
+    query.include_bends = query.include_bends.or(Some(false));
+    query.include_cut_tubis = query.include_cut_tubis.or(Some(true));
+    query.include_fittings = query.include_fittings.or(Some(false));
+    query.include_tags = query.include_tags.or(Some(false));
+    query.include_position_tags = query.include_position_tags.or(Some(false));
+    query.include_elevation_marks = query.include_elevation_marks.or(Some(false));
+    query.include_branch_label = query.include_branch_label.or(Some(false));
+    query.include_material_balloons = query.include_material_balloons.or(Some(false));
+    query.include_material_table = query.include_material_table.or(Some(false));
+    query.include_layout_hints = query.include_layout_hints.or(Some(true));
     query.include_branch_attrs = true;
-    query.include_weld_nouns = true;
+    query.include_weld_nouns = query.include_weld_nouns || query.include_welds.unwrap_or(false);
     query
 }
 
@@ -902,6 +1001,8 @@ struct CacheTubiSeg {
     /// 外径（mm）。对应 PML `aod of $!tubi`。从 pe.aod 或 pe.attrs.AOD 取；
     /// 不存在时 None，由 `compute_branch_layout_result` 回退到 default_od=229。
     outside_diameter: Option<f32>,
+    /// 公称口径（mm）。优先来自 tubi_relate.bore_size，用于材料表 N.S。
+    bore: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -926,6 +1027,7 @@ struct RawFittingElement {
     refno: RefnoEnum,
     noun: String,
     anchor_point: Vec3,
+    has_anchor: bool,
     face_center_1: Option<Vec3>,
     face_center_2: Option<Vec3>,
     angle: Option<f32>,
@@ -941,6 +1043,7 @@ struct BranchMeasurementOutput {
     slopes: Vec<MbdSlopeDto>,
     fittings: Vec<MbdFittingDto>,
     tags: Vec<MbdTagDto>,
+    material_rows: Vec<MbdMaterialRowDto>,
     bends: Vec<MbdBendDto>,
 }
 
@@ -1091,8 +1194,24 @@ impl<'a> BranchMeasurementPlanner<'a> {
         output.slopes = self.build_slopes();
         output.bends = self.bends.to_vec();
         output.fittings = self.build_fittings();
-        output.tags = self.build_tags(&output.cut_tubis, &output.fittings);
+        output.material_rows = self.build_material_rows(&output.cut_tubis);
+        output.tags = self.build_tags(&output.cut_tubis, &output.fittings, &output.material_rows);
         output
+    }
+
+    fn has_usable_fitting_anchor(&self, item: &RawFittingElement) -> bool {
+        if !item.has_anchor || !item.anchor_point.is_finite() {
+            return false;
+        }
+
+        const MAX_FITTING_ANCHOR_DISTANCE_MM: f32 = 10_000.0;
+        AnnotationLayoutPlanner::owner_segment(self.topology, item.anchor_point)
+            .map(|(_, seg)| {
+                AnnotationLayoutPlanner::project_point_to_segment(item.anchor_point, seg)
+                    .distance(item.anchor_point)
+                    <= MAX_FITTING_ANCHOR_DISTANCE_MM
+            })
+            .unwrap_or(true)
     }
 
     fn build_segments(&self) -> Vec<MbdPipeSegmentDto> {
@@ -1110,7 +1229,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 length: seg.start.distance(seg.end),
                 straight_length: seg.start.distance(seg.end),
                 outside_diameter: seg.outside_diameter,
-                bore: None,
+                bore: seg.bore,
             })
             .collect()
     }
@@ -1449,6 +1568,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
         }
         self.fitting_elements
             .iter()
+            .filter(|item| self.has_usable_fitting_anchor(item))
             .filter_map(|item| {
                 let kind = fitting_kind_from_noun(&item.noun);
                 if kind == MbdFittingKind::Unknown {
@@ -1482,11 +1602,39 @@ impl<'a> BranchMeasurementPlanner<'a> {
         &self,
         cut_tubis: &[MbdCutTubiDto],
         fittings: &[MbdFittingDto],
+        material_rows: &[MbdMaterialRowDto],
     ) -> Vec<MbdTagDto> {
         if !self.query.include_tags {
             return Vec::new();
         }
         let mut tags = Vec::new();
+        if self.query.include_branch_label {
+            if let Some(pos) = self.branch_label_position() {
+                tags.push(MbdTagDto {
+                    id: format!("tag:branch:{}", self.topology.branch_refno),
+                    refno: self.topology.branch_refno.to_string(),
+                    noun: "BRAN".to_string(),
+                    role: "branch_label".to_string(),
+                    text: self.topology.branch_refno.to_string(),
+                    position: pos.to_array(),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::anchor_hint(
+                            self.topology,
+                            pos,
+                            "branch_label",
+                            2,
+                            None,
+                        )
+                    }),
+                });
+            }
+        }
+        if self.query.include_position_tags {
+            tags.extend(self.build_position_tags());
+        }
+        if self.query.include_elevation_marks {
+            tags.extend(self.build_elevation_tags());
+        }
         for cut in cut_tubis {
             let start = Vec3::from_array(cut.start);
             let end = Vec3::from_array(cut.end);
@@ -1502,6 +1650,36 @@ impl<'a> BranchMeasurementPlanner<'a> {
                     AnnotationLayoutPlanner::anchor_hint(self.topology, pos, "tag_tubi", 1, None)
                 }),
             });
+        }
+        if self.query.include_material_balloons {
+            for row in material_rows {
+                let Some(refno) = row.refnos.first() else {
+                    continue;
+                };
+                let Some(cut) = cut_tubis.iter().find(|cut| &cut.refno == refno) else {
+                    continue;
+                };
+                let start = Vec3::from_array(cut.start);
+                let end = Vec3::from_array(cut.end);
+                let pos = (start + end) * 0.5;
+                tags.push(MbdTagDto {
+                    id: format!("tag:material:{}:{}", row.item_no, refno),
+                    refno: refno.clone(),
+                    noun: "MATERIAL".to_string(),
+                    role: "material_balloon".to_string(),
+                    text: row.item_no.to_string(),
+                    position: pos.to_array(),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::anchor_hint(
+                            self.topology,
+                            pos,
+                            "material_balloon",
+                            3,
+                            None,
+                        )
+                    }),
+                });
+            }
         }
         for fitting in fittings {
             let text = match fitting.kind {
@@ -1526,6 +1704,126 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 position: pos.to_array(),
                 layout_hint: fitting.layout_hint.clone(),
             });
+        }
+        tags
+    }
+
+    fn build_material_rows(&self, cut_tubis: &[MbdCutTubiDto]) -> Vec<MbdMaterialRowDto> {
+        if !self.query.include_material_table && !self.query.include_material_balloons {
+            return Vec::new();
+        }
+        cut_tubis
+            .iter()
+            .enumerate()
+            .map(|(idx, cut)| MbdMaterialRowDto {
+                item_no: idx as u32 + 1,
+                ns: format_material_ns(
+                    self
+                        .topology
+                        .segments
+                        .iter()
+                        .find(|seg| seg.refno.to_string() == cut.refno)
+                        .and_then(|seg| seg.bore),
+                    self
+                        .topology
+                        .segments
+                        .iter()
+                        .find(|seg| seg.refno.to_string() == cut.refno)
+                        .and_then(|seg| seg.outside_diameter),
+                ),
+                item_code: "TUBI".to_string(),
+                description: "Cut pipe length".to_string(),
+                quantity: (cut.length / 1000.0).max(0.0),
+                unit: "m".to_string(),
+                unit_weight: None,
+                refnos: vec![cut.refno.clone()],
+            })
+            .collect()
+    }
+
+    fn branch_label_position(&self) -> Option<Vec3> {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        let mut seen = false;
+        for seg in &self.topology.segments {
+            for point in [seg.start, seg.end] {
+                if !point.is_finite() {
+                    continue;
+                }
+                min = min.min(point);
+                max = max.max(point);
+                seen = true;
+            }
+        }
+        seen.then_some((min + max) * 0.5)
+    }
+
+    fn build_position_tags(&self) -> Vec<MbdTagDto> {
+        let Some(first) = self.topology.segments.first() else {
+            return Vec::new();
+        };
+        let Some(last) = self.topology.segments.last() else {
+            return Vec::new();
+        };
+
+        let (head, _) = segment_port_points(first);
+        let (_, tail) = segment_port_points(last);
+        [("head", head), ("tail", tail)]
+            .into_iter()
+            .filter(|(_, point)| point.is_finite())
+            .map(|(role, point)| MbdTagDto {
+                id: format!("tag:position:{}:{role}", self.topology.branch_refno),
+                refno: self.topology.branch_refno.to_string(),
+                noun: "BRAN".to_string(),
+                role: "position_tag".to_string(),
+                text: format!(
+                    "{}\nX {:.0}\nY {:.0}\nPE {:.0}",
+                    self.topology.branch_refno, point.x, point.y, point.z
+                ),
+                position: point.to_array(),
+                layout_hint: self.query.include_layout_hints.then(|| {
+                    AnnotationLayoutPlanner::anchor_hint(
+                        self.topology,
+                        point,
+                        "position_tag",
+                        4,
+                        None,
+                    )
+                }),
+            })
+            .collect()
+    }
+
+    fn build_elevation_tags(&self) -> Vec<MbdTagDto> {
+        let mut tags = Vec::new();
+        let mut seen = HashSet::<i32>::new();
+        for (idx, seg) in self.topology.segments.iter().enumerate() {
+            for (suffix, point) in [("start", seg.start), ("end", seg.end)] {
+                if !point.is_finite() {
+                    continue;
+                }
+                let elevation = point.z.round() as i32;
+                if !seen.insert(elevation) {
+                    continue;
+                }
+                tags.push(MbdTagDto {
+                    id: format!("tag:elevation:{}:{idx}:{suffix}", seg.refno),
+                    refno: seg.refno.to_string(),
+                    noun: "ELEVATION".to_string(),
+                    role: "elevation_tag".to_string(),
+                    text: format!("PE {elevation}"),
+                    position: point.to_array(),
+                    layout_hint: self.query.include_layout_hints.then(|| {
+                        AnnotationLayoutPlanner::anchor_hint(
+                            self.topology,
+                            point,
+                            "elevation_tag",
+                            2,
+                            None,
+                        )
+                    }),
+                });
+            }
         }
         tags
     }
@@ -1559,6 +1857,21 @@ fn segment_port_points(seg: &CacheTubiSeg) -> (Vec3, Vec3) {
     let start = seg.leave_axis.unwrap_or(seg.start);
     let end = seg.arrive_axis.unwrap_or(seg.end);
     (start, end)
+}
+
+fn format_material_ns(bore_mm: Option<f32>, outside_diameter_mm: Option<f32>) -> String {
+    if let Some(bore) = bore_mm.filter(|value| value.is_finite() && *value > 0.0) {
+        let inch = bore / 25.4;
+        let rounded_inch = inch.round();
+        if (inch - rounded_inch).abs() <= 0.08 && rounded_inch > 0.0 {
+            return format!("{:.0}\"", rounded_inch);
+        }
+        return format!("DN{:.0}", bore);
+    }
+    outside_diameter_mm
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|od| format!("OD{:.0}", od))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 #[inline]
@@ -2034,6 +2347,7 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
             arrive_axis: None,
             leave_axis: None,
             outside_diameter: None,
+            bore: None,
         });
     }
 
@@ -2201,6 +2515,7 @@ async fn fetch_tubi_segments_from_cache_with_debug(
                 arrive_axis: tubi_data.arrive_axis_pt.map(Vec3::from),
                 leave_axis: tubi_data.leave_axis_pt.map(Vec3::from),
                 outside_diameter: None,
+                bore: None,
             },
         );
     }
@@ -2308,6 +2623,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             arrive_axis: row.arrive_axis.map(|p| p.0),
             leave_axis: row.leave_axis.map(|p| p.0),
             outside_diameter: row.aod,
+            bore: None,
         });
     }
 
@@ -2461,10 +2777,10 @@ async fn fetch_discrete_fitting_elements_for_branch(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let anchor = row
+        let world_anchor = row
             .world_trans
             .map(|wt| wt.to_matrix().transform_point3(Vec3::ZERO))
-            .unwrap_or(Vec3::ZERO);
+            .filter(|point| point.is_finite());
 
         let mut flat_pts = row
             .ptset_pts
@@ -2478,11 +2794,14 @@ async fn fetch_discrete_fitting_elements_for_branch(
 
         let face_center_1 = flat_pts.first().copied();
         let face_center_2 = flat_pts.get(1).copied();
+        let anchor_point = face_center_1.or(world_anchor).unwrap_or(Vec3::ZERO);
+        let has_anchor = face_center_1.is_some() || world_anchor.is_some();
 
         items.push(RawFittingElement {
             refno: row.refno,
             noun: row.noun,
-            anchor_point: face_center_1.unwrap_or(anchor),
+            anchor_point,
+            has_anchor,
             face_center_1,
             face_center_2,
             angle: None,
@@ -2691,6 +3010,11 @@ fn export_default_query() -> MbdPipeQuery {
         include_cut_tubis: Some(true),
         include_fittings: Some(true),
         include_tags: Some(true),
+        include_position_tags: Some(true),
+        include_elevation_marks: Some(true),
+        include_branch_label: Some(true),
+        include_material_balloons: Some(true),
+        include_material_table: Some(true),
         include_layout_hints: Some(true),
         include_branch_attrs: true,
         include_weld_nouns: false,
@@ -2734,6 +3058,7 @@ async fn build_mbd_pipe_data_from_segments(
                 .unwrap_or_else(|_| branch_refno.clone()),
             noun: bend.noun.clone(),
             anchor_point: Vec3::from_array(bend.work_point),
+            has_anchor: true,
             face_center_1: bend.face_center_1.map(Vec3::from_array),
             face_center_2: bend.face_center_2.map(Vec3::from_array),
             angle: bend.angle,
@@ -2750,6 +3075,7 @@ async fn build_mbd_pipe_data_from_segments(
         slopes_count: output.slopes.len(),
         fittings_count: output.fittings.len(),
         tags_count: output.tags.len(),
+        material_rows_count: output.material_rows.len(),
         bends_count: output.bends.len(),
     };
 
@@ -2765,6 +3091,7 @@ async fn build_mbd_pipe_data_from_segments(
         slopes: output.slopes,
         fittings: output.fittings,
         tags: output.tags,
+        material_rows: output.material_rows,
         bends: output.bends,
         stats,
         debug_info: query.debug.then_some(debug_info),
@@ -3390,6 +3717,7 @@ mod tests {
             arrive_axis: Some(Vec3::new(9.0, 0.0, 0.0)),
             leave_axis: Some(Vec3::new(1.0, 0.0, 0.0)),
             outside_diameter: None,
+            bore: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -3408,6 +3736,7 @@ mod tests {
             arrive_axis: None,
             leave_axis: None,
             outside_diameter: None,
+            bore: None,
         };
 
         let (a, b) = segment_port_points(&seg);
@@ -3445,22 +3774,102 @@ mod tests {
     }
 
     #[test]
-    fn test_mbd_pipe_query_resolve_layout_first_defaults_match_construction() {
-        let lf = MbdPipeQuery {
+    fn test_mbd_pipe_query_resolve_layout_first_defaults_are_length_only() {
+        let resolved = MbdPipeQuery {
             mode: Some(MbdPipeMode::LayoutFirst),
             ..Default::default()
         }
         .resolve();
-        let cons = MbdPipeQuery {
-            mode: Some(MbdPipeMode::Construction),
+
+        assert_eq!(resolved.mode, MbdPipeMode::LayoutFirst);
+        assert!(!resolved.include_dims);
+        assert!(resolved.include_chain_dims);
+        assert!(!resolved.include_overall_dim);
+        assert!(resolved.include_port_dims);
+        assert!(resolved.include_cut_tubis);
+        assert!(!resolved.include_welds);
+        assert!(!resolved.include_slopes);
+        assert!(!resolved.include_bends);
+        assert!(!resolved.include_fittings);
+        assert!(!resolved.include_tags);
+        assert!(!resolved.include_position_tags);
+        assert!(!resolved.include_elevation_marks);
+        assert!(!resolved.include_branch_label);
+        assert!(!resolved.include_material_balloons);
+        assert!(!resolved.include_material_table);
+        assert!(resolved.include_layout_hints);
+    }
+
+    #[test]
+    fn test_mbd_v2_layout_query_defaults_to_bran_length_dims() {
+        let resolved = mbd_v2_layout_query(MbdPipeQuery::default()).resolve();
+
+        assert_eq!(resolved.mode, MbdPipeMode::LayoutFirst);
+        assert!(matches!(resolved.source, MbdPipeSource::Db));
+        assert!(!resolved.include_dims);
+        assert!(resolved.include_chain_dims);
+        assert!(!resolved.include_overall_dim);
+        assert!(resolved.include_port_dims);
+        assert!(resolved.include_cut_tubis);
+        assert!(!resolved.include_welds);
+        assert!(!resolved.include_slopes);
+        assert!(!resolved.include_bends);
+        assert!(!resolved.include_fittings);
+        assert!(!resolved.include_tags);
+        assert!(!resolved.include_position_tags);
+        assert!(!resolved.include_elevation_marks);
+        assert!(!resolved.include_branch_label);
+        assert!(!resolved.include_material_balloons);
+        assert!(!resolved.include_material_table);
+        assert!(resolved.include_layout_hints);
+        assert!(!resolved.include_weld_nouns);
+    }
+
+    #[test]
+    fn test_mbd_v2_layout_query_preserves_explicit_extra_switches() {
+        let resolved = mbd_v2_layout_query(MbdPipeQuery {
+            include_dims: Some(true),
+            include_welds: Some(true),
+            include_slopes: Some(true),
+            include_bends: Some(true),
+            include_fittings: Some(true),
+            include_tags: Some(true),
+            include_position_tags: Some(true),
+            include_elevation_marks: Some(true),
+            include_branch_label: Some(true),
+            include_material_balloons: Some(true),
+            include_material_table: Some(true),
             ..Default::default()
-        }
+        })
         .resolve();
-        assert_eq!(lf.mode, MbdPipeMode::LayoutFirst);
-        assert_eq!(cons.mode, MbdPipeMode::Construction);
-        assert_eq!(lf.include_dims, cons.include_dims);
-        assert_eq!(lf.include_chain_dims, cons.include_chain_dims);
-        assert_eq!(lf.include_welds, cons.include_welds);
+
+        assert!(resolved.include_dims);
+        assert!(resolved.include_welds);
+        assert!(resolved.include_slopes);
+        assert!(resolved.include_bends);
+        assert!(resolved.include_fittings);
+        assert!(resolved.include_tags);
+        assert!(resolved.include_position_tags);
+        assert!(resolved.include_elevation_marks);
+        assert!(resolved.include_branch_label);
+        assert!(resolved.include_material_balloons);
+        assert!(resolved.include_material_table);
+        assert!(resolved.include_weld_nouns);
+    }
+
+    #[test]
+    fn test_mbd_v2_layout_query_enables_tags_from_specific_label_switches() {
+        let resolved = mbd_v2_layout_query(MbdPipeQuery {
+            include_position_tags: Some(true),
+            include_material_balloons: Some(true),
+            ..Default::default()
+        })
+        .resolve();
+
+        assert!(resolved.include_tags);
+        assert!(resolved.include_position_tags);
+        assert!(!resolved.include_elevation_marks);
+        assert!(resolved.include_material_balloons);
     }
 
     #[test]
@@ -3544,6 +3953,7 @@ mod tests {
                     arrive_axis: None,
                     leave_axis: None,
                     outside_diameter: None,
+                    bore: None,
                 },
                 CacheTubiSeg {
                     refno: RefnoEnum::from("1_2"),
@@ -3554,6 +3964,7 @@ mod tests {
                     arrive_axis: None,
                     leave_axis: None,
                     outside_diameter: None,
+                    bore: None,
                 },
             ],
         );
@@ -3590,6 +4001,7 @@ mod tests {
                 arrive_axis: None,
                 leave_axis: None,
                 outside_diameter: None,
+                bore: None,
             }],
         );
         let fittings = vec![
@@ -3597,6 +4009,7 @@ mod tests {
                 refno: RefnoEnum::from("2_1"),
                 noun: "TEE".to_string(),
                 anchor_point: Vec3::new(50.0, 0.0, 0.0),
+                has_anchor: true,
                 face_center_1: None,
                 face_center_2: None,
                 angle: None,
@@ -3606,6 +4019,7 @@ mod tests {
                 refno: RefnoEnum::from("2_2"),
                 noun: "FLAN".to_string(),
                 anchor_point: Vec3::new(100.0, 0.0, 0.0),
+                has_anchor: true,
                 face_center_1: None,
                 face_center_2: None,
                 angle: None,
@@ -3657,12 +4071,14 @@ mod tests {
             slopes_count: 5,
             fittings_count: 6,
             tags_count: 7,
-            bends_count: 8,
+            material_rows_count: 8,
+            bends_count: 9,
         };
         let json = serde_json::to_value(stats).expect("stats serialize");
         assert!(json.get("cut_tubis_count").is_some());
         assert!(json.get("fittings_count").is_some());
         assert!(json.get("tags_count").is_some());
+        assert!(json.get("material_rows_count").is_some());
     }
 
     #[test]
@@ -3679,6 +4095,7 @@ mod tests {
             slopes: Vec::new(),
             fittings: Vec::new(),
             tags: Vec::new(),
+            material_rows: Vec::new(),
             bends: Vec::new(),
             stats: MbdPipeStats::default(),
             debug_info: Some(MbdPipeDebugInfo::default()),
@@ -3688,6 +4105,7 @@ mod tests {
         assert!(json.get("cut_tubis").is_some());
         assert!(json.get("fittings").is_some());
         assert!(json.get("tags").is_some());
+        assert!(json.get("material_rows").is_some());
     }
 
     #[test]

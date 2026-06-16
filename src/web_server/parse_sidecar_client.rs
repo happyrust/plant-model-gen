@@ -414,6 +414,8 @@ pub async fn shutdown_site_sidecars(site_id: &str) -> usize {
     let generate_key = cli_job_sidecar_key(&format!("generate:{site_id}"));
     let mut killed = shutdown_sidecars_by_keys(&[site_key.clone(), parse_key, generate_key]).await;
     killed += shutdown_orphan_site_sidecars(&site_key).await;
+    // 顺带回收本实例归属根下“属主已死”的全类型孤儿（db-index/resolve/scan/preview/mdb 等）。
+    killed += reap_dead_owner_sidecars().await;
     killed
 }
 
@@ -483,6 +485,267 @@ fn stable_key(value: &str) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SidecarOwnerMarker {
+    owner_pid: u32,
+    owner_start_token: Option<u64>,
+    sidecar_pid: u32,
+    sidecar_start_token: Option<u64>,
+    bind_port: u16,
+    key: String,
+    created_at: String,
+}
+
+/// 本 web_server 实例的 sidecar 归属根：`<cwd>/runtime/admin_sidecars`。
+/// 所有清理动作都只针对 `--runtime-dir` 落在此根下的 sidecar，避免误杀其它仓库/release。
+fn admin_sidecars_root() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join("runtime")
+        .join("admin_sidecars")
+}
+
+fn write_sidecar_owner_marker(runtime_dir: &Path, key: &str, port: u16, handle: &SidecarHandle) {
+    let marker = SidecarOwnerMarker {
+        owner_pid: std::process::id(),
+        owner_start_token: process_start_token(std::process::id()),
+        sidecar_pid: handle.pid,
+        sidecar_start_token: handle.start_token,
+        bind_port: port,
+        key: key.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&marker) {
+        let _ = std::fs::write(runtime_dir.join("owner.json"), json);
+    }
+}
+
+fn normalize_path_str(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
+fn process_is_aios_database(process: &sysinfo::Process) -> bool {
+    if let Some(name) = process
+        .exe()
+        .and_then(|exe| exe.file_name())
+        .and_then(|name| name.to_str())
+    {
+        if name.eq_ignore_ascii_case(aios_database_exe_name()) {
+            return true;
+        }
+    }
+    let name = process.name().to_string_lossy();
+    name.eq_ignore_ascii_case(aios_database_exe_name())
+        || name.eq_ignore_ascii_case("aios-database")
+}
+
+/// 扫描进程表，找出 `aios-database serve` 且 `--runtime-dir` 落在本实例归属根下的 sidecar。
+fn find_owned_serve_sidecars(root: &Path) -> Vec<SidecarHandle> {
+    let root_norm = normalize_path_str(root);
+    let system = System::new_all();
+    system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            if !process_is_aios_database(process) {
+                return None;
+            }
+            let args = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            if !args.iter().any(|arg| arg == "serve") {
+                return None;
+            }
+            let runtime_dir = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--runtime-dir").then(|| pair[1].clone()))?;
+            if !normalize_path_str(Path::new(&runtime_dir)).starts_with(&root_norm) {
+                return None;
+            }
+            let pid = pid.as_u32();
+            Some(SidecarHandle {
+                base_url: String::new(),
+                token: String::new(),
+                pid,
+                start_token: process_start_token(pid),
+            })
+        })
+        .collect()
+}
+
+/// 启动期 reaper：清理上一轮本实例残留的 `aios-database serve`。
+///
+/// 新实例启动时内存注册表必为空，因此归属根下任何仍在运行的 serve sidecar
+/// 都是上一轮残留，可安全终止（杀前校验 PID + start-token）。
+pub async fn reap_orphan_sidecars_on_startup() -> usize {
+    let root = admin_sidecars_root();
+    let handles = find_owned_serve_sidecars(&root);
+    let scanned = handles.len();
+    let mut killed = 0usize;
+    for handle in handles {
+        if kill_handle_process_tree(&handle).await {
+            killed += 1;
+        }
+    }
+    if scanned > 0 {
+        tracing::warn!(
+            phase = "startup",
+            scope_root = %root.display(),
+            scanned,
+            killed,
+            "sidecar reaper: 清理上一轮残留 aios-database serve"
+        );
+    }
+    killed
+}
+
+fn read_owner_marker(runtime_dir: &Path) -> Option<SidecarOwnerMarker> {
+    let bytes = std::fs::read(runtime_dir.join("owner.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// 属主 web_server 是否仍存活（PID + start-token 双重校验，规避 PID 复用）。
+fn owner_process_alive(owner_pid: u32, owner_start_token: Option<u64>) -> bool {
+    if owner_pid == 0 {
+        return false;
+    }
+    match (owner_start_token, process_start_token(owner_pid)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// 回收“属主已死”的孤儿 sidecar：覆盖本实例归属根下的所有 key 类型
+/// （site/job/db-index/resolve/scan/preview/mdb）。
+///
+/// 通过 owner.json 判定属主存活：属主仍在运行的 sidecar 一律跳过，
+/// 因此不会误杀其它存活实例正在使用的共享 sidecar。
+async fn reap_dead_owner_sidecars() -> usize {
+    let root = admin_sidecars_root();
+    let root_norm = normalize_path_str(&root);
+    let candidates: Vec<(SidecarHandle, PathBuf)> = {
+        let system = System::new_all();
+        system
+            .processes()
+            .iter()
+            .filter_map(|(pid, process)| {
+                if !process_is_aios_database(process) {
+                    return None;
+                }
+                let args = process
+                    .cmd()
+                    .iter()
+                    .map(|part| part.to_string_lossy().to_string())
+                    .collect::<Vec<_>>();
+                if !args.iter().any(|arg| arg == "serve") {
+                    return None;
+                }
+                let runtime_dir = args
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == "--runtime-dir").then(|| pair[1].clone()))?;
+                if !normalize_path_str(Path::new(&runtime_dir)).starts_with(&root_norm) {
+                    return None;
+                }
+                let pid = pid.as_u32();
+                Some((
+                    SidecarHandle {
+                        base_url: String::new(),
+                        token: String::new(),
+                        pid,
+                        start_token: process_start_token(pid),
+                    },
+                    PathBuf::from(runtime_dir),
+                ))
+            })
+            .collect()
+    };
+    let mut killed = 0usize;
+    for (handle, runtime_dir) in candidates {
+        let owner_alive = match read_owner_marker(&runtime_dir) {
+            Some(marker) => owner_process_alive(marker.owner_pid, marker.owner_start_token),
+            // 无 owner.json：旧版/未知来源的归属根孤儿，按孤儿回收。
+            None => false,
+        };
+        if owner_alive {
+            continue;
+        }
+        if kill_handle_process_tree(&handle).await {
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        tracing::warn!(
+            phase = "dead-owner",
+            scope_root = %root.display(),
+            killed,
+            "sidecar reaper: 回收无存活属主的孤儿"
+        );
+    }
+    killed
+}
+
+/// 退出期回收：尽力终止内存注册表中的全部 sidecar（覆盖所有 key 类型）。
+pub async fn shutdown_all_sidecars() -> usize {
+    let handles = {
+        let mut guard = sidecars().lock().await;
+        guard.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+    };
+    let mut killed = 0usize;
+    for handle in handles {
+        if kill_handle_process_tree(&handle).await {
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        tracing::warn!(phase = "shutdown", killed, "sidecar reaper: 退出期回收");
+    }
+    killed
+}
+
+/// 让 sidecar 在父进程（web_server）死亡时被 OS 一并带走。
+/// Unix 走 `PR_SET_PDEATHSIG`；Windows 由 spawn 后的 Job Object 绑定负责（见 `assign_sidecar_to_job`）。
+fn bind_sidecar_parent_death(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        // SAFETY: pre_exec 在 fork 出的子进程内、exec 之前执行；prctl 设置父死信号。
+        unsafe {
+            command.pre_exec(|| {
+                let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+/// Windows：把 sidecar 子进程加入本实例的 Job Object（KILL_ON_JOB_CLOSE）。
+fn assign_sidecar_to_job(child: &tokio::process::Child) {
+    #[cfg(windows)]
+    {
+        if let Some(handle) = child.raw_handle() {
+            win_job::assign_current_job(handle);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
 async fn ensure_sidecar(key: &str) -> Result<SidecarHandle> {
     {
         let guard = sidecars().lock().await;
@@ -532,7 +795,9 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
     }
 
     isolate_sidecar_process_group(&mut command);
+    bind_sidecar_parent_death(&mut command);
     let child = command.spawn().context("启动 aios-database sidecar 失败")?;
+    assign_sidecar_to_job(&child);
     let pid = child.id().unwrap_or_default();
     let handle = SidecarHandle {
         base_url: format!("http://{SIDECAR_HOST}:{port}"),
@@ -540,6 +805,7 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
         pid,
         start_token: process_start_token(pid),
     };
+    write_sidecar_owner_marker(&runtime_dir, key, port, &handle);
     wait_for_sidecar_health(&handle).await?;
     Ok(handle)
 }
@@ -848,5 +1114,107 @@ fn internal_proxy_error(err: impl std::fmt::Display) -> SidecarProxyError {
                 "retryable": true
             }
         }),
+    }
+}
+
+/// Windows Job Object 绑定：本实例创建一个 `KILL_ON_JOB_CLOSE` 的 Job，
+/// 每个 sidecar 子进程加入该 Job；web_server 进程退出（含崩溃/强杀）时
+/// Job 句柄随之关闭，OS 自动终止全部已分配 sidecar。
+#[cfg(windows)]
+mod win_job {
+    use std::os::windows::io::RawHandle;
+    use std::sync::OnceLock;
+
+    type Handle = *mut core::ffi::c_void;
+
+    #[repr(C)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+
+    unsafe extern "system" {
+        fn CreateJobObjectW(
+            lp_job_attributes: *mut core::ffi::c_void,
+            lp_name: *const u16,
+        ) -> Handle;
+        fn SetInformationJobObject(
+            h_job: Handle,
+            job_object_information_class: i32,
+            lp_job_object_information: *mut core::ffi::c_void,
+            cb_job_object_information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(h_job: Handle, h_process: Handle) -> i32;
+    }
+
+    fn job_handle() -> Option<Handle> {
+        static JOB: OnceLock<usize> = OnceLock::new();
+        let raw = JOB.get_or_init(|| unsafe { create_kill_on_close_job() as usize });
+        let handle = *raw as Handle;
+        if handle.is_null() { None } else { Some(handle) }
+    }
+
+    unsafe fn create_kill_on_close_job() -> Handle {
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job.is_null() {
+            tracing::warn!("CreateJobObjectW 失败，sidecar 将依赖 reaper/idle 超时回收");
+            return std::ptr::null_mut();
+        }
+        let mut info: JobObjectExtendedLimitInformation = unsafe { std::mem::zeroed() };
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            )
+        };
+        if ok == 0 {
+            tracing::warn!(
+                "SetInformationJobObject(KILL_ON_JOB_CLOSE) 失败，父死自动回收可能不生效"
+            );
+        }
+        job
+    }
+
+    pub(super) fn assign_current_job(process: RawHandle) {
+        let Some(job) = job_handle() else {
+            return;
+        };
+        let rc = unsafe { AssignProcessToJobObject(job, process as Handle) };
+        if rc == 0 {
+            tracing::warn!("AssignProcessToJobObject 失败，将依赖 reaper/idle 超时回收 sidecar");
+        }
     }
 }

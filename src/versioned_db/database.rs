@@ -113,10 +113,30 @@ fn resolve_single_indextree_chunk_size(db_option: &DbOption) -> usize {
 #[derive(Debug, Clone)]
 struct ParsedDbArtifact {
     project_name: String,
+    tree_dir: PathBuf,
     dbnum: u32,
     db_type: String,
     file_name: String,
     tree_node_count: usize,
+}
+
+fn parse_tree_output_dir(source_project_name: &str) -> PathBuf {
+    let Some(active_tree_dir) = db_meta_info::get_current_project_tree_dir() else {
+        return db_meta_info::get_project_tree_dir(source_project_name);
+    };
+
+    if let Some(active_project_name) = db_meta_info::get_current_project_name() {
+        if active_project_name != source_project_name {
+            info!(
+                "[tree_export] 使用当前配置输出命名空间: source_project={}, output_project={}, tree_dir={}",
+                source_project_name,
+                active_project_name,
+                active_tree_dir.display()
+            );
+        }
+    }
+
+    active_tree_dir
 }
 
 fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow::Result<()> {
@@ -128,7 +148,7 @@ fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow
     let mut errors = Vec::new();
 
     for artifact in artifacts {
-        let tree_dir = db_meta_info::get_project_tree_dir(&artifact.project_name);
+        let tree_dir = &artifact.tree_dir;
         let meta_path = tree_dir.join("db_meta_info.json");
         let meta = match std::fs::read_to_string(&meta_path) {
             Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
@@ -519,7 +539,9 @@ where
         let data_db_types_refs = data_db_types.iter().map(String::as_str).collect::<Vec<_>>();
 
         // 统计项目中的文件数量
-        let project_dir = db_option.get_project_path(&project).unwrap();
+        let project_dir = db_option
+            .get_project_path(project)
+            .ok_or_else(|| anyhow::anyhow!("项目路径不存在: {}", project))?;
         let total_files = if Path::new(&project_dir).exists() {
             let target_dir = std::fs::read_dir(&project_dir)
                 .unwrap()
@@ -885,7 +907,9 @@ where
     info!("开始解析 {project} 的 {:?}", db_types);
     let db_option_arc = Arc::new(db_option.clone());
 
-    let project_dir = db_option.get_project_path(&project).unwrap();
+    let project_dir = db_option
+        .get_project_path(project)
+        .ok_or_else(|| anyhow::anyhow!("项目路径不存在: {}", project))?;
 
     if !Path::new(&project_dir).exists() {
         dbg!("项目文件夹指定不正确");
@@ -1522,7 +1546,7 @@ where
                 );
             }
         }
-        let output_dir = db_meta_info::get_project_tree_dir(&project_name);
+        let output_dir = parse_tree_output_dir(&project_name);
         // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
         // CATA 闭包部分解析时 tree_nodes 只覆盖闭包子集，db_meta 的 ref0->dbnum 映射不能缩水。
         let mut ref0s = BTreeSet::new();
@@ -1580,6 +1604,7 @@ where
 
         parsed_artifacts.push(ParsedDbArtifact {
             project_name: project_name.clone(),
+            tree_dir: output_dir.clone(),
             dbnum,
             db_type: db_type.clone(),
             file_name: file_name.clone(),
@@ -1652,7 +1677,9 @@ pub async fn sync_total_async_threaded(
     info!("开始解析 {project} 的 {:?}", db_types);
     let db_option_arc = Arc::new(db_option.clone()); // 创建一个Arc对象，表示数据库选项
 
-    let project_dir = db_option.get_project_path(&project).unwrap(); // 创建一个Path对象，表示项目目录的路径
+    let project_dir = db_option
+        .get_project_path(project)
+        .ok_or_else(|| anyhow::anyhow!("项目路径不存在: {}", project))?; // 创建一个Path对象，表示项目目录的路径
     dbg!(&project_dir);
 
     if !Path::new(&project_dir).exists() {
@@ -2297,6 +2324,7 @@ pub async fn sync_total_async_threaded(
                 // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_tree_only=true 也要生成）。
                 //
                 // 该文件用于：refno(ref_0) -> dbnum 的快速映射，以及记录 db 文件头的关键信息以便排查。
+                let output_dir = parse_tree_output_dir(&project_name);
                 let db_meta_stage_start = Instant::now();
                 {
                     // ref_0 为 RefU64 高 32 位（注意：ref_0 并非 dbnum）。
@@ -2322,7 +2350,7 @@ pub async fn sync_total_async_threaded(
                     let header_debug = None;
 
                     db_meta_info::update_db_meta_info_json(
-                        &db_meta_info::get_project_tree_dir(&project_name),
+                        &output_dir,
                         db_meta_info::DbFileMetaUpdate {
                             dbnum,
                             db_type: &db_type,
@@ -2358,13 +2386,14 @@ pub async fn sync_total_async_threaded(
                     db_basic.as_ref(),
                     &tree_nodes,
                     &db_basic.children_map,
-                    &db_meta_info::get_project_tree_dir(&project_name),
+                    &output_dir,
                 )
                 .map_err(|e| anyhow::anyhow!("[tree_export] dbnum={} 导出失败: {}", dbnum, e))?;
                 let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
                 parsed_artifacts.push(ParsedDbArtifact {
                     project_name: project_name.clone(),
+                    tree_dir: output_dir,
                     dbnum,
                     db_type: db_type.clone(),
                     file_name: file_name.clone(),
@@ -2562,6 +2591,7 @@ mod scene_tree_artifact_tests {
     fn artifact(nodes: usize) -> ParsedDbArtifact {
         ParsedDbArtifact {
             project_name: "demo".to_string(),
+            tree_dir: crate::versioned_db::db_meta_info::get_project_tree_dir("demo"),
             dbnum: 42,
             db_type: "DESI".to_string(),
             file_name: "DESI0001".to_string(),
@@ -2751,7 +2781,7 @@ pub async fn parse_single_db_file(
 
     // 导出 tree 文件
     let tree_export_stage_start = Instant::now();
-    let output_dir = db_meta_info::get_project_tree_dir(project_name);
+    let output_dir = parse_tree_output_dir(project_name);
     if let Err(e) = export_tree_file(
         target_dbnum,
         db_basic.as_ref(),
@@ -2826,6 +2856,7 @@ pub async fn parse_single_db_file(
 
     validate_parse_scene_tree_artifacts(&[ParsedDbArtifact {
         project_name: project_name.to_string(),
+        tree_dir: output_dir,
         dbnum: target_dbnum,
         db_type: db_type.clone(),
         file_name: file_name.clone(),

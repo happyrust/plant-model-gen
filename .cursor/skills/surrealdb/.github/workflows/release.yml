@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)publish (e.g. v1.4.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-publish:
+    name: Validate and Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: false
+
+      - name: Python syntax validation
+        run: |
+          for script in scripts/*.py; do
+            echo "Compiling $script"
+            python3 -m py_compile "$script"
+          done
+
+      - name: Validate SKILL.md
+        run: |
+          if [ ! -f SKILL.md ]; then
+            echo "ERROR: SKILL.md not found"
+            exit 1
+          fi
+          head -1 SKILL.md | grep -q "^---" || { echo "ERROR: SKILL.md missing frontmatter"; exit 1; }
+          grep -q "^name:" SKILL.md || { echo "ERROR: SKILL.md missing 'name' field"; exit 1; }
+          grep -q "^description:" SKILL.md || { echo "ERROR: SKILL.md missing 'description' field"; exit 1; }
+          echo "SKILL.md is valid."
+
+      - name: Validate version consistency
+        env:
+          RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_VERSION"]
+          if expected.startswith("v"):
+              expected = expected[1:]
+
+          version_re = re.compile(r'(?m)^  version:\s*"([^"]+)"$')
+          badge_re = re.compile(r'badge/version-([0-9][^-\]]*)-blue')
+          changelog_re = re.compile(r'(?m)^## \[([^\]]+)\] - ')
+
+          def extract_version(path: Path) -> str:
+              match = version_re.search(path.read_text())
+              if not match:
+                  raise SystemExit(f"missing metadata.version in {path}")
+              return match.group(1)
+
+          root_version = extract_version(Path("SKILL.md"))
+          if root_version != expected:
+              raise SystemExit(f"SKILL.md version {root_version} != release tag {expected}")
+
+          for path in sorted(Path("skills").glob("*/SKILL.md")):
+              subskill_version = extract_version(path)
+              if subskill_version != expected:
+                  raise SystemExit(f"{path} version {subskill_version} != release tag {expected}")
+
+          sources = json.loads(Path("SOURCES.json").read_text())
+          if sources.get("skill_version") != expected:
+              raise SystemExit(
+                  f"SOURCES.json skill_version {sources.get('skill_version')} != release tag {expected}"
+              )
+
+          readme = Path("README.md").read_text()
+          badge = badge_re.search(readme)
+          if not badge or badge.group(1) != expected:
+              raise SystemExit("README.md version badge does not match release tag")
+
+          changelog = Path("CHANGELOG.md").read_text()
+          latest = changelog_re.search(changelog)
+          if not latest or latest.group(1) != expected:
+              raise SystemExit("CHANGELOG.md latest entry does not match release tag")
+
+          if not Path("rules/surrealkit.md").exists():
+              raise SystemExit("rules/surrealkit.md is missing")
+          if not Path("rules/ecosystem-integrations.md").exists():
+              raise SystemExit("rules/ecosystem-integrations.md is missing")
+          PY
+
+      - name: Script smoke tests
+        run: |
+          uv run scripts/onboard.py --agent >/tmp/onboard.json
+          uv run scripts/schema.py --help >/dev/null
+          uv run scripts/doctor.py --help >/dev/null
+
+      - name: Set up Node
+        uses: actions/setup-node@v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Publish to clawhub.ai
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          [ -n "$CLAWHUB_TOKEN" ] || { echo "ERROR: CLAWHUB_TOKEN is not configured"; exit 1; }
+          VERSION="${RELEASE_TAG#v}"
+          CHANGELOG_TEXT="$(
+            VERSION="$VERSION" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          changelog = Path("CHANGELOG.md").read_text()
+          match = re.search(
+              rf"(?ms)^## \[{re.escape(version)}\] - .*?(?=^## \[|\Z)",
+              changelog,
+          )
+          if not match:
+              raise SystemExit(f"missing CHANGELOG.md entry for {version}")
+          print(match.group(0).strip())
+          PY
+          )"
+          export CLAWHUB_CONFIG_PATH="$RUNNER_TEMP/clawhub-config.json"
+          echo "Publishing skill to clawhub.ai..."
+          npx --yes clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+          PUBLISH_LOG="$RUNNER_TEMP/clawhub-publish.log"
+          set +e
+          npx --yes clawhub publish . \
+            --slug surrealdb \
+            --name "SurrealDB 3" \
+            --version "$VERSION" \
+            --changelog "$CHANGELOG_TEXT" \
+            --tags "latest,ai-agents,database,graph,openclaw,surrealdb,vector" \
+            2>&1 | tee "$PUBLISH_LOG"
+          PUBLISH_STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$PUBLISH_STATUS" -ne 0 ]; then
+            if grep -Fq "Version already exists" "$PUBLISH_LOG"; then
+              echo "Version already exists on clawhub.ai; treating as already published."
+            else
+              echo "ERROR: Failed to publish to clawhub.ai"
+              exit "$PUBLISH_STATUS"
+            fi
+          else
+            echo "Published successfully."
+          fi
+
+      - name: Trigger skills.sh reindex
+        run: |
+          echo "Triggering skills.sh reindex..."
+          curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --proto '=https' --tlsv1.2 -X POST \
+            "https://skills.sh/api/reindex?repo=$GITHUB_REPOSITORY" \
+            || echo "WARNING: skills.sh reindex trigger failed (non-fatal)"
+          echo "Reindex triggered."

@@ -228,7 +228,7 @@ watch(() => route.query.task_id, (next) => {
     deployTaskError.value = ''
   }
 })
-const LOG_TABS: ManagedSiteLogKind[] = ['parse', 'generate', 'db', 'web', 'viewer']
+const LOG_TABS: ManagedSiteLogKind[] = ['parse', 'generate', 'room-compute', 'db', 'web', 'viewer']
 function normalizeLogKind(value: unknown): ManagedSiteLogKind {
   return typeof value === 'string' && LOG_TABS.includes(value as ManagedSiteLogKind)
     ? value as ManagedSiteLogKind
@@ -305,6 +305,7 @@ const emptyLogState = (): DetailLogState => ({
 const detailLogs = ref<Record<ManagedSiteLogKind, DetailLogState>>({
   parse: emptyLogState(),
   generate: emptyLogState(),
+  'room-compute': emptyLogState(),
   db: emptyLogState(),
   web: emptyLogState(),
   viewer: emptyLogState(),
@@ -407,7 +408,9 @@ function buildDeployProgressSteps(): DeployProgressStep[] {
   const s = site.value
   const r = runtime.value
   const generationEnabled = !!(s?.gen_model || s?.gen_mesh || s?.gen_spatial_tree)
+  const roomComputeEnabled = generationEnabled && !!s?.gen_spatial_tree
   const currentStage = r?.current_stage ?? ''
+  const hasReachedStart = r?.status === 'Running' || r?.web_running || r?.viewer_running
   return [
     {
       key: 'preflight',
@@ -442,12 +445,32 @@ function buildDeployProgressSteps(): DeployProgressStep[] {
         ? 'skipped'
         : currentStage === 'generating'
           ? 'current'
-          : r?.status === 'Running' || r?.web_running
+          : currentStage === 'room_computing' || hasReachedStart
             ? 'complete'
             : r?.status === 'Failed'
               ? 'error'
               : 'pending',
       detail: generationEnabled ? (r?.current_stage_detail || '等待生成') : '生成配置未启用，部署时跳过',
+    },
+    {
+      key: 'room-compute',
+      label: '房间计算',
+      state: !roomComputeEnabled
+        ? 'skipped'
+        : currentStage === 'room_computing'
+          ? 'current'
+          : hasReachedStart
+            ? 'complete'
+            : r?.status === 'Failed' && r?.last_error?.includes('房间计算')
+              ? 'error'
+              : 'pending',
+      detail: roomComputeEnabled
+        ? (currentStage === 'room_computing'
+            ? r?.current_stage_detail || '正在自动构建房间关系'
+            : hasReachedStart
+              ? '房间计算已完成或已通过部署验收'
+              : '等待模型生成完成后自动执行')
+        : '未启用 gen_spatial_tree，部署时跳过',
     },
     {
       key: 'db',
@@ -974,6 +997,8 @@ function logTabLabel(tab: ManagedSiteLogKind) {
       return '解析日志'
     case 'generate':
       return '生成日志'
+    case 'room-compute':
+      return '房间计算日志'
     case 'db':
       return 'DB 日志'
     case 'web':
@@ -1587,7 +1612,7 @@ onMounted(async () => {
         <div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2">
           <div class="flex flex-wrap items-center gap-2">
             <button
-              v-for="tab in (['parse', 'generate', 'db', 'web', 'viewer'] as const)"
+              v-for="tab in LOG_TABS"
               :key="tab"
               @click="onLogTabChange(tab)"
               class="rounded-md px-3 py-1 text-xs font-medium transition-colors"

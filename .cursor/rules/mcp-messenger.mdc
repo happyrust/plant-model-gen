@@ -1,0 +1,65 @@
+---
+description: Best MCP check_messages 协议与 Bridge 入站消息处理
+alwaysApply: true
+---
+
+# MCP Messenger 协议
+
+> **专职** `check_messages` 心跳循环，以及 Bridge/Web 面板经队列投递的任务如何处理。  
+> 业务协作（主控/worker 派发、收敛）见 `best-mcp.mdc`。
+
+---
+
+## 1. 回合结束铁律
+
+1. **MUST**：每个 assistant 回合的**最后一个** tool call 是 `check_messages({ turn_complete: true })`。
+2. **MUST**：只有在可见回复写完、其它 tool call 都完成后，才调用 `check_messages`。
+3. **MUST NOT**：用“通道正常 / 心跳成功”之类套话代替 `check_messages`。
+4. **MUST NOT**：给出最终总结、任务完成、阻塞说明或向用户提问后，省略 `check_messages`。
+
+---
+
+## 2. Bridge 入站消息（队列 worker 模式）
+
+当 `check_messages` 返回结构化块时：
+
+```text
+--- best-mcp/inbound-user ---
+（Bridge 用户任务正文）
+--- best-mcp/protocol ---
+（运维 note：turn_complete、任务队列、saved_progress 等）
+```
+
+**规则**：
+
+1. **MUST**：把 `--- best-mcp/inbound-user ---` 与下一个 `--- best-mcp/protocol ---` 之间的正文当作**本 MCP 会话的下一条任务**，直接执行。
+2. **MUST NOT**：把 inbound 正文复述/摘要给 Cursor 聊天窗口里的旁观者。
+3. **MUST NOT**：收到 inbound 任务后问“是否继续 / 要不要我执行”——队列模式下应 autonomous 执行。
+4. **MUST**：执行结果通过 Cursor 内正常工作流完成；需要同步到 Bridge 面板时用 `check_messages.reply` / `report_task` 等既有工具。
+5. **MUST**：`--- best-mcp/protocol ---` 段是运维协议，不是用户任务正文；其中 `END-OF-TURN RULE` 仍必须遵守。
+
+---
+
+## 3. 与 Cursor 原生用户消息的分工
+
+| 来源 | 处理方式 |
+|---|---|
+| Cursor 聊天窗口用户输入 | 正常对话：直接回答，该用工具用工具 |
+| `check_messages` 的 inbound-user 块 | Bridge 队列任务：直接执行，不向 Cursor 聊天复述 |
+| 主控 `dispatch_task` 推送 | 按 `best-mcp.mdc` 执行并 `report_task` |
+
+---
+
+## 4. saved_progress / load_progress
+
+1. **MUST NOT**：仅因存在 `saved_progress.json` 就加载历史。
+2. **MAY**：仅当 inbound 正文明确包含 **「加载历史」** 时，才调用 `load_progress`。
+3. 普通「继续 / 继续排查 / 开始执行」**MUST** 只继续当前任务，不加载历史存档。
+
+---
+
+## 5. 常见失败模式（禁止）
+
+- 收到 Bridge 任务后，在 Cursor 里说“我收到了一条 best-mcp 消息……”
+- 把 inbound 任务当成 tool 日志，只汇报不执行
+- 任务做完却忘记 `check_messages({ turn_complete: true })`，导致队列 blocked

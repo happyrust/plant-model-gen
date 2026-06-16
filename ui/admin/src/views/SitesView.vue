@@ -1,19 +1,20 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, Loader2, MemoryStick, Play, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
+import { AlertTriangle, CircleAlert, Cpu, FolderKanban, HardDrive, HelpCircle, Loader2, MemoryStick, Play, RefreshCw, RotateCcw, Server, Square, Activity, Trash2, X } from 'lucide-vue-next'
 import { extractErrorMessage } from '@/api/client'
 import { sitesApi } from '@/api/sites'
 import { usePolling } from '@/composables/usePolling'
 import { useAdminSitesStream } from '@/composables/useAdminSitesStream'
 import SiteDataTable from '@/components/sites/SiteDataTable.vue'
+import SiteDeploymentGuide from '@/components/sites/SiteDeploymentGuide.vue'
 import SiteDrawer from '@/components/sites/SiteDrawer.vue'
 import SiteToolbar from '@/components/sites/SiteToolbar.vue'
 import SiteWorkbenchHeader from '@/components/sites/SiteWorkbenchHeader.vue'
 import { useSitesStore, type SiteBulkAction } from '@/stores/sites'
 import { matchesQuickFilter, computeStats, siteActionLabelMap, type QuickFilter } from '@/components/sites/site-status'
 import { AVEVA_PLANT_SAMPLE_APS250160_DB_FILE } from '@/components/sites/site-presets'
-import type { AdminResourceSummary, ManagedProjectSite, ManagedSiteDbMode, ManagedSiteRiskLevel } from '@/types/site'
+import type { AdminResourceSummary, ManagedProjectSite, ManagedSiteDbMode, ManagedSiteRiskLevel, QuickDeploySiteRequest } from '@/types/site'
 
 const sitesStore = useSitesStore()
 const router = useRouter()
@@ -26,6 +27,8 @@ const cloningSiteId = ref<string | null>(null)
 //
 // 选中的 site_id 集 + 当前 in-flight 批量动作（用于禁用按钮 + 显示进度）。
 const selectedSiteIds = ref<string[]>([])
+const highlightedSiteId = ref('')
+let highlightedSiteClearTimer: number | undefined
 const bulkInFlight = ref<SiteBulkAction | null>(null)
 const bulkSummary = ref<{
   action: SiteBulkAction
@@ -53,27 +56,52 @@ const resourceSummary = ref<AdminResourceSummary | null>(null)
 const resourceLoading = ref(false)
 const resourceError = ref('')
 const QUICK_DEPLOY_DBFILE_STORAGE_KEY = 'admin:quick-deploy:last-dbfile'
+const QUICK_DEPLOY_MODE_STORAGE_KEY = 'admin:quick-deploy:mode'
+const QUICK_DEPLOY_MDB_NAME_STORAGE_KEY = 'admin:quick-deploy:mdb-name'
+const QUICK_DEPLOY_SEARCH_ROOT_STORAGE_KEY = 'admin:quick-deploy:search-root'
+const QUICK_DEPLOY_DEFAULT_SEARCH_ROOT = 'D:\\AVEVA\\Projects\\E3D2.1'
+type QuickDeployMode = 'dbfile' | 'mdb'
+interface SiteDeploymentGuideStep {
+  id: string
+  targetSelector: string
+  title: string
+  description: string
+  actionHint?: string
+}
 
-function loadQuickDeployDbFile() {
+function loadStoredValue(key: string, fallback = '') {
   try {
-    const saved = localStorage.getItem(QUICK_DEPLOY_DBFILE_STORAGE_KEY)?.trim()
-    return saved || AVEVA_PLANT_SAMPLE_APS250160_DB_FILE
+    const saved = localStorage.getItem(key)?.trim()
+    return saved || fallback
   } catch {
-    return AVEVA_PLANT_SAMPLE_APS250160_DB_FILE
+    return fallback
   }
 }
 
-function rememberQuickDeployDbFile(value: string) {
+function rememberStoredValue(key: string, value: string) {
   const trimmed = value.trim()
   if (!trimmed) return
   try {
-    localStorage.setItem(QUICK_DEPLOY_DBFILE_STORAGE_KEY, trimmed)
+    localStorage.setItem(key, trimmed)
   } catch {
     // localStorage may be unavailable in restricted browser contexts.
   }
 }
 
+function loadQuickDeployDbFile() {
+  return loadStoredValue(QUICK_DEPLOY_DBFILE_STORAGE_KEY, AVEVA_PLANT_SAMPLE_APS250160_DB_FILE)
+}
+
+function rememberQuickDeployDbFile(value: string) {
+  rememberStoredValue(QUICK_DEPLOY_DBFILE_STORAGE_KEY, value)
+}
+
+const quickDeployMode = ref<QuickDeployMode>(
+  loadStoredValue(QUICK_DEPLOY_MODE_STORAGE_KEY, 'dbfile') === 'mdb' ? 'mdb' : 'dbfile',
+)
 const quickDeployDbFile = ref(loadQuickDeployDbFile())
+const quickDeployMdbName = ref(loadStoredValue(QUICK_DEPLOY_MDB_NAME_STORAGE_KEY, '/ALL'))
+const quickDeploySearchRoot = ref(loadStoredValue(QUICK_DEPLOY_SEARCH_ROOT_STORAGE_KEY, QUICK_DEPLOY_DEFAULT_SEARCH_ROOT))
 const quickDeployDbMode = ref<ManagedSiteDbMode>('ws')
 // 默认启用按需解析依赖库（CATA 闭包 manifest 部分解析）
 const quickDeployAutoDeps = ref(true)
@@ -83,6 +111,41 @@ const quickDeployGenMesh = ref(true)
 const quickDeployLoading = ref(false)
 const quickDeployError = ref('')
 const quickDeployMessage = ref('')
+const deployGuideOpen = ref(false)
+
+const deployGuideSteps: SiteDeploymentGuideStep[] = [
+  {
+    id: 'target-dbfile',
+    targetSelector: '[data-guide="site-deploy-dbfile"]',
+    title: '选择目标 DB 文件',
+    description: '即使只部署一个 dbfile，也先把目标文件填到这里。目标文件负责确定本次解析范围，例如 aps250160_0001。',
+  },
+  {
+    id: 'mbd-context',
+    targetSelector: '[data-guide="site-deploy-mbd-context"]',
+    title: '指定 MBD 名称',
+    description: 'MBD 是依赖工程路径的来源。单文件部署也必须指定 MBD 名称，例如 ALL 或 /ALL，后端会据此发现 AvevaCatalogue 等关联工程。',
+  },
+  {
+    id: 'deploy-options',
+    targetSelector: '[data-guide="site-deploy-options"]',
+    title: '确认解析选项',
+    description: '保持“自动解析依赖库”和“按需解析 CATA”开启，可以按目标设计库引用闭包自动纳入依赖库。',
+  },
+  {
+    id: 'create-config',
+    targetSelector: '[data-guide="site-deploy-create"]',
+    title: '创建部署配置',
+    description: '点击后只创建站点和配置文件，不会直接启动服务。创建成功后仍停留在当前页面，并自动定位到新站点所在行。',
+  },
+  {
+    id: 'result-list',
+    targetSelector: '[data-guide="site-deploy-result-list"]',
+    title: '回到列表核对结果',
+    description: '列表摘要会显示解析范围，例如 dbnum=250160。需要调整时可进入“查看/编辑配置”。',
+    actionHint: '创建配置后，页面会下移到新站点所在行，方便立即打开编辑抽屉。',
+  },
+]
 
 const siteStats = computed(() => computeStats(sitesStore.sites))
 
@@ -139,6 +202,26 @@ const resourceCards = computed(() => [
 
 watch(quickDeployDbFile, (value) => {
   rememberQuickDeployDbFile(value)
+})
+
+watch(quickDeployMode, (value) => {
+  rememberStoredValue(QUICK_DEPLOY_MODE_STORAGE_KEY, value)
+})
+
+watch(quickDeployMdbName, (value) => {
+  rememberStoredValue(QUICK_DEPLOY_MDB_NAME_STORAGE_KEY, value)
+})
+
+watch(quickDeploySearchRoot, (value) => {
+  rememberStoredValue(QUICK_DEPLOY_SEARCH_ROOT_STORAGE_KEY, value)
+})
+
+const quickDeployReady = computed(() => {
+  if (quickDeployLoading.value) return false
+  if (quickDeployMode.value === 'mdb') {
+    return !!quickDeployMdbName.value.trim() && !!quickDeploySearchRoot.value.trim()
+  }
+  return !!quickDeployDbFile.value.trim() && !!quickDeployMdbName.value.trim()
 })
 
 const resourceRiskBanner = computed(() => {
@@ -223,6 +306,30 @@ function clearSelection() {
   selectedSiteIds.value = []
 }
 
+function resetFiltersForNewSiteLocator() {
+  activeQuickFilter.value = 'all'
+  searchQuery.value = ''
+  statusFilter.value = ''
+  riskFilter.value = ''
+}
+
+async function scrollToSiteRow(siteId: string) {
+  highlightedSiteId.value = siteId
+  if (highlightedSiteClearTimer !== undefined) {
+    window.clearTimeout(highlightedSiteClearTimer)
+  }
+  await nextTick()
+  window.requestAnimationFrame(() => {
+    const row = Array.from(document.querySelectorAll<HTMLElement>('[data-site-id]'))
+      .find((element) => element.dataset.siteId === siteId)
+    row?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+  highlightedSiteClearTimer = window.setTimeout(() => {
+    if (highlightedSiteId.value === siteId) highlightedSiteId.value = ''
+    highlightedSiteClearTimer = undefined
+  }, 12_000)
+}
+
 async function handleBulkAction(action: SiteBulkAction) {
   if (bulkInFlight.value !== null || selectedSiteIds.value.length === 0) return
   if (action === 'delete') {
@@ -292,15 +399,12 @@ async function fetchResourceSummary() {
 }
 
 async function submitQuickDeploy() {
-  const dbFile = quickDeployDbFile.value.trim()
-  if (!dbFile || quickDeployLoading.value) return
-  rememberQuickDeployDbFile(dbFile)
+  if (!quickDeployReady.value) return
   quickDeployLoading.value = true
   quickDeployError.value = ''
   quickDeployMessage.value = ''
   try {
-    const result = await sitesApi.quickDeploy({
-      db_file: dbFile,
+    const commonPayload = {
       auto_parse_related_dbnums: quickDeployAutoDeps.value,
       cata_partial_parse: quickDeployCataPartial.value,
       gen_model: true,
@@ -309,12 +413,28 @@ async function submitQuickDeploy() {
       start_site: false,
       wait: false,
       pipeline_db_mode: quickDeployDbMode.value,
-    })
+    } satisfies QuickDeploySiteRequest
+    const payload: QuickDeploySiteRequest = quickDeployMode.value === 'mdb'
+      ? {
+          ...commonPayload,
+          mbd_name: quickDeployMdbName.value.trim(),
+          search_roots: [quickDeploySearchRoot.value.trim()],
+        }
+      : {
+          ...commonPayload,
+          db_file: quickDeployDbFile.value.trim(),
+          mbd_name: quickDeployMdbName.value.trim(),
+          search_roots: quickDeploySearchRoot.value.trim() ? [quickDeploySearchRoot.value.trim()] : [],
+        }
+    if (payload.db_file) rememberQuickDeployDbFile(payload.db_file)
+    const result = await sitesApi.quickDeploy(payload)
     const dbnumText = result.dbnum ? `（dbnum=${result.dbnum}）` : ''
     const fileText = result.resolved_db_file ? `，目标文件 ${result.resolved_db_file}` : ''
-    quickDeployMessage.value = `已创建部署配置：${result.site_id}${dbnumText}${fileText}；请到站点详情手动执行部署或启动。`
+    const warningText = result.warnings?.length ? `；提示：${result.warnings.join('；')}` : ''
+    quickDeployMessage.value = `已创建部署配置：${result.site_id}${dbnumText}${fileText}；已在下方列表定位，可直接查看/编辑配置。${warningText}`
+    resetFiltersForNewSiteLocator()
     await fetchPageData()
-    void router.push({ path: `/sites/${result.site_id}`, query: { tab: 'deploy' } })
+    await scrollToSiteRow(result.site_id)
   } catch (err: unknown) {
     quickDeployError.value = extractErrorMessage(err)
   } finally {
@@ -368,26 +488,69 @@ onMounted(async () => {
       @refresh="fetchPageData"
     />
 
-    <section class="rounded-lg border border-primary/20 bg-primary/5 p-4">
+    <section class="rounded-lg border border-primary/20 bg-primary/5 p-4" data-guide="site-deploy-quick-card">
       <div class="flex flex-col gap-3 lg:flex-row lg:items-end">
         <div class="min-w-0 flex-1 space-y-1.5">
-          <div class="flex items-center gap-2">
-            <Play class="h-4 w-4 text-primary" />
-            <h3 class="text-base font-medium">快速创建部署 dbfile</h3>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <Play class="h-4 w-4 text-primary" />
+              <h3 class="text-base font-medium">快速创建部署</h3>
+            </div>
+            <button
+              type="button"
+              class="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/30 bg-background px-3 text-xs font-medium text-primary hover:bg-primary/10"
+              @click="deployGuideOpen = true"
+            >
+              <HelpCircle class="h-3.5 w-3.5" />
+              部署向导
+            </button>
           </div>
           <p class="text-sm text-muted-foreground">
-            输入单个 E3D dbfile 绝对路径，后端会自动推断工程根、读取文件头得到 dbnum；这里只创建站点和配置文件，部署/启动由用户在站点详情手动执行。
-            首次默认填入可直接使用的 AvevaPlantSample 路径；修改后会记住最近一次输入。
+            可输入单个 E3D dbfile，也可按 MBD 名称在工程根目录下自动发现目标 DB。单文件部署同样需要 MBD 名称，因为关联工程路径来自 MBD 配置。这里只创建站点和配置文件，部署/启动由用户在站点详情手动执行。
           </p>
+          <div class="flex flex-wrap gap-2 text-xs">
+            <label class="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1">
+              <input v-model="quickDeployMode" type="radio" value="dbfile" />
+              <span>按 dbfile</span>
+            </label>
+            <label class="inline-flex items-center gap-1.5 rounded-full border border-border bg-background px-3 py-1">
+              <input v-model="quickDeployMode" type="radio" value="mdb" />
+              <span>按 MBD 名称</span>
+            </label>
+          </div>
           <input
+            v-if="quickDeployMode === 'dbfile'"
             v-model="quickDeployDbFile"
             type="text"
+            data-guide="site-deploy-dbfile"
             class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             :placeholder="AVEVA_PLANT_SAMPLE_APS250160_DB_FILE"
             @keydown.enter.prevent="submitQuickDeploy"
           />
+          <div
+            class="grid gap-2 md:grid-cols-[minmax(0,0.7fr)_minmax(0,1.3fr)]"
+            data-guide="site-deploy-mbd-context"
+          >
+            <input
+              v-model="quickDeployMdbName"
+              type="text"
+              class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              placeholder="/ALL"
+              @keydown.enter.prevent="submitQuickDeploy"
+            />
+            <input
+              v-model="quickDeploySearchRoot"
+              type="text"
+              class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              :placeholder="QUICK_DEPLOY_DEFAULT_SEARCH_ROOT"
+              @keydown.enter.prevent="submitQuickDeploy"
+            />
+            <p class="md:col-span-2 text-xs text-muted-foreground">
+              MBD 名称必填。搜索根目录通常是多个 E3D 工程的父目录，例如 {{ QUICK_DEPLOY_DEFAULT_SEARCH_ROOT }}；dbfile 为绝对路径时也可留空，让后端从目标 DB 推断工程根。
+            </p>
+          </div>
         </div>
-        <div class="flex flex-wrap items-center gap-3 text-sm">
+        <div class="flex flex-wrap items-center gap-3 text-sm" data-guide="site-deploy-options">
           <label class="flex items-center gap-1.5">
             <span>解析/生成 DB 模式</span>
             <select
@@ -420,7 +583,8 @@ onMounted(async () => {
             <span>配置生成 Viewer 网格</span>
           </label>
           <button
-            :disabled="quickDeployLoading || !quickDeployDbFile.trim()"
+            :disabled="!quickDeployReady"
+            data-guide="site-deploy-create"
             class="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow hover:bg-primary/90 transition-colors disabled:pointer-events-none disabled:opacity-50"
             @click="submitQuickDeploy"
           >
@@ -635,6 +799,8 @@ onMounted(async () => {
       :sites="filteredSites"
       :loading="sitesStore.loading"
       :selected="selectedSiteIds"
+      :highlight-site-id="highlightedSiteId"
+      data-guide="site-deploy-result-list"
       @edit-site="openEditDrawer"
       @clone-site="openCloneDrawer"
       @update-selection="handleSelectionChange"
@@ -645,6 +811,10 @@ onMounted(async () => {
       :clone="cloningSiteId !== null"
       @close="drawerOpen = false; editingSiteId = null; cloningSiteId = null"
       @saved="handleDrawerSaved"
+    />
+    <SiteDeploymentGuide
+      v-model:open="deployGuideOpen"
+      :steps="deployGuideSteps"
     />
   </div>
 </template>

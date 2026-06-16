@@ -13,6 +13,7 @@ export interface ParsePresetOption {
 }
 
 export const DEFAULT_PARSE_DB_TYPES = ['SYST', 'DESI', 'CATA', 'DICT', 'GLB', 'GLOB']
+export const DEFAULT_MANAGED_SITE_PARSE_DB_TYPES = ['SYST', 'DESI']
 
 export const PARSE_DB_TYPE_OPTIONS: ParseDbTypeOption[] = [
   {

@@ -82,15 +82,20 @@ file_server_host = "http://192.168.31.38:8100/asset/archives"
 
 
 # SurrealDB 连接配置 (PE/属性/输入数据读取)
-# 离线模型生成使用 file 模式 (嵌入式 RocksDB)
+# 默认使用 ws 连接外部 SurrealDB；离线 file 模式需通过 CLI --offline 显式启用。
 [surrealdb]
-mode = "file"
+mode = "ws"
+ip = "127.0.0.1"
+port = 8020
+user = "root"
+password = "root"
 path = "data.rdb"
 
 # SurrealKV 连接配置 (模型数据写入)
-# 离线模型生成使用 file 模式 (嵌入式 SurrealKV)
+# 默认关闭独立 SurrealKV，模型写回主 SurrealDB。
 [surrealkv]
-mode = "file"
+enabled = false
+mode = "ws"
 path = "data.kv"
 
 #调试选项

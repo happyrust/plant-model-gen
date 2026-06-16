@@ -260,12 +260,16 @@ litefs_status_url = "http://localhost:20203/status"
 
 # ====== SurrealDB 连接配置 (PE/属性/输入数据) ======
 [surrealdb]
-mode = "file"
+mode = "ws"
+ip = "127.0.0.1"
+port = 8020
+user = "root"
+password = "root"
 path = "D:/backup-dbs/ams-8020.db"
 
 # ====== SurrealKV 连接配置 (模型数据写入) ======
 # enabled = false 时模型数据写回主 SurrealDB，避免跨库 pe 表缺失
 [surrealkv]
 enabled = false
-mode = "file"
+mode = "ws"
 path = "D:/backup-dbs/ams-8020.db.kv"

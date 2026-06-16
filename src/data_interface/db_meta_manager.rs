@@ -189,29 +189,53 @@ impl DbMetaManager {
         db_option.total_sync = true;
         db_option.save_db = Some(false);
 
-        // 只生成 project_name 对应的 indextree
-        let project_name = db_option.project_name.clone();
+        // project_name 是输出/运行库名称；源 E3D 工程必须来自 included_projects。
+        let output_project_name = db_option.project_name.clone();
+        let mut source_projects = db_option
+            .included_projects
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .filter(|project| db_option.get_project_path(project).is_some())
+            .collect::<Vec<_>>();
+        if source_projects.is_empty() {
+            let fallback = db_option.project_name.trim().to_string();
+            if !fallback.is_empty() && db_option.get_project_path(&fallback).is_some() {
+                source_projects.push(fallback);
+            }
+        }
+        if source_projects.is_empty() {
+            anyhow::bail!(
+                "无法生成 indextree：输出项目 {} 未映射到源工程路径，included_projects={:?}",
+                output_project_name,
+                db_option.included_projects
+            );
+        }
 
         println!(
-            "🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 项目: {}, 类型: DESI)...",
-            project_name
+            "🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 输出项目: {}, 源工程: {:?}, 类型: DESI)...",
+            output_project_name, source_projects
         );
 
         // 使用 tokio runtime 执行异步生成
-        let result = match tokio::runtime::Handle::try_current() {
+        let result: Result<()> = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
                         let cur_dbno_set = Arc::new(DashSet::new());
-                        // 【关键】只处理 DESI 类型的 db 文件
-                        sync_total_async_threaded(
-                            &db_option,
-                            &project_name,
-                            cur_dbno_set,
-                            &["DESI"],
-                            100,
-                        )
-                        .await
+                        for project in &source_projects {
+                            // 【关键】只处理 DESI 类型的 db 文件
+                            sync_total_async_threaded(
+                                &db_option,
+                                project,
+                                cur_dbno_set.clone(),
+                                &["DESI"],
+                                100,
+                            )
+                            .await?;
+                        }
+                        Ok(())
                     })
                 })
             }
@@ -219,15 +243,18 @@ impl DbMetaManager {
                 let rt = build_indextree_runtime()?;
                 rt.block_on(async {
                     let cur_dbno_set = Arc::new(DashSet::new());
-                    // 【关键】只处理 DESI 类型的 db 文件
-                    sync_total_async_threaded(
-                        &db_option,
-                        &project_name,
-                        cur_dbno_set,
-                        &["DESI"],
-                        100,
-                    )
-                    .await
+                    for project in &source_projects {
+                        // 【关键】只处理 DESI 类型的 db 文件
+                        sync_total_async_threaded(
+                            &db_option,
+                            project,
+                            cur_dbno_set.clone(),
+                            &["DESI"],
+                            100,
+                        )
+                        .await?;
+                    }
+                    Ok(())
                 })
             }
         };

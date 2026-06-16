@@ -139,5 +139,5 @@ user = "root"
 
 [surrealkv]
 enabled = false
-mode = "file"
+mode = "ws"
 path = "runtime/bran-closure/surreal.db.kv"

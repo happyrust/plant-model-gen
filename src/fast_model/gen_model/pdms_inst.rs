@@ -70,13 +70,8 @@ fn infer_failed_sql_stage(query: &str) -> &'static str {
 }
 
 fn failed_sql_dump_dir() -> PathBuf {
-    let db_option = get_db_option();
-    let project_name = db_option.project_name.trim();
-    let base = if project_name.is_empty() {
-        PathBuf::from("output").join("_unknown_project")
-    } else {
-        PathBuf::from("output").join(project_name)
-    };
+    let db_option = crate::options::get_db_option_ext();
+    let base = db_option.get_project_output_dir();
     base.join("diagnostics").join("failed_sql")
 }
 

@@ -183,6 +183,7 @@ fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<u64> {
 
 const MESH_CHECK_LOD_TAG: &str = "L1";
 const MESH_REPORT_REFNO_SAMPLE_LIMIT: usize = 50;
+const SURREAL_REFNO_QUERY_BATCH_SIZE: usize = 100;
 
 struct MissingMeshReportSummary {
     report_file: String,
@@ -244,6 +245,14 @@ fn record_geo_hash_usage(
         .or_default()
         .insert(owner_refno.to_string());
     *row_count_by_hash.entry(hash.to_string()).or_insert(0) += 1;
+}
+
+fn pe_record_list(refnos: &[RefnoEnum]) -> String {
+    refnos
+        .iter()
+        .map(|refno| refno.to_pe_key())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn append_tubing_rows_for_owner(
@@ -993,6 +1002,14 @@ struct AabbQueryRow {
 #[derive(Debug, Deserialize, SurrealValue)]
 struct InstInfoPtsetQueryRow {
     refno: RefnoEnum,
+    inst_info_id: Option<serde_json::Value>,
+    cata_hash: Option<serde_json::Value>,
+    ptset: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct InstInfoPtsetRecordRow {
+    inst_info_id: Option<serde_json::Value>,
     cata_hash: Option<serde_json::Value>,
     ptset: Option<serde_json::Value>,
 }
@@ -1006,21 +1023,53 @@ struct PrimitiveKeyPointQueryRow {
 struct PtsetExportData {
     refno_cata_hash: HashMap<RefnoEnum, String>,
     rows_by_cata_hash: HashMap<String, Vec<PtsetRow>>,
+    requested_refnos: usize,
+    relation_rows: usize,
+    inst_info_rows: usize,
+    invalid_cata_hash_rows: usize,
     missing_cata_hash_refnos: usize,
     empty_ptset_hashes: usize,
 }
 
-fn normalize_cata_hash(value: Option<serde_json::Value>) -> Option<String> {
+fn normalize_record_id(value: Option<serde_json::Value>) -> Option<String> {
     match value? {
         serde_json::Value::String(s) => {
-            let trimmed = s.trim().to_string();
-            is_valid_cata_hash(&trimmed).then_some(trimmed)
+            let trimmed = s.trim().trim_matches('⟨').trim_matches('⟩').to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
         }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Array(mut values) if values.len() == 1 => {
+            normalize_record_id(Some(values.remove(0)))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_cata_hash_str(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_matches('⟨').trim_matches('⟩').to_string();
+    is_valid_cata_hash(&trimmed).then_some(trimmed)
+}
+
+fn normalize_cata_hash(value: Option<serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(s) => normalize_cata_hash_str(&s),
+        serde_json::Value::Number(n) => normalize_cata_hash_str(&n.to_string()),
         serde_json::Value::Array(values) => values
             .into_iter()
             .find_map(|value| normalize_cata_hash(Some(value))),
         _ => None,
     }
+}
+
+fn normalize_cata_hash_record_id(value: Option<serde_json::Value>) -> Option<String> {
+    normalize_record_id(value).and_then(|id| normalize_cata_hash_str(&id))
+}
+
+fn inst_info_record_ref(id: &str) -> String {
+    format!(
+        "inst_info:⟨{}⟩",
+        id.trim().trim_matches('⟨').trim_matches('⟩')
+    )
 }
 
 fn parse_ptset_value(value: serde_json::Value) -> Vec<CateAxisParam> {
@@ -1250,24 +1299,19 @@ async fn query_inst_relate_by_refnos(
         return Ok(Vec::new());
     }
 
-    const BATCH_SIZE: usize = 500;
     let mut rows = Vec::new();
 
-    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+    for (idx, chunk) in refnos.chunks(SURREAL_REFNO_QUERY_BATCH_SIZE).enumerate() {
         if verbose {
             println!(
                 "   - 查询 inst_relate 分批 {}/{} (批大小 {})",
                 idx + 1,
-                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                refnos.len().div_ceil(SURREAL_REFNO_QUERY_BATCH_SIZE),
                 chunk.len()
             );
         }
 
-        let pe_list = chunk
-            .iter()
-            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let pe_list = pe_record_list(chunk);
 
         let sql = format!(
             r#"
@@ -1277,7 +1321,8 @@ async fn query_inst_relate_by_refnos(
                 in as refno,
                 in.noun as noun,
                 spec_value as spec_value
-            FROM [{pe_list}]->inst_relate
+            FROM inst_relate
+            WHERE in IN [{pe_list}]
             "#
         );
 
@@ -1300,36 +1345,43 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
         return Ok(PtsetExportData {
             refno_cata_hash,
             rows_by_cata_hash,
+            requested_refnos: 0,
+            relation_rows: 0,
+            inst_info_rows: 0,
+            invalid_cata_hash_rows: 0,
             missing_cata_hash_refnos,
             empty_ptset_hashes,
         });
     }
 
-    const BATCH_SIZE: usize = 500;
-    for (idx, chunk) in refnos.chunks(BATCH_SIZE).enumerate() {
+    let requested_refnos = refnos.len();
+    let mut relation_rows = 0usize;
+    let mut inst_info_rows = 0usize;
+    let mut invalid_cata_hash_rows = 0usize;
+    let mut cata_hash_inst_info: HashMap<String, String> = HashMap::new();
+
+    for (idx, chunk) in refnos.chunks(SURREAL_REFNO_QUERY_BATCH_SIZE).enumerate() {
         if verbose {
             println!(
                 "   - 查询 inst_info ptset 分批 {}/{} (批大小 {})",
                 idx + 1,
-                (refnos.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+                refnos.len().div_ceil(SURREAL_REFNO_QUERY_BATCH_SIZE),
                 chunk.len()
             );
         }
 
-        let pe_list = chunk
-            .iter()
-            .map(|r| format!("pe:⟨{}⟩", r.to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let pe_list = pe_record_list(chunk);
 
         let sql = format!(
             r#"
             SELECT
                 in as refno,
+                record::id(out) as inst_info_id,
                 out.cata_hash as cata_hash,
                 out.ptset as ptset
-            FROM [{pe_list}]->inst_relate
-            WHERE out != NONE
+            FROM inst_relate
+            WHERE in IN [{pe_list}]
+                AND out != NONE
             "#
         );
 
@@ -1339,14 +1391,82 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
             .with_context(|| format!("query_ptset_export_data SQL: {sql}"))?;
 
         for row in rows {
-            let cata_hash = normalize_cata_hash(row.cata_hash);
+            relation_rows += 1;
+            let inst_info_id = normalize_record_id(row.inst_info_id);
+            let cata_hash = normalize_cata_hash(row.cata_hash)
+                .or_else(|| inst_info_id.as_deref().and_then(normalize_cata_hash_str));
             let Some(cata_hash) = cata_hash else {
-                missing_cata_hash_refnos += 1;
+                invalid_cata_hash_rows += 1;
+                continue;
+            };
+            let inst_info_id = inst_info_id.unwrap_or_else(|| cata_hash.clone());
+
+            refno_cata_hash.insert(row.refno, cata_hash.clone());
+            cata_hash_inst_info
+                .entry(cata_hash.clone())
+                .or_insert(inst_info_id);
+
+            if row.ptset.is_some() && !rows_by_cata_hash.contains_key(&cata_hash) {
+                let ptset_rows = row
+                    .ptset
+                    .map(parse_ptset_value)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|axis| axis_to_ptset_row(&cata_hash, axis))
+                    .collect::<Vec<_>>();
+
+                if !ptset_rows.is_empty() {
+                    rows_by_cata_hash.insert(cata_hash, ptset_rows);
+                }
+            }
+        }
+    }
+
+    let mut missing_ptset_hashes = cata_hash_inst_info
+        .iter()
+        .filter_map(|(cata_hash, inst_info_id)| {
+            rows_by_cata_hash
+                .get(cata_hash)
+                .map_or(true, Vec::is_empty)
+                .then_some((cata_hash.clone(), inst_info_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    missing_ptset_hashes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for chunk in missing_ptset_hashes.chunks(SURREAL_REFNO_QUERY_BATCH_SIZE) {
+        let inst_info_list = chunk
+            .iter()
+            .map(|(_, inst_info_id)| inst_info_record_ref(inst_info_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            SELECT
+                record::id(id) as inst_info_id,
+                cata_hash as cata_hash,
+                ptset as ptset
+            FROM [{inst_info_list}]
+            "#
+        );
+
+        let rows: Vec<InstInfoPtsetRecordRow> = aios_core::project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .with_context(|| format!("query_ptset_export_data inst_info SQL: {sql}"))?;
+
+        for row in rows {
+            inst_info_rows += 1;
+            let cata_hash = normalize_cata_hash(row.cata_hash)
+                .or_else(|| normalize_cata_hash_record_id(row.inst_info_id));
+            let Some(cata_hash) = cata_hash else {
+                invalid_cata_hash_rows += 1;
                 continue;
             };
 
-            refno_cata_hash.insert(row.refno, cata_hash.clone());
-            if rows_by_cata_hash.contains_key(&cata_hash) {
+            if rows_by_cata_hash
+                .get(&cata_hash)
+                .map_or(false, |rows| !rows.is_empty())
+            {
                 continue;
             }
 
@@ -1358,21 +1478,32 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
                 .map(|axis| axis_to_ptset_row(&cata_hash, axis))
                 .collect::<Vec<_>>();
 
-            if ptset_rows.is_empty() {
-                empty_ptset_hashes += 1;
-            }
             rows_by_cata_hash.insert(cata_hash, ptset_rows);
         }
     }
 
+    empty_ptset_hashes = rows_by_cata_hash
+        .values()
+        .filter(|rows| rows.is_empty())
+        .count();
+
+    missing_cata_hash_refnos = refnos
+        .iter()
+        .filter(|refno| !refno_cata_hash.contains_key(refno))
+        .count();
+
     if verbose {
         let ptset_point_count: usize = rows_by_cata_hash.values().map(Vec::len).sum();
         println!(
-            "✅ ptset 导出索引: refno_cata_hash={}, cata_hash={}, ptset_points={}, missing_cata_hash_refnos={}, empty_ptset_hashes={}",
+            "✅ ptset 导出索引: requested_refnos={}, relation_rows={}, inst_info_rows={}, refno_cata_hash={}, cata_hash={}, ptset_points={}, missing_cata_hash_refnos={}, invalid_cata_hash_rows={}, empty_ptset_hashes={}",
+            requested_refnos,
+            relation_rows,
+            inst_info_rows,
             refno_cata_hash.len(),
             rows_by_cata_hash.len(),
             ptset_point_count,
             missing_cata_hash_refnos,
+            invalid_cata_hash_rows,
             empty_ptset_hashes
         );
     }
@@ -1380,6 +1511,10 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
     Ok(PtsetExportData {
         refno_cata_hash,
         rows_by_cata_hash,
+        requested_refnos,
+        relation_rows,
+        inst_info_rows,
+        invalid_cata_hash_rows,
         missing_cata_hash_refnos,
         empty_ptset_hashes,
     })
@@ -2631,6 +2766,14 @@ pub async fn export_dbnum_instances_parquet(
         },
         "ptset_export": {
             "cata_hashes": used_cata_hashes.len(),
+            "used_cata_hashes": used_cata_hashes.len(),
+            "available_cata_hashes": ptset_export_data.rows_by_cata_hash.len(),
+            "refno_cata_hashes": ptset_export_data.refno_cata_hash.len(),
+            "requested_refnos": ptset_export_data.requested_refnos,
+            "relation_rows": ptset_export_data.relation_rows,
+            "inst_info_rows": ptset_export_data.inst_info_rows,
+            "written_ptset_points": ptset_rows.len(),
+            "invalid_cata_hash_rows": ptset_export_data.invalid_cata_hash_rows,
             "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
             "empty_ptset_hashes": ptset_export_data.empty_ptset_hashes,
         },
@@ -2709,6 +2852,14 @@ pub async fn export_dbnum_instances_parquet(
             },
             "ptset_export": {
                 "cata_hashes": used_cata_hashes.len(),
+                "used_cata_hashes": used_cata_hashes.len(),
+                "available_cata_hashes": ptset_export_data.rows_by_cata_hash.len(),
+                "refno_cata_hashes": ptset_export_data.refno_cata_hash.len(),
+                "requested_refnos": ptset_export_data.requested_refnos,
+                "relation_rows": ptset_export_data.relation_rows,
+                "inst_info_rows": ptset_export_data.inst_info_rows,
+                "written_ptset_points": ptset_rows.len(),
+                "invalid_cata_hash_rows": ptset_export_data.invalid_cata_hash_rows,
                 "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
                 "empty_ptset_hashes": ptset_export_data.empty_ptset_hashes,
             },

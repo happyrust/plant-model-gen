@@ -73,7 +73,7 @@ fn get_cached_index() -> Result<&'static CachedIndex, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct SqliteSpatialQueryParams {
-    /// bbox | refno | position
+    /// bbox | refno | position | bran_centerline
     pub mode: Option<String>,
     /// refno string like "17496_123456" (也兼容 "17496/123456")
     pub refno: Option<String>,
@@ -142,6 +142,8 @@ pub struct SpatialQueryResultItem {
     pub spec_value: i64,
     pub aabb: Option<AabbDto>,
     pub distance: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub within_radius: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -449,6 +451,12 @@ fn parse_mode(params: &SqliteSpatialQueryParams) -> &'static str {
     }
     if mode == "position" {
         return "position";
+    }
+    if matches!(
+        mode.as_str(),
+        "bran" | "branch" | "bran_centerline" | "branch_centerline" | "centerline"
+    ) {
+        return "bran_centerline";
     }
     // 未指定时：优先 position，其次 refno，最后 bbox
     if params.x.is_some() && params.y.is_some() && params.z.is_some() {
@@ -1095,6 +1103,38 @@ pub async fn api_sqlite_spatial_nearest_clearance(
 pub async fn api_sqlite_spatial_query(
     Query(params): Query<SqliteSpatialQueryParams>,
 ) -> Json<SpatialQueryResult> {
+    let prepared_centerline = if parse_mode(&params) == "bran_centerline" {
+        match params
+            .refno
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(refno) => match parse_refno_enum_for_source(refno) {
+                Ok(branch_refno) => match fetch_bran_centerline_segments(branch_refno).await {
+                    Ok(segments) => Some(segments),
+                    Err(e) => {
+                        return Json(error_spatial_query_result(
+                            format!("fetch BRAN centerline failed: {e}"),
+                            None,
+                        ));
+                    }
+                },
+                Err(e) => {
+                    return Json(error_spatial_query_result(e, None));
+                }
+            },
+            None => {
+                return Json(error_spatial_query_result(
+                    "mode=bran_centerline requires refno",
+                    None,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let fallback_refno_ids = match query_refno_visible_inst_ids_for_fallback(&params).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1103,8 +1143,10 @@ pub async fn api_sqlite_spatial_query(
     };
 
     // 将 SQLite 阻塞 I/O 放入 blocking 线程池
-    let result =
-        tokio::task::spawn_blocking(move || do_spatial_query(params, fallback_refno_ids)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        do_spatial_query(params, fallback_refno_ids, prepared_centerline)
+    })
+    .await;
     match result {
         Ok(r) => Json(r),
         Err(e) => Json(error_spatial_query_result(
@@ -1655,6 +1697,7 @@ fn query_aabbs_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<A
 fn do_spatial_query(
     params: SqliteSpatialQueryParams,
     fallback_refno_ids: Option<Vec<i64>>,
+    prepared_centerline: Option<Vec<BranCenterlineSegment>>,
 ) -> SpatialQueryResult {
     let cached = match get_cached_index() {
         Ok(c) => c,
@@ -1720,6 +1763,21 @@ fn do_spatial_query(
                 );
             }
         }
+    } else if mode == "bran_centerline" {
+        let Some(centerline) = prepared_centerline else {
+            return error_spatial_query_result("BRAN centerline was not prepared", None);
+        };
+        if centerline.is_empty() {
+            return error_spatial_query_result("BRAN centerline has no segments", None);
+        }
+        let search_distance = normalized_search_distance(params.distance, params.radius);
+        return query_by_target_geometry(
+            params,
+            cached,
+            QueryTargetGeometry::BranCenterline(centerline),
+            search_distance,
+            self_id,
+        );
     } else if mode == "refno" {
         let refno = params.refno.as_deref().unwrap_or("").trim();
         if refno.is_empty() {
@@ -1743,7 +1801,7 @@ fn do_spatial_query(
             if let Some(ids) = fallback_refno_ids.as_deref() {
                 match query_aabbs_for_ids(&conn, ids) {
                     Ok(aabbs) if !aabbs.is_empty() => {
-                        let distance = normalized_distance(params.distance);
+                        let distance = normalized_search_distance(params.distance, params.radius);
                         return query_by_target_aabbs(params, cached, aabbs, distance, self_id);
                     }
                     Ok(_) => {}
@@ -1767,7 +1825,7 @@ fn do_spatial_query(
         }
     };
 
-    let distance = normalized_distance(params.distance);
+    let distance = normalized_search_distance(params.distance, params.radius);
     query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_id)
 }
 
@@ -1787,8 +1845,8 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
     }
 }
 
-fn normalized_distance(distance: Option<f32>) -> f32 {
-    let distance = distance.unwrap_or(DEFAULT_DISTANCE);
+fn normalized_search_distance(distance: Option<f32>, radius: Option<f32>) -> f32 {
+    let distance = distance.or(radius).unwrap_or(DEFAULT_DISTANCE);
     if distance.is_finite() && distance > 0.0 {
         distance
     } else {
@@ -1797,7 +1855,7 @@ fn normalized_distance(distance: Option<f32>) -> f32 {
 }
 
 fn default_shape_for_mode(mode: &str) -> &'static str {
-    if mode == "refno" || mode == "position" {
+    if mode == "refno" || mode == "position" || mode == "bran_centerline" {
         "sphere"
     } else {
         "cube"
@@ -1881,10 +1939,31 @@ fn query_ids_for_regions(
     Ok((ids, query_union))
 }
 
+enum QueryTargetGeometry {
+    Aabbs(Vec<Aabb>),
+    BranCenterline(Vec<BranCenterlineSegment>),
+}
+
 fn query_by_target_aabbs(
     params: SqliteSpatialQueryParams,
     cached: &CachedIndex,
     target_aabbs: Vec<Aabb>,
+    search_distance: f32,
+    self_id: Option<i64>,
+) -> SpatialQueryResult {
+    query_by_target_geometry(
+        params,
+        cached,
+        QueryTargetGeometry::Aabbs(target_aabbs),
+        search_distance,
+        self_id,
+    )
+}
+
+fn query_by_target_geometry(
+    params: SqliteSpatialQueryParams,
+    cached: &CachedIndex,
+    target_geometry: QueryTargetGeometry,
     search_distance: f32,
     self_id: Option<i64>,
 ) -> SpatialQueryResult {
@@ -1893,7 +1972,15 @@ fn query_by_target_aabbs(
     let spec_value_filter = parse_spec_value_filter(&params.spec_values);
     let preferred_db_prefix = refno_db_prefix(params.refno.as_deref());
 
-    if target_aabbs.is_empty() {
+    let query_regions = match &target_geometry {
+        QueryTargetGeometry::Aabbs(target_aabbs) => target_aabbs.clone(),
+        QueryTargetGeometry::BranCenterline(centerline) => centerline
+            .iter()
+            .map(centerline_segment_aabb)
+            .collect::<Vec<_>>(),
+    };
+
+    if query_regions.is_empty() {
         return success_spatial_query_result(vec![], 0, page, per_page, None);
     }
 
@@ -1904,7 +1991,7 @@ fn query_by_target_aabbs(
         .as_deref()
         .unwrap_or(default_shape_for_mode(mode))
         .eq_ignore_ascii_case("sphere");
-    let (ids, query_aabb) = match query_ids_for_regions(cached, &target_aabbs, search_distance) {
+    let (ids, query_aabb) = match query_ids_for_regions(cached, &query_regions, search_distance) {
         Ok(v) => v,
         Err(e) => {
             return error_spatial_query_result(e, None);
@@ -1990,7 +2077,14 @@ fn query_by_target_aabbs(
         // 计算候选 AABB 到目标 AABB/点的最小距离，避免长模型因中心点较远被误排除。
         let distance = if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
             let candidate_aabb = aabb_from_row(minx, miny, minz, maxx, maxy, maxz);
-            let min_distance = min_distance_to_targets(&candidate_aabb, &target_aabbs);
+            let min_distance = match &target_geometry {
+                QueryTargetGeometry::Aabbs(target_aabbs) => {
+                    min_distance_to_targets(&candidate_aabb, target_aabbs)
+                }
+                QueryTargetGeometry::BranCenterline(centerline) => {
+                    min_distance_to_centerline(&candidate_aabb, centerline)
+                }
+            };
 
             if is_sphere && min_distance > search_distance {
                 continue;
@@ -2012,6 +2106,7 @@ fn query_by_target_aabbs(
             spec_value,
             aabb,
             distance,
+            within_radius: distance.map(|value| value <= search_distance),
         });
     }
 
@@ -2380,7 +2475,7 @@ mod tests {
                 include_self: None,
                 shape: None,
             };
-            do_spatial_query(params, None)
+            do_spatial_query(params, None, None)
         });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
@@ -2434,7 +2529,7 @@ mod tests {
                 include_self: None,
                 shape: None,
             };
-            do_spatial_query(params, None)
+            do_spatial_query(params, None, None)
         });
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
@@ -2497,7 +2592,7 @@ mod tests {
                 include_self: None,
                 shape: None,
             };
-            do_spatial_query(params, None)
+            do_spatial_query(params, None, None)
         });
 
         assert!(resp.success);
@@ -2572,7 +2667,7 @@ mod tests {
                 include_self: Some(false),
                 shape: None,
             };
-            do_spatial_query(params, None)
+            do_spatial_query(params, None, None)
         });
 
         assert!(resp.success);

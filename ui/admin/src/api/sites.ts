@@ -25,7 +25,7 @@ import type {
   SiteTaskMetricsList,
 } from '@/types/site'
 
-export type ManagedSiteLogKind = 'parse' | 'generate' | 'db' | 'web' | 'viewer'
+export type ManagedSiteLogKind = 'parse' | 'generate' | 'room-compute' | 'db' | 'web' | 'viewer'
 
 export interface TailLogResponse {
   kind: ManagedSiteLogKind

@@ -178,19 +178,19 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"]
 # ─────────────────────────────────────────────────────────────
 # 设计原则：按"业务能力"切片，而不是按 library 切片。
 #   review          三维校审最小必要集（不含 RocksDB）
-#   review-rocksdb  review + kv-rocksdb（default 的基础能力，启用 RocksDB 持久化）
+#   review-rocksdb  review + kv-rocksdb（显式启用 RocksDB 嵌入式持久化）
 #   web_server      基础 Web HTTP 服务（axum + 周边，不带业务扩展）
 #   gen_model       模型几何生成开关（aios_core 转发）
 #   parquet-export  Parquet 列式导出（拉 polars/arrow/ethnum，重）
 #   mbd-pipe        MBD 管线读 parquet（mbd_pipe_api.rs，依赖 parquet-export）
 #   excel-export    Excel 数据导出（data_to_excel，已弃用但保留 hook）
 #   kv-rocksdb      RocksDB 嵌入后端（C++ 编译重）
-#   full            完整产物，等价旧 default+web_server+parquet-export 行为
-# 默认启用 kv-rocksdb 与 parquet-export，确保嵌入式 RocksDB(file) 模式和 Parquet 导出开箱可用。
+#   full            完整产物，默认仍使用 SurrealDB ws 模式；RocksDB/file 需显式启用 review-rocksdb 或 kv-rocksdb。
+# 默认使用 SurrealDB ws 模式，不编译 kv-rocksdb，避免 release/站点部署默认拉起 file/RocksDB 后端。
 # 轻量校审构建请用 `--no-default-features --features review`。
 # ═══════════════════════════════════════════════════════════════
 [features]
-default = ["review-rocksdb", "parquet-export"]
+default = ["review", "parquet-export"]
 
 # 三维校审最小必要集
 # 不含：polars / arrow / parquet / ethnum / RocksDB（C++ 编译重）
@@ -239,10 +239,9 @@ excel-export = ["dep:rust_xlsxwriter"]
 # 否则那些 fn 会返回 "spec-loader feature not enabled" 错误。
 spec-loader = ["dep:calamine", "aios_core/spec-loader"]
 
-# 完整产物：等价旧 default+web_server 行为
+# 完整产物：保留完整业务能力，但默认仍走 SurrealDB ws，不启用嵌入式 RocksDB/file。
 full = [
     "review",
-    "kv-rocksdb",
     "parquet-export",
     "mbd-pipe",
     "excel-export",

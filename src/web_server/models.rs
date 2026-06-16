@@ -964,13 +964,16 @@ pub struct ManagedProjectSite {
     /// 模型生成阶段手动指定的数据库编号；为空时沿用解析范围，兼容旧站点。
     #[serde(default)]
     pub generate_db_nums: Vec<u32>,
+    /// 模型生成阶段手动指定的根 refno；用于 quick-deploy scoped BRAN 这类按根节点生成的快测。
+    #[serde(default)]
+    pub manual_refnos: Vec<String>,
     #[serde(default)]
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
     /// 是否自动解析目标 dbnum 关联的依赖库（如元件库 CATA / 字典库 DICT）。
-    /// 默认关闭；开启后解析范围会额外纳入依赖库（首版按 db 类型粗粒度纳入，后续完善为按引用精确解析）。
-    #[serde(default)]
+    /// 默认开启；解析范围会额外纳入依赖库（优先按引用精确解析）。
+    #[serde(default = "default_true")]
     pub auto_parse_related_dbnums: bool,
     /// CATA 按需部分解析开关：与 `auto_parse_related_dbnums` 配合使用。
     /// true（默认）= 解析前生成 refno 闭包 manifest，关联 CATA 库只解析被引用条目、
@@ -1066,6 +1069,12 @@ pub struct CreateManagedSiteRequest {
     pub site_name: Option<String>,
     #[serde(default)]
     pub projects: Vec<SiteProject>,
+    /// 可选 MDB 名称（如 ALL 或 /ALL）。提供后，保存站点前会按工程扫描根自动补全 projects 和目标 dbnum。
+    #[serde(default)]
+    pub mbd_name: Option<String>,
+    /// MDB 自动发现搜索根。通常为包含 AvevaPlantSample/AvevaCatalogue 等工程目录的父目录。
+    #[serde(default)]
+    pub search_roots: Vec<String>,
     pub project_name: String,
     pub project_path: String,
     pub project_code: u32,
@@ -1078,11 +1087,13 @@ pub struct CreateManagedSiteRequest {
     #[serde(default)]
     pub generate_db_files: Vec<String>,
     #[serde(default)]
+    pub manual_refnos: Vec<String>,
+    #[serde(default)]
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
-    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
-    #[serde(default)]
+    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认开启。
+    #[serde(default = "default_true")]
     pub auto_parse_related_dbnums: bool,
     /// CATA 按需部分解析（闭包 manifest）。默认开启；关闭时关联 CATA 库整库全量解析。
     #[serde(default = "default_true")]
@@ -1130,6 +1141,12 @@ pub struct UpdateManagedSiteRequest {
     pub site_name: Option<String>,
     #[serde(default)]
     pub projects: Option<Vec<SiteProject>>,
+    /// 可选 MDB 名称（如 ALL 或 /ALL）。提供后，保存站点前会按工程扫描根自动补全 projects 和目标 dbnum。
+    #[serde(default)]
+    pub mbd_name: Option<String>,
+    /// MDB 自动发现搜索根。通常为包含 AvevaPlantSample/AvevaCatalogue 等工程目录的父目录。
+    #[serde(default)]
+    pub search_roots: Vec<String>,
     #[serde(default)]
     pub project_name: Option<String>,
     #[serde(default)]
@@ -1144,6 +1161,8 @@ pub struct UpdateManagedSiteRequest {
     pub generate_db_nums: Option<Vec<u32>>,
     #[serde(default)]
     pub generate_db_files: Vec<String>,
+    #[serde(default)]
+    pub manual_refnos: Option<Vec<String>>,
     #[serde(default)]
     pub parse_db_types: Option<Vec<String>>,
     #[serde(default)]
@@ -1211,8 +1230,8 @@ pub struct PreviewManagedSiteParsePlanRequest {
     pub parse_db_types: Vec<String>,
     #[serde(default)]
     pub force_rebuild_system_db: bool,
-    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认关闭。
-    #[serde(default)]
+    /// 是否自动解析目标 dbnum 关联的依赖库（CATA/DICT 等）。默认开启。
+    #[serde(default = "default_true")]
     pub auto_parse_related_dbnums: bool,
     /// CATA 按需部分解析（闭包 manifest）。默认开启。
     #[serde(default = "default_true")]
@@ -1230,7 +1249,7 @@ pub struct PreviewManagedSiteParsePlanRequest {
 }
 
 /// MBD 部署前候选发现请求（只读）：
-/// 按当前工程组成离线读 SYST，枚举 MDB 候选及成员 DB 文件定位状态。
+/// 按当前工程组成离线读 SYST/GLOB/GLB，枚举 MDB 候选及成员 DB 文件定位状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MdbCandidatesRequest {
     /// 站点 ID（可选）：提供后复用该站点的 sidecar 进程。
@@ -1273,12 +1292,15 @@ pub struct QuickDeployTestRequest {
     #[serde(default)]
     pub dbnum: Option<u32>,
     /// 是否自动纳入关联依赖库（CATA/DICT，首版粗粒度）。
-    /// None 表示由具体入口决定默认值；快速部署默认关闭，便于快速 smoke。
+    /// None 表示由具体入口决定默认值；快速部署默认开启。
     #[serde(default)]
     pub auto_parse_related_dbnums: Option<bool>,
     /// CATA 按需部分解析（闭包 manifest）。None 时跟随入口默认（开启）。
     #[serde(default)]
     pub cata_partial_parse: Option<bool>,
+    /// 可选 BRAN 根 refno；提供后 quick deploy 只生成该根节点子树。
+    #[serde(default)]
+    pub target_root_refno: Option<String>,
     #[serde(default = "default_true")]
     pub gen_model: bool,
     #[serde(default)]
@@ -1297,8 +1319,8 @@ pub struct QuickDeployTestRequest {
     /// 已存在同名站点时是否删除重建
     #[serde(default)]
     pub force_recreate: bool,
-    /// 管线（解析/生成）数据库模式：缺省 file（嵌入式 RocksDB，需 kv-rocksdb 构建）；
-    /// 传 "ws" 则解析/生成连接临时 SurrealDB，免 kv-rocksdb，便于快测验证。
+    /// 管线（解析/生成）数据库模式：缺省 ws（连接临时 SurrealDB，免 kv-rocksdb）；
+    /// file/rocksdb 仅作为显式选择的离线管线模式保留。
     #[serde(default)]
     pub pipeline_db_mode: Option<ManagedSiteDbMode>,
 }
@@ -1318,6 +1340,12 @@ pub struct QuickDeployTestResponse {
     pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_root_refno: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_refno_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_viewer_url: Option<String>,
     pub duration_ms: u64,
     #[serde(default)]
     pub parse_log_tail: Vec<String>,

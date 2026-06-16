@@ -16,7 +16,42 @@ pub struct UiAttrResponse {
     /// 构件完整路径名称（层级路径，如 /SITE/ZONE/EQUI-001）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_name: Option<String>,
+    /// 引用类属性（值形如 `pe:<refno>`，如 OWNER/REFNO）解析出的 full_name；键为属性名。
+    /// 前端可据此把参考号显示成对应元素的完整路径名，无需再逐个回查。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_full_names: Option<serde_json::Value>,
     pub error_message: Option<String>,
+}
+
+/// 把属性值 `pe:<refno>` 解析为 RefnoEnum（要求显式 `pe:` 前缀，避免误判普通数值）。
+fn parse_pe_ref(value: &serde_json::Value) -> Option<RefnoEnum> {
+    let raw = value.as_str()?.trim();
+    let rest = raw.strip_prefix("pe:")?.trim();
+    RefU64::from_str(rest).map(RefnoEnum::from).ok()
+}
+
+/// 扫描属性表，对值为 `pe:<refno>` 的引用属性解析对应元素 full_name；
+/// 返回「属性名 -> full_name」映射（无引用属性时返回 None）。
+async fn resolve_ref_full_names(attrs: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = attrs.as_object()?;
+    let mut out = serde_json::Map::new();
+    for (key, value) in obj.iter() {
+        let Some(ref_refno) = parse_pe_ref(value) else {
+            continue;
+        };
+        if let Some(name) = aios_core::get_default_full_name(ref_refno)
+            .await
+            .ok()
+            .and_then(non_empty_string)
+        {
+            out.insert(key.clone(), serde_json::json!(name));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(out))
+    }
 }
 
 async fn get_ui_attr(Path(refno): Path<String>) -> Result<Json<UiAttrResponse>, StatusCode> {
@@ -29,6 +64,7 @@ async fn get_ui_attr(Path(refno): Path<String>) -> Result<Json<UiAttrResponse>, 
                 refno: refno_str.clone(),
                 attrs: serde_json::Value::Object(serde_json::Map::new()),
                 full_name: None,
+                ref_full_names: None,
                 error_message: Some(format!("invalid refno path: {refno_str}")),
             }));
         }
@@ -40,51 +76,67 @@ async fn get_ui_attr(Path(refno): Path<String>) -> Result<Json<UiAttrResponse>, 
             for (k, v) in attmap.map.into_iter() {
                 map.insert(k, v.into());
             }
+            let attrs = serde_json::Value::Object(map);
             let full_name = aios_core::get_default_full_name(refno).await.ok();
+            let ref_full_names = resolve_ref_full_names(&attrs).await;
             Ok(Json(UiAttrResponse {
                 success: true,
                 refno: refno_str,
-                attrs: serde_json::Value::Object(map),
+                attrs,
                 full_name,
+                ref_full_names,
                 error_message: None,
             }))
         }
         Err(e) => {
             let primary_error = e.to_string();
             match query_full_named_attrs_without_uda(refno, &primary_error).await {
-                Ok((attrs, full_name)) => Ok(Json(UiAttrResponse {
-                    success: true,
-                    refno: refno_str,
-                    attrs,
-                    full_name,
-                    error_message: None,
-                })),
-                Err(full_fallback_error) => match query_rvm_relation_attrs(refno).await {
-                    Ok((attrs, full_name)) => Ok(Json(UiAttrResponse {
+                Ok((attrs, full_name)) => {
+                    let ref_full_names = resolve_ref_full_names(&attrs).await;
+                    Ok(Json(UiAttrResponse {
                         success: true,
                         refno: refno_str,
                         attrs,
                         full_name,
-                        error_message: Some(format!(
-                            "using rvm relation-store fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}"
-                        )),
-                    })),
+                        ref_full_names,
+                        error_message: None,
+                    }))
+                }
+                Err(full_fallback_error) => match query_rvm_relation_attrs(refno).await {
+                    Ok((attrs, full_name)) => {
+                        let ref_full_names = resolve_ref_full_names(&attrs).await;
+                        Ok(Json(UiAttrResponse {
+                            success: true,
+                            refno: refno_str,
+                            attrs,
+                            full_name,
+                            ref_full_names,
+                            error_message: Some(format!(
+                                "using rvm relation-store fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}"
+                            )),
+                        }))
+                    }
                     Err(rvm_fallback_error) => {
                         match query_basic_pe_attrs(refno, &primary_error).await {
-                            Ok((attrs, full_name)) => Ok(Json(UiAttrResponse {
-                                success: true,
-                                refno: refno_str,
-                                attrs,
-                                full_name,
-                                error_message: Some(format!(
-                                    "using basic pe fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; rvm relation-store fallback failed: {rvm_fallback_error}"
-                                )),
-                            })),
+                            Ok((attrs, full_name)) => {
+                                let ref_full_names = resolve_ref_full_names(&attrs).await;
+                                Ok(Json(UiAttrResponse {
+                                    success: true,
+                                    refno: refno_str,
+                                    attrs,
+                                    full_name,
+                                    ref_full_names,
+                                    error_message: Some(format!(
+                                        "using basic pe fallback: get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; rvm relation-store fallback failed: {rvm_fallback_error}"
+                                    )),
+                                }))
+                            }
                             Err(pe_fallback_error) => Ok(Json(UiAttrResponse {
                                 success: false,
                                 refno: refno_str,
                                 attrs: serde_json::Value::Object(serde_json::Map::new()),
                                 full_name: None,
+                                ref_full_names: None,
                                 error_message: Some(format!(
                                     "get_ui_named_attmap failed: {e}; full named attribute fallback failed: {full_fallback_error}; rvm relation-store fallback failed: {rvm_fallback_error}; basic pe fallback failed: {pe_fallback_error}"
                                 )),

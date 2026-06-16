@@ -1,13 +1,13 @@
 //! MBD 部署前候选发现（.planning/2026-06-12-mbd-deploy-preflight Phase 2/4）
 //!
-//! 离线读取工程根下的 SYST 库文件，枚举 MDB 元素及其成员 DB（children 成员关系），
+//! 离线读取工程根下的系统库文件（SYST/GLOB/GLB），枚举 MDB 元素及其成员 DB（children 成员关系），
 //! 并把成员 dbnum 映射到当前 `projects[]` 可定位的 db 文件，输出
 //! `available / missing / ambiguous` 状态，供站点部署前依赖完整性检查。
 //!
 //! 架构边界：与工程扫描、db file resolve 一样放在 aios-database sidecar 侧，
 //! web_server 不直接读取 E3D DB 文件。本模块只做只读发现，不写任何持久化。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use aios_core::tool::db_tool::db1_hash;
@@ -18,6 +18,7 @@ use serde::Serialize;
 /// 与 parse_sidecar 扫描口径一致的安全上限。
 const SCAN_MAX_DEPTH: usize = 8;
 const SCAN_MAX_FILES: usize = 200_000;
+const MDB_SOURCE_DB_TYPES: &[&str] = &["SYST", "GLOB", "GLB"];
 
 /// MDB 成员 DB 文件定位状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,9 +57,13 @@ pub struct MdbDbFileStatus {
 pub struct MdbCandidate {
     /// MDB 名称，保留前导 `/`，例如 `/SAMPLE`。
     pub mdb_name: String,
-    /// 来源 SYST 所属工程名。
+    /// 来源系统库所属工程名。
     pub project: String,
-    /// 来源 SYST 文件路径（证据可回溯）。
+    /// 来源系统库文件路径（证据可回溯）。
+    pub source_file: String,
+    /// 来源系统库类型（SYST/GLOB/GLB）。
+    pub source_db_type: String,
+    /// 兼容旧前端字段：历史上只解析 SYST，因此字段名保留为 syst_file。
     pub syst_file: String,
     /// CURD 顺序的成员 dbnum 列表。
     pub dbnums: Vec<u32>,
@@ -90,10 +95,40 @@ struct DbFileEntry {
     project: String,
 }
 
+fn is_mdb_source_db_type(db_type: &str) -> bool {
+    MDB_SOURCE_DB_TYPES
+        .iter()
+        .any(|candidate| db_type.eq_ignore_ascii_case(candidate))
+}
+
+fn mdb_source_priority(db_type: &str) -> u8 {
+    match db_type {
+        "SYST" => 0,
+        "GLOB" => 1,
+        "GLB" => 2,
+        _ => 9,
+    }
+}
+
+fn ordered_system_db_entries(
+    system_dbs_by_project: BTreeMap<(String, String, u32), DbFileEntry>,
+) -> Vec<DbFileEntry> {
+    let mut entries = system_dbs_by_project.into_values().collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        a.project
+            .to_ascii_lowercase()
+            .cmp(&b.project.to_ascii_lowercase())
+            .then(mdb_source_priority(&a.db_type).cmp(&mdb_source_priority(&b.db_type)))
+            .then(a.dbnum.cmp(&b.dbnum))
+            .then(a.file_name.cmp(&b.file_name))
+    });
+    entries
+}
+
 /// 在 `roots = [(project_name, root_path)]` 下做只读 MBD 候选发现。
 ///
 /// 1. 扫描全部 db 文件头建立 dbnum -> 文件清单；
-/// 2. 解析每个工程的 SYST 库（同 dbnum 多副本取 ses_pgno 最大者）；
+/// 2. 解析每个工程的系统库（SYST/GLOB/GLB，同类型同 dbnum 多副本取 ses_pgno 最大者）；
 /// 3. 枚举 MDB 元素与成员 DB，逐个成员定位文件并标注状态。
 pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidatesResult {
     let mut result = MdbCandidatesResult::default();
@@ -101,19 +136,18 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
 
     // dbnum -> 候选文件（跨工程根合并，按 canonical 路径去重）
     let mut files_by_dbnum: BTreeMap<u32, Vec<DbFileEntry>> = BTreeMap::new();
-    // (project, syst dbnum) -> 最新 SYST 文件
-    let mut syst_by_project: BTreeMap<(String, u32), DbFileEntry> = BTreeMap::new();
+    // (project, db_type, dbnum) -> 最新系统库文件
+    let mut system_dbs_by_project: BTreeMap<(String, String, u32), DbFileEntry> = BTreeMap::new();
     for entry in &inventory {
-        if entry.db_type.eq_ignore_ascii_case("SYST") {
-            let key = (entry.project.clone(), entry.dbnum);
-            let replace = syst_by_project
+        if is_mdb_source_db_type(&entry.db_type) {
+            let key = (entry.project.clone(), entry.db_type.clone(), entry.dbnum);
+            let replace = system_dbs_by_project
                 .get(&key)
                 .map(|existing| entry.ses_pgno > existing.ses_pgno)
                 .unwrap_or(true);
             if replace {
-                syst_by_project.insert(key, entry.clone());
+                system_dbs_by_project.insert(key, entry.clone());
             }
-            continue;
         }
         files_by_dbnum
             .entry(entry.dbnum)
@@ -121,24 +155,33 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
             .push(entry.clone());
     }
 
-    if syst_by_project.is_empty() {
+    if system_dbs_by_project.is_empty() {
         result
             .warnings
-            .push("未在任何工程根下发现 SYST 系统库文件，无法枚举 MDB 候选".to_string());
+            .push("未在任何工程根下发现 SYST/GLOB/GLB 系统库文件，无法枚举 MDB 候选".to_string());
         return result;
     }
 
     let mdb_noun_hash = db1_hash("MDB");
-    // 同一工程内多个 SYST dbnum 时按 mdb_name 去重，保留先解析到的。
+    // 同一工程内多个系统库声明同一 MDB 时按 mdb_name 去重，保留优先级最高的来源。
     let mut seen_mdb_keys: BTreeSet<(String, String)> = BTreeSet::new();
-    for ((project, _dbnum), syst_entry) in &syst_by_project {
-        let parsed = parse_file(&syst_entry.file_path, &None, &syst_entry.file_name, project).await;
+    let system_db_entries = ordered_system_db_entries(system_dbs_by_project);
+    for system_entry in system_db_entries {
+        let project = &system_entry.project;
+        let parsed = parse_file(
+            &system_entry.file_path,
+            &None,
+            &system_entry.file_name,
+            project,
+        )
+        .await;
         let data = match parsed {
             Ok(data) => data,
             Err(err) => {
                 result.warnings.push(format!(
-                    "解析 SYST 失败 {}: {err}",
-                    syst_entry.file_path.display()
+                    "解析 {} 失败 {}: {err}",
+                    system_entry.db_type,
+                    system_entry.file_path.display()
                 ));
                 continue;
             }
@@ -172,7 +215,9 @@ pub async fn discover_mdb_candidates(roots: &[(String, PathBuf)]) -> MdbCandidat
             let mut candidate = MdbCandidate {
                 mdb_name,
                 project: project.clone(),
-                syst_file: syst_entry.file_path.to_string_lossy().to_string(),
+                source_file: system_entry.file_path.to_string_lossy().to_string(),
+                source_db_type: system_entry.db_type.clone(),
+                syst_file: system_entry.file_path.to_string_lossy().to_string(),
                 dbnums: Vec::with_capacity(members.len()),
                 db_files: Vec::with_capacity(members.len()),
                 available_count: 0,

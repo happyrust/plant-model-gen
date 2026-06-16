@@ -170,6 +170,7 @@ export interface ManagedProjectSite {
   project_path: string
   manual_db_nums: number[]
   generate_db_nums: number[]
+  manual_refnos: string[]
   parse_db_types: string[]
   force_rebuild_system_db: boolean
   auto_parse_related_dbnums: boolean
@@ -395,15 +396,22 @@ export interface AppendManagedSiteDbFileResponse {
 
 export interface QuickDeploySiteRequest {
   /** 目标 db 文件：绝对路径 / 文件名 / 相对 project_path 的路径；仅传绝对路径时后端会自动推断 project_path。 */
-  db_file: string
+  db_file?: string
   /** 工程根目录；省略时要求 db_file 为绝对路径。 */
   project_path?: string
+  /** 工程组成。可由后端按 mbd_name/search_roots 自动发现，也可由调用方直接传入。 */
+  projects?: SiteProject[]
+  /** MBD 名称，例如 /ALL。提供后后端会在 search_roots/project_path 下发现依赖工程和目标 DB。 */
+  mbd_name?: string
+  /** MBD 自动发现搜索根。通常填写包含多个 E3D 工程目录的父目录。 */
+  search_roots?: string[]
   /** E3D 项目名 / 站点显示名；省略时后端按工程目录名和 dbnum 生成。 */
   project_name?: string
   project_code?: number
   dbnum?: number
   auto_parse_related_dbnums?: boolean
   cata_partial_parse?: boolean
+  target_root_refno?: string
   gen_model?: boolean
   gen_mesh?: boolean
   gen_spatial_tree?: boolean
@@ -423,6 +431,9 @@ export interface QuickDeploySiteResponse {
   parse_status: string
   generated: boolean
   entry_url?: string | null
+  target_root_refno?: string | null
+  scoped_refno_count?: number | null
+  scoped_viewer_url?: string | null
   duration_ms: number
   parse_log_tail: string[]
   generate_log_tail: string[]
@@ -444,6 +455,8 @@ export interface ManagedSiteReconcileResponse {
 export interface CreateManagedSiteRequest {
   site_name?: string
   projects?: SiteProject[]
+  mbd_name?: string
+  search_roots?: string[]
   project_name: string
   project_path: string
   project_code: number
@@ -451,6 +464,7 @@ export interface CreateManagedSiteRequest {
   manual_db_files?: string[]
   generate_db_nums?: number[]
   generate_db_files?: string[]
+  manual_refnos?: string[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean
@@ -477,6 +491,8 @@ export interface CreateManagedSiteRequest {
 export interface UpdateManagedSiteRequest {
   site_name?: string
   projects?: SiteProject[]
+  mbd_name?: string
+  search_roots?: string[]
   project_name?: string
   project_path?: string
   project_code?: number
@@ -484,6 +500,7 @@ export interface UpdateManagedSiteRequest {
   manual_db_files?: string[]
   generate_db_nums?: number[]
   generate_db_files?: string[]
+  manual_refnos?: string[]
   parse_db_types?: string[]
   force_rebuild_system_db?: boolean
   auto_parse_related_dbnums?: boolean

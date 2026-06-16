@@ -48,6 +48,7 @@ pub struct ParseSidecarOptions {
     pub token: Option<String>,
     pub shutdown_after_job: bool,
     pub shutdown_delay_ms: u64,
+    pub idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,8 @@ struct ParseSidecarState {
     token: Option<String>,
     shutdown_after_job: bool,
     shutdown_delay_ms: u64,
+    idle_timeout_secs: u64,
+    last_activity: Arc<std::sync::Mutex<Instant>>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     events_tx: broadcast::Sender<Value>,
     jobs: Arc<Mutex<BTreeMap<String, SidecarJobRecord>>>,
@@ -295,11 +298,14 @@ pub async fn run_parse_sidecar(options: ParseSidecarOptions) -> Result<()> {
         token: options.token,
         shutdown_after_job: options.shutdown_after_job,
         shutdown_delay_ms: options.shutdown_delay_ms,
+        idle_timeout_secs: options.idle_timeout_secs,
+        last_activity: Arc::new(std::sync::Mutex::new(Instant::now())),
         shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
         events_tx,
         jobs: Arc::new(Mutex::new(BTreeMap::new())),
         job_cancels: Arc::new(Mutex::new(BTreeMap::new())),
     };
+    spawn_idle_watchdog(&state);
     let bind_host = options.bind_host;
     let http_port = options.http_port;
     let app = Router::new()
@@ -752,6 +758,52 @@ async fn run_submitted_cli_job(
     schedule_shutdown_after_job(&state).await;
 }
 
+fn is_terminal_job_status(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled")
+}
+
+/// 空闲看门狗：serve sidecar 在 `idle_timeout_secs` 内无任何请求且无活跃 job 时自动退出。
+/// 这是 reaper / Job Object 之外的第三道保险，防止孤儿无限驻留。
+fn spawn_idle_watchdog(state: &ParseSidecarState) {
+    let idle_secs = state.idle_timeout_secs;
+    if idle_secs == 0 {
+        return;
+    }
+    let idle = Duration::from_secs(idle_secs);
+    let last_activity = state.last_activity.clone();
+    let jobs = state.jobs.clone();
+    let shutdown_tx = state.shutdown_tx.clone();
+    let site_key = state.site_key.clone();
+    let check_interval = Duration::from_secs((idle_secs / 4).clamp(5, 60));
+    task::spawn(async move {
+        loop {
+            tokio::time::sleep(check_interval).await;
+            let elapsed = last_activity
+                .lock()
+                .map(|ts| ts.elapsed())
+                .unwrap_or_default();
+            if elapsed < idle {
+                continue;
+            }
+            let has_active_job = {
+                let guard = jobs.lock().await;
+                guard
+                    .values()
+                    .any(|record| !is_terminal_job_status(&record.status))
+            };
+            if has_active_job {
+                continue;
+            }
+            let Some(tx) = shutdown_tx.lock().await.take() else {
+                return;
+            };
+            println!("📴 aios-database sidecar {site_key} idle {idle_secs}s 超时，自动退出");
+            let _ = tx.send(());
+            return;
+        }
+    });
+}
+
 async fn schedule_shutdown_after_job(state: &ParseSidecarState) {
     if !state.shutdown_after_job {
         return;
@@ -965,6 +1017,10 @@ async fn kill_child_process_tree(child: &mut Child) {
 }
 
 fn authorize(state: &ParseSidecarState, headers: &HeaderMap) -> Result<(), Response> {
+    // 每次请求刷新活跃时间，供 idle watchdog 判断空闲。
+    if let Ok(mut ts) = state.last_activity.lock() {
+        *ts = Instant::now();
+    }
     let Some(expected) = state.token.as_deref().filter(|value| !value.is_empty()) else {
         return Ok(());
     };
@@ -1173,7 +1229,7 @@ fn build_preview_plan(payload: ParsePreviewRequest) -> Result<ManagedSiteParsePl
     ))
 }
 
-/// MBD 候选发现：规范化工程组成后，离线读 SYST 枚举 MDB 及成员 DB 文件定位状态。
+/// MBD 候选发现：规范化工程组成后，离线读 SYST/GLOB/GLB 枚举 MDB 及成员 DB 文件定位状态。
 async fn discover_mdb_candidates_request(
     payload: MdbCandidatesRequest,
 ) -> Result<crate::data_interface::mdb_candidates::MdbCandidatesResult> {

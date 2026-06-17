@@ -437,7 +437,27 @@ async fn fetch_bran_centerline_segments(
         "USE NS `{}` DB `{}`;\n{}",
         db_option.surreal_ns, db_option.project_name, sql
     );
-    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 1).await?;
+    let mut rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 1).await?;
+    if rows.is_empty() {
+        let pe_key = branch_refno.to_pe_key();
+        let legacy_tubi_range = format!("tubi_relate:[{pe_key}, 0]..=[{pe_key}, ..]");
+        let sql = format!(
+            r#"
+            SELECT
+                in as leave_refno,
+                world_trans.d as world_trans,
+                start_pt.d as start_pt,
+                end_pt.d as end_pt,
+                id[1] as index
+            FROM {legacy_tubi_range};
+            "#
+        );
+        let sql = format!(
+            "USE NS `{}` DB `{}`;\n{}",
+            db_option.surreal_ns, db_option.project_name, sql
+        );
+        rows = SUL_DB.query_take(&sql, 1).await?;
+    }
     if rows.is_empty() {
         anyhow::bail!(
             "tubi_relate returned no segments for branch_refno={} pe_key={}",

@@ -283,6 +283,33 @@ pub struct NearestClearanceCandidate {
     pub distance_mm: f32,
     pub intersects: bool,
     pub aabb: AabbDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest: Option<NearestClearanceNearest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<NearestClearanceAnnotation>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NearestClearanceNearest {
+    pub source_segment_refno: String,
+    pub source_segment_order: Option<u32>,
+    pub source_point: Vec3Dto,
+    pub target_point: Vec3Dto,
+    pub vector: Vec3DeltaDto,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct NearestClearanceAnnotation {
+    pub start_point: Vec3Dto,
+    pub end_point: Vec3Dto,
+    pub label_mm: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Vec3DeltaDto {
+    pub dx: f32,
+    pub dy: f32,
+    pub dz: f32,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -871,11 +898,16 @@ fn resolve_target_groups(
         let (name, nouns): (String, Vec<String>) = match group.as_str() {
             "WALL" => (
                 "wall".to_string(),
-                vec!["WALL".to_string(), "PANE".to_string()],
+                vec![
+                    "WALL".to_string(),
+                    "PANE".to_string(),
+                    "GWALL".to_string(),
+                    "STWALL".to_string(),
+                ],
             ),
             "COLUMN" => (
                 "column".to_string(),
-                vec!["COLU".to_string(), "SCTN".to_string()],
+                vec!["COLU".to_string(), "SCTN".to_string(), "GENSEC".to_string()],
             ),
             _ => {
                 return Err(format!("unknown target_group `{}`", group));
@@ -1079,7 +1111,62 @@ fn point_aabb_distance(point: Vec3, aabb: &Aabb) -> f32 {
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
-fn segment_intersects_aabb(start: Vec3, end: Vec3, aabb: &Aabb) -> bool {
+fn clamp_point_to_aabb(point: Vec3, aabb: &Aabb) -> Vec3 {
+    Vec3::new(
+        point.x.clamp(aabb.mins.x, aabb.maxs.x),
+        point.y.clamp(aabb.mins.y, aabb.maxs.y),
+        point.z.clamp(aabb.mins.z, aabb.maxs.z),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct CenterlineAabbNearest {
+    source_segment_refno: String,
+    source_segment_order: Option<u32>,
+    source_point: Vec3,
+    target_point: Vec3,
+    vector: Vec3,
+    distance_mm: f32,
+    intersects: bool,
+}
+
+impl CenterlineAabbNearest {
+    fn to_nearest_dto(&self) -> NearestClearanceNearest {
+        NearestClearanceNearest {
+            source_segment_refno: self.source_segment_refno.clone(),
+            source_segment_order: self.source_segment_order,
+            source_point: vec3_to_dto(self.source_point),
+            target_point: vec3_to_dto(self.target_point),
+            vector: Vec3DeltaDto {
+                dx: self.vector.x,
+                dy: self.vector.y,
+                dz: self.vector.z,
+            },
+        }
+    }
+
+    fn to_annotation_dto(&self) -> NearestClearanceAnnotation {
+        NearestClearanceAnnotation {
+            start_point: vec3_to_dto(self.source_point),
+            end_point: vec3_to_dto(self.target_point),
+            label_mm: self.distance_mm,
+        }
+    }
+}
+
+fn vec3_to_dto(point: Vec3) -> Vec3Dto {
+    Vec3Dto {
+        x: point.x,
+        y: point.y,
+        z: point.z,
+    }
+}
+
+fn refno_enum_to_output_refno(refno: &RefnoEnum) -> String {
+    refno.to_string().replace('/', "_")
+}
+
+fn segment_aabb_intersection_t(start: Vec3, end: Vec3, aabb: &Aabb) -> Option<f32> {
     let dir = end - start;
     let mut t_min = 0.0_f32;
     let mut t_max = 1.0_f32;
@@ -1090,7 +1177,7 @@ fn segment_intersects_aabb(start: Vec3, end: Vec3, aabb: &Aabb) -> bool {
     ] {
         if delta.abs() <= f32::EPSILON {
             if origin < min || origin > max {
-                return false;
+                return None;
             }
             continue;
         }
@@ -1103,28 +1190,76 @@ fn segment_intersects_aabb(start: Vec3, end: Vec3, aabb: &Aabb) -> bool {
         t_min = t_min.max(t1);
         t_max = t_max.min(t2);
         if t_min > t_max {
-            return false;
+            return None;
         }
     }
-    true
+    Some(t_min.clamp(0.0, 1.0))
 }
 
-fn segment_aabb_distance(segment: &BranCenterlineSegment, aabb: &Aabb) -> f32 {
-    if segment_intersects_aabb(segment.start, segment.end, aabb) {
-        return 0.0;
+fn segment_intersects_aabb(start: Vec3, end: Vec3, aabb: &Aabb) -> bool {
+    segment_aabb_intersection_t(start, end, aabb).is_some()
+}
+
+fn segment_aabb_nearest(segment: &BranCenterlineSegment, aabb: &Aabb) -> CenterlineAabbNearest {
+    if let Some(t) = segment_aabb_intersection_t(segment.start, segment.end, aabb) {
+        let point = segment.start + (segment.end - segment.start) * t;
+        return CenterlineAabbNearest {
+            source_segment_refno: refno_enum_to_output_refno(&segment.refno),
+            source_segment_order: segment.order,
+            source_point: point,
+            target_point: point,
+            vector: Vec3::ZERO,
+            distance_mm: 0.0,
+            intersects: true,
+        };
     }
 
     let axis = segment.end - segment.start;
     let len_sq = axis.length_squared();
     if len_sq <= f32::EPSILON {
-        return point_aabb_distance(segment.start, aabb);
+        let target_point = clamp_point_to_aabb(segment.start, aabb);
+        let vector = target_point - segment.start;
+        return CenterlineAabbNearest {
+            source_segment_refno: refno_enum_to_output_refno(&segment.refno),
+            source_segment_order: segment.order,
+            source_point: segment.start,
+            target_point,
+            vector,
+            distance_mm: vector.length(),
+            intersects: false,
+        };
     }
 
     // Deterministic MVP approximation: sample endpoints, AABB corners projected onto the
     // segment, and segment points closest to box face coordinates. This is tighter than using
     // the whole BRAN AABB while staying cheap for per-candidate filtering.
-    let mut best =
-        point_aabb_distance(segment.start, aabb).min(point_aabb_distance(segment.end, aabb));
+    let mut best_source = segment.start;
+    let mut best_target = clamp_point_to_aabb(segment.start, aabb);
+    let mut best_distance_sq = (best_target - best_source).length_squared();
+
+    let mut consider_t = |t: f32| {
+        let source_point = segment.start + axis * t.clamp(0.0, 1.0);
+        let target_point = clamp_point_to_aabb(source_point, aabb);
+        let distance_sq = (target_point - source_point).length_squared();
+        let best_key = (
+            best_source.x.to_bits(),
+            best_source.y.to_bits(),
+            best_source.z.to_bits(),
+        );
+        let current_key = (
+            source_point.x.to_bits(),
+            source_point.y.to_bits(),
+            source_point.z.to_bits(),
+        );
+        if distance_sq < best_distance_sq
+            || ((distance_sq - best_distance_sq).abs() <= 1.0e-5 && current_key < best_key)
+        {
+            best_source = source_point;
+            best_target = target_point;
+            best_distance_sq = distance_sq;
+        }
+    };
+    consider_t(1.0);
 
     let corners = [
         Vec3::new(aabb.mins.x, aabb.mins.y, aabb.mins.z),
@@ -1138,7 +1273,7 @@ fn segment_aabb_distance(segment: &BranCenterlineSegment, aabb: &Aabb) -> f32 {
     ];
     for corner in corners {
         let t = ((corner - segment.start).dot(axis) / len_sq).clamp(0.0, 1.0);
-        best = best.min(point_aabb_distance(segment.start + axis * t, aabb));
+        consider_t(t);
     }
 
     for (start_axis, delta_axis, min_axis, max_axis) in [
@@ -1152,19 +1287,63 @@ fn segment_aabb_distance(segment: &BranCenterlineSegment, aabb: &Aabb) -> f32 {
         for plane in [min_axis, max_axis] {
             let t = (plane - start_axis) / delta_axis;
             if (0.0..=1.0).contains(&t) {
-                best = best.min(point_aabb_distance(segment.start + axis * t, aabb));
+                consider_t(t);
             }
         }
     }
 
-    best
+    let vector = best_target - best_source;
+    CenterlineAabbNearest {
+        source_segment_refno: refno_enum_to_output_refno(&segment.refno),
+        source_segment_order: segment.order,
+        source_point: best_source,
+        target_point: best_target,
+        vector,
+        distance_mm: vector.length(),
+        intersects: false,
+    }
+}
+
+fn segment_aabb_distance(segment: &BranCenterlineSegment, aabb: &Aabb) -> f32 {
+    segment_aabb_nearest(segment, aabb).distance_mm
+}
+
+fn centerline_aabb_nearest(
+    candidate: &Aabb,
+    centerline: &[BranCenterlineSegment],
+) -> Option<CenterlineAabbNearest> {
+    centerline
+        .iter()
+        .map(|segment| segment_aabb_nearest(segment, candidate))
+        .min_by(|a, b| {
+            a.distance_mm
+                .partial_cmp(&b.distance_mm)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.source_segment_order
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.source_segment_order.unwrap_or(u32::MAX))
+                })
+                .then_with(|| a.source_segment_refno.cmp(&b.source_segment_refno))
+                .then_with(|| {
+                    (
+                        a.source_point.x.to_bits(),
+                        a.source_point.y.to_bits(),
+                        a.source_point.z.to_bits(),
+                    )
+                        .cmp(&(
+                            b.source_point.x.to_bits(),
+                            b.source_point.y.to_bits(),
+                            b.source_point.z.to_bits(),
+                        ))
+                })
+        })
 }
 
 fn min_distance_to_centerline(candidate: &Aabb, centerline: &[BranCenterlineSegment]) -> f32 {
-    centerline
-        .iter()
-        .map(|segment| segment_aabb_distance(segment, candidate))
-        .fold(f32::INFINITY, f32::min)
+    centerline_aabb_nearest(candidate, centerline)
+        .map(|nearest| nearest.distance_mm)
+        .unwrap_or(f32::INFINITY)
 }
 
 // ============================================================================
@@ -1442,7 +1621,7 @@ fn do_nearest_clearance_query(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let mut self_id = None;
+    let mut self_ids = HashSet::new();
     let (source, source_geometry, source_dbnum) = if source_mode == "bran_centerline" {
         let Some(source_refno) = source_refno else {
             return error_nearest_clearance_response(
@@ -1464,7 +1643,7 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         };
-        self_id = Some(id);
+        self_ids.insert(id);
         let Some(centerline) = prepared_centerline else {
             return error_nearest_clearance_response(
                 "BRAN centerline was not prepared",
@@ -1484,6 +1663,12 @@ fn do_nearest_clearance_query(
                 include_debug.then(NearestClearanceDebug::default),
                 distance_method,
             );
+        }
+        for segment in &centerline {
+            if let Some(segment_id) = refno_str_to_i64(&refno_enum_to_output_refno(&segment.refno))
+            {
+                self_ids.insert(segment_id);
+            }
         }
         let bbox = centerline_bbox(&centerline).expect("non-empty centerline has bbox");
         let source = NearestClearanceSource {
@@ -1521,7 +1706,7 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         };
-        self_id = Some(id);
+        self_ids.insert(id);
         let row = match query_aabb_row(&conn, id) {
             Ok(row) => row,
             Err(e) => {
@@ -1708,7 +1893,7 @@ fn do_nearest_clearance_query(
     for id in ids {
         debug.rows_examined += 1;
 
-        if !include_self && self_id.is_some_and(|source_id| source_id == id) {
+        if !include_self && self_ids.contains(&id) {
             continue;
         }
 
@@ -1740,18 +1925,35 @@ fn do_nearest_clearance_query(
             continue;
         };
 
-        let distance = match &source_geometry {
-            ClearanceSourceGeometry::Aabb(source_aabb) => {
+        let centerline_nearest = match &source_geometry {
+            ClearanceSourceGeometry::Aabb(_) => None,
+            ClearanceSourceGeometry::BranCenterline(centerline) => {
+                centerline_aabb_nearest(&candidate_aabb, centerline)
+            }
+        };
+        let distance = match (&source_geometry, &centerline_nearest) {
+            (ClearanceSourceGeometry::Aabb(source_aabb), _) => {
                 aabb_min_distance(source_aabb, &candidate_aabb)
             }
-            ClearanceSourceGeometry::BranCenterline(centerline) => {
-                min_distance_to_centerline(&candidate_aabb, centerline)
-            }
+            (ClearanceSourceGeometry::BranCenterline(_), Some(nearest)) => nearest.distance_mm,
+            (ClearanceSourceGeometry::BranCenterline(_), None) => f32::INFINITY,
         };
         if distance > radius {
             debug.distance_filtered += 1;
             continue;
         }
+
+        let nearest = centerline_nearest
+            .as_ref()
+            .map(CenterlineAabbNearest::to_nearest_dto);
+        let annotation = centerline_nearest
+            .as_ref()
+            .map(CenterlineAabbNearest::to_annotation_dto);
+
+        let intersects = centerline_nearest
+            .as_ref()
+            .map(|nearest| nearest.intersects)
+            .unwrap_or(distance == 0.0);
 
         candidates.push((
             noun_upper,
@@ -1760,8 +1962,10 @@ fn do_nearest_clearance_query(
                 noun,
                 spec_value,
                 distance_mm: distance,
-                intersects: distance == 0.0,
+                intersects,
                 aabb: candidate_aabb_dto,
+                nearest,
+                annotation,
             },
         ));
     }

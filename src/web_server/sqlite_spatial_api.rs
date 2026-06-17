@@ -202,7 +202,7 @@ pub struct NearestClearanceQueryParams {
     pub z: Option<f32>,
     /// Comma-separated target NOUN filters.
     pub target_nouns: Option<String>,
-    /// Comma-separated shortcut groups. MVP: wall -> WALL,PANE; column -> COLU,SCTN.
+    /// Comma-separated shortcut groups. wall -> WALL,PANE,GWALL,STWALL; column -> COLU,SCTN,GENSEC.
     pub target_groups: Option<String>,
     /// Search radius in mm. Default 5000. Valid range: 0 < radius <= 100000.
     pub radius: Option<f32>,
@@ -1230,9 +1230,10 @@ fn segment_aabb_nearest(segment: &BranCenterlineSegment, aabb: &Aabb) -> Centerl
         };
     }
 
-    // Deterministic MVP approximation: sample endpoints, AABB corners projected onto the
-    // segment, and segment points closest to box face coordinates. This is tighter than using
-    // the whole BRAN AABB while staying cheap for per-candidate filtering.
+    // Exact segment-to-AABB distance for a convex, piecewise-quadratic function.
+    // The closest target point is the source point clamped to the box. The active clamped axes
+    // only change when the segment crosses an AABB face, so evaluate each interval between face
+    // crossings and the local minimum inside that interval.
     let mut best_source = segment.start;
     let mut best_target = clamp_point_to_aabb(segment.start, aabb);
     let mut best_distance_sq = (best_target - best_source).length_squared();
@@ -1259,23 +1260,8 @@ fn segment_aabb_nearest(segment: &BranCenterlineSegment, aabb: &Aabb) -> Centerl
             best_distance_sq = distance_sq;
         }
     };
-    consider_t(1.0);
 
-    let corners = [
-        Vec3::new(aabb.mins.x, aabb.mins.y, aabb.mins.z),
-        Vec3::new(aabb.mins.x, aabb.mins.y, aabb.maxs.z),
-        Vec3::new(aabb.mins.x, aabb.maxs.y, aabb.mins.z),
-        Vec3::new(aabb.mins.x, aabb.maxs.y, aabb.maxs.z),
-        Vec3::new(aabb.maxs.x, aabb.mins.y, aabb.mins.z),
-        Vec3::new(aabb.maxs.x, aabb.mins.y, aabb.maxs.z),
-        Vec3::new(aabb.maxs.x, aabb.maxs.y, aabb.mins.z),
-        Vec3::new(aabb.maxs.x, aabb.maxs.y, aabb.maxs.z),
-    ];
-    for corner in corners {
-        let t = ((corner - segment.start).dot(axis) / len_sq).clamp(0.0, 1.0);
-        consider_t(t);
-    }
-
+    let mut breaks = vec![0.0_f32, 1.0_f32];
     for (start_axis, delta_axis, min_axis, max_axis) in [
         (segment.start.x, axis.x, aabb.mins.x, aabb.maxs.x),
         (segment.start.y, axis.y, aabb.mins.y, aabb.maxs.y),
@@ -1287,8 +1273,64 @@ fn segment_aabb_nearest(segment: &BranCenterlineSegment, aabb: &Aabb) -> Centerl
         for plane in [min_axis, max_axis] {
             let t = (plane - start_axis) / delta_axis;
             if (0.0..=1.0).contains(&t) {
-                consider_t(t);
+                breaks.push(t);
             }
+        }
+    }
+    breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    breaks.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-6);
+
+    for t in &breaks {
+        consider_t(*t);
+    }
+
+    for window in breaks.windows(2) {
+        let lo = window[0];
+        let hi = window[1];
+        if hi - lo <= 1.0e-6 {
+            continue;
+        }
+        let mid = (lo + hi) * 0.5;
+        let mid_point = segment.start + axis * mid;
+        let mut numerator = 0.0_f32;
+        let mut denominator = 0.0_f32;
+        for (start_axis, delta_axis, point_axis, min_axis, max_axis) in [
+            (
+                segment.start.x,
+                axis.x,
+                mid_point.x,
+                aabb.mins.x,
+                aabb.maxs.x,
+            ),
+            (
+                segment.start.y,
+                axis.y,
+                mid_point.y,
+                aabb.mins.y,
+                aabb.maxs.y,
+            ),
+            (
+                segment.start.z,
+                axis.z,
+                mid_point.z,
+                aabb.mins.z,
+                aabb.maxs.z,
+            ),
+        ] {
+            let bound = if point_axis < min_axis {
+                Some(min_axis)
+            } else if point_axis > max_axis {
+                Some(max_axis)
+            } else {
+                None
+            };
+            if let Some(bound) = bound {
+                numerator += delta_axis * (bound - start_axis);
+                denominator += delta_axis * delta_axis;
+            }
+        }
+        if denominator > f32::EPSILON {
+            consider_t((numerator / denominator).clamp(lo, hi));
         }
     }
 
@@ -1355,7 +1397,44 @@ pub async fn api_sqlite_spatial_nearest_clearance(
     Query(params): Query<NearestClearanceQueryParams>,
 ) -> Json<NearestClearanceResponse> {
     let include_debug = params.debug.unwrap_or(false);
-    let prepared_centerline = if parse_clearance_source_mode(&params) == "bran_centerline" {
+    let source_mode = parse_clearance_source_mode(&params);
+    let distance_method = if source_mode == "bran_centerline" {
+        "centerline_aabb_clearance_mm"
+    } else {
+        "aabb_clearance_mm"
+    };
+    if source_mode == "invalid" {
+        return Json(error_nearest_clearance_response(
+            "invalid source_mode (expected aabb, point, or bran_centerline)",
+            None,
+            None,
+            None,
+            include_debug.then(NearestClearanceDebug::default),
+            distance_method,
+        ));
+    }
+    if let Err(e) = resolve_target_groups(&params) {
+        return Json(error_nearest_clearance_response(
+            e,
+            None,
+            None,
+            None,
+            include_debug.then(NearestClearanceDebug::default),
+            distance_method,
+        ));
+    }
+    if let Err(e) = resolve_clearance_radius(params.radius) {
+        return Json(error_nearest_clearance_response(
+            e,
+            None,
+            None,
+            None,
+            include_debug.then(NearestClearanceDebug::default),
+            distance_method,
+        ));
+    }
+
+    let prepared_centerline = if source_mode == "bran_centerline" {
         match params
             .source_refno
             .as_deref()
@@ -1380,7 +1459,7 @@ pub async fn api_sqlite_spatial_nearest_clearance(
                             None,
                             None,
                             include_debug.then(NearestClearanceDebug::default),
-                            "centerline_aabb_clearance_mm",
+                            distance_method,
                         ));
                     }
                 },
@@ -1391,7 +1470,7 @@ pub async fn api_sqlite_spatial_nearest_clearance(
                         None,
                         None,
                         include_debug.then(NearestClearanceDebug::default),
-                        "centerline_aabb_clearance_mm",
+                        distance_method,
                     ));
                 }
             },
@@ -1402,7 +1481,7 @@ pub async fn api_sqlite_spatial_nearest_clearance(
                     None,
                     None,
                     include_debug.then(NearestClearanceDebug::default),
-                    "centerline_aabb_clearance_mm",
+                    distance_method,
                 ));
             }
         }

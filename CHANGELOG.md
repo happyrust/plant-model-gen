@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-06-17
+
+### Added — 系统库 MDB 依赖发现与 MBD 名称快速部署验证（spec 019）
+
+> MDB 名称快速部署现在以解析 `SYST` / `GLOB` / `GLB` 系统库后的 MDB 成员事实作为依赖证明，不再把目录扫描或 dbfile 猜测当作工程依赖依据。
+
+- `mdb_candidates.rs` 扩展系统库解析来源，按 `SYST -> GLOB -> GLB` 优先级枚举 MDB candidates，并在响应中暴露 `source_file` / `source_db_type`，同时保留 `syst_file` 兼容字段。
+- MDB member DB 定位结果统一分类为 `available` / `missing` / `ambiguous`，返回 `source_project`、`file_path` 和歧义候选路径，供 operator 缩小 `search_roots` 或显式提供 `projects[]`。
+- `managed_project_sites.rs` 的 MDB-name quick deploy 在创建站点前解析依赖工程集合、目标 `dbnum` / `db_file`，并对 missing、ambiguous、多目标未指定等场景 fail-fast；不传 `mbd_name` 时保留 legacy dbfile 模式。
+- HTTP 验证使用独立构建 sidecar 和临时 `web_server:18080` 完成：`/api/admin/projects/mdb-candidates` 返回 source evidence；`AvevaMarineSample` `/ALL1` + `dbnum=7997` create-only quick deploy 成功，解析为 `ams7997_0001`；`AvevaPlantSample` 窄 `search_roots` 触发 `missing=24`，宽 `E3D2.1` 搜索根触发 `ambiguous=36`。
+- `specs/019-system-mdb-dependency-discovery/` 的任务清单与 quickstart 已回填本机实测数据集差异：`/ALL` 在 Plant/Catalogue 样例中不是 deployable success case，成功路径改用 Marine `/ALL1`。
+
 ## 2026-06-15
 
 ### Added — 模型产物版本化 array record id（versioned-model-record-id）

@@ -1143,6 +1143,10 @@ pub async fn start_web_server_with_config(
             get(sqlite_spatial_api::api_sqlite_spatial_query),
         )
         .route(
+            "/api/sqlite-spatial/nearby",
+            get(sqlite_spatial_api::api_sqlite_spatial_nearby),
+        )
+        .route(
             "/api/sqlite-spatial/nearest-clearance",
             get(sqlite_spatial_api::api_sqlite_spatial_nearest_clearance),
         )

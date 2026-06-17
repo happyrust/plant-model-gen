@@ -4345,10 +4345,29 @@ fn filter_quick_deploy_projects_for_mbd(
         return projects.to_vec();
     }
 
+    let wanted_paths = projects
+        .iter()
+        .filter(|project| wanted.contains(&project.name.trim().to_ascii_lowercase()))
+        .map(|project| quick_deploy_path_prefix_key(Path::new(project.path.trim())))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
     let target_project = target.source_project.trim().to_ascii_lowercase();
     let mut filtered = projects
         .iter()
-        .filter(|project| wanted.contains(&project.name.trim().to_ascii_lowercase()))
+        .filter(|project| {
+            let name = project.name.trim().to_ascii_lowercase();
+            if wanted.contains(&name) {
+                return true;
+            }
+            let project_path = quick_deploy_path_prefix_key(Path::new(project.path.trim()));
+            if project_path.is_empty() {
+                return false;
+            }
+            let prefix = format!("{project_path}\\");
+            wanted_paths
+                .iter()
+                .any(|wanted_path| wanted_path.starts_with(&prefix))
+        })
         .cloned()
         .collect::<Vec<_>>();
     if filtered.is_empty() {
@@ -4630,9 +4649,7 @@ pub async fn resolve_create_site_mbd_request(req: &mut CreateManagedSiteRequest)
         .is_empty()
     {
         if first_mbd_target_db_file(&req.project_path, &req.manual_db_files).is_some() {
-            bail!(
-                "当前指定的是目标 DB 文件，必须提供 MBD 名称；依赖工程路径需要从 MBD 配置中解析"
-            );
+            bail!("当前指定的是目标 DB 文件，必须提供 MBD 名称；依赖工程路径需要从 MBD 配置中解析");
         }
         return Ok(());
     }

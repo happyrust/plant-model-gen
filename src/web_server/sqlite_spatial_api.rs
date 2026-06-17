@@ -10,6 +10,7 @@
 //!
 //! ## Endpoints
 //! - `GET /api/sqlite-spatial/query` - 按 refno 或 bbox 查询周边构件
+//! - `GET /api/sqlite-spatial/nearby` - 前端空间查询抽屉契约：按 refno 或点 + 半径查询
 //! - `GET /api/sqlite-spatial/nearest-clearance` - 按 refno 或点查询最近净距
 //! - `GET /api/sqlite-spatial/stats` - 获取索引统计与健康信息
 
@@ -111,6 +112,15 @@ pub struct SqliteSpatialQueryParams {
 pub struct SpatialQueryResult {
     pub success: bool,
     pub results: Option<Vec<SpatialQueryResultItem>>,
+    /// /nearby 响应的查询中心；legacy /query 可能没有该字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center: Option<SpatialNearbyCenterDto>,
+    /// /nearby 响应使用的半径
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<f32>,
+    /// /nearby 响应使用的形状
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
     /// 是否还有更多结果；兼容旧字段名
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
@@ -157,6 +167,16 @@ pub struct Vec3Dto {
     pub x: f32,
     pub y: f32,
     pub z: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpatialNearbyCenterDto {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refno: Option<String>,
 }
 
 /// 索引统计响应
@@ -553,6 +573,9 @@ fn error_spatial_query_result(
     SpatialQueryResult {
         success: false,
         results: None,
+        center: None,
+        radius: None,
+        shape: None,
         truncated: None,
         total_count: None,
         returned_count: None,
@@ -591,6 +614,9 @@ fn success_spatial_query_result(
     SpatialQueryResult {
         success: true,
         results: Some(results),
+        center: None,
+        radius: None,
+        shape: None,
         truncated: Some(has_more),
         total_count: Some(total_count),
         returned_count: Some(returned_count),
@@ -680,6 +706,128 @@ fn dbnum_from_refno_id(id: i64) -> u32 {
 
 fn normalize_refno_string(refno: &str) -> Option<String> {
     refno_str_to_i64(refno).map(i64_to_refno_str)
+}
+
+struct NearbyQueryPlan {
+    params: SqliteSpatialQueryParams,
+    center_hint: Option<SpatialNearbyCenterDto>,
+    center_source: String,
+    center_refno: Option<String>,
+    radius: f32,
+    shape: String,
+}
+
+fn normalize_nearby_shape(shape: &Option<String>, mode: &str) -> String {
+    let value = shape.as_deref().unwrap_or("").trim();
+    if value.is_empty() {
+        default_shape_for_mode(mode).to_string()
+    } else {
+        value.to_ascii_lowercase()
+    }
+}
+
+fn validate_nearby_radius(radius: Option<f32>) -> Result<f32, String> {
+    let radius = radius.ok_or_else(|| "nearby requires radius".to_string())?;
+    if radius.is_finite() && radius > 0.0 && radius <= MAX_CLEARANCE_RADIUS_MM {
+        Ok(radius)
+    } else {
+        Err(format!(
+            "invalid radius (must be 0 < radius <= {} mm)",
+            MAX_CLEARANCE_RADIUS_MM
+        ))
+    }
+}
+
+fn prepare_nearby_query(mut params: SqliteSpatialQueryParams) -> Result<NearbyQueryPlan, String> {
+    let radius = validate_nearby_radius(params.radius)?;
+    let refno = params
+        .refno
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if let Some(refno) = refno {
+        let normalized = normalize_refno_string(&refno)
+            .ok_or_else(|| "invalid refno format (expected dbnum_refno)".to_string())?;
+        let shape = normalize_nearby_shape(&params.shape, "refno");
+        params.mode = Some("refno".to_string());
+        params.refno = Some(normalized.clone());
+        params.radius = Some(radius);
+        params.distance = Some(radius);
+        params.shape = Some(shape.clone());
+
+        return Ok(NearbyQueryPlan {
+            params,
+            center_hint: None,
+            center_source: "refno_aabb_center".to_string(),
+            center_refno: Some(normalized),
+            radius,
+            shape,
+        });
+    }
+
+    let (Some(x), Some(y), Some(z)) = (params.x, params.y, params.z) else {
+        return Err("nearby requires refno or x/y/z".to_string());
+    };
+    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+        return Err("nearby position contains non-finite value".to_string());
+    }
+
+    let shape = normalize_nearby_shape(&params.shape, "position");
+    params.mode = Some("position".to_string());
+    params.radius = Some(radius);
+    params.distance = None;
+    params.shape = Some(shape.clone());
+
+    Ok(NearbyQueryPlan {
+        params,
+        center_hint: Some(SpatialNearbyCenterDto {
+            x,
+            y,
+            z,
+            source: "point_input".to_string(),
+            refno: None,
+        }),
+        center_source: "point_input".to_string(),
+        center_refno: None,
+        radius,
+        shape,
+    })
+}
+
+fn query_bbox_center(
+    bbox: &AabbDto,
+    source: String,
+    refno: Option<String>,
+) -> SpatialNearbyCenterDto {
+    SpatialNearbyCenterDto {
+        x: (bbox.min.x + bbox.max.x) * 0.5,
+        y: (bbox.min.y + bbox.max.y) * 0.5,
+        z: (bbox.min.z + bbox.max.z) * 0.5,
+        source,
+        refno,
+    }
+}
+
+fn with_nearby_metadata(
+    mut result: SpatialQueryResult,
+    center_hint: Option<SpatialNearbyCenterDto>,
+    center_source: String,
+    center_refno: Option<String>,
+    radius: f32,
+    shape: String,
+) -> SpatialQueryResult {
+    let center = center_hint.or_else(|| {
+        result
+            .query_bbox
+            .as_ref()
+            .map(|bbox| query_bbox_center(bbox, center_source, center_refno))
+    });
+    result.center = center;
+    result.radius = Some(radius);
+    result.shape = Some(shape);
+    result
 }
 
 fn parse_clearance_source_mode(params: &NearestClearanceQueryParams) -> &'static str {
@@ -1154,6 +1302,60 @@ pub async fn api_sqlite_spatial_query(
             None,
         )),
     }
+}
+
+/// GET /api/sqlite-spatial/nearby
+pub async fn api_sqlite_spatial_nearby(
+    Query(params): Query<SqliteSpatialQueryParams>,
+) -> Json<SpatialQueryResult> {
+    let plan = match prepare_nearby_query(params) {
+        Ok(plan) => plan,
+        Err(e) => return Json(error_spatial_query_result(e, None)),
+    };
+
+    let NearbyQueryPlan {
+        params,
+        center_hint,
+        mut center_source,
+        center_refno,
+        radius,
+        shape,
+    } = plan;
+
+    let fallback_refno_ids = match query_refno_visible_inst_ids_for_fallback(&params).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            return Json(with_nearby_metadata(
+                error_spatial_query_result(e, None),
+                center_hint,
+                center_source,
+                center_refno,
+                radius,
+                shape,
+            ));
+        }
+    };
+
+    if fallback_refno_ids.is_some() && center_source == "refno_aabb_center" {
+        center_source = "visible_children_aabb_center".to_string();
+    }
+
+    let result =
+        tokio::task::spawn_blocking(move || do_spatial_query(params, fallback_refno_ids, None))
+            .await;
+    let query_result = match result {
+        Ok(r) => r,
+        Err(e) => error_spatial_query_result(format!("internal error: {}", e), None),
+    };
+
+    Json(with_nearby_metadata(
+        query_result,
+        center_hint,
+        center_source,
+        center_refno,
+        radius,
+        shape,
+    ))
 }
 
 fn do_nearest_clearance_query(
@@ -1834,6 +2036,9 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
     SpatialQueryResult {
         success: true,
         results: Some(vec![]),
+        center: None,
+        radius: None,
+        shape: None,
         truncated: Some(false),
         total_count: Some(0),
         returned_count: Some(0),

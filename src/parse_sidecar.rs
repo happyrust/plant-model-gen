@@ -2103,6 +2103,38 @@ fn collect_project_db_entries(
     Ok(())
 }
 
+fn has_project_root_marker(root: &Path) -> Result<bool> {
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("读取目录失败: {}", root.display()))?
+        .flatten()
+    {
+        if !is_safe_scan_entry(&entry) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if file_name.starts_with("evars") && file_name.ends_with(".bat") {
+            return Ok(true);
+        }
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let mut buf = [0u8; 60];
+        if file.read_exact(&mut buf).is_err() {
+            continue;
+        }
+        let db_info = parse_file_basic_info(&buf);
+        if db_info.dbnum > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn infer_scanned_role(db_types: &HashSet<String>) -> ProjectRole {
     if db_types.contains("DESI") {
         ProjectRole::Design
@@ -2116,20 +2148,29 @@ fn infer_scanned_role(db_types: &HashSet<String>) -> ProjectRole {
 fn scan_projects_under_root(raw_root: &str) -> Result<ScanProjectsResult> {
     let root = canonical_project_path(raw_root.trim())?;
     let mut candidate_dirs = Vec::new();
-    for entry in fs::read_dir(&root)
-        .with_context(|| format!("读取目录失败: {}", root.display()))?
-        .flatten()
-    {
-        if !is_safe_scan_entry(&entry) {
-            continue;
+    if has_project_root_marker(&root)? {
+        let mut visited = 0usize;
+        let mut entries = Vec::new();
+        collect_project_db_entries(&root, 0, &mut visited, &mut entries)?;
+        if !entries.is_empty() {
+            candidate_dirs.push((root.clone(), entries));
         }
-        let path = entry.path();
-        if path.is_dir() {
-            let mut visited = 0usize;
-            let mut entries = Vec::new();
-            collect_project_db_entries(&path, 0, &mut visited, &mut entries)?;
-            if !entries.is_empty() {
-                candidate_dirs.push((path, entries));
+    } else {
+        for entry in fs::read_dir(&root)
+            .with_context(|| format!("读取目录失败: {}", root.display()))?
+            .flatten()
+        {
+            if !is_safe_scan_entry(&entry) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let mut visited = 0usize;
+                let mut entries = Vec::new();
+                collect_project_db_entries(&path, 0, &mut visited, &mut entries)?;
+                if !entries.is_empty() {
+                    candidate_dirs.push((path, entries));
+                }
             }
         }
     }

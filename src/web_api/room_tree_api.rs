@@ -487,6 +487,7 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
     #[derive(Debug, Deserialize, SurrealValue)]
     struct RoomNumRow {
         room_num: String,
+        direct_match: Option<bool>,
         o1: Option<String>,
         o2: Option<String>,
         o3: Option<String>,
@@ -494,11 +495,19 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
         o5: Option<String>,
     }
     let sql = format!(
-        "SELECT room_num, out.owner.noun AS o1, out.owner.owner.noun AS o2, \
+        "SELECT room_num, (out = pe:⟨{}⟩) AS direct_match, \
+         out.owner.noun AS o1, out.owner.owner.noun AS o2, \
          out.owner.owner.owner.noun AS o3, out.owner.owner.owner.owner.noun AS o4, \
          out.owner.owner.owner.owner.owner.noun AS o5 \
-         FROM room_relate WHERE out = pe:⟨{}⟩ LIMIT 1",
-        target
+         FROM room_relate \
+         WHERE out = pe:⟨{}⟩ \
+            OR out.owner = pe:⟨{}⟩ \
+            OR out.owner.owner = pe:⟨{}⟩ \
+            OR out.owner.owner.owner = pe:⟨{}⟩ \
+            OR out.owner.owner.owner.owner = pe:⟨{}⟩ \
+            OR out.owner.owner.owner.owner.owner = pe:⟨{}⟩ \
+         LIMIT 1",
+        target, target, target, target, target, target, target
     );
     let rows: Vec<RoomNumRow> = model_primary_db()
         .query_take(&sql, 0)
@@ -517,10 +526,26 @@ pub async fn room_tree_ancestors_core(id: &str) -> anyhow::Result<AncestorsRespo
         // 从 map 中找到该 room_num 对应的房间 refno 和 group
         for (group, rooms) in &map {
             if let Some(room_entry) = rooms.iter().find(|r| r.display_name == *room_num) {
+                if row.direct_match.unwrap_or(false) {
+                    return Ok(AncestorsResponse {
+                        success: true,
+                        ids: vec![
+                            RoomTreeNodeId::Refno(target), // 构件自身
+                            RoomTreeNodeId::Str(comp_group_node_id(
+                                &room_entry.refno,
+                                &comp_group_key,
+                            )), // 分组
+                            RoomTreeNodeId::Refno(room_entry.refno), // 房间
+                            RoomTreeNodeId::Str(group_node_id(group)), // 房间分组
+                            RoomTreeNodeId::Str(ROOM_ROOT_ID.to_string()), // 根
+                        ],
+                        error_message: None,
+                    });
+                }
+
                 return Ok(AncestorsResponse {
                     success: true,
                     ids: vec![
-                        RoomTreeNodeId::Refno(target), // 构件自身
                         RoomTreeNodeId::Str(comp_group_node_id(&room_entry.refno, &comp_group_key)), // 分组
                         RoomTreeNodeId::Refno(room_entry.refno), // 房间
                         RoomTreeNodeId::Str(group_node_id(group)), // 房间分组

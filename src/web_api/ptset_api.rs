@@ -14,6 +14,10 @@ use surrealdb::types::SurrealValue;
 
 pub fn create_ptset_routes() -> Router {
     Router::new()
+        .route(
+            "/api/pdms/ptset/children/{refno}",
+            get(get_ptset_children_by_owner),
+        )
         .route("/api/pdms/ptset/{refno}", get(get_ptset_by_refno))
         .route("/api/pdms/ptset/batch-query", post(post_ptset_batch_query))
 }
@@ -22,6 +26,17 @@ pub fn create_ptset_routes() -> Router {
 #[derive(Debug, Deserialize, SurrealValue)]
 struct CompressedPtsetQueryResult {
     pub ptset: Option<Vec<CateAxisParamCompact>>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct InstRelatePtsetQueryResult {
+    pub refno: RefnoEnum,
+    pub ptset: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct TransformQueryResult {
+    world_trans: Option<serde_json::Value>,
 }
 
 /// 单个轴点的信息（用于前端展示）
@@ -131,6 +146,17 @@ pub struct PtsetBatchQueryResponse {
     pub failed_count: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtsetChildrenResponse {
+    pub success: bool,
+    pub refno: String,
+    pub results: Vec<PtsetBatchItemResult>,
+    pub total_count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+    pub error_message: Option<String>,
+}
+
 #[derive(Debug)]
 struct PtsetLookupResult {
     success: bool,
@@ -163,6 +189,41 @@ async fn get_ptset_by_refno(
 ) -> Result<Json<PtsetResponse>, StatusCode> {
     let result = query_ptset(refno, query.dbno, query.batch_id.as_deref()).await;
     Ok(Json(result.into()))
+}
+
+async fn get_ptset_children_by_owner(
+    Path(refno): Path<RefnoEnum>,
+    Query(query): Query<PtsetQuery>,
+) -> Result<Json<PtsetChildrenResponse>, StatusCode> {
+    let refno_str = refno.to_string();
+    let lookup = query_child_ptsets(refno, query.dbno, query.batch_id.as_deref()).await;
+    let results = match lookup {
+        Ok(results) => results,
+        Err(error_message) => {
+            return Ok(Json(PtsetChildrenResponse {
+                success: false,
+                refno: refno_str,
+                results: vec![],
+                total_count: 0,
+                success_count: 0,
+                failed_count: 0,
+                error_message: Some(error_message),
+            }));
+        }
+    };
+    let total_count = results.len();
+    let success_count = results.iter().filter(|item| item.success).count();
+    let failed_count = total_count.saturating_sub(success_count);
+
+    Ok(Json(PtsetChildrenResponse {
+        success: success_count > 0,
+        refno: refno_str,
+        results,
+        total_count,
+        success_count,
+        failed_count,
+        error_message: (success_count == 0).then(|| "未找到子元件 ptset 数据".to_string()),
+    }))
 }
 
 async fn post_ptset_batch_query(
@@ -252,39 +313,53 @@ async fn query_ptset(
 }
 
 async fn query_ptset_from_db(refno_str: &str) -> PtsetLookupResult {
-    let sql = format!("SELECT ptset FROM inst_relate:{}->inst_info", refno_str);
-
-    let query_result: Option<CompressedPtsetQueryResult> =
-        match project_primary_db().query_take(&sql, 0).await {
-            Ok(result) => result,
-            Err(error) => {
-                return failure_lookup_result(
-                    refno_str.to_string(),
-                    format!("数据库查询失败: {error}"),
-                );
-            }
-        };
-
-    let ptset_points = query_result
-        .and_then(|result| result.ptset)
-        .map(|compacts| decompress_ptset(&compacts))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|param| PtsetPoint::from(&param))
-        .collect::<Vec<_>>();
-
-    if !ptset_points.is_empty() {
-        PtsetLookupResult {
-            success: true,
-            refno: refno_str.to_string(),
-            ptset: ptset_points,
-            world_transform: None,
-            batch_id: None,
-            unit_info: Some(default_ptset_unit_info()),
-            error_message: None,
+    let refno = match RefnoEnum::from_str(&refno_str.replace('_', "/")) {
+        Ok(value) => value,
+        Err(error) => {
+            return failure_lookup_result(refno_str.to_string(), format!("无效 refno: {error}"));
         }
-    } else {
-        failure_lookup_result(refno_str.to_string(), "未找到 ptset 数据".to_string())
+    };
+    let pe_key = refno.to_pe_key();
+    let sql = format!(
+        r#"
+        SELECT
+            in as refno,
+            out.ptset as ptset
+        FROM inst_relate
+        WHERE in = {pe_key}
+            AND out != NONE
+        LIMIT 1
+        "#
+    );
+
+    let rows: Vec<InstRelatePtsetQueryResult> = match project_primary_db().query_take(&sql, 0).await {
+        Ok(result) => result,
+        Err(error) => {
+            return failure_lookup_result(
+                refno_str.to_string(),
+                format!("数据库查询失败: {error}"),
+            );
+        }
+    };
+
+    let Some(row) = rows.into_iter().next() else {
+        return failure_lookup_result(refno_str.to_string(), "未找到 ptset 数据".to_string());
+    };
+
+    let ptset_points = parse_ptset_points(row.ptset);
+
+    if ptset_points.is_empty() {
+        return failure_lookup_result(refno_str.to_string(), "未找到 ptset 数据".to_string());
+    }
+
+    PtsetLookupResult {
+        success: true,
+        refno: row.refno.to_string(),
+        ptset: ptset_points,
+        world_transform: query_world_transform(row.refno).await,
+        batch_id: None,
+        unit_info: Some(default_ptset_unit_info()),
+        error_message: None,
     }
 }
 
@@ -333,6 +408,178 @@ fn parse_batch_refno(raw: &str) -> Result<RefnoEnum, String> {
     }
 
     RefnoEnum::from_str(&normalized).map_err(|error| error.to_string())
+}
+
+fn parse_ptset_points(value: Option<serde_json::Value>) -> Vec<PtsetPoint> {
+    let Some(value) = value else {
+        return vec![];
+    };
+    let value = match value {
+        serde_json::Value::Array(mut values) if values.len() == 1 && values[0].is_array() => {
+            values.remove(0)
+        }
+        value => value,
+    };
+
+    let mut points = match serde_json::from_value::<Vec<CateAxisParamCompact>>(value.clone()) {
+        Ok(compact) => decompress_ptset(&compact)
+            .iter()
+            .map(PtsetPoint::from)
+            .collect::<Vec<_>>(),
+        Err(_) => serde_json::from_value::<Vec<CateAxisParam>>(value)
+            .unwrap_or_default()
+            .iter()
+            .map(PtsetPoint::from)
+            .collect::<Vec<_>>(),
+    };
+    points.sort_by_key(|p| p.number);
+    points
+}
+
+async fn query_child_ptsets(
+    owner_refno: RefnoEnum,
+    _dbno: Option<u32>,
+    batch_id: Option<&str>,
+) -> Result<Vec<PtsetBatchItemResult>, String> {
+    let owner_key = owner_refno.to_pe_key();
+    let sql = format!(
+        r#"
+        SELECT
+            in as refno,
+            out.ptset as ptset
+        FROM inst_relate
+        WHERE owner_refno = {owner_key}
+            AND out != NONE
+        ORDER BY in
+        "#
+    );
+
+    let rows: Vec<InstRelatePtsetQueryResult> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .map_err(|error| format!("数据库查询失败: {error}"))?;
+
+    let snapshot_id = batch_id.map(|value| value.to_string());
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ptset = parse_ptset_points(row.ptset);
+        let success = !ptset.is_empty();
+        results.push(PtsetBatchItemResult {
+            input_refno: row.refno.to_string(),
+            refno: Some(row.refno.to_string()),
+            success,
+            ptset,
+            world_transform: query_world_transform(row.refno).await,
+            batch_id: snapshot_id.clone(),
+            unit_info: success.then(default_ptset_unit_info),
+            error_message: (!success).then(|| "未找到 ptset 数据".to_string()),
+        });
+    }
+
+    Ok(results)
+}
+
+async fn query_world_transform(refno: RefnoEnum) -> Option<Vec<f64>> {
+    let pe_transform_key = refno.to_pe_key().replace("pe:", "pe_transform:");
+    let sql = format!(
+        "SELECT world_trans.d as world_trans FROM {pe_transform_key} WHERE world_trans != none"
+    );
+
+    project_primary_db()
+        .query_take::<Option<TransformQueryResult>>(&sql, 0)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| parse_transform_matrix(row.world_trans))
+}
+
+fn parse_transform_matrix(trans: Option<serde_json::Value>) -> Option<Vec<f64>> {
+    let trans = trans?;
+
+    if let Some(obj) = trans.as_object() {
+        if let Some(d) = obj.get("d")
+            && let Some(arr) = d.as_array()
+            && arr.len() == 16
+        {
+            return Some(arr.iter().filter_map(|v| v.as_f64()).collect());
+        }
+
+        if let (Some(t), Some(r), Some(s)) = (
+            obj.get("translation").and_then(|v| v.as_array()),
+            obj.get("rotation").and_then(|v| v.as_array()),
+            obj.get("scale").and_then(|v| v.as_array()),
+        ) && t.len() >= 3 && r.len() >= 4 && s.len() >= 3
+        {
+            return Some(compose_transform_matrix(
+                [
+                    t[0].as_f64().unwrap_or(0.0),
+                    t[1].as_f64().unwrap_or(0.0),
+                    t[2].as_f64().unwrap_or(0.0),
+                ],
+                [
+                    r[0].as_f64().unwrap_or(0.0),
+                    r[1].as_f64().unwrap_or(0.0),
+                    r[2].as_f64().unwrap_or(0.0),
+                    r[3].as_f64().unwrap_or(1.0),
+                ],
+                [
+                    s[0].as_f64().unwrap_or(1.0),
+                    s[1].as_f64().unwrap_or(1.0),
+                    s[2].as_f64().unwrap_or(1.0),
+                ],
+            ));
+        }
+    }
+
+    if let Some(arr) = trans.as_array()
+        && arr.len() == 16
+    {
+        return Some(arr.iter().filter_map(|v| v.as_f64()).collect());
+    }
+
+    None
+}
+
+fn compose_transform_matrix(
+    translation: [f64; 3],
+    rotation: [f64; 4],
+    scale: [f64; 3],
+) -> Vec<f64> {
+    let [x, y, z] = translation;
+    let [qx, qy, qz, qw] = rotation;
+    let [sx, sy, sz] = scale;
+
+    let x2 = qx + qx;
+    let y2 = qy + qy;
+    let z2 = qz + qz;
+    let xx = qx * x2;
+    let xy = qx * y2;
+    let xz = qx * z2;
+    let yy = qy * y2;
+    let yz = qy * y2;
+    let zz = qz * z2;
+    let wx = qw * x2;
+    let wy = qw * y2;
+    let wz = qw * z2;
+
+    vec![
+        (1.0 - (yy + zz)) * sx,
+        (xy + wz) * sx,
+        (xz - wy) * sx,
+        0.0,
+        (xy - wz) * sy,
+        (1.0 - (xx + zz)) * sy,
+        (yz + wx) * sy,
+        0.0,
+        (xz + wy) * sz,
+        (yz - wx) * sz,
+        (1.0 - (xx + yy)) * sz,
+        0.0,
+        x,
+        y,
+        z,
+        1.0,
+    ]
 }
 
 async fn try_get_ptset_from_cache(

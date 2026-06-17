@@ -380,6 +380,8 @@ pub struct MbdPipeStats {
 pub struct BranchAttrsDto {
     pub duty: Option<String>,
     pub pspec: Option<String>,
+    pub hbor: Option<f32>,
+    pub tbor: Option<f32>,
     pub rccm: Option<String>,
     pub clean: Option<String>,
     pub temp: Option<String>,
@@ -719,16 +721,55 @@ async fn get_mbd_pipe_v2(
     let ctx = MbdV2PipelineContext {
         input_refno: input_refno_enum.to_string(),
         branch_refno: data.branch_refno.clone(),
-        branch_attrs: branch_attrs_to_mbd_v2_map(&data.branch_attrs),
+        branch_attrs: branch_attrs_to_mbd_v2_map_with_name(&data.branch_attrs, &data.branch_name),
         ..MbdV2PipelineContext::production_defaults()
     };
-    let v2_data = build_mbd_v2_pipe_data(layout, &ctx);
+    let mut v2_data = build_mbd_v2_pipe_data(layout, &ctx);
+    enrich_mbd_v2_source_refnos(&mut v2_data, &data);
 
     json_utf8(MbdV2Response {
         success: true,
         error_message: None,
         data: Some(v2_data),
     })
+}
+
+fn enrich_mbd_v2_source_refnos(
+    v2_data: &mut aios_core::mbd::v2::MbdV2PipeData,
+    data: &MbdPipeData,
+) {
+    use aios_core::mbd::v2::{LinearDimSubKind, MbdPrimitive};
+
+    let tag_refno_by_id: HashMap<&str, &str> = data
+        .tags
+        .iter()
+        .map(|tag| (tag.id.as_str(), tag.refno.as_str()))
+        .collect();
+    let cut_tubi_refno_by_id: HashMap<&str, &str> = data
+        .cut_tubis
+        .iter()
+        .map(|cut| (cut.id.as_str(), cut.refno.as_str()))
+        .collect();
+
+    for primitive in &mut v2_data.primitives {
+        match primitive {
+            MbdPrimitive::Label(label) => {
+                if label.common.source_refno.is_none() {
+                    if let Some(refno) = tag_refno_by_id.get(label.common.id.as_str()) {
+                        label.common.source_refno = Some((*refno).to_string());
+                    }
+                }
+            }
+            MbdPrimitive::LinearDim(dim) if dim.sub_kind == LinearDimSubKind::CutTubi => {
+                if dim.common.source_refno.is_none() {
+                    if let Some(refno) = cut_tubi_refno_by_id.get(dim.common.id.as_str()) {
+                        dim.common.source_refno = Some((*refno).to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// V2 直算路径（Phase 8）：从 SurrealDB 直接构建 V2 数据，不经过 V1 generate_mbd_data。
@@ -786,15 +827,16 @@ async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: Refno
     };
     qr.compute_bbox_center();
 
-    let (_, branch_attrs) = match try_fill_branch_name_and_attrs(branch_refno.clone()).await {
-        Ok(v) => v,
-        Err(_) => (branch_refno.to_string(), BranchAttrsDto::default()),
-    };
+    let (branch_name, branch_attrs) =
+        match try_fill_branch_name_and_attrs(branch_refno.clone()).await {
+            Ok(v) => v,
+            Err(_) => (branch_refno.to_string(), BranchAttrsDto::default()),
+        };
 
     let ctx = MbdV2PipelineContext {
         input_refno: input_refno_enum.to_string(),
         branch_refno: branch_refno.to_string(),
-        branch_attrs: branch_attrs_to_mbd_v2_map(&branch_attrs),
+        branch_attrs: branch_attrs_to_mbd_v2_map_with_name(&branch_attrs, &branch_name),
         ..MbdV2PipelineContext::production_defaults()
     };
 
@@ -850,6 +892,12 @@ fn branch_attrs_to_mbd_v2_map(attrs: &BranchAttrsDto) -> BTreeMap<String, String
     }
     insert_opt!(duty, "DUTY");
     insert_opt!(pspec, "PSPEC");
+    if let Some(value) = attrs.hbor {
+        out.insert("HBOR".to_string(), value.to_string());
+    }
+    if let Some(value) = attrs.tbor {
+        out.insert("TBOR".to_string(), value.to_string());
+    }
     insert_opt!(rccm, "RCCM");
     insert_opt!(clean, "CLEAN");
     insert_opt!(temp, "TEMP");
@@ -866,6 +914,20 @@ fn branch_attrs_to_mbd_v2_map(attrs: &BranchAttrsDto) -> BTreeMap<String, String
     insert_opt!(rev, "REV");
     insert_opt!(status, "STATUS");
     insert_opt!(fluid, "FLUID");
+    out
+}
+
+fn branch_attrs_to_mbd_v2_map_with_name(
+    attrs: &BranchAttrsDto,
+    branch_name: &str,
+) -> BTreeMap<String, String> {
+    let mut out = branch_attrs_to_mbd_v2_map(attrs);
+    let name = branch_name.trim();
+    if !name.is_empty() {
+        out.insert("BRANCH_NAME".to_string(), name.to_string());
+        out.entry("NAME".to_string())
+            .or_insert_with(|| name.to_string());
+    }
     out
 }
 
@@ -1001,7 +1063,7 @@ struct CacheTubiSeg {
     /// 外径（mm）。对应 PML `aod of $!tubi`。从 pe.aod 或 pe.attrs.AOD 取；
     /// 不存在时 None，由 `compute_branch_layout_result` 回退到 default_od=229。
     outside_diameter: Option<f32>,
-    /// 公称口径（mm）。优先来自 tubi_relate.bore_size，用于材料表 N.S。
+    /// 公称口径（mm）。优先来自端点/管件属性，读不到时从 SPRE 末尾规格号兜底，用于材料表 N.S。
     bore: Option<f32>,
 }
 
@@ -1166,22 +1228,28 @@ impl AnnotationLayoutPlanner {
 struct BranchMeasurementPlanner<'a> {
     query: &'a ResolvedMbdPipeQuery,
     topology: &'a BranchTopology,
+    branch_name: &'a str,
     fitting_elements: &'a [RawFittingElement],
     bends: &'a [MbdBendDto],
+    pipe_item_code: Option<String>,
 }
 
 impl<'a> BranchMeasurementPlanner<'a> {
     fn new(
         query: &'a ResolvedMbdPipeQuery,
         topology: &'a BranchTopology,
+        branch_name: &'a str,
         fitting_elements: &'a [RawFittingElement],
         bends: &'a [MbdBendDto],
+        pipe_item_code: Option<String>,
     ) -> Self {
         Self {
             query,
             topology,
+            branch_name,
             fitting_elements,
             bends,
+            pipe_item_code,
         }
     }
 
@@ -1615,7 +1683,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
                     refno: self.topology.branch_refno.to_string(),
                     noun: "BRAN".to_string(),
                     role: "branch_label".to_string(),
-                    text: self.topology.branch_refno.to_string(),
+                    text: self.branch_display_name(),
                     position: pos.to_array(),
                     layout_hint: self.query.include_layout_hints.then(|| {
                         AnnotationLayoutPlanner::anchor_hint(
@@ -1682,16 +1750,17 @@ impl<'a> BranchMeasurementPlanner<'a> {
             }
         }
         for fitting in fittings {
+            let radius = fitting
+                .radius
+                .filter(|value| value.is_finite() && *value > 1e-3);
             let text = match fitting.kind {
-                MbdFittingKind::Elbo | MbdFittingKind::Bend => {
-                    match (fitting.angle, fitting.radius) {
-                        (Some(angle), Some(radius)) => {
-                            format!("{} {:.1}° R{:.0}", fitting.noun, angle, radius)
-                        }
-                        (Some(angle), None) => format!("{} {:.1}°", fitting.noun, angle),
-                        _ => fitting.noun.clone(),
+                MbdFittingKind::Elbo | MbdFittingKind::Bend => match (fitting.angle, radius) {
+                    (Some(angle), Some(radius)) => {
+                        format!("{} {:.1}° R{:.0}", fitting.noun, angle, radius)
                     }
-                }
+                    (Some(angle), None) => format!("{} {:.1}°", fitting.noun, angle),
+                    _ => fitting.noun.clone(),
+                },
                 _ => fitting.noun.clone(),
             };
             let pos = Vec3::from_array(fitting.anchor_point);
@@ -1708,30 +1777,38 @@ impl<'a> BranchMeasurementPlanner<'a> {
         tags
     }
 
+    fn branch_display_name(&self) -> String {
+        let name = self.branch_name.trim().trim_start_matches('/');
+        if name.is_empty() {
+            self.topology.branch_refno.to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
     fn build_material_rows(&self, cut_tubis: &[MbdCutTubiDto]) -> Vec<MbdMaterialRowDto> {
         if !self.query.include_material_table && !self.query.include_material_balloons {
             return Vec::new();
         }
+        let item_code = self.pipe_item_code.as_deref().unwrap_or("TUBI");
         cut_tubis
             .iter()
             .enumerate()
             .map(|(idx, cut)| MbdMaterialRowDto {
                 item_no: idx as u32 + 1,
                 ns: format_material_ns(
-                    self
-                        .topology
+                    self.topology
                         .segments
                         .iter()
                         .find(|seg| seg.refno.to_string() == cut.refno)
                         .and_then(|seg| seg.bore),
-                    self
-                        .topology
+                    self.topology
                         .segments
                         .iter()
                         .find(|seg| seg.refno.to_string() == cut.refno)
                         .and_then(|seg| seg.outside_diameter),
                 ),
-                item_code: "TUBI".to_string(),
+                item_code: item_code.to_string(),
                 description: "Cut pipe length".to_string(),
                 quantity: (cut.length / 1000.0).max(0.0),
                 unit: "m".to_string(),
@@ -1768,6 +1845,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
 
         let (head, _) = segment_port_points(first);
         let (_, tail) = segment_port_points(last);
+        let branch_display_name = self.branch_display_name();
         [("head", head), ("tail", tail)]
             .into_iter()
             .filter(|(_, point)| point.is_finite())
@@ -1778,7 +1856,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
                 role: "position_tag".to_string(),
                 text: format!(
                     "{}\nX {:.0}\nY {:.0}\nPE {:.0}",
-                    self.topology.branch_refno, point.x, point.y, point.z
+                    branch_display_name, point.x, point.y, point.z
                 ),
                 position: point.to_array(),
                 layout_hint: self.query.include_layout_hints.then(|| {
@@ -1861,10 +1939,8 @@ fn segment_port_points(seg: &CacheTubiSeg) -> (Vec3, Vec3) {
 
 fn format_material_ns(bore_mm: Option<f32>, outside_diameter_mm: Option<f32>) -> String {
     if let Some(bore) = bore_mm.filter(|value| value.is_finite() && *value > 0.0) {
-        let inch = bore / 25.4;
-        let rounded_inch = inch.round();
-        if (inch - rounded_inch).abs() <= 0.08 && rounded_inch > 0.0 {
-            return format!("{:.0}\"", rounded_inch);
+        if let Some(label) = format_nominal_bore_inch(bore) {
+            return label;
         }
         return format!("DN{:.0}", bore);
     }
@@ -1872,6 +1948,45 @@ fn format_material_ns(bore_mm: Option<f32>, outside_diameter_mm: Option<f32>) ->
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|od| format!("OD{:.0}", od))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_nominal_bore_inch(bore_mm: f32) -> Option<String> {
+    let rounded = bore_mm.round() as i32;
+    if (bore_mm - rounded as f32).abs() > 0.1 {
+        return None;
+    }
+    let label = match rounded {
+        6 => "1/8".to_string(),
+        8 => "1/4".to_string(),
+        10 => "3/8".to_string(),
+        14 | 15 => "1/2".to_string(),
+        16 => "5/8".to_string(),
+        20 => "3/4".to_string(),
+        24 => "7/8".to_string(),
+        25 | 27 => "1".to_string(),
+        30 => "1 1/8".to_string(),
+        32 | 33 => "1 1/4".to_string(),
+        36 => "1 3/8".to_string(),
+        39 | 40 => "1 1/2".to_string(),
+        42 => "1 5/8".to_string(),
+        50 => "2".to_string(),
+        65 => "2 1/2".to_string(),
+        80 => "3".to_string(),
+        90 => "3 1/2".to_string(),
+        100 => "4".to_string(),
+        125 => "5".to_string(),
+        150 => "6".to_string(),
+        value if value > 150 && (value - 150) % 50 == 0 => {
+            let inch = value as f32 / 25.0;
+            if inch.fract().abs() <= f32::EPSILON {
+                format!("{inch:.0}")
+            } else {
+                format!("{inch:.3}")
+            }
+        }
+        _ => return None,
+    };
+    Some(format!("{label}\""))
 }
 
 #[inline]
@@ -2614,6 +2729,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             .map(|p| p.0)
             .unwrap_or_else(|| m.transform_point3(Vec3::new(0.0, 0.0, 1.0)));
 
+        let bore = infer_segment_bore_mm(row.leave_refno.clone()).await;
         segs.push(CacheTubiSeg {
             refno: row.leave_refno,
             arrive_refno: Some(row.arrive_refno),
@@ -2623,7 +2739,7 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
             arrive_axis: row.arrive_axis.map(|p| p.0),
             leave_axis: row.leave_axis.map(|p| p.0),
             outside_diameter: row.aod,
-            bore: None,
+            bore,
         });
     }
 
@@ -2638,8 +2754,105 @@ async fn fetch_tubi_segments_from_surreal_with_debug(
     debug
         .notes
         .push(format!("tubi_aod_found={}/{}", found_aod, segs.len()));
+    let found_bore = segs.iter().filter(|s| s.bore.is_some()).count();
+    debug
+        .notes
+        .push(format!("tubi_bore_found={}/{}", found_bore, segs.len()));
 
     Ok((segs, debug))
+}
+
+async fn infer_segment_bore_mm(refno: RefnoEnum) -> Option<f32> {
+    if let Ok(att) = aios_core::get_named_attmap(refno).await {
+        if let Some(bore) = infer_bore_from_attmap(&att) {
+            return Some(bore);
+        }
+    }
+    let att = aios_core::get_ui_named_attmap(refno).await.ok()?;
+    infer_bore_from_attmap(&att)
+}
+
+fn infer_bore_from_attmap(att: &aios_core::NamedAttrMap) -> Option<f32> {
+    first_positive_attr_f32(
+        att,
+        &[
+            "ABOR", "LBOR", "HBOR", "TBOR", "PBOR", "P1BOR", "P2BOR", "P3BOR", "ABORE", "LBORE",
+            "HBORE", "TBORE", "PBORE", "P1BORE", "P2BORE", "P3BORE",
+        ],
+    )
+    .or_else(|| {
+        att.get_as_string("SPRE")
+            .and_then(|value| parse_trailing_bore_mm(&value))
+    })
+    .or_else(|| {
+        att.get_as_string("HSTU")
+            .and_then(|value| parse_trailing_bore_mm(&value))
+    })
+    .or_else(|| {
+        att.get_as_string("TSTU")
+            .and_then(|value| parse_trailing_bore_mm(&value))
+    })
+}
+
+async fn infer_branch_pipe_item_code(refno: RefnoEnum) -> Option<String> {
+    if let Ok(att) = aios_core::get_ui_named_attmap(refno.clone()).await {
+        if let Some(item_code) = infer_pipe_item_code_from_attmap(&att) {
+            return Some(item_code);
+        }
+    }
+    if let Ok(att) = aios_core::get_named_attmap(refno.clone()).await {
+        if let Some(item_code) = infer_pipe_item_code_from_attmap(&att) {
+            return Some(item_code);
+        }
+    }
+    None
+}
+
+fn infer_pipe_item_code_from_attmap(att: &aios_core::NamedAttrMap) -> Option<String> {
+    ["HSTU", "TSTU", "SPRE"]
+        .iter()
+        .filter_map(|key| att.get_as_string(key))
+        .filter_map(|value| normalize_material_item_code(&value))
+        .next()
+}
+
+fn normalize_material_item_code(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let before_colon = raw.split(':').next().unwrap_or(raw).trim();
+    let last_part = before_colon
+        .rsplit('/')
+        .next()
+        .unwrap_or(before_colon)
+        .trim()
+        .trim_start_matches('/');
+    if last_part.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    (!last_part.is_empty()).then(|| last_part.to_string())
+}
+
+fn first_positive_attr_f32(att: &aios_core::NamedAttrMap, keys: &[&str]) -> Option<f32> {
+    keys.iter()
+        .filter_map(|key| att.get_f32(key))
+        .find(|value| value.is_finite() && *value > 0.0)
+}
+
+fn parse_trailing_bore_mm(value: &str) -> Option<f32> {
+    let digits_rev: String = value
+        .trim()
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits_rev.is_empty() {
+        return None;
+    }
+    let digits: String = digits_rev.chars().rev().collect();
+    let bore = digits.parse::<f32>().ok()?;
+    (bore.is_finite() && bore > 0.0 && bore <= 5000.0).then_some(bore)
 }
 
 fn build_branch_child_element_query(pe_key: &str, nouns: &[&str]) -> String {
@@ -2837,6 +3050,8 @@ async fn try_fill_branch_name_and_attrs(
     // 这些键名以 markpipe/branAttlist.txt 的语义为准，后续若需映射/单位换算，可在此集中处理。
     attrs.duty = att.get_as_string("DUTY").map(fix_mojibake_utf8_latin1);
     attrs.pspec = att.get_as_string("PSPEC").map(fix_mojibake_utf8_latin1);
+    attrs.hbor = att.get_f32("HBOR").or_else(|| att.get_f32("HBORE"));
+    attrs.tbor = att.get_f32("TBOR").or_else(|| att.get_f32("TBORE"));
     attrs.rccm = att.get_as_string("RCCM").map(fix_mojibake_utf8_latin1);
     attrs.clean = att.get_as_string("CLEAN").map(fix_mojibake_utf8_latin1);
     attrs.temp = att.get_as_string("TEMP").map(fix_mojibake_utf8_latin1);
@@ -3051,14 +3266,15 @@ async fn build_mbd_pipe_data_from_segments(
     };
 
     for bend in &bends {
+        let (anchor_point, has_anchor) = resolve_bend_fitting_anchor(&topology, bend);
         fitting_elements.push(RawFittingElement {
             refno: bend
                 .refno
                 .parse::<RefnoEnum>()
                 .unwrap_or_else(|_| branch_refno.clone()),
             noun: bend.noun.clone(),
-            anchor_point: Vec3::from_array(bend.work_point),
-            has_anchor: true,
+            anchor_point,
+            has_anchor,
             face_center_1: bend.face_center_1.map(Vec3::from_array),
             face_center_2: bend.face_center_2.map(Vec3::from_array),
             angle: bend.angle,
@@ -3066,7 +3282,21 @@ async fn build_mbd_pipe_data_from_segments(
         });
     }
 
-    let output = BranchMeasurementPlanner::new(query, &topology, &fitting_elements, &bends).build();
+    let pipe_item_code = if query.include_material_table || query.include_material_balloons {
+        infer_branch_pipe_item_code(branch_refno.clone()).await
+    } else {
+        None
+    };
+
+    let output = BranchMeasurementPlanner::new(
+        query,
+        &topology,
+        &branch_name,
+        &fitting_elements,
+        &bends,
+        pipe_item_code,
+    )
+    .build();
     let stats = MbdPipeStats {
         segments_count: output.segments.len(),
         dims_count: output.dims.len(),
@@ -3110,6 +3340,32 @@ async fn build_mbd_pipe_data_from_segments(
     }
 
     Ok(data)
+}
+
+fn resolve_bend_fitting_anchor(topology: &BranchTopology, bend: &MbdBendDto) -> (Vec3, bool) {
+    let face_center_1 = bend.face_center_1.map(Vec3::from_array);
+    let face_center_2 = bend.face_center_2.map(Vec3::from_array);
+    match (face_center_1, face_center_2) {
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => return ((a + b) * 0.5, true),
+        (Some(a), _) if a.is_finite() => return (a, true),
+        (_, Some(b)) if b.is_finite() => return (b, true),
+        _ => {}
+    }
+
+    let work_point = Vec3::from_array(bend.work_point);
+    if work_point.is_finite() && work_point.length() > 1.0 {
+        return (work_point, true);
+    }
+
+    if let Some(seg) = topology
+        .segments
+        .iter()
+        .find(|seg| seg.refno.to_string() == bend.refno)
+    {
+        return ((seg.start + seg.end) * 0.5, true);
+    }
+
+    (Vec3::ZERO, false)
 }
 
 /// 把后端的 `MbdPipeData` 子集喂给 `aios_core::mbd::BranchCalculator`，产出完整 `LayoutResult`。
@@ -3745,6 +4001,62 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_trailing_bore_mm_from_spec_names() {
+        assert_eq!(parse_trailing_bore_mm("/A3B/TA80"), Some(80.0));
+        assert_eq!(parse_trailing_bore_mm("/A3B/PA100"), Some(100.0));
+        assert_eq!(parse_trailing_bore_mm("/A3B/EA80"), Some(80.0));
+        assert_eq!(parse_trailing_bore_mm("/A3B/EA"), None);
+    }
+
+    #[test]
+    fn test_normalize_material_item_code_from_spec_names() {
+        assert_eq!(
+            normalize_material_item_code("/A3B/PA100"),
+            Some("PA100".to_string())
+        );
+        assert_eq!(
+            normalize_material_item_code("/A3B/PA100:1"),
+            Some("PA100".to_string())
+        );
+        assert_eq!(
+            normalize_material_item_code("PA100"),
+            Some("PA100".to_string())
+        );
+        assert_eq!(normalize_material_item_code("229421"), None);
+        assert_eq!(normalize_material_item_code("   "), None);
+    }
+
+    #[test]
+    fn test_mbd_v2_branch_attrs_include_branch_name() {
+        let attrs = BranchAttrsDto {
+            hbor: Some(100.0),
+            tbor: Some(80.0),
+            ..Default::default()
+        };
+
+        let out = branch_attrs_to_mbd_v2_map_with_name(&attrs, "/03SKID1-PIPE-SUCTION/B1");
+
+        assert_eq!(
+            out.get("BRANCH_NAME").map(String::as_str),
+            Some("/03SKID1-PIPE-SUCTION/B1")
+        );
+        assert_eq!(
+            out.get("NAME").map(String::as_str),
+            Some("/03SKID1-PIPE-SUCTION/B1")
+        );
+        assert_eq!(out.get("HBOR").map(String::as_str), Some("100"));
+        assert_eq!(out.get("TBOR").map(String::as_str), Some("80"));
+    }
+
+    #[test]
+    fn test_format_material_ns_matches_rs_core_nominal_bores() {
+        assert_eq!(format_material_ns(Some(80.0), None), "3\"");
+        assert_eq!(format_material_ns(Some(100.0), None), "4\"");
+        assert_eq!(format_material_ns(Some(250.0), None), "10\"");
+        assert_eq!(format_material_ns(None, Some(114.3)), "OD114");
+    }
+
+    #[test]
     fn test_mbd_pipe_mode_defaults_to_construction() {
         let resolved = MbdPipeQuery::default().resolve();
         assert_eq!(resolved.mode, MbdPipeMode::Construction);
@@ -3969,7 +4281,8 @@ mod tests {
             ],
         );
 
-        let output = BranchMeasurementPlanner::new(&query, &topology, &[], &[]).build();
+        let output =
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &[], &[], None).build();
 
         assert_eq!(output.cut_tubis.len(), 2);
         assert!(output.dims.iter().all(|dim| {
@@ -4027,7 +4340,8 @@ mod tests {
             },
         ];
 
-        let output = BranchMeasurementPlanner::new(&query, &topology, &fittings, &[]).build();
+        let output =
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], None).build();
 
         assert_eq!(output.fittings.len(), 2);
         assert!(output.tags.iter().any(|tag| tag.noun == "TEE"));
@@ -4038,6 +4352,221 @@ mod tests {
                 .and_then(|hint| hint.owner_segment_id.clone())
                 .is_some()
         }));
+    }
+
+    #[test]
+    fn test_bend_fitting_anchor_falls_back_to_matching_segment_midpoint() {
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("2013286704_476"),
+            vec![CacheTubiSeg {
+                refno: RefnoEnum::from("2013286704_480"),
+                arrive_refno: None,
+                order: Some(0),
+                start: Vec3::new(-287110.2, 290960.0, 100790.0),
+                end: Vec3::new(-286965.2, 290960.0, 100790.0),
+                arrive_axis: None,
+                leave_axis: None,
+                outside_diameter: None,
+                bore: Some(80.0),
+            }],
+        );
+        let bend = MbdBendDto {
+            id: "bend:2013286704_480".to_string(),
+            refno: "2013286704_480".to_string(),
+            noun: "ELBO".to_string(),
+            angle: Some(90.0),
+            radius: Some(0.0),
+            work_point: [0.0, 0.0, 0.0],
+            face_center_1: None,
+            face_center_2: None,
+        };
+
+        let (anchor, has_anchor) = resolve_bend_fitting_anchor(&topology, &bend);
+
+        assert!(has_anchor);
+        assert!((anchor.x - -287037.7).abs() < 0.01);
+        assert!((anchor.y - 290960.0).abs() < 0.01);
+        assert!((anchor.z - 100790.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_elbo_tag_does_not_emit_zero_radius() {
+        let query = MbdPipeQuery {
+            include_tags: Some(true),
+            include_fittings: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("2013286704_476"),
+            vec![CacheTubiSeg {
+                refno: RefnoEnum::from("2013286704_480"),
+                arrive_refno: None,
+                order: Some(0),
+                start: Vec3::new(0.0, 0.0, 0.0),
+                end: Vec3::new(100.0, 0.0, 0.0),
+                arrive_axis: None,
+                leave_axis: None,
+                outside_diameter: None,
+                bore: Some(80.0),
+            }],
+        );
+        let fittings = vec![RawFittingElement {
+            refno: RefnoEnum::from("2013286704_480"),
+            noun: "ELBO".to_string(),
+            anchor_point: Vec3::new(50.0, 0.0, 0.0),
+            has_anchor: true,
+            face_center_1: None,
+            face_center_2: None,
+            angle: Some(90.0),
+            radius: Some(0.0),
+        }];
+
+        let output =
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], None).build();
+        let tag = output
+            .tags
+            .iter()
+            .find(|tag| tag.id == "tag:fitting:2013286704_480")
+            .expect("ELBO fitting tag");
+
+        assert_eq!(tag.text, "ELBO 90.0°");
+    }
+
+    #[test]
+    fn test_measurement_planner_uses_branch_name_for_visible_tags() {
+        let query = MbdPipeQuery {
+            include_branch_label: Some(true),
+            include_position_tags: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("2013286704_476"),
+            vec![CacheTubiSeg {
+                refno: RefnoEnum::from("2013286704_479"),
+                arrive_refno: None,
+                order: Some(0),
+                start: Vec3::new(-287110.0, 290960.0, 100790.0),
+                end: Vec3::new(-286965.0, 290960.0, 100790.0),
+                arrive_axis: None,
+                leave_axis: None,
+                outside_diameter: None,
+                bore: Some(80.0),
+            }],
+        );
+
+        let output = BranchMeasurementPlanner::new(
+            &query,
+            &topology,
+            "/03SKID1-PIPE-SUCTION/B1",
+            &[],
+            &[],
+            None,
+        )
+        .build();
+
+        let branch_label = output
+            .tags
+            .iter()
+            .find(|tag| tag.role == "branch_label")
+            .expect("branch label");
+        assert_eq!(branch_label.text, "03SKID1-PIPE-SUCTION/B1");
+        let position_tags = output
+            .tags
+            .iter()
+            .filter(|tag| tag.role == "position_tag")
+            .collect::<Vec<_>>();
+        assert_eq!(position_tags.len(), 2);
+        assert!(
+            position_tags
+                .iter()
+                .all(|tag| tag.text.starts_with("03SKID1-PIPE-SUCTION/B1\nX "))
+        );
+        assert!(
+            position_tags
+                .iter()
+                .all(|tag| !tag.text.contains("2013286704_476"))
+        );
+    }
+
+    #[test]
+    fn test_enrich_mbd_v2_source_refnos_from_v1_semantics() {
+        use aios_core::mbd::v2::primitive::CommonFields;
+        use aios_core::mbd::v2::{
+            LabelPrimitive, LinearDimPrimitive, LinearDimSubKind, MbdPrimitive, MbdV2PipeData,
+        };
+
+        let data = MbdPipeData {
+            input_refno: "2013286704_476".to_string(),
+            branch_refno: "2013286704_476".to_string(),
+            branch_name: "/03SKID1-PIPE-SUCTION/B1".to_string(),
+            branch_attrs: BranchAttrsDto::default(),
+            segments: Vec::new(),
+            dims: Vec::new(),
+            cut_tubis: vec![MbdCutTubiDto {
+                id: "cut_tubi:2013286704_479:0".to_string(),
+                segment_id: "seg:2013286704_479:0".to_string(),
+                refno: "2013286704_479".to_string(),
+                start: [0.0, 0.0, 0.0],
+                end: [600.0, 0.0, 0.0],
+                length: 600.0,
+                text: "600".to_string(),
+                layout_hint: None,
+            }],
+            welds: Vec::new(),
+            slopes: Vec::new(),
+            fittings: Vec::new(),
+            tags: vec![MbdTagDto {
+                id: "tag:tubi:2013286704_479".to_string(),
+                refno: "2013286704_479".to_string(),
+                noun: "TUBI".to_string(),
+                role: "tubi".to_string(),
+                text: "L=600".to_string(),
+                position: [300.0, 0.0, 0.0],
+                layout_hint: None,
+            }],
+            material_rows: Vec::new(),
+            bends: Vec::new(),
+            stats: MbdPipeStats::default(),
+            debug_info: None,
+            layout_result: None,
+        };
+        let mut v2_data = MbdV2PipeData {
+            primitives: vec![
+                MbdPrimitive::Label(LabelPrimitive {
+                    common: CommonFields {
+                        id: "tag:tubi:2013286704_479".to_string(),
+                        ..CommonFields::default()
+                    },
+                    ..LabelPrimitive::default()
+                }),
+                MbdPrimitive::LinearDim(LinearDimPrimitive {
+                    common: CommonFields {
+                        id: "cut_tubi:2013286704_479:0".to_string(),
+                        ..CommonFields::default()
+                    },
+                    sub_kind: LinearDimSubKind::CutTubi,
+                    ..LinearDimPrimitive::default()
+                }),
+            ],
+            ..MbdV2PipeData::default()
+        };
+
+        enrich_mbd_v2_source_refnos(&mut v2_data, &data);
+
+        match &v2_data.primitives[0] {
+            MbdPrimitive::Label(label) => {
+                assert_eq!(label.common.source_refno.as_deref(), Some("2013286704_479"));
+            }
+            _ => panic!("expected label"),
+        }
+        match &v2_data.primitives[1] {
+            MbdPrimitive::LinearDim(dim) => {
+                assert_eq!(dim.common.source_refno.as_deref(), Some("2013286704_479"));
+            }
+            _ => panic!("expected linear dim"),
+        }
     }
 
     #[test]

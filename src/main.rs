@@ -1665,6 +1665,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    if db_option_ext.export_parquet_after_gen
+        && db_option_ext.inner.debug_model_refnos.is_none()
+        && let Some(refnos) = debug_model_refnos
+            .as_ref()
+            .filter(|values| !values.is_empty())
+    {
+        db_option_ext.inner.debug_model_refnos = Some(refnos.clone());
+    }
+
     if debug_model_requested {
         // 仅 --debug-model 才启用日志文件写入
         db_option_ext.inner.enable_log = true;

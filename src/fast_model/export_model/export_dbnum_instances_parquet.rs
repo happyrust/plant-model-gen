@@ -21,6 +21,7 @@ use std::sync::Arc;
 use aios_core::SurrealQueryExt;
 use aios_core::options::DbOption;
 use aios_core::pdms_types::RefnoEnum;
+use aios_core::shape::pdms_shape::RsVec3;
 use anyhow::{Context, Result};
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray, UInt32Array,
@@ -32,6 +33,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde_json::json;
+use std::str::FromStr;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
 use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_sesno_range};
@@ -1072,6 +1074,77 @@ fn inst_info_record_ref(id: &str) -> String {
     )
 }
 
+fn parse_vec3_value(value: &serde_json::Value) -> Option<glam::Vec3> {
+    if let Some(values) = value.as_array() {
+        let x = values.first()?.as_f64()? as f32;
+        let y = values.get(1)?.as_f64()? as f32;
+        let z = values.get(2)?.as_f64()? as f32;
+        return Some(glam::Vec3::new(x, y, z));
+    }
+
+    let obj = value.as_object()?;
+    if let Some(inner) = obj.get("d") {
+        return parse_vec3_value(inner);
+    }
+    if let (Some(x), Some(y), Some(z)) = (obj.get("x"), obj.get("y"), obj.get("z")) {
+        return Some(glam::Vec3::new(
+            x.as_f64()? as f32,
+            y.as_f64()? as f32,
+            z.as_f64()? as f32,
+        ));
+    }
+    None
+}
+
+fn parse_refno_value(value: Option<&serde_json::Value>) -> RefnoEnum {
+    let Some(value) = value else {
+        return RefnoEnum::default();
+    };
+
+    let raw = value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|v| v.to_string()))
+        .unwrap_or_default();
+    let normalized = raw
+        .trim()
+        .trim_start_matches("pe:")
+        .trim_matches('⟨')
+        .trim_matches('⟩')
+        .replace('_', "/");
+    RefnoEnum::from_str(&normalized).unwrap_or_default()
+}
+
+fn parse_optional_vec3(value: Option<&serde_json::Value>) -> Option<RsVec3> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    parse_vec3_value(value).map(RsVec3)
+}
+
+fn parse_ptset_axis_object(value: &serde_json::Value) -> Option<CateAxisParam> {
+    let obj = value.as_object()?;
+    let number = obj.get("number").and_then(|v| v.as_i64())? as i32;
+    let pt = parse_vec3_value(obj.get("pt")?)?;
+    Some(CateAxisParam {
+        refno: parse_refno_value(obj.get("refno")),
+        number,
+        pt: RsVec3(pt),
+        dir: parse_optional_vec3(obj.get("dir")),
+        dir_flag: obj.get("dir_flag").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+        ref_dir: parse_optional_vec3(obj.get("ref_dir")),
+        pbore: obj.get("pbore").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        pwidth: obj.get("pwidth").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        pheight: obj.get("pheight").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        pconnect: obj
+            .get("pconnect")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
 fn parse_ptset_value(value: serde_json::Value) -> Vec<CateAxisParam> {
     let value = match value {
         serde_json::Value::Array(mut values) if values.len() == 1 && values[0].is_array() => {
@@ -1082,7 +1155,19 @@ fn parse_ptset_value(value: serde_json::Value) -> Vec<CateAxisParam> {
 
     match serde_json::from_value::<Vec<CateAxisParamCompact>>(value.clone()) {
         Ok(compact) => decompress_ptset(&compact),
-        Err(_) => serde_json::from_value::<Vec<CateAxisParam>>(value).unwrap_or_default(),
+        Err(_) => {
+            serde_json::from_value::<Vec<CateAxisParam>>(value.clone()).unwrap_or_else(|_| {
+                value
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(parse_ptset_axis_object)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+        }
     }
 }
 
@@ -1657,7 +1742,7 @@ async fn query_export_insts_local(
                     true as has_neg
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
-                  AND type::record("pe_transform", record::id(refno)).world_trans.d != NONE
+                  AND refno != NONE
                 "#,
                 bool_keys = bool_keys_str
             );
@@ -1698,12 +1783,13 @@ async fn query_export_insts_local(
                                 out.unit_flag ?? false as unit_flag
                              FROM {geo_range}
                              WHERE visible
+                               && out != NONE
                                && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                                && (trans.d ?? NONE) != NONE
                                && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                             false as has_neg
                         FROM [{inst_relate_key}]
-                        WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                        WHERE in != NONE;
                         "#
                     ));
                 }
@@ -1741,12 +1827,13 @@ async fn query_export_insts_local(
                             out.unit_flag ?? false as unit_flag
                          FROM {geo_range}
                          WHERE visible
+                           && out != NONE
                            && (out.param != NONE || out.meshed || out.unit_flag || record::id(out) IN ['1','2','3'])
                            && (trans.d ?? NONE) != NONE
                            && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound']) as insts,
                         false as has_neg
                     FROM [{inst_relate_key}]
-                    WHERE type::record("pe_transform", record::id(in)).world_trans.d != NONE;
+                    WHERE in != NONE;
                     "#
                 ));
             }
@@ -2059,7 +2146,7 @@ pub async fn export_dbnum_instances_parquet(
     // =========================================================================
     // 1-2. 扫描 inst_relate（按 dbnum 对应的 ref0 前缀过滤）
     // =========================================================================
-    let inst_rows = if let Some(root) = root_refno {
+    let (inst_rows, scoped_refno_filter) = if let Some(root) = root_refno {
         // root_refno 模式：先查子树 refno，再分批查 inst_relate
         use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
         if verbose {
@@ -2072,9 +2159,13 @@ pub async fn export_dbnum_instances_parquet(
         if verbose {
             println!("✅ 子树 refno 数量: {}", sub_refnos.len());
         }
-        query_inst_relate_by_refnos(&sub_refnos, verbose).await?
+        let scoped_refno_filter = sub_refnos.iter().copied().collect::<HashSet<_>>();
+        (
+            query_inst_relate_by_refnos(&sub_refnos, verbose).await?,
+            Some(scoped_refno_filter),
+        )
     } else {
-        query_inst_relate_by_dbnum(dbnum, verbose).await?
+        (query_inst_relate_by_dbnum(dbnum, verbose).await?, None)
     };
 
     // 按 owner 分组
@@ -2133,6 +2224,11 @@ pub async fn export_dbnum_instances_parquet(
 
     let mut tree_visible_added = 0usize;
     for refno in tree_manager.query_visible_geo_refnos() {
+        if let Some(scope) = &scoped_refno_filter
+            && !scope.contains(&refno)
+        {
+            continue;
+        }
         if !in_refno_set.insert(refno) {
             continue;
         }
@@ -2238,14 +2334,13 @@ pub async fn export_dbnum_instances_parquet(
     // =========================================================================
     // 3.5 查询 inst_info cata_hash / ptset（供 instances 与 ptsets.parquet 复用）
     // =========================================================================
-    let ptset_refnos = export_inst_map.keys().copied().collect::<Vec<_>>();
     if verbose {
         println!(
-            "🔍 查询 {} 个有几何实例的 refno 的 cata_hash / ptset...",
-            ptset_refnos.len()
+            "🔍 查询 {} 个导出实例 refno 的 cata_hash / ptset...",
+            in_refnos.len()
         );
     }
-    let ptset_export_data = query_ptset_export_data(&ptset_refnos, verbose).await?;
+    let ptset_export_data = query_ptset_export_data(&in_refnos, verbose).await?;
 
     // =========================================================================
     // 4. 查询 tubi_relate

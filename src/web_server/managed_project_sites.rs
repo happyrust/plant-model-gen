@@ -4385,6 +4385,114 @@ fn filter_quick_deploy_projects_for_mbd(
     filtered
 }
 
+async fn discover_quick_deploy_projects_for_source(
+    req: &QuickDeployTestRequest,
+    canonical_project_path: &Path,
+) -> Result<Vec<SiteProject>> {
+    if !req.projects.is_empty()
+        || req
+            .mbd_name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    {
+        let mut projects = req.projects.clone();
+        normalize_quick_deploy_projects(&mut projects);
+        return Ok(projects);
+    }
+
+    let Some(parent) = canonical_project_path.parent() else {
+        return Ok(Vec::new());
+    };
+
+    let value = crate::web_server::parse_sidecar_client::scan_projects(&parent.to_string_lossy())
+        .await
+        .map_err(|err| {
+            anyhow!(
+                "扫描 quick deploy sibling 工程失败 root={}: {}",
+                parent.display(),
+                err.message
+            )
+        })?;
+    let scan: QuickDeployScanProjectsResult =
+        serde_json::from_value(value).context("解析 quick deploy sibling 工程扫描响应失败")?;
+
+    let source_key = quick_deploy_path_prefix_key(canonical_project_path);
+    let mut selected = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for mut project in scan.projects {
+        let project_key = quick_deploy_path_prefix_key(Path::new(project.path.trim()));
+        if project_key.is_empty() {
+            continue;
+        }
+        let is_source = project_key == source_key;
+        let is_sibling_library = matches!(project.role, ProjectRole::Library)
+            || project.name.to_ascii_lowercase().contains("catalog");
+        if !is_source && !is_sibling_library {
+            continue;
+        }
+        if !seen_paths.insert(project_key) {
+            continue;
+        }
+        project.is_primary = is_source;
+        if is_sibling_library && !is_source {
+            project.role = ProjectRole::Library;
+        }
+        project.sort_order = if is_source {
+            0
+        } else {
+            (selected.len() + 1) as u32
+        };
+        selected.push(project);
+    }
+
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("读取 quick deploy sibling 工程目录失败: {}", parent.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let lower_name = name.to_ascii_lowercase();
+        if !lower_name.contains("catalog") {
+            continue;
+        }
+        let key = quick_deploy_path_prefix_key(&path);
+        if key.is_empty() || !seen_paths.insert(key) {
+            continue;
+        }
+        selected.push(SiteProject {
+            path: path.to_string_lossy().to_string(),
+            name,
+            role: ProjectRole::Library,
+            is_primary: false,
+            sort_order: selected.len() as u32 + 1,
+        });
+    }
+
+    if !selected.iter().any(|project| project.is_primary) {
+        selected.push(SiteProject {
+            path: canonical_project_path.to_string_lossy().to_string(),
+            name: canonical_project_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            role: ProjectRole::Design,
+            is_primary: true,
+            sort_order: 0,
+        });
+    }
+    selected.sort_by_key(|project| project.sort_order);
+    Ok(selected)
+}
+
 async fn discover_quick_deploy_projects(req: &QuickDeployTestRequest) -> Result<Vec<SiteProject>> {
     if !req.projects.is_empty() {
         let mut projects = req.projects.clone();
@@ -4904,6 +5012,7 @@ async fn quick_create_deploy_config(
     } else {
         canonical_project_path(&project_path)?
     };
+    let projects = discover_quick_deploy_projects_for_source(&req, &canonical).await?;
 
     let (dbnum, resolved_db_file) = match req.dbnum {
         Some(n) if n > 0 => (n, req.db_file.clone().unwrap_or_default()),
@@ -4950,7 +5059,7 @@ async fn quick_create_deploy_config(
     let (db_user, db_password) = profile.db_credentials(dbnum);
     let site = create_site(CreateManagedSiteRequest {
         site_name: Some(site_name),
-        projects: req.projects.clone(),
+        projects,
         mbd_name: None,
         search_roots: Vec::new(),
         project_name: e3d_project_name,
@@ -5042,6 +5151,7 @@ async fn quick_deploy(
     } else {
         canonical_project_path(&project_path)?
     };
+    let projects = discover_quick_deploy_projects_for_source(&req, &canonical).await?;
 
     // 1) dbnum 解析（dbnum 优先，否则按 db_file 读文件头）
     let (dbnum, resolved_db_file) = match req.dbnum {
@@ -5095,7 +5205,7 @@ async fn quick_deploy(
     let (db_user, db_password) = profile.db_credentials(dbnum);
     let create_req = CreateManagedSiteRequest {
         site_name: Some(site_name.clone()),
-        projects: req.projects.clone(),
+        projects,
         mbd_name: None,
         search_roots: Vec::new(),
         project_name: e3d_project_name.clone(),

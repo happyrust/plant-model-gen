@@ -77,6 +77,7 @@ use chrono::{Datelike, Local, Timelike};
 use dashmap::mapref::one::Ref;
 
 use dashmap::{DashMap, DashSet};
+use std::str::FromStr;
 
 use itertools::Itertools;
 
@@ -530,6 +531,12 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
                 let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
                 let db_option = Arc::new(db_option_ext.inner.clone());
+                let parquet_root_refno = db_option_ext
+                    .inner
+                    .debug_model_refnos
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .and_then(|value| RefnoEnum::from_str(&value.replace('_', "/")).ok());
                 let export_started = Instant::now();
                 for dbnum in dbnums {
                     log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
@@ -540,7 +547,7 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                         db_option.clone(),
                         true, // verbose
                         None, // target_unit
-                        None, // root_refno
+                        parquet_root_refno,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;

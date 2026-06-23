@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-06-23
+
+### Changed — 房间树保留 E3D 原始子层级
+
+- 房间树按 `ROOM -> BRAN/EQUI/HANG/OTHER` 重排最小交付单元后，交付单元不再作为叶子节点；`room-item:{room}:{refno}` 会继续代理原始 E3D 模型树子节点。
+- `/api/room-tree/ancestors` 对真实 refno 和房间虚拟节点返回同一条完整房间树路径，支持搜索、定位和展开到房间视图中的真实模型节点。
+- AvevaMarineSample R301 验证：`BRAN -CAM-E-2-H-5202` 下可继续展开 `STRT/BEND/TEE/ATTA` 等原始子节点。
+
 ## 2026-06-17
 
 ### Added — 系统库 MDB 依赖发现与 MBD 名称快速部署验证（spec 019）

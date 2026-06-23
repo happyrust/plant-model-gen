@@ -242,6 +242,8 @@ jobs:
 
           if [ -n "$active_service" ]; then
             systemctl start "$active_service"
+          elif systemctl list-unit-files surreal-8020.service >/dev/null 2>&1; then
+            systemctl start surreal-8020
           else
             systemctl start surrealdb
           fi

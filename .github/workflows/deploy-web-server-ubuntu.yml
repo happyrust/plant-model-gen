@@ -208,6 +208,7 @@ jobs:
         working-directory: surrealdb
         run: |
           sudo apt-get install -y build-essential clang cmake libclang-dev pkg-config protobuf-compiler
+          rm -f ../.cargo/config.toml
           cargo build --release --bin surreal --locked
 
       - name: Deploy SurrealDB binary

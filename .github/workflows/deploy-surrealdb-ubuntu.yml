@@ -1,0 +1,108 @@
+name: Deploy SurrealDB To Ubuntu
+
+on:
+  workflow_dispatch:
+    inputs:
+      surreal_ref:
+        description: 'happyrust/surrealdb git ref to build'
+        required: true
+        default: 'f01470af2660db59a94def365a9367d5b6bfd2e0'
+        type: string
+      remote_host:
+        description: 'Target server; empty uses DEPLOY_REMOTE_HOST'
+        required: false
+        default: ''
+        type: string
+      remote_user:
+        description: 'SSH user; empty uses DEPLOY_REMOTE_USER or root'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout SurrealDB
+        uses: actions/checkout@v4
+        with:
+          repository: happyrust/surrealdb
+          ref: ${{ inputs.surreal_ref }}
+          token: ${{ secrets.GH_PAT }}
+          path: surrealdb
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-15
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: surrealdb
+          shared-key: deploy-surrealdb-ubuntu
+          cache-on-failure: true
+
+      - name: Install build and deploy dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake libclang-dev pkg-config protobuf-compiler sshpass
+
+      - name: Build surreal
+        working-directory: surrealdb
+        run: cargo build --release --bin surreal --locked
+
+      - name: Deploy surreal
+        env:
+          REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
+          REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
+          REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
+        run: |
+          set -euo pipefail
+          test -n "$REMOTE_HOST" || { echo "Missing remote host"; exit 1; }
+          test -n "$REMOTE_USER" || { echo "Missing remote user"; exit 1; }
+          test -n "$REMOTE_PASS" || { echo "Missing DEPLOY_REMOTE_PASS"; exit 1; }
+
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+          sshpass -p "$REMOTE_PASS" scp "${ssh_opts[@]}" surrealdb/target/release/surreal "$REMOTE_USER@$REMOTE_HOST:/tmp/surreal.new"
+          sshpass -p "$REMOTE_PASS" ssh "${ssh_opts[@]}" "$REMOTE_USER@$REMOTE_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          active_service=""
+          if systemctl is-active --quiet surrealdb; then active_service="surrealdb"; fi
+          if systemctl is-active --quiet surreal-8020; then active_service="surreal-8020"; fi
+
+          systemctl stop web-server 2>/dev/null || true
+          systemctl stop surrealdb 2>/dev/null || true
+          systemctl stop surreal-8020 2>/dev/null || true
+
+          if [ -x /usr/local/bin/surreal ]; then
+            cp /usr/local/bin/surreal "/usr/local/bin/surreal.backup.$(date -u +%Y%m%d%H%M%S)"
+          fi
+          install -m 0755 /tmp/surreal.new /usr/local/bin/surreal
+          /usr/local/bin/surreal version
+
+          if [ -n "$active_service" ]; then
+            systemctl start "$active_service"
+          else
+            systemctl start surrealdb
+          fi
+
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8020/version && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8020/version | grep '3.2.0-nightly'
+
+          systemctl restart web-server
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:3100/api/health >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3100/api/health
+          curl -fsS http://127.0.0.1:3100/api/projects >/dev/null
+          REMOTE

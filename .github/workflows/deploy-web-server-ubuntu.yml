@@ -292,10 +292,13 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "$REMOTE_USER@$REMOTE_HOST" \
-            "ok=1; \
-             systemctl is-active web-server || ok=0; \
-             curl -fsS http://127.0.0.1:3100/api/health >/dev/null || ok=0; \
-             curl -fsS http://127.0.0.1:3100/api/projects >/dev/null || ok=0; \
+            "ok=0; \
+             for i in \$(seq 1 30); do \
+               systemctl is-active web-server >/dev/null && \
+               curl -fsS http://127.0.0.1:3100/api/health >/dev/null && \
+               curl -fsS http://127.0.0.1:3100/api/projects >/dev/null && ok=1 && break; \
+               sleep 2; \
+             done; \
              if [ \"\$ok\" != 1 ]; then \
                systemctl status web-server --no-pager -l || true; \
                journalctl -u web-server -n 120 --no-pager || true; \

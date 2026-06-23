@@ -25,6 +25,26 @@ on:
         required: false
         default: ''
         type: string
+      deploy_surrealdb:
+        description: '同时构建并部署匹配的 SurrealDB Linux 二进制'
+        required: false
+        default: false
+        type: boolean
+      surreal_ref:
+        description: 'happyrust/surrealdb git ref（deploy_surrealdb=true 时使用）'
+        required: false
+        default: 'f01470af2660db59a94def365a9367d5b6bfd2e0'
+        type: string
+      ssh_public_key:
+        description: '可选：写入远端 authorized_keys，用于本机同步数据库'
+        required: false
+        default: ''
+        type: string
+      ssh_key_only:
+        description: '只安装 ssh_public_key，不构建/部署后端'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -43,6 +63,7 @@ jobs:
   build-linux-artifact:
     name: Build Linux Release Artifact
     runs-on: ubuntu-latest
+    if: ${{ !inputs.ssh_key_only }}
 
     steps:
       - name: Checkout target ref
@@ -123,6 +144,7 @@ jobs:
     name: Deploy To Ubuntu
     runs-on: ubuntu-latest
     needs: build-linux-artifact
+    if: ${{ !inputs.ssh_key_only }}
     environment: production
 
     steps:
@@ -141,6 +163,95 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y sshpass rsync
+
+      - name: Install temporary SSH public key
+        if: ${{ inputs.ssh_public_key != '' }}
+        env:
+          REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
+          REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
+          REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+        run: |
+          set -euo pipefail
+          test -n "$REMOTE_HOST" || { echo "Missing remote host"; exit 1; }
+          test -n "$REMOTE_USER" || { echo "Missing remote user"; exit 1; }
+          test -n "$REMOTE_PASS" || { echo "Missing secret DEPLOY_REMOTE_PASS."; exit 1; }
+          test -n "$SSH_PUBLIC_KEY" || { echo "Missing ssh_public_key"; exit 1; }
+          sshpass -p "$REMOTE_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$REMOTE_USER@$REMOTE_HOST" \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF '$SSH_PUBLIC_KEY' ~/.ssh/authorized_keys || echo '$SSH_PUBLIC_KEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+
+      - name: Checkout SurrealDB
+        if: ${{ inputs.deploy_surrealdb }}
+        uses: actions/checkout@v4
+        with:
+          repository: happyrust/surrealdb
+          ref: ${{ inputs.surreal_ref }}
+          token: ${{ secrets.GH_PAT }}
+          path: surrealdb
+
+      - name: Install SurrealDB build toolchain
+        if: ${{ inputs.deploy_surrealdb }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-15
+
+      - name: Rust cache for SurrealDB
+        if: ${{ inputs.deploy_surrealdb }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: surrealdb
+          shared-key: deploy-surrealdb-ubuntu
+          cache-on-failure: true
+
+      - name: Build SurrealDB binary
+        if: ${{ inputs.deploy_surrealdb }}
+        working-directory: surrealdb
+        run: |
+          sudo apt-get install -y build-essential clang cmake libclang-dev pkg-config protobuf-compiler
+          cargo build --release --bin surreal --locked
+
+      - name: Deploy SurrealDB binary
+        if: ${{ inputs.deploy_surrealdb }}
+        env:
+          REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
+          REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
+          REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
+        run: |
+          set -euo pipefail
+          test -n "$REMOTE_HOST" || { echo "Missing remote host"; exit 1; }
+          test -n "$REMOTE_USER" || { echo "Missing remote user"; exit 1; }
+          test -n "$REMOTE_PASS" || { echo "Missing secret DEPLOY_REMOTE_PASS."; exit 1; }
+
+          ssh_opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+          sshpass -p "$REMOTE_PASS" scp "${ssh_opts[@]}" surrealdb/target/release/surreal "$REMOTE_USER@$REMOTE_HOST:/tmp/surreal.new"
+          sshpass -p "$REMOTE_PASS" ssh "${ssh_opts[@]}" "$REMOTE_USER@$REMOTE_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          active_service=""
+          if systemctl is-active --quiet surrealdb; then active_service="surrealdb"; fi
+          if systemctl is-active --quiet surreal-8020; then active_service="surreal-8020"; fi
+
+          systemctl stop web-server 2>/dev/null || true
+          systemctl stop surrealdb 2>/dev/null || true
+          systemctl stop surreal-8020 2>/dev/null || true
+
+          if [ -x /usr/local/bin/surreal ]; then
+            cp /usr/local/bin/surreal "/usr/local/bin/surreal.backup.$(date -u +%Y%m%d%H%M%S)"
+          fi
+          install -m 0755 /tmp/surreal.new /usr/local/bin/surreal
+          /usr/local/bin/surreal version
+
+          if [ -n "$active_service" ]; then
+            systemctl start "$active_service"
+          else
+            systemctl start surrealdb
+          fi
+
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8020/version && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8020/version | grep '3.2.0-nightly'
+          REMOTE
 
       - name: Validate deploy inputs
         env:
@@ -188,3 +299,29 @@ jobs:
                ss -tlnp | grep -E ':3100|:8020' || true; \
                exit 1; \
              fi"
+
+  install-ssh-key:
+    name: Install SSH Key Only
+    runs-on: ubuntu-latest
+    if: ${{ inputs.ssh_key_only && inputs.ssh_public_key != '' }}
+    environment: production
+
+    steps:
+      - name: Install sshpass
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Install temporary SSH public key
+        env:
+          REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST }}
+          REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
+          REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+        run: |
+          set -euo pipefail
+          test -n "$REMOTE_HOST" || { echo "Missing remote host"; exit 1; }
+          test -n "$REMOTE_USER" || { echo "Missing remote user"; exit 1; }
+          test -n "$REMOTE_PASS" || { echo "Missing secret DEPLOY_REMOTE_PASS."; exit 1; }
+          sshpass -p "$REMOTE_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$REMOTE_USER@$REMOTE_HOST" \
+            "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && grep -qxF '$SSH_PUBLIC_KEY' ~/.ssh/authorized_keys || echo '$SSH_PUBLIC_KEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"

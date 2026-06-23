@@ -178,7 +178,13 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             "$REMOTE_USER@$REMOTE_HOST" \
-            "set -e; \
-             systemctl is-active web-server; \
-             curl -fsS http://127.0.0.1:3100/api/health >/dev/null; \
-             curl -fsS http://127.0.0.1:3100/api/projects >/dev/null"
+            "ok=1; \
+             systemctl is-active web-server || ok=0; \
+             curl -fsS http://127.0.0.1:3100/api/health >/dev/null || ok=0; \
+             curl -fsS http://127.0.0.1:3100/api/projects >/dev/null || ok=0; \
+             if [ \"\$ok\" != 1 ]; then \
+               systemctl status web-server --no-pager -l || true; \
+               journalctl -u web-server -n 120 --no-pager || true; \
+               ss -tlnp | grep -E ':3100|:8020' || true; \
+               exit 1; \
+             fi"

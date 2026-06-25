@@ -979,49 +979,51 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
             anyhow::anyhow!("配置文件 {} transform backend 配置非法: {}", config_file, e)
         })?;
 
-    // 打印加载的配置
-    println!("📋 加载的配置:");
-    println!(
-        "   - default_lod: {:?}",
-        db_option_ext.inner.mesh_precision.default_lod
-    );
-    println!(
-        "   - LOD profiles 数量: {}",
-        db_option_ext.inner.mesh_precision.lod_profiles.len()
-    );
-    println!(
-        "   - model_writer: {}",
-        db_option_ext.model_writer_mode.as_str()
-    );
-    println!(
-        "   - transform_write_backend: {}",
-        db_option_ext.transform_write_backend.as_str()
-    );
-    println!(
-        "   - transform_read_backend: {}",
-        db_option_ext.transform_read_backend.as_str()
-    );
-    if !db_option_ext.index_tree_enabled_target_types.is_empty() {
+    if std::env::var_os("AIOS_QUIET_CONFIG").is_none() {
+        // 打印加载的配置
+        println!("📋 加载的配置:");
         println!(
-            "   - 启用的 noun 类别: {:?}",
-            db_option_ext.index_tree_enabled_target_types
+            "   - default_lod: {:?}",
+            db_option_ext.inner.mesh_precision.default_lod
         );
-    }
-    if !db_option_ext.index_tree_excluded_target_types.is_empty() {
         println!(
-            "   - 排除的 noun: {:?}",
-            db_option_ext.index_tree_excluded_target_types
+            "   - LOD profiles 数量: {}",
+            db_option_ext.inner.mesh_precision.lod_profiles.len()
         );
-    }
-    println!(
-        "   - boolean_pipeline_mode: {:?}",
-        db_option_ext.boolean_pipeline_mode
-    );
-    if db_option_ext.enable_db_backfill {
-        println!("   - enable_db_backfill: true");
-    }
-    if let Some(output_root) = db_option_ext.output_root.as_deref() {
-        println!("   - output_root: {}", output_root);
+        println!(
+            "   - model_writer: {}",
+            db_option_ext.model_writer_mode.as_str()
+        );
+        println!(
+            "   - transform_write_backend: {}",
+            db_option_ext.transform_write_backend.as_str()
+        );
+        println!(
+            "   - transform_read_backend: {}",
+            db_option_ext.transform_read_backend.as_str()
+        );
+        if !db_option_ext.index_tree_enabled_target_types.is_empty() {
+            println!(
+                "   - 启用的 noun 类别: {:?}",
+                db_option_ext.index_tree_enabled_target_types
+            );
+        }
+        if !db_option_ext.index_tree_excluded_target_types.is_empty() {
+            println!(
+                "   - 排除的 noun: {:?}",
+                db_option_ext.index_tree_excluded_target_types
+            );
+        }
+        println!(
+            "   - boolean_pipeline_mode: {:?}",
+            db_option_ext.boolean_pipeline_mode
+        );
+        if db_option_ext.enable_db_backfill {
+            println!("   - enable_db_backfill: true");
+        }
+        if let Some(output_root) = db_option_ext.output_root.as_deref() {
+            println!("   - output_root: {}", output_root);
+        }
     }
 
     Ok(db_option_ext)

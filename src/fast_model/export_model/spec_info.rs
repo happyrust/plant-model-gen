@@ -1,4 +1,4 @@
-//! spec_info 表：按 IndexTree SITE 层级遍历，只导出 BRAN/HANG/EQUI/WALL/FLOOR 最小交付单元的专业信息
+//! spec_info 表：按 IndexTree SITE 层级遍历，导出 SITE 与 BRAN/HANG/EQUI/WALL/FLOOR 的专业信息
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,12 +24,16 @@ fn site_name_to_spec_value(name: &str) -> i64 {
     let name = name.to_uppercase();
     if name.contains("PIPE") {
         1
-    } else if name.contains("ELEC") {
+    } else if name.contains("ELEC") || name.contains("DIANQI") || name.contains("电气") {
         2
-    } else if name.contains("INST") {
+    } else if name.contains("INST") || name.contains("INSTR") {
         3
     } else if name.contains("HVAC") {
         4
+    } else if name.contains("CIVI") || name.contains("CIVIL") || name.contains("ARCH") {
+        5
+    } else if name.contains("STRU") || name.contains("STRUCT") {
+        6
     } else {
         0
     }
@@ -106,6 +110,15 @@ pub async fn build_spec_info_parquet(
     for site_refno in &site_refnos {
         let site_u64 = site_refno.0;
         let spec_value = *site_spec_map.get(&site_u64).unwrap_or(&0);
+        if spec_map.insert(site_u64, spec_value).is_none() {
+            let refno_str = RefnoEnum::from(*site_refno).to_string();
+            rows.push((refno_str, site_u64, "SITE".to_string(), spec_value, dbnum));
+        }
+    }
+
+    for site_refno in &site_refnos {
+        let site_u64 = site_refno.0;
+        let spec_value = *site_spec_map.get(&site_u64).unwrap_or(&0);
 
         let options = TreeQueryOptions {
             include_self: false,
@@ -132,7 +145,7 @@ pub async fn build_spec_info_parquet(
 
     if verbose {
         println!(
-            "   📋 spec_info: 收集到 {} 个 BRAN/HANG/EQUI/WALL/FLOOR, site_spec_map {} 条",
+            "   📋 spec_info: 收集到 {} 个 SITE/BRAN/HANG/EQUI/WALL/FLOOR, site_spec_map {} 条",
             rows.len(),
             site_spec_map.len()
         );

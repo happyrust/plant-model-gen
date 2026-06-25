@@ -450,175 +450,18 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
             return Err(e.into());
         }
 
-        // 模型生成完成后，若启用 export_parquet_after_gen：
-        // - 指定 manual_db_nums 时按指定库导出；
-        // - 全库部署时从 inst_relate 自动发现实际生成过的 DESI dbnum。
-        if db_option_ext.export_parquet_after_gen {
-            #[cfg(feature = "parquet-export")]
-            {
-                use crate::data_interface::db_meta_manager::db_meta;
-                use crate::fast_model::export_model::export_dbnum_instances_parquet::{
-                    export_dbnum_instances_parquet, query_distinct_dbnums_from_inst_relate,
-                };
-                use std::sync::Arc;
-
-                // gen_all_geos_data has already initialized the active DB context.
-                // Re-initializing here can fail in lean managed-site schemas while
-                // still leaving the generated inst_relate data ready for export.
-                let mut dbnums = db_option_ext
-                    .inner
-                    .manual_db_nums
-                    .clone()
-                    .filter(|values| !values.is_empty())
-                    .unwrap_or_else(Vec::new);
-
-                let dbnum_source = if dbnums.is_empty() {
-                    if db_meta().ensure_loaded().is_ok() {
-                        dbnums = db_meta().get_dbnums_by_type(&db_option_ext.inner.module);
-                        "db_meta_module"
-                    } else {
-                        match query_distinct_dbnums_from_inst_relate().await {
-                            Ok(discovered) if !discovered.is_empty() => {
-                                log::warn!(
-                                    "db_meta_info.json 不可用，临时从 inst_relate 发现 Parquet 导出 dbnum；可能包含非 DESI 库: {:?}",
-                                    discovered
-                                );
-                                dbnums = discovered;
-                                "inst_relate_fallback"
-                            }
-                            Ok(_) => {
-                                log::warn!(
-                                    "export_parquet_after_gen 已启用，但 inst_relate 未发现可导出的 dbnum"
-                                );
-                                "inst_relate_empty"
-                            }
-                            Err(err) => {
-                                log::error!("自动发现 Parquet 导出 dbnum 失败: {}", err);
-                                "inst_relate_error"
-                            }
-                        }
-                    }
-                } else {
-                    "manual_db_nums"
-                };
-
-                dbnums.sort_unstable();
-                dbnums.dedup();
-
-                if dbnums.is_empty() {
-                    log::warn!(
-                        "export_parquet_after_gen 已启用，但没有可导出的 dbnum (source={})",
-                        dbnum_source
-                    );
-                } else {
-                    log::info!(
-                        "📦 自动导出 Parquet: source={}, dbnums={:?}",
-                        dbnum_source,
-                        dbnums
-                    );
-                    log::info!("🔄 Parquet 导出前刷新 pe_transform: dbnums={:?}", dbnums);
-                    let refreshed = crate::pe_transform_refresh::refresh_pe_transform_for_dbnums(
-                        &dbnums,
-                        &db_option_ext,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Parquet 导出前刷新 pe_transform 失败: {}", e))?;
-                    log::info!(
-                        "✅ Parquet 导出前 pe_transform 刷新完成: {} 个节点",
-                        refreshed
-                    );
-                }
-
-                let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
-                let db_option = Arc::new(db_option_ext.inner.clone());
-                let parquet_root_refno = db_option_ext
-                    .inner
-                    .debug_model_refnos
-                    .as_ref()
-                    .and_then(|values| values.first())
-                    .and_then(|value| RefnoEnum::from_str(&value.replace('_', "/")).ok());
-                let export_started = Instant::now();
-                for dbnum in dbnums {
-                    log::info!("📦 自动导出 dbnum={} 的 Parquet...", dbnum);
-                    let output_dir = base_output_dir.join(dbnum.to_string());
-                    export_dbnum_instances_parquet(
-                        dbnum,
-                        &output_dir,
-                        db_option.clone(),
-                        true, // verbose
-                        None, // target_unit
-                        parquet_root_refno,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
-
-                    #[cfg(feature = "sqlite-index")]
-                    {
-                        use crate::spatial_index::SqliteSpatialIndex;
-                        use crate::sqlite_index::SqliteAabbIndex;
-
-                        let idx_path = SqliteSpatialIndex::default_path();
-                        if let Some(parent) = idx_path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        let idx = SqliteAabbIndex::open(&idx_path)?;
-                        let import_stats =
-                            idx.refresh_dbnum_from_parquet_dir(dbnum, &output_dir)?;
-                        log::info!(
-                            "SQLite spatial index refreshed from Parquet: dbnum={}, inserted={}, path={}",
-                            dbnum,
-                            import_stats.total_inserted,
-                            idx_path.display()
-                        );
-                    }
-
-                    #[cfg(not(feature = "sqlite-index"))]
-                    {
-                        log::warn!(
-                            "SQLite spatial index refresh skipped because sqlite-index feature is disabled"
-                        );
-                    }
-                }
-
-                // spec 004：导出阶段统计——walk parquet 输出目录汇总文件数与字节数。
-                {
-                    let mut parquet_files = 0usize;
-                    let mut parquet_bytes = 0u64;
-                    let mut json_files = 0usize;
-                    let mut json_bytes = 0u64;
-                    for entry in walkdir::WalkDir::new(&base_output_dir)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().is_file())
-                    {
-                        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        match entry.path().extension().and_then(|s| s.to_str()) {
-                            Some("parquet") => {
-                                parquet_files += 1;
-                                parquet_bytes += len;
-                            }
-                            Some("json") => {
-                                json_files += 1;
-                                json_bytes += len;
-                            }
-                            _ => {}
-                        }
-                    }
-                    crate::perf_metrics::record_export_stage(
-                        parquet_files,
-                        parquet_bytes,
-                        json_files,
-                        json_bytes,
-                        export_started.elapsed().as_millis() as u64,
-                    );
-                }
-            }
-            #[cfg(not(feature = "parquet-export"))]
-            {
-                log::warn!(
-                    "export_parquet_after_gen 已启用，但 parquet-export 特性未编译，跳过 Parquet 导出"
-                );
-            }
+        let parquet_report =
+            crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
+                &db_option_ext,
+                db_option_ext.inner.manual_db_nums.clone(),
+            )
+            .await?;
+        if parquet_report.enabled {
+            log::info!(
+                "生成后 Parquet 导出完成: dbnums={:?}, skipped={:?}",
+                parquet_report.exported_dbnums,
+                parquet_report.skipped_reason
+            );
         }
         crate::perf_metrics::finalize_task_metrics(true);
     }

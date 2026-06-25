@@ -14,13 +14,13 @@
 //! - `GET /api/sqlite-spatial/nearest-clearance` - 按 refno 或点查询最近净距
 //! - `GET /api/sqlite-spatial/stats` - 获取索引统计与健康信息
 
-use aios_core::RefnoEnum;
+use aios_core::{RefnoEnum, pdms_types::TOTAL_NEG_NOUN_NAMES};
 use axum::{extract::Query, response::Json};
 use glam::Vec3;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
@@ -104,6 +104,8 @@ pub struct SqliteSpatialQueryParams {
     pub spec_values: Option<String>,
     /// 是否包含自身（mode=refno 时有效，默认 true）
     pub include_self: Option<bool>,
+    /// 是否包含负实体（默认 false）
+    pub include_negative: Option<bool>,
     /// 查询形状："cube"（默认）| "sphere"（球体，会对结果做距离二次过滤）
     pub shape: Option<String>,
 }
@@ -142,7 +144,30 @@ pub struct SpatialQueryResult {
     /// 实际查询使用的 AABB（便于调试）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_bbox: Option<AabbDto>,
+    /// 本次查询结果可用的过滤选项
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_options: Option<SpatialQueryFilterOptions>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpatialQueryFilterOptions {
+    pub nouns: Vec<SpatialQueryNounFilterOption>,
+    pub spec_values: Vec<SpatialQuerySpecValueFilterOption>,
+    pub include_negative: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpatialQueryNounFilterOption {
+    pub value: String,
+    pub count: usize,
+    pub is_negative: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SpatialQuerySpecValueFilterOption {
+    pub value: i64,
+    pub count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -613,6 +638,20 @@ fn parse_spec_value_filter(spec_values: &Option<String>) -> Option<Vec<i64>> {
     })
 }
 
+fn negative_nouns() -> &'static HashSet<String> {
+    static NEGATIVE_NOUNS: OnceLock<HashSet<String>> = OnceLock::new();
+    NEGATIVE_NOUNS.get_or_init(|| {
+        TOTAL_NEG_NOUN_NAMES
+            .iter()
+            .map(|name| name.trim().to_uppercase())
+            .collect()
+    })
+}
+
+fn is_negative_noun(noun: &str) -> bool {
+    negative_nouns().contains(&noun.trim().to_uppercase())
+}
+
 fn error_spatial_query_result(
     error: impl Into<String>,
     query_bbox: Option<AabbDto>,
@@ -630,7 +669,54 @@ fn error_spatial_query_result(
         per_page: None,
         has_more: None,
         query_bbox,
+        filter_options: None,
         error: Some(error.into()),
+    }
+}
+
+fn empty_filter_options(include_negative: bool) -> SpatialQueryFilterOptions {
+    SpatialQueryFilterOptions {
+        nouns: vec![],
+        spec_values: vec![],
+        include_negative,
+    }
+}
+
+fn record_filter_option(
+    noun_counts: &mut BTreeMap<String, usize>,
+    spec_value_counts: &mut BTreeMap<i64, usize>,
+    noun: &str,
+    spec_value: i64,
+) {
+    let normalized_noun = noun.trim().to_uppercase();
+    let noun = if normalized_noun.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        normalized_noun
+    };
+    *noun_counts.entry(noun).or_insert(0) += 1;
+    *spec_value_counts.entry(spec_value).or_insert(0) += 1;
+}
+
+fn build_filter_options_from_counts(
+    noun_counts: BTreeMap<String, usize>,
+    spec_value_counts: BTreeMap<i64, usize>,
+    include_negative: bool,
+) -> SpatialQueryFilterOptions {
+    SpatialQueryFilterOptions {
+        nouns: noun_counts
+            .into_iter()
+            .map(|(value, count)| SpatialQueryNounFilterOption {
+                is_negative: is_negative_noun(&value),
+                value,
+                count,
+            })
+            .collect(),
+        spec_values: spec_value_counts
+            .into_iter()
+            .map(|(value, count)| SpatialQuerySpecValueFilterOption { value, count })
+            .collect(),
+        include_negative,
     }
 }
 
@@ -650,6 +736,7 @@ fn success_spatial_query_result(
     page: usize,
     per_page: usize,
     query_bbox: Option<AabbDto>,
+    filter_options: Option<SpatialQueryFilterOptions>,
 ) -> SpatialQueryResult {
     let returned_count = results.len();
     let end = page
@@ -671,6 +758,7 @@ fn success_spatial_query_result(
         per_page: Some(per_page),
         has_more: Some(has_more),
         query_bbox,
+        filter_options,
         error: None,
     }
 }
@@ -2349,6 +2437,7 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
         per_page: Some(per_page),
         has_more: Some(false),
         query_bbox: None,
+        filter_options: Some(empty_filter_options(params.include_negative.unwrap_or(false))),
         error: None,
     }
 }
@@ -2478,6 +2567,7 @@ fn query_by_target_geometry(
     let (page, per_page) = resolve_pagination(&params);
     let noun_filter = parse_noun_filter(&params.nouns);
     let spec_value_filter = parse_spec_value_filter(&params.spec_values);
+    let include_negative = params.include_negative.unwrap_or(false);
     let preferred_db_prefix = refno_db_prefix(params.refno.as_deref());
 
     let query_regions = match &target_geometry {
@@ -2489,7 +2579,14 @@ fn query_by_target_geometry(
     };
 
     if query_regions.is_empty() {
-        return success_spatial_query_result(vec![], 0, page, per_page, None);
+        return success_spatial_query_result(
+            vec![],
+            0,
+            page,
+            per_page,
+            None,
+            Some(empty_filter_options(include_negative)),
+        );
     }
 
     // 球体模式：使用候选 AABB 到目标 AABB/点的最小距离做二次过滤。
@@ -2540,6 +2637,8 @@ fn query_by_target_geometry(
     };
 
     let mut results: Vec<SpatialQueryResultItem> = Vec::with_capacity(ids.len().min(1024));
+    let mut noun_option_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut spec_value_option_counts: BTreeMap<i64, usize> = BTreeMap::new();
 
     for id in ids {
         // include_self 过滤
@@ -2555,17 +2654,8 @@ fn query_by_target_geometry(
             .unwrap_or(None);
         let (noun, spec_value) = item_row.unwrap_or_else(|| ("UNKNOWN".to_string(), 0));
 
-        // noun 过滤
-        if let Some(ref filter) = noun_filter {
-            if !filter.contains(&noun.to_uppercase()) {
-                continue;
-            }
-        }
-
-        if let Some(ref filter) = spec_value_filter {
-            if !filter.contains(&spec_value) {
-                continue;
-            }
+        if !include_negative && is_negative_noun(&noun) {
+            continue;
         }
 
         let aabb_row: Option<(f32, f32, f32, f32, f32, f32)> = stmt_aabb
@@ -2607,6 +2697,26 @@ fn query_by_target_geometry(
             aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz)
         });
 
+        record_filter_option(
+            &mut noun_option_counts,
+            &mut spec_value_option_counts,
+            &noun,
+            spec_value,
+        );
+
+        // noun 过滤
+        if let Some(ref filter) = noun_filter {
+            if !filter.contains(&noun.to_uppercase()) {
+                continue;
+            }
+        }
+
+        if let Some(ref filter) = spec_value_filter {
+            if !filter.contains(&spec_value) {
+                continue;
+            }
+        }
+
         let refno = i64_to_refno_str(id as i64);
         results.push(SpatialQueryResultItem {
             refno,
@@ -2643,7 +2753,20 @@ fn query_by_target_geometry(
         results.into_iter().skip(offset).take(per_page).collect()
     };
 
-    success_spatial_query_result(page_results, total_count, page, per_page, query_bbox_dto)
+    let filter_options = build_filter_options_from_counts(
+        noun_option_counts,
+        spec_value_option_counts,
+        include_negative,
+    );
+
+    success_spatial_query_result(
+        page_results,
+        total_count,
+        page,
+        per_page,
+        query_bbox_dto,
+        Some(filter_options),
+    )
 }
 
 // ============================================================================
@@ -2927,6 +3050,32 @@ mod tests {
             .unwrap_or(&[])
     }
 
+    fn base_spatial_bbox_params() -> SqliteSpatialQueryParams {
+        SqliteSpatialQueryParams {
+            mode: Some("bbox".to_string()),
+            refno: None,
+            x: None,
+            y: None,
+            z: None,
+            radius: None,
+            distance: Some(0.0),
+            minx: Some(-0.5),
+            miny: Some(-0.5),
+            minz: Some(-0.5),
+            maxx: Some(3.5),
+            maxy: Some(1.5),
+            maxz: Some(1.5),
+            max_results: None,
+            page: None,
+            per_page: None,
+            nouns: None,
+            spec_values: None,
+            include_self: None,
+            include_negative: None,
+            shape: None,
+        }
+    }
+
     #[test]
     fn bbox_query_returns_refno_strings() {
         let dir = tempdir().unwrap();
@@ -2981,6 +3130,7 @@ mod tests {
                 nouns: None,
                 spec_values: None,
                 include_self: None,
+                include_negative: None,
                 shape: None,
             };
             do_spatial_query(params, None, None)
@@ -3035,6 +3185,7 @@ mod tests {
                 nouns: None,
                 spec_values: None,
                 include_self: None,
+                include_negative: None,
                 shape: None,
             };
             do_spatial_query(params, None, None)
@@ -3098,6 +3249,7 @@ mod tests {
                 nouns: None,
                 spec_values: None,
                 include_self: None,
+                include_negative: None,
                 shape: None,
             };
             do_spatial_query(params, None, None)
@@ -3173,6 +3325,7 @@ mod tests {
                 nouns: None,
                 spec_values: None,
                 include_self: Some(false),
+                include_negative: None,
                 shape: None,
             };
             do_spatial_query(params, None, None)
@@ -3182,6 +3335,109 @@ mod tests {
         let items = resp.results.unwrap_or_default();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].refno, "1_2");
+    }
+
+    #[test]
+    fn spatial_query_excludes_negative_nouns_by_default() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                1,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "NBOX".to_string(),
+                1,
+                2.0,
+                3.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        let resp = with_test_index(&db, || do_spatial_query(base_spatial_bbox_params(), None, None));
+
+        assert!(resp.success);
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_1");
+        assert!(items.iter().all(|item| item.noun != "NBOX"));
+
+        let filter_options = resp.filter_options.unwrap();
+        assert!(!filter_options.include_negative);
+        assert_eq!(filter_options.nouns.len(), 1);
+        assert_eq!(filter_options.nouns[0].value, "PIPE");
+        assert!(!filter_options.nouns[0].is_negative);
+        assert!(filter_options.nouns.iter().all(|item| item.value != "NBOX"));
+    }
+
+    #[test]
+    fn spatial_query_includes_negative_nouns_when_requested() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                1,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "NBOX".to_string(),
+                2,
+                2.0,
+                3.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_spatial_bbox_params();
+            params.nouns = Some("NBOX".to_string());
+            params.spec_values = Some("2".to_string());
+            params.include_negative = Some(true);
+            do_spatial_query(params, None, None)
+        });
+
+        assert!(resp.success);
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_2");
+        assert_eq!(items[0].noun, "NBOX");
+        assert_eq!(items[0].spec_value, 2);
+
+        let filter_options = resp.filter_options.unwrap();
+        assert!(filter_options.include_negative);
+        assert!(filter_options
+            .nouns
+            .iter()
+            .any(|item| item.value == "NBOX" && item.is_negative));
     }
 
     #[test]

@@ -1325,7 +1325,8 @@ async fn rebuild_db_index_request(
     site_key: String,
 ) -> Result<DbIndexRebuildSummary> {
     use crate::data_interface::db_index::{
-        DbIndexStore, ScanReport, collect_design_outbound, prescan_roots_with_progress,
+        DbIndexStore, ScanReport, collect_design_outbound, collect_design_outbound_for_dbnums,
+        prescan_roots_with_progress,
     };
 
     let mut roots = Vec::new();
@@ -1401,10 +1402,11 @@ async fn rebuild_db_index_request(
         Err(err) => bail!("db_index phase1 任务失败: {err}"),
     }
 
-    let outbound = filter_design_outbound_for_manual_dbnums(
-        collect_design_outbound(&roots).await,
-        &payload.manual_db_nums,
-    );
+    let outbound = if payload.manual_db_nums.iter().any(|dbnum| *dbnum > 0) {
+        collect_design_outbound_for_dbnums(&roots, &payload.manual_db_nums).await
+    } else {
+        collect_design_outbound(&roots).await
+    };
     if !outbound.is_empty() {
         let index_p2 = index_path.clone();
         match task::spawn_blocking(move || -> Result<usize> {
@@ -1427,18 +1429,6 @@ async fn rebuild_db_index_request(
     }
 
     Ok(summary)
-}
-
-#[cfg(feature = "sqlite-index")]
-fn filter_design_outbound_for_manual_dbnums(
-    mut outbound: Vec<(u32, Vec<u32>)>,
-    manual_db_nums: &[u32],
-) -> Vec<(u32, Vec<u32>)> {
-    let target_dbnums = manual_db_nums.iter().copied().collect::<HashSet<_>>();
-    if !target_dbnums.is_empty() {
-        outbound.retain(|(src, _)| target_dbnums.contains(src));
-    }
-    outbound
 }
 
 async fn run_cli_job_request(payload: RunCliJobRequest) -> Result<RunCliJobResponse> {

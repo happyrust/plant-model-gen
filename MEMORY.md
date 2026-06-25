@@ -1,8 +1,8 @@
 # Memory — plant-model-gen-cata-closure
 
-> Generated: 2026-06-16 19:43:59  
-> Total memories: **12**  
-> Breakdown: decision: 3, event: 4, learning: 3, observation: 2
+> Generated: 2026-06-23 17:55:39  
+> Total memories: **18**  
+> Breakdown: decision: 3, event: 6, learning: 3, observation: 5, artifact: 1
 
 ---
 
@@ -96,11 +96,23 @@ MBD 候选发现已从只解析 SYST 扩展为解析 SYST/GLOB/GLB 系统库：s
 
 *Confidence: 1 | Status: active | Created: 2026-06-16T11:35:11*
 
+### Spec Kit 019 实施核对已推进：specs/019-system-mdb-dependen...
+
+Spec Kit 019 实施核对已推进：specs/019-system-mdb-dependency-discovery/tasks.md 已标记 T001-T009、T011-T013、T016-T017、T019-T023 为完成；静态验证通过 cargo fmt、cargo check --bin web_server --no-default-features --features ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import，以及 ui/admin 的 npx vue-tsc -b；T010/T014/T015/T018/T024 保留为需要运行服务 HTTP/POST 或实际响应观察的验证项。
+
+*Confidence: 1 | Status: active | Created: 2026-06-16T12:31:29*
+
 ### Configured MEMANTO for project plant-model-gen-cat...
 
 Configured MEMANTO for project plant-model-gen-cata-closure with cloud backend and active project agent. API key is stored outside the repository via MOORCHEH_API_KEY user environment variable.
 
 *Confidence: 1 | Status: active | Created: 2026-06-15T16:37:33 | Tags: `memanto`, `configuration`, `plant-model-gen-cata-closure`*
+
+### Spec Kit 019 系统库 MDB 依赖发现已完成运行服务 HTTP 验证：使用独立构建的 s...
+
+Spec Kit 019 系统库 MDB 依赖发现已完成运行服务 HTTP 验证：使用独立构建的 sidecar runtime/codex_validation/mdb_sidecar_target/debug/aios-database.exe 和临时 web_server:18080。T018 验证 candidates 返回 source_file/source_db_type；T010 使用 AvevaMarineSample /ALL1 dbnum 7997 成功 create-only quick deploy，resolved_db_file=ams7997_0001；T014 使用 AvevaPlantSample 窄 search_roots 触发 missing=24；T015 使用 E3D2.1 宽 search_roots 触发 ambiguous=36。已更新 specs/019-system-mdb-dependency-discovery/tasks.md 和 quickstart.md，并清理临时站点、web_server 与 sidecar 进程。
+
+*Confidence: 1 | Status: active | Created: 2026-06-16T13:17:16*
 
 ### 完成修复：自动房间计算已改为默认关闭，仅通过 AIOS_AUTO_ROOM_COMPUTE=1/tr...
 
@@ -156,13 +168,35 @@ Spec Kit 016 已扩展覆盖站点重命名后的模型生成 precheck 回归：
 
 *Confidence: 0.95 | Status: active | Created: 2026-06-16T10:39:49*
 
+### Spec Kit 019 HTTP 验证推进发现：运行中的 8080 release web_ser...
+
+Spec Kit 019 HTTP 验证推进发现：运行中的 8080 release web_server 与临时 18080 当前源码 web_server 都能调用 MDB candidates，但返回中缺少 source_file/source_db_type；原因定位为 web_server 启动的 aios-database sidecar 仍是旧 target/debug/aios-database.exe。parse_sidecar_client 支持 ADMIN_AIOS_DATABASE_BINARY 覆盖 sidecar 路径。target/debug/aios-database.exe 被运行进程占用导致无法覆盖，已改用 CARGO_TARGET_DIR=runtime/codex_validation/mdb_sidecar_target 独立构建；等待该产物完成后应设置 ADMIN_AIOS_DATABASE_BINARY 指向 runtime/codex_validation/mdb_sidecar_target/debug/aios-database.exe 并重启临时 web_server 验证 T018/T010。
+
+*Confidence: 1 | Status: active | Created: 2026-06-16T12:58:49*
+
+### PE 和属性 ATT 当前没有版本化存储；现有解析链路通过 INSERT IGNORE 写当前态 p...
+
+PE 和属性 ATT 当前没有版本化存储；现有解析链路通过 INSERT IGNORE 写当前态 pe、按 noun 的 ATT 表和 ATT_UDA，缺少 source_version/model_version 维度、PE/ATT snapshot、attr diff 与可按版本读取的 QueryProvider。
+
+*Confidence: 1 | Status: active | Created: 2026-06-23T09:01:07*
+
+### 当前模型生成/运行数据存储并没有保存版本化模型数据；现有 version_management 更偏...
+
+当前模型生成/运行数据存储并没有保存版本化模型数据；现有 version_management 更偏 release 包和 DuckLake 目录能力，生成成功后缺少版本数据持久化闭环。
+
+*Confidence: 1 | Status: active | Created: 2026-06-23T08:58:52*
+
 ---
 
 ## Artifacts
 
 *Tool outputs, files, reports, and external references.*
 
-*No memories of this type.*
+### 已为系统库 MDB 依赖发现创建 Spec Kit 019：specs/019-system-mdb...
+
+已为系统库 MDB 依赖发现创建 Spec Kit 019：specs/019-system-mdb-dependency-discovery，包含 spec、requirements checklist、plan、research、data-model、contract、quickstart、tasks；.specify/feature.json、AGENTS.md、.cursor/rules/specify-rules.mdc 已指向 specs/019-system-mdb-dependency-discovery/plan.md。
+
+*Confidence: 1 | Status: active | Created: 2026-06-16T12:07:25*
 
 ---
 

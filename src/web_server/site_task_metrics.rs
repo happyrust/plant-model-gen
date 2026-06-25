@@ -187,6 +187,29 @@ fn ingest_task_metrics_from_path(site_id: &str, task_id: &str, job_success: bool
         .cloned()
         .unwrap_or_else(|| json!({}))
         .to_string();
+    if let Some(parse) = file.get("stages").and_then(|v| v.get("parse")) {
+        let parse_duration = parse
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let max_db_duration = parse
+            .get("dbs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|db| db.get("duration_ms").and_then(Value::as_u64))
+            .max()
+            .unwrap_or_default();
+        if parse_duration < max_db_duration {
+            tracing::warn!(
+                site = %site_id,
+                task = %task_id,
+                parse_duration,
+                max_db_duration,
+                "任务指标异常：parse 阶段耗时小于单库最大耗时"
+            );
+        }
+    }
 
     let conn = match open_deployment_sites_sqlite() {
         Ok(c) => c,

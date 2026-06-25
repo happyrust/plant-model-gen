@@ -59,6 +59,7 @@ struct InstanceRow {
     trans_hash: String,
     aabb_hash: String,
     spec_value: i64,
+    spec_info_fallback: bool,
     has_neg: bool,
     dbnum: u32,
 }
@@ -83,6 +84,7 @@ struct TubingRow {
     trans_hash: String,
     aabb_hash: String,
     spec_value: i64,
+    spec_info_fallback: bool,
     dbnum: u32,
 }
 
@@ -186,6 +188,8 @@ fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<u64> {
 const MESH_CHECK_LOD_TAG: &str = "L1";
 const MESH_REPORT_REFNO_SAMPLE_LIMIT: usize = 50;
 const SURREAL_REFNO_QUERY_BATCH_SIZE: usize = 100;
+const PRIMITIVE_KEYPOINT_QUERY_BATCH_SIZE: usize = 50;
+const MAX_SPEC_ANCESTOR_DEPTH: usize = 64;
 
 struct MissingMeshReportSummary {
     report_file: String,
@@ -193,6 +197,20 @@ struct MissingMeshReportSummary {
     missing_geo_hashes: usize,
     missing_owner_refnos: usize,
     missing_geo_hash_values: HashSet<String>,
+}
+
+struct MeshValidationExportSummary {
+    policy: &'static str,
+    raw_checked_geo_hashes: usize,
+    raw_missing_geo_hashes: usize,
+    raw_missing_owner_refnos: usize,
+    render_missing_geo_hashes: usize,
+    render_missing_owner_refnos: usize,
+    quarantined_geo_hashes: usize,
+    quarantined_owner_refnos: usize,
+    dropped_geo_instance_rows: usize,
+    dropped_tubing_rows: usize,
+    dropped_instance_rows: usize,
 }
 
 fn mesh_base_dir_from_db_option(db_option: &DbOption) -> PathBuf {
@@ -229,7 +247,7 @@ fn mesh_candidates_for_geo_hash(
 }
 
 fn is_builtin_geo_hash(geo_hash: &str) -> bool {
-    matches!(geo_hash.trim(), "1" | "2" | "3")
+    matches!(geo_hash.trim(), "0" | "1" | "2" | "3")
 }
 
 fn record_geo_hash_usage(
@@ -249,6 +267,53 @@ fn record_geo_hash_usage(
     *row_count_by_hash.entry(hash.to_string()).or_insert(0) += 1;
 }
 
+fn tree_owner_refno(tree_manager: &TreeIndexManager, refno: RefnoEnum) -> Option<RefnoEnum> {
+    let meta = tree_manager.get_node_meta(refno)?;
+    (meta.owner.0 != 0).then(|| RefnoEnum::from(meta.owner))
+}
+
+fn resolve_spec_value_with_ancestors(
+    refno: RefnoEnum,
+    owner_refno: Option<RefnoEnum>,
+    tree_manager: &TreeIndexManager,
+    spec_info_map: &HashMap<u64, i64>,
+    cache: &mut HashMap<u64, i64>,
+) -> i64 {
+    let original_u64 = refno_to_u64(&refno);
+    if let Some(value) = cache.get(&original_u64) {
+        return *value;
+    }
+
+    let mut current = Some(refno);
+    for depth in 0..MAX_SPEC_ANCESTOR_DEPTH {
+        let Some(candidate) = current else {
+            break;
+        };
+        let candidate_u64 = refno_to_u64(&candidate);
+        if let Some(value) = spec_info_map
+            .get(&candidate_u64)
+            .copied()
+            .filter(|value| *value != 0)
+        {
+            cache.insert(original_u64, value);
+            return value;
+        }
+
+        let parent = if depth == 0 {
+            owner_refno.or_else(|| tree_owner_refno(tree_manager, candidate))
+        } else {
+            tree_owner_refno(tree_manager, candidate)
+        };
+        if parent.map(|p| refno_to_u64(&p)) == Some(candidate_u64) {
+            break;
+        }
+        current = parent;
+    }
+
+    cache.insert(original_u64, 0);
+    0
+}
+
 fn pe_record_list(refnos: &[RefnoEnum]) -> String {
     refnos
         .iter()
@@ -261,6 +326,8 @@ fn append_tubing_rows_for_owner(
     owner_refno: &RefnoEnum,
     tubis: &[TubiQueryResult],
     spec_info_map: &HashMap<u64, i64>,
+    tree_manager: &TreeIndexManager,
+    spec_lookup_cache: &mut HashMap<u64, i64>,
     dbnum: u32,
     tubing_rows: &mut Vec<TubingRow>,
     trans_hashes: &mut HashSet<String>,
@@ -287,8 +354,16 @@ fn append_tubing_rows_for_owner(
         let index = tubi.index.and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
 
         let mut tubi_spec = tubi.spec_value.unwrap_or(0);
+        let mut spec_info_fallback = false;
         if tubi_spec == 0 {
-            tubi_spec = *spec_info_map.get(&refno_to_u64(owner_refno)).unwrap_or(&0);
+            tubi_spec = resolve_spec_value_with_ancestors(
+                tubi.leave,
+                Some(*owner_refno),
+                tree_manager,
+                spec_info_map,
+                spec_lookup_cache,
+            );
+            spec_info_fallback = tubi_spec == 0;
         }
 
         tubing_rows.push(TubingRow {
@@ -301,6 +376,7 @@ fn append_tubing_rows_for_owner(
             trans_hash,
             aabb_hash,
             spec_value: tubi_spec,
+            spec_info_fallback,
             dbnum,
         });
         record_geo_hash_usage(
@@ -899,6 +975,7 @@ fn append_owner_chain_rows(
     instance_rows: &mut Vec<InstanceRow>,
     tree_manager: &TreeIndexManager,
     spec_info_map: &HashMap<u64, i64>,
+    spec_lookup_cache: &mut HashMap<u64, i64>,
     dbnum: u32,
     root_refno: Option<RefnoEnum>,
     verbose: bool,
@@ -932,7 +1009,13 @@ fn append_owner_chain_rows(
         let owner_noun = parent_refno
             .and_then(|parent| tree_manager.get_noun(parent))
             .unwrap_or_default();
-        let spec_value = *spec_info_map.get(&owner_u64).unwrap_or(&0);
+        let spec_value = resolve_spec_value_with_ancestors(
+            owner_refno,
+            parent_refno,
+            tree_manager,
+            spec_info_map,
+            spec_lookup_cache,
+        );
 
         present_refnos.insert(owner_u64);
         if let Some(parent_u64) = parent_u64 {
@@ -952,6 +1035,7 @@ fn append_owner_chain_rows(
             trans_hash: String::new(),
             aabb_hash: String::new(),
             spec_value,
+            spec_info_fallback: spec_value == 0,
             has_neg: false,
             dbnum,
         });
@@ -1072,6 +1156,11 @@ fn inst_info_record_ref(id: &str) -> String {
         "inst_info:⟨{}⟩",
         id.trim().trim_matches('⟨').trim_matches('⟩')
     )
+}
+
+fn synthetic_ptset_lookup_key(refno: RefnoEnum) -> String {
+    // ponytail: keep the Parquet schema stable; this string is a PTSET lookup key, not a catalog hash.
+    format!("refno:{refno}")
 }
 
 fn parse_vec3_value(value: &serde_json::Value) -> Option<glam::Vec3> {
@@ -1480,22 +1569,27 @@ async fn query_ptset_export_data(refnos: &[RefnoEnum], verbose: bool) -> Result<
             let inst_info_id = normalize_record_id(row.inst_info_id);
             let cata_hash = normalize_cata_hash(row.cata_hash)
                 .or_else(|| inst_info_id.as_deref().and_then(normalize_cata_hash_str));
-            let Some(cata_hash) = cata_hash else {
-                invalid_cata_hash_rows += 1;
-                continue;
+            let has_catalog_cata_hash = cata_hash.is_some();
+            let ptset_axes = row.ptset.map(parse_ptset_value).unwrap_or_default();
+            let cata_hash = match cata_hash {
+                Some(cata_hash) => cata_hash,
+                None if !ptset_axes.is_empty() => synthetic_ptset_lookup_key(row.refno),
+                None => {
+                    invalid_cata_hash_rows += 1;
+                    continue;
+                }
             };
             let inst_info_id = inst_info_id.unwrap_or_else(|| cata_hash.clone());
 
             refno_cata_hash.insert(row.refno, cata_hash.clone());
-            cata_hash_inst_info
-                .entry(cata_hash.clone())
-                .or_insert(inst_info_id);
+            if has_catalog_cata_hash {
+                cata_hash_inst_info
+                    .entry(cata_hash.clone())
+                    .or_insert(inst_info_id);
+            }
 
-            if row.ptset.is_some() && !rows_by_cata_hash.contains_key(&cata_hash) {
-                let ptset_rows = row
-                    .ptset
-                    .map(parse_ptset_value)
-                    .unwrap_or_default()
+            if !ptset_axes.is_empty() && !rows_by_cata_hash.contains_key(&cata_hash) {
+                let ptset_rows = ptset_axes
                     .iter()
                     .map(|axis| axis_to_ptset_row(&cata_hash, axis))
                     .collect::<Vec<_>>();
@@ -1614,65 +1708,55 @@ async fn query_primitive_keypoint_rows(
         return Ok(Vec::new());
     }
 
+    let primitive_keypoints_enabled = std::env::var("AIOS_PARQUET_ENABLE_PRIMITIVE_KEYPOINTS")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if !primitive_keypoints_enabled {
+        if verbose {
+            println!(
+                "⚠️ primitive_keypoints.parquet 默认跳过: geo_hashes={}（设置 AIOS_PARQUET_ENABLE_PRIMITIVE_KEYPOINTS=1 可启用慢查询）",
+                geo_hashes.len()
+            );
+        }
+        return Ok(Vec::new());
+    }
+
     let mut rows_by_geo_hash: HashMap<String, Vec<PrimitiveKeyPointRow>> = HashMap::new();
     let mut sorted_geo_hashes = geo_hashes.iter().cloned().collect::<Vec<_>>();
     sorted_geo_hashes.sort();
 
-    for chunk in sorted_geo_hashes.chunks(500) {
-        let quoted_hashes = chunk
-            .iter()
-            .map(|hash| format!("'{}'", hash.replace('\\', "\\\\").replace('\'', "\\'")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let sql = format!(
-            r#"
-            SELECT
-                record::id(out) AS geo_hash,
-                pts[*].d AS pts
-            FROM geo_relate
-            WHERE visible
-              AND record::id(out) IN [{quoted_hashes}]
-              AND pts != NONE
-            "#
-        );
-
-        let query_rows: Vec<PrimitiveKeyPointQueryRow> = aios_core::project_primary_db()
-            .query_take(&sql, 0)
-            .await
-            .with_context(|| format!("query_primitive_keypoint_rows SQL: {sql}"))?;
-
-        for query_row in query_rows {
-            if rows_by_geo_hash.contains_key(&query_row.geo_hash) {
-                continue;
+    for chunk in sorted_geo_hashes.chunks(PRIMITIVE_KEYPOINT_QUERY_BATCH_SIZE) {
+        match query_primitive_keypoint_rows_chunk(chunk).await {
+            Ok(query_rows) => {
+                merge_primitive_keypoint_query_rows(query_rows, &mut rows_by_geo_hash);
             }
-
-            let rows = query_row
-                .pts
-                .unwrap_or_default()
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .map(|(idx, point)| {
-                    let v = point.0;
-                    PrimitiveKeyPointRow {
-                        geo_hash: query_row.geo_hash.clone(),
-                        keypoint_index: idx as i32,
-                        kind: "key_point".to_string(),
-                        local_x: v.x as f64,
-                        local_y: v.y as f64,
-                        local_z: v.z as f64,
-                        has_dir: false,
-                        dir_x: 0.0,
-                        dir_y: 0.0,
-                        dir_z: 0.0,
-                        source: "geo_relate.pts".to_string(),
+            Err(err) if chunk.len() > 1 => {
+                eprintln!(
+                    "⚠️ primitive_keypoints 批量查询失败，将拆分单条重试: chunk_size={}, error={err:#}",
+                    chunk.len()
+                );
+                for geo_hash in chunk {
+                    match query_primitive_keypoint_rows_chunk(std::slice::from_ref(geo_hash)).await
+                    {
+                        Ok(query_rows) => {
+                            merge_primitive_keypoint_query_rows(query_rows, &mut rows_by_geo_hash);
+                        }
+                        Err(single_err) => {
+                            eprintln!(
+                                "⚠️ primitive_keypoints 跳过 geo_hash={}，查询失败: {single_err:#}",
+                                geo_hash
+                            );
+                        }
                     }
-                })
-                .collect::<Vec<_>>();
-
-            if !rows.is_empty() {
-                rows_by_geo_hash.insert(query_row.geo_hash, rows);
+                }
+            }
+            Err(err) => {
+                if let Some(geo_hash) = chunk.first() {
+                    eprintln!(
+                        "⚠️ primitive_keypoints 跳过 geo_hash={}，查询失败: {err:#}",
+                        geo_hash
+                    );
+                }
             }
         }
     }
@@ -1704,6 +1788,76 @@ async fn query_primitive_keypoint_rows(
     Ok(rows)
 }
 
+async fn query_primitive_keypoint_rows_chunk(
+    chunk: &[String],
+) -> Result<Vec<PrimitiveKeyPointQueryRow>> {
+    if chunk.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let quoted_hashes = chunk
+        .iter()
+        .map(|hash| format!("'{}'", hash.replace('\\', "\\\\").replace('\'', "\\'")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        r#"
+        SELECT
+            record::id(out) AS geo_hash,
+            pts[*].d AS pts
+        FROM geo_relate
+        WHERE visible
+          AND record::id(out) IN [{quoted_hashes}]
+          AND pts != NONE
+        "#
+    );
+
+    aios_core::project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .with_context(|| format!("query_primitive_keypoint_rows chunk_size={}", chunk.len()))
+}
+
+fn merge_primitive_keypoint_query_rows(
+    query_rows: Vec<PrimitiveKeyPointQueryRow>,
+    rows_by_geo_hash: &mut HashMap<String, Vec<PrimitiveKeyPointRow>>,
+) {
+    for query_row in query_rows {
+        if rows_by_geo_hash.contains_key(&query_row.geo_hash) {
+            continue;
+        }
+
+        let rows = query_row
+            .pts
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(idx, point)| {
+                let v = point.0;
+                PrimitiveKeyPointRow {
+                    geo_hash: query_row.geo_hash.clone(),
+                    keypoint_index: idx as i32,
+                    kind: "key_point".to_string(),
+                    local_x: v.x as f64,
+                    local_y: v.y as f64,
+                    local_z: v.z as f64,
+                    has_dir: false,
+                    dir_x: 0.0,
+                    dir_y: 0.0,
+                    dir_z: 0.0,
+                    source: "geo_relate.pts".to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if !rows.is_empty() {
+            rows_by_geo_hash.insert(query_row.geo_hash, rows);
+        }
+    }
+}
+
 /// 本地实现导出专用实例查询。
 ///
 /// 直接内联导出所需的 SurrealQL，避免外部 aios_core 依赖图或 cargo patch
@@ -1711,6 +1865,7 @@ async fn query_primitive_keypoint_rows(
 async fn query_export_insts_local(
     refnos: &[RefnoEnum],
     enable_holes: bool,
+    verbose: bool,
 ) -> Result<Vec<aios_core::ExportInstQuery>> {
     if refnos.is_empty() {
         return Ok(Vec::new());
@@ -1718,8 +1873,11 @@ async fn query_export_insts_local(
 
     let batch_size = 50;
     let mut results = Vec::new();
+    let total_batches = refnos.len().div_ceil(batch_size);
+    let query_start = std::time::Instant::now();
 
-    for chunk in refnos.chunks(batch_size) {
+    for (batch_idx, chunk) in refnos.chunks(batch_size).enumerate() {
+        let batch_start = std::time::Instant::now();
         if enable_holes {
             let bool_keys = chunk
                 .iter()
@@ -1847,6 +2005,27 @@ async fn query_export_insts_local(
                 results.append(&mut chunk_results);
             }
         }
+
+        if verbose && ((batch_idx + 1) % 20 == 0 || batch_idx + 1 == total_batches) {
+            println!(
+                "   - geo hash batch {}/{}: chunk={}, results_so_far={}, batch_elapsed={:?}, total_elapsed={:?}",
+                batch_idx + 1,
+                total_batches,
+                chunk.len(),
+                results.len(),
+                batch_start.elapsed(),
+                query_start.elapsed()
+            );
+        }
+    }
+
+    if verbose {
+        println!(
+            "✅ 几何体实例 hash 查询完成: {} / {} refno ({:?})",
+            results.len(),
+            refnos.len(),
+            query_start.elapsed()
+        );
     }
 
     Ok(results)
@@ -2078,6 +2257,7 @@ pub struct ParquetExportStats {
     pub tubing_count: usize,
     pub transform_count: usize,
     pub aabb_count: usize,
+    pub spec_info_fallback_count: usize,
     pub total_bytes: u64,
     pub elapsed: std::time::Duration,
 }
@@ -2173,6 +2353,7 @@ pub async fn export_dbnum_instances_parquet(
         refno: RefnoEnum,
         noun: String,
         spec_value: i64,
+        spec_info_fallback: bool,
         owner_refno: Option<RefnoEnum>,
         owner_type: String,
     }
@@ -2181,6 +2362,7 @@ pub async fn export_dbnum_instances_parquet(
     let mut ungrouped: Vec<ChildInfo> = Vec::new();
     let mut in_refnos: Vec<RefnoEnum> = Vec::new();
     let mut in_refno_set: HashSet<RefnoEnum> = HashSet::new();
+    let mut spec_lookup_cache: HashMap<u64, i64> = HashMap::new();
 
     for row in inst_rows {
         let owner_type = row
@@ -2190,19 +2372,22 @@ pub async fn export_dbnum_instances_parquet(
             .to_ascii_uppercase();
 
         let mut spec_value = row.spec_value.unwrap_or(0);
+        let mut spec_info_fallback = false;
         if spec_value == 0 {
-            spec_value = *spec_info_map.get(&refno_to_u64(&row.refno)).unwrap_or(&0);
-            // 组件(ELBO/BEND等)的 refno 不在 spec_info，用 owner(BRAN/HANG) 查
-            if spec_value == 0 {
-                if let Some(owner) = &row.owner_refno {
-                    spec_value = *spec_info_map.get(&refno_to_u64(owner)).unwrap_or(&0);
-                }
-            }
+            spec_value = resolve_spec_value_with_ancestors(
+                row.refno,
+                row.owner_refno,
+                &tree_manager,
+                &spec_info_map,
+                &mut spec_lookup_cache,
+            );
+            spec_info_fallback = spec_value == 0;
         }
         let child = ChildInfo {
             refno: row.refno,
             noun: row.noun.unwrap_or_default(),
             spec_value,
+            spec_info_fallback,
             owner_refno: row.owner_refno,
             owner_type: owner_type.clone(),
         };
@@ -2245,17 +2430,20 @@ pub async fn export_dbnum_instances_parquet(
             .and_then(|owner| tree_manager.get_noun(owner))
             .unwrap_or_default()
             .to_ascii_uppercase();
-        let mut spec_value = *spec_info_map.get(&refno_to_u64(&refno)).unwrap_or(&0);
-        if spec_value == 0 {
-            if let Some(owner) = owner_refno {
-                spec_value = *spec_info_map.get(&refno_to_u64(&owner)).unwrap_or(&0);
-            }
-        }
+        let spec_value = resolve_spec_value_with_ancestors(
+            refno,
+            owner_refno,
+            &tree_manager,
+            &spec_info_map,
+            &mut spec_lookup_cache,
+        );
+        let spec_info_fallback = spec_value == 0;
 
         let child = ChildInfo {
             refno,
             noun: tree_manager.get_noun(refno).unwrap_or_default(),
             spec_value,
+            spec_info_fallback,
             owner_refno,
             owner_type: owner_type.clone(),
         };
@@ -2288,7 +2476,7 @@ pub async fn export_dbnum_instances_parquet(
     }
     let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
     if !in_refnos.is_empty() {
-        match query_export_insts_local(&in_refnos, true).await {
+        match query_export_insts_local(&in_refnos, true, verbose).await {
             Ok(export_insts) => {
                 for inst in export_insts {
                     export_inst_map.insert(inst.refno, inst);
@@ -2434,6 +2622,7 @@ pub async fn export_dbnum_instances_parquet(
                     trans_hash: trans_hash.clone(),
                     aabb_hash: child_aabb_hash,
                     spec_value: child.spec_value,
+                    spec_info_fallback: child.spec_info_fallback,
                     has_neg,
                     dbnum,
                 });
@@ -2465,6 +2654,8 @@ pub async fn export_dbnum_instances_parquet(
                 owner_refno,
                 tubis,
                 &spec_info_map,
+                &tree_manager,
+                &mut spec_lookup_cache,
                 dbnum,
                 &mut tubing_rows,
                 &mut trans_hashes,
@@ -2485,6 +2676,8 @@ pub async fn export_dbnum_instances_parquet(
                 owner_refno,
                 tubis,
                 &spec_info_map,
+                &tree_manager,
+                &mut spec_lookup_cache,
                 dbnum,
                 &mut tubing_rows,
                 &mut trans_hashes,
@@ -2534,6 +2727,7 @@ pub async fn export_dbnum_instances_parquet(
                 trans_hash: trans_hash.clone(),
                 aabb_hash: child_aabb_hash,
                 spec_value: child.spec_value,
+                spec_info_fallback: child.spec_info_fallback,
                 has_neg,
                 dbnum,
             });
@@ -2577,6 +2771,19 @@ pub async fn export_dbnum_instances_parquet(
             )
         })
         .unwrap_or(false);
+    let mut mesh_validation_summary = MeshValidationExportSummary {
+        policy: "retain_missing_mesh_rows",
+        raw_checked_geo_hashes: missing_mesh_report.checked_geo_hashes,
+        raw_missing_geo_hashes: missing_mesh_report.missing_geo_hashes,
+        raw_missing_owner_refnos: missing_mesh_report.missing_owner_refnos,
+        render_missing_geo_hashes: missing_mesh_report.missing_geo_hashes,
+        render_missing_owner_refnos: missing_mesh_report.missing_owner_refnos,
+        quarantined_geo_hashes: 0,
+        quarantined_owner_refnos: 0,
+        dropped_geo_instance_rows: 0,
+        dropped_tubing_rows: 0,
+        dropped_instance_rows: 0,
+    };
     if drop_missing_mesh_rows && !missing_mesh_report.missing_geo_hash_values.is_empty() {
         let before_geo_rows = geo_instance_rows.len();
         let before_tubing_rows = tubing_rows.len();
@@ -2600,6 +2807,20 @@ pub async fn export_dbnum_instances_parquet(
             .collect::<HashSet<_>>();
         instance_rows.retain(|row| renderable_refnos.contains(&row.refno_str));
 
+        mesh_validation_summary = MeshValidationExportSummary {
+            policy: "quarantine_missing_mesh_rows",
+            raw_checked_geo_hashes: missing_mesh_report.checked_geo_hashes,
+            raw_missing_geo_hashes: missing_mesh_report.missing_geo_hashes,
+            raw_missing_owner_refnos: missing_mesh_report.missing_owner_refnos,
+            render_missing_geo_hashes: 0,
+            render_missing_owner_refnos: 0,
+            quarantined_geo_hashes: missing_mesh_report.missing_geo_hashes,
+            quarantined_owner_refnos: missing_mesh_report.missing_owner_refnos,
+            dropped_geo_instance_rows: before_geo_rows.saturating_sub(geo_instance_rows.len()),
+            dropped_tubing_rows: before_tubing_rows.saturating_sub(tubing_rows.len()),
+            dropped_instance_rows: before_instance_rows.saturating_sub(instance_rows.len()),
+        };
+
         if verbose {
             println!(
                 "   ⚠️ 已从 Parquet 渲染表剔除缺失 GLB: geo_rows {} -> {}, tubings {} -> {}, instances {} -> {}",
@@ -2622,6 +2843,7 @@ pub async fn export_dbnum_instances_parquet(
         &mut instance_rows,
         &tree_manager,
         &spec_info_map,
+        &mut spec_lookup_cache,
         dbnum,
         root_refno,
         verbose,
@@ -2650,6 +2872,17 @@ pub async fn export_dbnum_instances_parquet(
             ptset_rows.len()
         );
     }
+
+    let instance_spec_info_fallback_rows = instance_rows
+        .iter()
+        .filter(|row| row.spec_info_fallback)
+        .count();
+    let tubing_spec_info_fallback_rows = tubing_rows
+        .iter()
+        .filter(|row| row.spec_info_fallback)
+        .count();
+    let spec_info_fallback_count =
+        instance_spec_info_fallback_rows + tubing_spec_info_fallback_rows;
 
     let used_geo_hashes = geo_instance_rows
         .iter()
@@ -2843,10 +3076,28 @@ pub async fn export_dbnum_instances_parquet(
         "mesh_validation": {
             "lod_tag": MESH_CHECK_LOD_TAG,
             "report_file": missing_mesh_report.report_file,
-            "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
-            "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
-            "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
+            "policy": mesh_validation_summary.policy,
+            "checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
+            "missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
+            "missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
+            "raw_checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
+            "raw_missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
+            "raw_missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
+            "render_missing_geo_hashes": mesh_validation_summary.render_missing_geo_hashes,
+            "render_missing_owner_refnos": mesh_validation_summary.render_missing_owner_refnos,
+            "quarantined_geo_hashes": mesh_validation_summary.quarantined_geo_hashes,
+            "quarantined_owner_refnos": mesh_validation_summary.quarantined_owner_refnos,
+            "dropped_geo_instance_rows": mesh_validation_summary.dropped_geo_instance_rows,
+            "dropped_tubing_rows": mesh_validation_summary.dropped_tubing_rows,
+            "dropped_instance_rows": mesh_validation_summary.dropped_instance_rows,
         },
+        "spec_info_validation": {
+            "fallback_count": spec_info_fallback_count,
+            "instance_fallback_rows": instance_spec_info_fallback_rows,
+            "tubing_fallback_rows": tubing_spec_info_fallback_rows,
+            "definition": "raw/default zero spec_value unresolved by spec_info self, owner, or ancestor lookup",
+        },
+        "spec_info_fallback_count": spec_info_fallback_count,
         "ptset_unit": {
             "source": LengthUnit::Millimeter.name(),
             "target": target.name(),
@@ -2929,10 +3180,28 @@ pub async fn export_dbnum_instances_parquet(
             "mesh_validation": {
                 "lod_tag": MESH_CHECK_LOD_TAG,
                 "report_file": format!("{}/{}", subdir, missing_mesh_report.report_file),
-                "checked_geo_hashes": missing_mesh_report.checked_geo_hashes,
-                "missing_geo_hashes": missing_mesh_report.missing_geo_hashes,
-                "missing_owner_refnos": missing_mesh_report.missing_owner_refnos,
+                "policy": mesh_validation_summary.policy,
+                "checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
+                "missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
+                "missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
+                "raw_checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
+                "raw_missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
+                "raw_missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
+                "render_missing_geo_hashes": mesh_validation_summary.render_missing_geo_hashes,
+                "render_missing_owner_refnos": mesh_validation_summary.render_missing_owner_refnos,
+                "quarantined_geo_hashes": mesh_validation_summary.quarantined_geo_hashes,
+                "quarantined_owner_refnos": mesh_validation_summary.quarantined_owner_refnos,
+                "dropped_geo_instance_rows": mesh_validation_summary.dropped_geo_instance_rows,
+                "dropped_tubing_rows": mesh_validation_summary.dropped_tubing_rows,
+                "dropped_instance_rows": mesh_validation_summary.dropped_instance_rows,
             },
+            "spec_info_validation": {
+                "fallback_count": spec_info_fallback_count,
+                "instance_fallback_rows": instance_spec_info_fallback_rows,
+                "tubing_fallback_rows": tubing_spec_info_fallback_rows,
+                "definition": "raw/default zero spec_value unresolved by spec_info self, owner, or ancestor lookup",
+            },
+            "spec_info_fallback_count": spec_info_fallback_count,
             "ptset_unit": {
                 "source": LengthUnit::Millimeter.name(),
                 "target": target.name(),
@@ -2980,6 +3249,7 @@ pub async fn export_dbnum_instances_parquet(
         tubing_count: tubing_rows.len(),
         transform_count: transform_rows.len(),
         aabb_count: aabb_row_data.len(),
+        spec_info_fallback_count,
         total_bytes,
         elapsed,
     })

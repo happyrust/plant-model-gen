@@ -4190,6 +4190,13 @@ fn quick_deploy_path_prefix_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn quick_deploy_path_is_strict_child(child: &str, parent: &str) -> bool {
+    if child.is_empty() || parent.is_empty() || child == parent {
+        return false;
+    }
+    child.starts_with(&format!("{parent}\\"))
+}
+
 fn quick_deploy_request_target_db_file(req: &QuickDeployTestRequest) -> Option<&str> {
     req.db_file
         .as_deref()
@@ -4374,6 +4381,30 @@ fn filter_quick_deploy_projects_for_mbd(
         return projects.to_vec();
     }
 
+    let filtered_keys = filtered
+        .iter()
+        .map(|project| quick_deploy_path_prefix_key(Path::new(project.path.trim())))
+        .collect::<Vec<_>>();
+    let mut keep = vec![true; filtered.len()];
+    for (idx, key) in filtered_keys.iter().enumerate() {
+        if key.is_empty() {
+            continue;
+        }
+        if filtered_keys.iter().enumerate().any(|(other_idx, other)| {
+            idx != other_idx && quick_deploy_path_is_strict_child(key, other)
+        }) {
+            keep[idx] = false;
+        }
+    }
+    filtered = filtered
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, project)| keep[idx].then_some(project))
+        .collect();
+    if filtered.is_empty() {
+        return projects.to_vec();
+    }
+
     for (idx, project) in filtered.iter_mut().enumerate() {
         project.is_primary =
             !target_project.is_empty() && project.name.trim().eq_ignore_ascii_case(&target_project);
@@ -4446,9 +4477,12 @@ async fn discover_quick_deploy_projects_for_source(
         selected.push(project);
     }
 
-    for entry in fs::read_dir(parent)
-        .with_context(|| format!("读取 quick deploy sibling 工程目录失败: {}", parent.display()))?
-    {
+    for entry in fs::read_dir(parent).with_context(|| {
+        format!(
+            "读取 quick deploy sibling 工程目录失败: {}",
+            parent.display()
+        )
+    })? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_dir() {
@@ -9852,6 +9886,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             "🧩 生成 CATA refno 闭包 manifest（仅处理 manual_db_nums 指定的 DESI 库）...",
         );
         let parse_log_path = parse_log_path_for_site(&site);
+        let closure_args = vec!["gen-cata-closure".to_string()];
         let closure_job = run_sidecar_cli_job_with_site_events(
             &site.site_id,
             SidecarCliJobKind::Parse,
@@ -9860,7 +9895,7 @@ async fn spawn_parse_process(site_id: String) -> Result<()> {
             repo.to_string_lossy().to_string(),
             parse_log_path.clone(),
             parse_log_path,
-            vec!["gen-cata-closure".to_string(), "--rescan-index".to_string()],
+            closure_args,
             metrics_env.clone(),
         )
         .await
@@ -11736,10 +11771,14 @@ pub(crate) fn site_db_index_path(site_id: &str) -> PathBuf {
     site_runtime_dir(site_id).join(crate::data_interface::db_index::DB_INDEX_FILE_NAME)
 }
 
-/// 站点级 db_index.sqlite 路径（runtime/admin_sites/<project_slug>/<site_id>/db_index.sqlite）。
+/// 站点级 db_index.sqlite 路径。
+///
+/// 解析预览、db_index 预扫描、CATA closure 必须使用同一份索引；closure CLI
+/// 默认读取 `<output_root>/<project>/scene_tree/db_index.sqlite`，这里与其对齐，
+/// 避免预扫描写 runtime 目录而 closure 再次 `--rescan-index` 重建一份。
 #[cfg(feature = "sqlite-index")]
 fn site_db_index_path_for_site(site: &ManagedProjectSite) -> PathBuf {
-    site_runtime_dir_for_site(site).join(crate::data_interface::db_index::DB_INDEX_FILE_NAME)
+    cata_index_path_for_site(site)
 }
 
 /// 站点预扫描的 (project_name, root_path) 列表（多工程用 projects[]，否则回退派生根）。

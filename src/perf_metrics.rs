@@ -8,8 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -56,14 +57,39 @@ pub struct ParseDbMetrics {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParseStageMetrics {
     pub dbs: Vec<ParseDbMetrics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ParseProgressMetrics>,
     pub total_elements: usize,
     /// failed_sql 转储计数（写入失败诊断）。
     pub error_count: usize,
+    #[serde(default)]
+    pub db_duration_sum_ms: u64,
+    #[serde(default)]
+    pub db_duration_max_ms: u64,
     pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParseProgressMetrics {
+    pub stage: String,
+    pub project_name: String,
+    pub file_name: String,
+    pub dbnum: u32,
+    pub db_type: String,
+    pub save_db: bool,
+    pub refnos_total: usize,
+    pub chunks_total: usize,
+    pub chunks_completed: usize,
+    pub last_chunk: Option<usize>,
+    pub parsed_attrs: usize,
+    pub elapsed_ms: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerateStageMetrics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<GenerateProgressMetrics>,
     pub inst_relate: usize,
     pub inst_info: usize,
     pub inst_relate_aabb: usize,
@@ -77,6 +103,14 @@ pub struct GenerateStageMetrics {
     pub error_count: usize,
     pub cache_miss: usize,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenerateProgressMetrics {
+    pub stage: String,
+    pub detail: Option<String>,
+    pub elapsed_ms: u64,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,6 +166,26 @@ pub struct TaskMetricsCollector {
 }
 
 static COLLECTOR: OnceCell<Option<TaskMetricsCollector>> = OnceCell::new();
+
+pub struct GenerateHeartbeatGuard {
+    stop: Option<Arc<(Mutex<bool>, Condvar)>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for GenerateHeartbeatGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let (lock, cvar) = &*stop;
+            if let Ok(mut stopped) = lock.lock() {
+                *stopped = true;
+                cvar.notify_all();
+            }
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 /// 从 env 初始化全局采集器；未设置 `AIOS_TASK_METRICS_PATH` 时为 None（全程 no-op）。
 pub fn init_task_metrics_from_env() {
@@ -203,13 +257,18 @@ impl TaskMetricsCollector {
 
     /// 原子落盘当前快照（每次记录后调用，保证中断也有部分产物）。
     fn flush(&self, inner: &CollectorInner) {
+        let now = chrono::Local::now().to_rfc3339();
+        let finished_at = inner.finished.then_some(now.clone());
+        let duration_ms =
+            wall_duration_ms(&self.started_at, finished_at.as_deref().unwrap_or(&now))
+                .unwrap_or_else(|| self.started.elapsed().as_millis() as u64);
         let file = TaskMetricsFile {
             schema_version: TASK_METRICS_SCHEMA_VERSION,
             task_id: self.task_id.clone(),
             job_kind: self.infer_kind(inner),
             started_at: self.started_at.clone(),
-            finished_at: inner.finished.then(|| chrono::Local::now().to_rfc3339()),
-            duration_ms: self.started.elapsed().as_millis() as u64,
+            finished_at,
+            duration_ms,
             success: inner.success,
             stages: inner.stages.clone(),
         };
@@ -221,6 +280,13 @@ impl TaskMetricsCollector {
             );
         }
     }
+}
+
+fn wall_duration_ms(started_at: &str, finished_at: &str) -> Option<u64> {
+    let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+    let finished = chrono::DateTime::parse_from_rfc3339(finished_at).ok()?;
+    let ms = finished.signed_duration_since(started).num_milliseconds();
+    (ms >= 0).then_some(ms as u64)
 }
 
 fn write_json_atomic(path: &Path, value: &TaskMetricsFile) -> anyhow::Result<()> {
@@ -274,6 +340,45 @@ pub fn note_parse_db_mode(dbnum: u32, mode: &str, total_in_file: usize) {
     });
 }
 
+pub struct ParseProgressUpdate<'a> {
+    pub stage: &'a str,
+    pub project_name: &'a str,
+    pub file_name: &'a str,
+    pub dbnum: u32,
+    pub db_type: &'a str,
+    pub save_db: bool,
+    pub refnos_total: usize,
+    pub chunks_total: usize,
+    pub chunks_completed: usize,
+    pub last_chunk: Option<usize>,
+    pub parsed_attrs: usize,
+    pub elapsed_ms: u64,
+}
+
+/// 解析阶段心跳：长耗时全量解析时实时落当前 DB/chunk 进度。
+pub fn record_parse_progress(update: ParseProgressUpdate<'_>) {
+    with_collector(|c| {
+        let mut inner = c.inner.lock().expect("task metrics lock");
+        let parse = inner.stages.parse.get_or_insert_with(Default::default);
+        parse.progress = Some(ParseProgressMetrics {
+            stage: update.stage.to_string(),
+            project_name: update.project_name.to_string(),
+            file_name: update.file_name.to_string(),
+            dbnum: update.dbnum,
+            db_type: update.db_type.to_string(),
+            save_db: update.save_db,
+            refnos_total: update.refnos_total,
+            chunks_total: update.chunks_total,
+            chunks_completed: update.chunks_completed,
+            last_chunk: update.last_chunk,
+            parsed_attrs: update.parsed_attrs,
+            elapsed_ms: update.elapsed_ms,
+            updated_at: chrono::Local::now().to_rfc3339(),
+        });
+        c.flush(&inner);
+    });
+}
+
 /// 解析阶段：单库解析完成（含 skipped：elements=0）。
 pub fn record_parse_db(dbnum: u32, db_type: &str, elements: usize, duration_ms: u64) {
     with_collector(|c| {
@@ -295,12 +400,23 @@ pub fn record_parse_db(dbnum: u32, db_type: &str, elements: usize, duration_ms: 
             duration_ms,
         });
         parse.total_elements = parse.dbs.iter().map(|d| d.elements).sum();
+        parse.refresh_db_durations();
         parse.db_count_refresh();
         c.flush(&inner);
     });
 }
 
 impl ParseStageMetrics {
+    fn refresh_db_durations(&mut self) {
+        self.db_duration_sum_ms = self.dbs.iter().map(|d| d.duration_ms).sum();
+        self.db_duration_max_ms = self
+            .dbs
+            .iter()
+            .map(|d| d.duration_ms)
+            .max()
+            .unwrap_or_default();
+    }
+
     fn db_count_refresh(&mut self) {
         // 预留：db_count 由 dbs.len() 派生，序列化时无需冗余字段。
     }
@@ -311,8 +427,11 @@ pub fn finish_parse_stage(error_count: usize, duration_ms: u64) {
     with_collector(|c| {
         let mut inner = c.inner.lock().expect("task metrics lock");
         let parse = inner.stages.parse.get_or_insert_with(Default::default);
+        parse.refresh_db_durations();
         parse.error_count = error_count;
-        parse.duration_ms = duration_ms;
+        // 解析 job 与 closure job 分进程落盘，且历史调用点传入的阶段耗时有可能
+        // 只覆盖局部收尾时间。这里保证 parse 阶段不会小于任何单库解析耗时。
+        parse.duration_ms = duration_ms.max(parse.db_duration_max_ms);
         c.flush(&inner);
     });
 }
@@ -325,6 +444,105 @@ pub fn add_generate_counters(mesh_generated: usize, mesh_cache_hit: usize) {
         g.mesh_generated += mesh_generated;
         g.mesh_cache_hit += mesh_cache_hit;
     });
+}
+
+/// 生成阶段心跳：CLI/sidecar 长耗时生成时实时落当前阶段。
+pub fn record_generate_progress(stage: &str, detail: Option<&str>, elapsed_ms: u64) {
+    with_collector(|c| {
+        let mut inner = c.inner.lock().expect("task metrics lock");
+        let g = inner.stages.generate.get_or_insert_with(Default::default);
+        g.progress = Some(GenerateProgressMetrics {
+            stage: stage.to_string(),
+            detail: detail.map(str::to_string),
+            elapsed_ms,
+            updated_at: chrono::Local::now().to_rfc3339(),
+        });
+        c.flush(&inner);
+    });
+}
+
+/// 生成阶段运行中心跳：保留最近一次具体 stage/detail，只刷新 elapsed/updated_at。
+pub fn record_generate_heartbeat(
+    default_stage: &str,
+    default_detail: Option<&str>,
+    elapsed_ms: u64,
+) {
+    with_collector(|c| {
+        let mut inner = c.inner.lock().expect("task metrics lock");
+        let g = inner.stages.generate.get_or_insert_with(Default::default);
+        let mut progress = g
+            .progress
+            .clone()
+            .unwrap_or_else(|| GenerateProgressMetrics {
+                stage: default_stage.to_string(),
+                detail: default_detail.map(str::to_string),
+                elapsed_ms,
+                updated_at: chrono::Local::now().to_rfc3339(),
+            });
+        if progress.stage.is_empty() {
+            progress.stage = default_stage.to_string();
+        }
+        if progress.detail.is_none() {
+            progress.detail = default_detail.map(str::to_string);
+        }
+        progress.elapsed_ms = elapsed_ms;
+        progress.updated_at = chrono::Local::now().to_rfc3339();
+        g.progress = Some(progress);
+        c.flush(&inner);
+    });
+}
+
+/// Periodically refresh generate progress during long synchronous phases.
+///
+pub fn start_generate_heartbeat(
+    stage: impl Into<String>,
+    detail: Option<String>,
+    interval: Duration,
+) -> GenerateHeartbeatGuard {
+    if COLLECTOR.get().and_then(|c| c.as_ref()).is_none() {
+        return GenerateHeartbeatGuard {
+            stop: None,
+            handle: None,
+        };
+    }
+
+    let stage = stage.into();
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_stop = Arc::clone(&stop);
+    let started = Instant::now();
+    let interval = interval.max(Duration::from_secs(1));
+    let thread_detail = detail.clone();
+    record_generate_progress(
+        &stage,
+        detail.as_deref(),
+        started.elapsed().as_millis() as u64,
+    );
+    let handle = std::thread::spawn(move || {
+        loop {
+            let (lock, cvar) = &*thread_stop;
+            let Ok(stopped) = lock.lock() else {
+                break;
+            };
+            let Ok((stopped, _)) = cvar.wait_timeout_while(stopped, interval, |stopped| !*stopped)
+            else {
+                break;
+            };
+            if *stopped {
+                break;
+            }
+            drop(stopped);
+            record_generate_heartbeat(
+                &stage,
+                thread_detail.as_deref(),
+                started.elapsed().as_millis() as u64,
+            );
+        }
+    });
+
+    GenerateHeartbeatGuard {
+        stop: Some(stop),
+        handle: Some(handle),
+    }
 }
 
 /// 生成阶段：布尔任务结果累计。
@@ -347,6 +565,39 @@ pub fn record_generate_stage_ms(stages: &[(String, u64)]) {
         }
         c.flush(&inner);
     });
+}
+
+/// 生成阶段收尾：按当前模型库查询验收口径表计数。
+pub async fn finish_generate_stage_from_model_store(duration_ms: u64) {
+    if COLLECTOR.get().and_then(|c| c.as_ref()).is_none() {
+        return;
+    }
+
+    async fn surreal_count(table: &str) -> usize {
+        let sql = format!("SELECT count() FROM {table} GROUP ALL;");
+        match crate::fast_model::model_store::model_query_take::<Vec<serde_json::Value>, _>(sql, 0)
+            .await
+        {
+            Ok(rows) => rows
+                .first()
+                .and_then(|v| v.get("count"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+            Err(_) => 0,
+        }
+    }
+    let cache_miss = crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
+        .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
+        .unwrap_or(0);
+    finish_generate_stage(
+        surreal_count("inst_relate").await,
+        surreal_count("inst_info").await,
+        surreal_count("inst_relate_aabb").await,
+        surreal_count("tubi_relate").await,
+        crate::fast_model::gen_model::pdms_inst::failed_sql_dump_count(),
+        cache_miss,
+        duration_ms,
+    );
 }
 
 /// 生成阶段收尾：落库数量（调用方查询统计）、错误与 cache miss、总耗时。

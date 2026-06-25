@@ -267,6 +267,9 @@ write-to-surrealdb = []
 model-writer-drain = []
 # DuckLake backend for ModelWriter (goals/ducklake-model-writer). Default off; loads Rust duckdb crate.
 model-writer-ducklake = ["dep:duckdb"]
+# DuckLake catalog for immutable model release snapshots. Default off; this is
+# separate from the experimental generation writer above.
+model-version-ducklake = ["dep:duckdb", "parquet-export"]
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

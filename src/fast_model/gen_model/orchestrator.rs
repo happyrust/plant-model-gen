@@ -35,7 +35,9 @@ use crate::fast_model::export_model::ParquetStreamWriter;
 use super::cache_miss_report;
 use super::config::IndexTreeConfig;
 use super::errors::{IndexTreeError, Result};
-use super::index_tree_mode::gen_index_tree_geos_optimized;
+use super::index_tree_mode::{
+    gen_index_tree_geos_for_incremental_log, gen_index_tree_geos_optimized,
+};
 use super::models::NounCategory;
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use aios_core::tool::db_tool::db1_hash;
@@ -1086,9 +1088,21 @@ async fn process_index_tree_generation(
         }
         GenerationScope::Incremental { log } => {
             let roots: Vec<RefnoEnum> = log.get_all_visible_refnos().into_iter().collect();
-            println!("[gen_model] 当前 scope: Incremental roots={}", roots.len());
+            println!(
+                "[gen_model] 当前 scope: Incremental roots={} deletes={}",
+                roots.len(),
+                log.delete_refnos.len()
+            );
             Some(roots)
         }
+    };
+    let incremental_cleanup_roots = match &scope {
+        GenerationScope::Incremental { log } => {
+            let mut roots = log.get_all_visible_refnos();
+            roots.extend(log.delete_refnos.iter().copied());
+            roots.into_iter().collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
     };
     let is_boolean_scoped_generation = matches!(
         scope,
@@ -1105,6 +1119,7 @@ async fn process_index_tree_generation(
         );
     }
     let full_start = Instant::now();
+    crate::perf_metrics::record_generate_progress("index_tree_init", None, 0);
     perf.mark("categorize_and_inst_relate");
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
@@ -1116,6 +1131,46 @@ async fn process_index_tree_generation(
     let _replace_exist_deprecated = false; // replace_exist 已废弃，由 pre_cleanup_for_regen 替代
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
+
+    if matches!(scope, GenerationScope::Incremental { .. }) {
+        let cleanup_enabled = use_surrealdb
+            && !defer_db_write
+            && !db_option.gen_model_dry_run
+            && db_option.model_writer_mode.writes_to_surreal();
+        if incremental_cleanup_roots.is_empty() {
+            println!("[gen_model] 增量模型清理跳过：无清理 roots");
+        } else if cleanup_enabled {
+            println!(
+                "[gen_model] 增量模型清理开始: cleanup_roots={}",
+                incremental_cleanup_roots.len()
+            );
+            crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(
+                &incremental_cleanup_roots,
+            )
+            .await
+            .map_err(IndexTreeError::Other)?;
+            println!("[gen_model] 增量模型清理完成");
+        } else {
+            println!(
+                "[gen_model] 增量模型清理跳过: use_surrealdb={} defer_db_write={} gen_model_dry_run={} writer={}",
+                use_surrealdb,
+                defer_db_write,
+                db_option.gen_model_dry_run,
+                db_option.model_writer_mode.as_str()
+            );
+        }
+
+        if seed_roots
+            .as_ref()
+            .map(|roots| roots.is_empty())
+            .unwrap_or(false)
+        {
+            println!("[gen_model] 增量日志没有可见生成 roots，仅执行清理路径后结束");
+            perf.mark("incremental_no_visible_roots");
+            perf.end_current();
+            return Ok(GenModelResult { success: true });
+        }
+    }
 
     if db_option.model_writer_mode == ModelWriterMode::DrainOnly {
         println!(
@@ -1139,13 +1194,26 @@ async fn process_index_tree_generation(
         }
         let drain_handle = tokio::spawn(run_model_writer_sink(receiver, drain_writer));
         println!("⏳ [1/2] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
-        let _categorized = gen_index_tree_geos_optimized(
-            Arc::new(db_option.clone()),
-            &config,
-            sender.clone(),
-            seed_roots,
-        )
-        .await
+        let _categorized = match &scope {
+            GenerationScope::Incremental { log } => {
+                gen_index_tree_geos_for_incremental_log(
+                    Arc::new(db_option.clone()),
+                    &config,
+                    sender.clone(),
+                    log,
+                )
+                .await
+            }
+            _ => {
+                gen_index_tree_geos_optimized(
+                    Arc::new(db_option.clone()),
+                    &config,
+                    sender.clone(),
+                    seed_roots,
+                )
+                .await
+            }
+        }
         .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
         println!(
             "✅ [1/2] 几何体生成完成, 用时 {}ms",
@@ -1317,22 +1385,50 @@ async fn process_index_tree_generation(
         base_model_writer.clone(),
     ));
     println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
-    let categorized = gen_index_tree_geos_optimized(
-        Arc::new(db_option.clone()),
-        &config,
-        sender.clone(),
-        seed_roots,
-    )
-    .await
+    crate::perf_metrics::record_generate_progress(
+        "geometry_generation",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
+    let categorized = match &scope {
+        GenerationScope::Incremental { log } => {
+            gen_index_tree_geos_for_incremental_log(
+                Arc::new(db_option.clone()),
+                &config,
+                sender.clone(),
+                log,
+            )
+            .await
+        }
+        _ => {
+            gen_index_tree_geos_optimized(
+                Arc::new(db_option.clone()),
+                &config,
+                sender.clone(),
+                seed_roots,
+            )
+            .await
+        }
+    }
     .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
     println!(
         "✅ [1/5] 几何体生成完成, 用时 {}ms",
         full_start.elapsed().as_millis()
     );
+    crate::perf_metrics::record_generate_progress(
+        "geometry_generation_done",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
 
     // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
     // 否则 insert_handle.await 会永久阻塞
     println!("⏳ [2/5] 实例数据入库...");
+    crate::perf_metrics::record_generate_progress(
+        "instance_data_write",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
     drop(sender);
     let insert_report = sink_handle
         .await
@@ -1373,6 +1469,14 @@ async fn process_index_tree_generation(
     let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
     // spec 004：生成阶段 mesh 计数（批量屏障汇总点，一次性记录）。
     crate::perf_metrics::add_generate_counters(total_mesh_new_generated, total_mesh_cache_hits);
+    crate::perf_metrics::record_generate_progress(
+        "batch_barrier_done",
+        Some(&format!(
+            "batches={} mesh_cache_hit={} mesh_new_generated={}",
+            completed_batches, total_mesh_cache_hits, total_mesh_new_generated
+        )),
+        full_start.elapsed().as_millis() as u64,
+    );
     println!(
         "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",
         completed_batches,
@@ -1447,6 +1551,11 @@ async fn process_index_tree_generation(
 
         perf.mark("boolean_operation");
         println!("⏳ [4/5] 布尔运算...");
+        crate::perf_metrics::record_generate_progress(
+            "boolean_operation",
+            None,
+            full_start.elapsed().as_millis() as u64,
+        );
 
         // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
         if use_surrealdb {
@@ -1523,6 +1632,11 @@ async fn process_index_tree_generation(
         }
         perf.mark("web_bundle_export");
         println!("⏳ [5/5] 导出...");
+        crate::perf_metrics::record_generate_progress(
+            "web_bundle_export",
+            None,
+            full_start.elapsed().as_millis() as u64,
+        );
 
         // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
         if db_option.mesh_formats.contains(&MeshFormat::Glb) {
@@ -1565,6 +1679,11 @@ async fn process_index_tree_generation(
     }
 
     perf.mark("sqlite_spatial_index");
+    crate::perf_metrics::record_generate_progress(
+        "sqlite_spatial_index",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
     println!(
         "[gen_model] IndexTree 模式全部完成，总用时 {} ms",
         full_start.elapsed().as_millis()
@@ -1696,6 +1815,11 @@ async fn process_index_tree_generation(
 
     // model_cache close 已移除（foyer-cache-cleanup）
     perf.end_current();
+    crate::perf_metrics::record_generate_progress(
+        "index_tree_finished",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
 
     // spec 004：生成阶段分段耗时（直接来自 PerfTimer 分段记录）。
     {

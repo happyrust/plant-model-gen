@@ -5397,6 +5397,74 @@ async fn execute_real_task(state: AppState, task_id: String) {
             return;
         }
 
+        match crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
+            &db_option_ext,
+            if config.manual_db_nums.is_empty() {
+                None
+            } else {
+                Some(config.manual_db_nums.clone())
+            },
+        )
+        .await
+        {
+            Ok(report) => {
+                if report.enabled {
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                        task.add_log(
+                            LogLevel::Info,
+                            format!(
+                                "生成后 Parquet 导出完成: dbnums={:?}, skipped={:?}",
+                                report.exported_dbnums, report.skipped_reason
+                            ),
+                        );
+                        persist_task_progress(task);
+                    }
+                }
+            }
+            Err(e) => {
+                let mut task_manager = state.task_manager.lock().await;
+                if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
+                    task.status = TaskStatus::Failed;
+                    task.completed_at = Some(SystemTime::now());
+                    let error_details = ErrorDetails {
+                        error_type: "PostGenerationExportError".to_string(),
+                        error_code: Some("POST_GEN_EXPORT_001".to_string()),
+                        failed_step: "生成后导出 Parquet".to_string(),
+                        detailed_message: format!("模型生成成功，但生成后 Parquet 导出失败: {}", e),
+                        stack_trace: Some(format!("{:?}", e)),
+                        suggested_solutions: vec![
+                            "检查 export_parquet_after_gen/export_parquet 配置是否正确".to_string(),
+                            "确认 pe_transform 覆盖目标 dbnum".to_string(),
+                            "确认输出目录可写并且磁盘空间充足".to_string(),
+                        ],
+                        related_config: Some(serde_json::json!({
+                            "manual_db_nums": config.manual_db_nums.clone(),
+                            "export_parquet": config.export_parquet,
+                            "gen_model": config.gen_model,
+                        })),
+                    };
+                    task.set_error_details(error_details);
+                    task.add_log_with_details(
+                        LogLevel::Error,
+                        format!("生成后 Parquet 导出失败: {}", e),
+                        Some("POST_GEN_EXPORT_001".to_string()),
+                        Some(format!("{:?}", e)),
+                    );
+                    persist_task_progress(&task);
+                    task_manager.task_history.push(task);
+                }
+                let fail_msg = crate::shared::ProgressMessageBuilder::new(task_id.clone())
+                    .status(crate::shared::TaskStatus::Failed)
+                    .message("生成后 Parquet 导出失败")
+                    .build();
+                let _ = state.progress_hub.publish(fail_msg);
+                set_update_finalize(&config.manual_db_nums, "Failed").await;
+                try_start_next_pending(state.clone());
+                return;
+            }
+        }
+
         // 停止进度监控
         progress_monitor.abort();
 
@@ -8958,6 +9026,71 @@ async fn execute_refno_model_generation(
                     }
                 }
             }
+
+            let parquet_dbnum_hint = dbno.map(|value| vec![value]).or_else(|| {
+                (!config.manual_db_nums.is_empty()).then(|| config.manual_db_nums.clone())
+            });
+            match crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
+                &db_option_ext,
+                parquet_dbnum_hint,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if report.enabled {
+                        let mut task_manager = state.task_manager.lock().await;
+                        if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
+                            task.add_log(
+                                LogLevel::Info,
+                                format!(
+                                    "生成后 Parquet 导出完成: dbnums={:?}, skipped={:?}",
+                                    report.exported_dbnums, report.skipped_reason
+                                ),
+                            );
+                            persist_task_progress(task);
+                        }
+                    }
+                }
+                Err(export_err) => {
+                    let mut task_manager = state.task_manager.lock().await;
+                    if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
+                        task.status = TaskStatus::Failed;
+                        task.completed_at = Some(SystemTime::now());
+                        task.actual_duration = Some(duration.as_millis() as u64);
+                        task.progress.percentage = 100.0;
+                        task.progress.current_step = "失败(Parquet导出)".to_string();
+                        task.add_log(
+                            LogLevel::Error,
+                            format!("模型生成成功，但生成后 Parquet 导出失败: {}", export_err),
+                        );
+                        task.set_error_details(ErrorDetails {
+                            error_type: "PostGenerationExportError".to_string(),
+                            error_code: Some("POST_GEN_EXPORT_001".to_string()),
+                            failed_step: "生成后导出 Parquet".to_string(),
+                            detailed_message: format!(
+                                "基于 Refno 的模型生成成功，但 Parquet 导出失败: {}",
+                                export_err
+                            ),
+                            stack_trace: Some(format!("{:?}", export_err)),
+                            suggested_solutions: vec![
+                                "检查 export_parquet_after_gen/export_parquet 配置是否正确".to_string(),
+                                "确认目标 refno 能解析出 dbnum".to_string(),
+                                "确认输出目录可写并且磁盘空间充足".to_string(),
+                            ],
+                            related_config: Some(serde_json::json!({
+                                "manual_refnos": config.manual_refnos.clone(),
+                                "manual_db_nums": config.manual_db_nums.clone(),
+                                "dbno": dbno,
+                                "export_parquet": config.export_parquet,
+                            })),
+                        });
+                        persist_task_progress(&task);
+                        task_manager.task_history.push(task);
+                    }
+                    return;
+                }
+            }
+
             let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
                 &parsed_refnos,
                 &task_id,

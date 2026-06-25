@@ -2,6 +2,7 @@ pub mod collision_api;
 pub mod e3d_tree_api;
 #[cfg(feature = "mbd-pipe")]
 pub mod mbd_pipe_api;
+pub mod model_version_api;
 pub mod noun_hierarchy_api;
 pub mod pdms_attr_api;
 pub mod pdms_transform_api;
@@ -21,6 +22,7 @@ pub use mbd_pipe_api::{
     MbdExportScope, MbdExportStats, create_mbd_pipe_routes, export_mbd_json_batch,
     generate_mbd_data, get_mbd_output_dir,
 };
+pub use model_version_api::create_model_version_routes;
 #[cfg(all(feature = "web_server", not(feature = "mbd-pipe")))]
 pub fn create_mbd_pipe_routes() -> axum::Router {
     axum::Router::new()
@@ -86,6 +88,7 @@ pub fn assemble_stateless_web_api_routes() -> axum::Router {
         .merge(create_review_api_routes())
         .merge(create_annotation_state_routes())
         .merge(create_scene_tree_routes())
+        .merge(create_model_version_routes())
         .merge(create_mbd_pipe_routes())
         .nest("/api/pipeline", create_pipeline_annotation_routes())
         .nest("/api", create_version_routes())
@@ -177,6 +180,35 @@ pub fn stateless_web_api_route_paths() -> Vec<&'static str> {
         "GET    /api/scene-tree/{refno}/leaves",
         "GET    /api/scene-tree/{refno}/children",
         "GET    /api/scene-tree/{refno}/ancestors",
+        // model_version_api
+        "GET    /api/model-version/releases",
+        "POST   /api/model-version/releases/register",
+        "POST   /api/model-version/releases/publish-history",
+        "POST   /api/model-version/incremental/handoff",
+        "POST   /api/model-version/runs",
+        "POST   /api/model-version/runs/prepare-physical-snapshot",
+        "POST   /api/model-version/runs/prepare-history-replay",
+        "POST   /api/model-version/runs/execute-history-replay-plan",
+        "POST   /api/model-version/runs/parse-baseline",
+        "POST   /api/model-version/runs/generate-full-model",
+        "GET    /api/model-version/runs/{run_id}",
+        "POST   /api/model-version/runs/{run_id}/cancel",
+        "GET    /api/model-version/releases/{release_id}",
+        "GET    /api/model-version/releases/{release_id}/runtime-scene",
+        "GET    /api/model-version/releases/{release_id}/events",
+        "POST   /api/model-version/releases/{release_id}/reconcile",
+        "POST   /api/model-version/releases/{release_id}/state-machine",
+        "POST   /api/model-version/releases/{release_id}/index",
+        "POST   /api/model-version/releases/{release_id}/index-units",
+        "POST   /api/model-version/releases/{release_id}/index-assets",
+        "GET    /api/model-version/releases/{release_id}/mesh-assets",
+        "GET    /api/model-version/compare-readiness",
+        "GET    /api/model-version/history-baseline-inspect",
+        "GET    /api/model-version/diff",
+        "GET    /api/model-version/unit-diff",
+        "GET    /api/model-version/component-impact",
+        "GET    /model-version/compare",
+        "GET    /model-version/release-viewer",
         // mbd_pipe_api
         "GET    /api/mbd/pipe/{refno}",
         "GET    /api/mbd/v2/pipe/{refno}",

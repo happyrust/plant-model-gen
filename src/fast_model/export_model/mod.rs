@@ -38,6 +38,8 @@ pub mod parquet_stream_writer;
 
 pub mod simple_color_palette;
 
+pub mod post_gen_export;
+
 #[cfg(feature = "parquet-export")]
 pub mod pe_parquet_writer;
 

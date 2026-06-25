@@ -436,6 +436,59 @@ fn file_fingerprint(path: &Path) -> Result<String> {
     Ok(format!("{mtime}:{size}"))
 }
 
+fn inactive_db_path(path: &Path) -> bool {
+    if path.components().any(|component| {
+        matches!(
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .as_str(),
+            "back" | "backup" | "cbas"
+        )
+    }) {
+        return true;
+    }
+
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.ends_with("_old")
+        || name.ends_with("-old")
+        || name.ends_with(".old")
+        || name.contains("_old.")
+        || name.contains("-old.")
+        || name.contains(" copy")
+        || name.contains("_copy")
+        || name.contains("-copy")
+        || name.ends_with("_new")
+        || name.ends_with("-new")
+        || name.ends_with(".new")
+        || name.contains("_new.")
+        || name.contains("-new.")
+        || name.ends_with("_test")
+        || name.ends_with("-test")
+        || name.ends_with(".test")
+        || name.contains("_test.")
+        || name.contains("-test.")
+}
+
+fn db_candidate_rank(path: &Path) -> (u8, usize, String) {
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let parent_rank = if parent.ends_with("000") { 0 } else { 1 };
+    let depth = path.components().count();
+    (
+        parent_rank,
+        usize::MAX.saturating_sub(depth),
+        path.to_string_lossy().to_string(),
+    )
+}
+
 /// index-only 扫描单个 db 文件：打开 -> 取最新会话号 -> 遍历整棵 B+树索引取全部 owned ref0。
 ///
 /// 不解析元素记录/属性（不调用 `parse_db_basic_data`）。
@@ -482,6 +535,7 @@ where
     F: FnMut(ScanProgress),
 {
     let mut report = ScanReport::default();
+    let mut candidates = Vec::new();
 
     for (project, root) in roots {
         if !root.exists() {
@@ -499,22 +553,7 @@ where
                 continue;
             }
             let path = entry.path();
-            if path
-                .strip_prefix(root)
-                .ok()
-                .into_iter()
-                .flat_map(|relative| relative.components())
-                .any(|component| {
-                    matches!(
-                        component
-                            .as_os_str()
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .as_str(),
-                        "back" | "backup"
-                    )
-                })
-            {
+            if inactive_db_path(path) {
                 continue;
             }
 
@@ -523,63 +562,72 @@ where
             if info.dbnum == 0 {
                 continue;
             }
-
-            let fingerprint = match file_fingerprint(path) {
-                Ok(fp) => fp,
-                Err(_) => continue,
-            };
-
-            // 增量：指纹未变则跳过（不打开 PdmsIO）。
-            if !force {
-                if let Some(stored) = store.fingerprint_of(info.dbnum) {
-                    if stored == fingerprint {
-                        report.skipped += 1;
-                        emit_scan_progress(&report, project, path, &mut on_progress);
-                        continue;
-                    }
-                }
-            }
-
-            // 单文件扫描隔离 panic，避免一个坏文件中断整轮预扫。
-            let scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scan_one_db(project, path)
-            }));
-            match scan {
-                Ok(Ok((latest_sesno, ref0s))) => {
-                    let rec = DbFileRecord {
-                        dbnum: info.dbnum,
-                        db_type: info.db_type.clone(),
-                        file_name: path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        file_path: path.to_string_lossy().to_string(),
-                        project: project.clone(),
-                        latest_sesno,
-                        fingerprint,
-                    };
-                    if let Err(e) = store.upsert_db_file(&rec) {
-                        report
-                            .errors
-                            .push(format!("{}: upsert 失败 {}", path.display(), e));
-                        continue;
-                    }
-                    if let Err(e) = store.replace_ref0_owners(info.dbnum, &rec.file_name, &ref0s) {
-                        report
-                            .errors
-                            .push(format!("{}: 写 ref0_owner 失败 {}", path.display(), e));
-                        continue;
-                    }
-                    report.scanned += 1;
-                    report.ref0_total += ref0s.len();
-                }
-                Ok(Err(e)) => report.errors.push(format!("{}: {}", path.display(), e)),
-                Err(_) => report
-                    .errors
-                    .push(format!("{}: 扫描时 panic（已跳过）", path.display())),
-            }
-            emit_scan_progress(&report, project, path, &mut on_progress);
+            candidates.push((project.clone(), path.to_path_buf(), info));
         }
+    }
+
+    candidates.sort_by_key(|(_, path, info)| (info.dbnum, db_candidate_rank(path)));
+    let mut seen_dbnums = BTreeSet::new();
+    for (project, path, info) in candidates {
+        if !seen_dbnums.insert(info.dbnum) {
+            continue;
+        }
+
+        let fingerprint = match file_fingerprint(&path) {
+            Ok(fp) => fp,
+            Err(_) => continue,
+        };
+
+        // 增量：指纹未变则跳过（不打开 PdmsIO）。
+        if !force {
+            if let Some(stored) = store.fingerprint_of(info.dbnum) {
+                if stored == fingerprint {
+                    report.skipped += 1;
+                    emit_scan_progress(&report, &project, &path, &mut on_progress);
+                    continue;
+                }
+            }
+        }
+
+        // 单文件扫描隔离 panic，避免一个坏文件中断整轮预扫。
+        let scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scan_one_db(&project, &path)
+        }));
+        match scan {
+            Ok(Ok((latest_sesno, ref0s))) => {
+                let rec = DbFileRecord {
+                    dbnum: info.dbnum,
+                    db_type: info.db_type.clone(),
+                    file_name: path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    file_path: path.to_string_lossy().to_string(),
+                    project: project.clone(),
+                    latest_sesno,
+                    fingerprint,
+                };
+                if let Err(e) = store.upsert_db_file(&rec) {
+                    report
+                        .errors
+                        .push(format!("{}: upsert 失败 {}", path.display(), e));
+                    continue;
+                }
+                if let Err(e) = store.replace_ref0_owners(info.dbnum, &rec.file_name, &ref0s) {
+                    report
+                        .errors
+                        .push(format!("{}: 写 ref0_owner 失败 {}", path.display(), e));
+                    continue;
+                }
+                report.scanned += 1;
+                report.ref0_total += ref0s.len();
+            }
+            Ok(Err(e)) => report.errors.push(format!("{}: {}", path.display(), e)),
+            Err(_) => report
+                .errors
+                .push(format!("{}: 扫描时 panic（已跳过）", path.display())),
+        }
+        emit_scan_progress(&report, &project, &path, &mut on_progress);
     }
 
     report.db_files = store.db_file_count();
@@ -629,12 +677,11 @@ fn extract_outbound_ref0s(data: &parse_pdms_db::parse::PdmsDbData) -> Vec<u32> {
     set.into_iter().collect()
 }
 
-/// 异步：扫描 roots 下的 DESI 设计库，解析其属性并抽取外向 ref0。
-///
-/// 返回 `(src_dbnum, outbound_ref0s)` 列表；**不持有 SQLite 连接**，便于在 async 上下文调用
-/// （写库由调用方在 spawn_blocking 中完成，避免把 rusqlite Connection 跨 await 持有）。
-pub async fn collect_design_outbound(roots: &[(String, PathBuf)]) -> Vec<(u32, Vec<u32>)> {
-    let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+fn collect_design_db_candidates(
+    roots: &[(String, PathBuf)],
+    targets: Option<&BTreeSet<u32>>,
+) -> Vec<(String, PathBuf, u32)> {
+    let mut candidates = Vec::new();
     for (project, root) in roots {
         if !root.exists() {
             continue;
@@ -648,26 +695,50 @@ pub async fn collect_design_outbound(roots: &[(String, PathBuf)]) -> Vec<(u32, V
                 continue;
             }
             let path = entry.path();
+            if inactive_db_path(path) {
+                continue;
+            }
             let info = parse_db_basic_info(path.to_path_buf());
             if info.dbnum == 0 || !info.db_type.eq_ignore_ascii_case("DESI") {
                 continue;
             }
-            let file_name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            match parse_pdms_db::parse::parse_file(&path.to_path_buf(), &None, &file_name, project)
-                .await
-            {
-                Ok(data) => {
-                    let ref0s = extract_outbound_ref0s(&data);
-                    if !ref0s.is_empty() {
-                        out.push((info.dbnum, ref0s));
-                    }
+            if let Some(targets) = targets {
+                if !targets.contains(&info.dbnum) {
+                    continue;
                 }
-                Err(e) => {
-                    log::warn!("collect_design_outbound 解析失败 {}: {}", path.display(), e);
+            }
+            candidates.push((project.clone(), path.to_path_buf(), info.dbnum));
+        }
+    }
+
+    candidates.sort_by_key(|(_, path, dbnum)| (*dbnum, db_candidate_rank(path)));
+    let mut seen = BTreeSet::new();
+    candidates
+        .into_iter()
+        .filter(|(_, _, dbnum)| seen.insert(*dbnum))
+        .collect()
+}
+
+/// 异步：扫描 roots 下的 DESI 设计库，解析其属性并抽取外向 ref0。
+///
+/// 返回 `(src_dbnum, outbound_ref0s)` 列表；**不持有 SQLite 连接**，便于在 async 上下文调用
+/// （写库由调用方在 spawn_blocking 中完成，避免把 rusqlite Connection 跨 await 持有）。
+pub async fn collect_design_outbound(roots: &[(String, PathBuf)]) -> Vec<(u32, Vec<u32>)> {
+    let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (project, path, dbnum) in collect_design_db_candidates(roots, None) {
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match parse_pdms_db::parse::parse_file(&path, &None, &file_name, &project).await {
+            Ok(data) => {
+                let ref0s = extract_outbound_ref0s(&data);
+                if !ref0s.is_empty() {
+                    out.push((dbnum, ref0s));
                 }
+            }
+            Err(e) => {
+                log::warn!("collect_design_outbound 解析失败 {}: {}", path.display(), e);
             }
         }
     }
@@ -688,50 +759,24 @@ pub async fn collect_design_outbound_for_dbnums(
     }
 
     let mut out: Vec<(u32, Vec<u32>)> = Vec::new();
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    for (project, root) in roots {
-        if !root.exists() {
-            continue;
-        }
-        for entry in walkdir::WalkDir::new(root)
-            .max_depth(8)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let info = parse_db_basic_info(path.to_path_buf());
-            if !targets.contains(&info.dbnum)
-                || !info.db_type.eq_ignore_ascii_case("DESI")
-                || !seen.insert(info.dbnum)
-            {
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            match parse_pdms_db::parse::parse_file(&path.to_path_buf(), &None, &file_name, project)
-                .await
-            {
-                Ok(data) => {
-                    let ref0s = extract_outbound_ref0s(&data);
-                    if !ref0s.is_empty() {
-                        out.push((info.dbnum, ref0s));
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "collect_design_outbound_for_dbnums 解析失败 {}: {}",
-                        path.display(),
-                        e
-                    );
+    for (project, path, dbnum) in collect_design_db_candidates(roots, Some(&targets)) {
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match parse_pdms_db::parse::parse_file(&path, &None, &file_name, &project).await {
+            Ok(data) => {
+                let ref0s = extract_outbound_ref0s(&data);
+                if !ref0s.is_empty() {
+                    out.push((dbnum, ref0s));
                 }
             }
-            if seen.len() == targets.len() {
-                return out;
+            Err(e) => {
+                log::warn!(
+                    "collect_design_outbound_for_dbnums 解析失败 {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     }
@@ -803,7 +848,17 @@ pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
     };
 
     // Phase 2（async）：设计库外向引用（不持有连接）。
-    let outbound = collect_design_outbound(&roots).await;
+    // 单库/少量库部署时只解析目标 DESI，避免把一次快速部署放大成全工程 DESI 深扫。
+    let manual_db_nums = db_option
+        .manual_db_nums
+        .as_deref()
+        .unwrap_or_default()
+        .to_vec();
+    let outbound = if manual_db_nums.iter().any(|dbnum| *dbnum > 0) {
+        collect_design_outbound_for_dbnums(&roots, &manual_db_nums).await
+    } else {
+        collect_design_outbound(&roots).await
+    };
 
     // Phase 3（同步）：记录精确依赖边。
     let mut edges = 0usize;

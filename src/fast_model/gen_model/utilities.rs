@@ -116,25 +116,21 @@ fn build_refno_cata_key(refno: &RefnoEnum) -> String {
     format!("refno_{}", refno.to_string().replace('/', "_"))
 }
 
-fn insert_cata_hash_refno(
+fn insert_cata_hash_refno_by_values(
     map: &DashMap<String, CataHashRefnoKV>,
-    meta: &aios_core::tree_query::TreeNodeMeta,
+    refno: RefnoEnum,
+    noun_hash: u32,
+    cata_hash: Option<u64>,
 ) {
-    if is_bran_or_hang(meta.noun) {
+    if is_bran_or_hang(noun_hash) {
         return;
     }
-    // 带有效 cata_hash 的元素必然是元件引用件（cal_cata_hash 基于 SPRE/CATR 计算成功），
-    // 直接入组 —— 否则 BRAN 子管件（ELBO/VALV/OLET/ATTA 等，不在 USE_CATE_NOUN_NAMES
-    // 白名单内）会被整体滤掉，导致 BRAN 管线 unique_cata=0、管件实例从不生成。
-    // 无有效 hash 的退化路径（refno key）仍按 CATE noun 白名单收口，避免容器节点混入。
-    let has_valid_hash = meta.cata_hash.is_some_and(|hash| hash != 0);
-    if !has_valid_hash && !is_cate_noun(meta.noun) {
+    let has_valid_hash = cata_hash.is_some_and(|hash| hash != 0);
+    if !has_valid_hash && !is_cate_noun(noun_hash) {
         return;
     }
-    let refno = RefnoEnum::from(meta.refno);
     let fallback_key = build_refno_cata_key(&refno);
-    let key = meta
-        .cata_hash
+    let key = cata_hash
         .filter(|&hash| hash != 0)
         .map(|hash| hash.to_string())
         .unwrap_or(fallback_key);
@@ -145,6 +141,18 @@ fn insert_cata_hash_refno(
         ptset: None,
     });
     entry.group_refnos.push(refno);
+}
+
+fn insert_cata_hash_refno(
+    map: &DashMap<String, CataHashRefnoKV>,
+    meta: &aios_core::tree_query::TreeNodeMeta,
+) {
+    // 带有效 cata_hash 的元素必然是元件引用件（cal_cata_hash 基于 SPRE/CATR 计算成功），
+    // 直接入组 —— 否则 BRAN 子管件（ELBO/VALV/OLET/ATTA 等，不在 USE_CATE_NOUN_NAMES
+    // 白名单内）会被整体滤掉，导致 BRAN 管线 unique_cata=0、管件实例从不生成。
+    // 无有效 hash 的退化路径（refno key）仍按 CATE noun 白名单收口，避免容器节点混入。
+    let refno = RefnoEnum::from(meta.refno);
+    insert_cata_hash_refno_by_values(map, refno, meta.noun, meta.cata_hash);
 }
 
 async fn build_cata_hash_map_from_tree_index(
@@ -190,6 +198,27 @@ pub async fn build_cata_hash_map_from_tree_by_dbnum(
     build_cata_hash_map_from_tree_index(&index, refnos).await
 }
 
+async fn build_cata_hash_map_from_db(
+    refnos: &[RefnoEnum],
+) -> Result<DashMap<String, CataHashRefnoKV>> {
+    let result_map: DashMap<String, CataHashRefnoKV> = DashMap::new();
+    for &refno in refnos {
+        let att = match aios_core::get_named_attmap(refno).await {
+            Ok(att) => att,
+            Err(e) => {
+                eprintln!(
+                    "[build_cata_hash_map][db_fallback] get_named_attmap 失败: refno={} err={}",
+                    refno, e
+                );
+                continue;
+            }
+        };
+        let noun_hash = db1_hash(att.get_type_str());
+        insert_cata_hash_refno_by_values(&result_map, refno, noun_hash, att.cal_cata_hash());
+    }
+    Ok(result_map)
+}
+
 /// 基于 tree 文件（自动按 dbnum 分组）构建 cata_hash 分组
 pub async fn build_cata_hash_map_from_tree(
     refnos: &[RefnoEnum],
@@ -233,12 +262,12 @@ pub async fn build_cata_hash_map_from_tree(
             Ok(map) => map,
             Err(e) => {
                 eprintln!(
-                    "[build_cata_hash_map] dbnum={} 加载 tree/构建 cata_hash 失败（跳过该组 {} 个 refno）: {}",
+                    "[build_cata_hash_map] dbnum={} 加载 tree/构建 cata_hash 失败，回退 DB 构建（{} 个 refno）: {}",
                     dbnum,
                     group_refnos.len(),
                     e
                 );
-                continue;
+                build_cata_hash_map_from_db(&group_refnos).await?
             }
         };
         for entry in map.into_iter() {

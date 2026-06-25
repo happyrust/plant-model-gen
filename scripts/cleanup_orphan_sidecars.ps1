@@ -45,6 +45,23 @@ function Normalize-PathStr {
     return ($Path -replace '\\', '/').ToLowerInvariant().TrimEnd('/')
 }
 
+function Test-PathUnderRoot {
+    param(
+        [string]$PathNorm,
+        [string]$RootNorm
+    )
+    if (-not $PathNorm -or -not $RootNorm) { return $false }
+    if ($PathNorm -eq $RootNorm) { return $true }
+    $rootPrefix = if ($RootNorm.EndsWith('/')) { $RootNorm } else { "$RootNorm/" }
+    return $PathNorm.StartsWith($rootPrefix)
+}
+
+function Format-DisplayValue {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "-" }
+    return $Value
+}
+
 function Get-ArgValue {
     param([string]$CommandLine, [string]$Flag)
     # Matches: --flag "value with spaces"  OR  --flag value
@@ -73,7 +90,7 @@ foreach ($p in $procs) {
     $runtimeDir = Get-ArgValue -CommandLine $cmd -Flag '--runtime-dir'
     if (-not $runtimeDir) { continue }
     $rdNorm = Normalize-PathStr -Path $runtimeDir
-    if (-not $rdNorm.StartsWith($rootNorm)) { continue }
+    if (-not (Test-PathUnderRoot -PathNorm $rdNorm -RootNorm $rootNorm)) { continue }
     $siteKey = Get-ArgValue -CommandLine $cmd -Flag '--site-key'
     $matched.Add([pscustomobject]@{
         ProcessId   = $p.ProcessId
@@ -89,7 +106,8 @@ if ($matched.Count -eq 0) {
 
 Write-Host "Matched $($matched.Count) sidecar(s) under scope_root:" -ForegroundColor Yellow
 foreach ($m in $matched) {
-    Write-Host ("  PID {0,-8} {1,-40} {2}" -f $m.ProcessId, ($m.SiteKey ?? '-'), $m.RuntimeDir)
+    $siteKey = Format-DisplayValue -Value $m.SiteKey
+    Write-Host ("  PID {0,-8} {1,-40} {2}" -f $m.ProcessId, $siteKey, $m.RuntimeDir)
 }
 Write-Host ""
 
@@ -103,7 +121,8 @@ foreach ($m in $matched) {
     try {
         Stop-Process -Id $m.ProcessId -Force -ErrorAction Stop
         $killed++
-        Write-Host ("  killed PID {0} ({1})" -f $m.ProcessId, ($m.SiteKey ?? '-')) -ForegroundColor Green
+        $siteKey = Format-DisplayValue -Value $m.SiteKey
+        Write-Host ("  killed PID {0} ({1})" -f $m.ProcessId, $siteKey) -ForegroundColor Green
     } catch {
         Write-Host ("  failed PID {0}: {1}" -f $m.ProcessId, $_.Exception.Message) -ForegroundColor Red
     }

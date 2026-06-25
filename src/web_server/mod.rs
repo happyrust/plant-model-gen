@@ -488,25 +488,29 @@ pub async fn start_web_server_with_config(
     });
 
     // 仅在模型/空间树功能需要时做启动期 Scene Tree 初始化；解析/验证站点按需懒加载。
+    // 这一步可能触发全量 tree 构建，必须放在后台，避免阻塞只读 API 和静态文件监听。
     if initialize_scene_tree_on_startup {
-        match db_init_handle.await {
-            Ok(true) => {
-                println!("🌳 检查 Scene Tree 初始化状态...");
-                match crate::scene_tree::ensure_initialized().await {
-                    Ok(_) => println!("✅ Scene Tree 初始化检查完成"),
-                    Err(e) => {
-                        eprintln!("⚠️ Scene Tree 初始化失败: {}", e);
-                        // 不阻塞启动，允许后续手动初始化
+        tokio::spawn(async move {
+            match db_init_handle.await {
+                Ok(true) => {
+                    println!("🌳 检查 Scene Tree 初始化状态...");
+                    match crate::scene_tree::ensure_initialized().await {
+                        Ok(_) => println!("✅ Scene Tree 初始化检查完成"),
+                        Err(e) => {
+                            eprintln!("⚠️ Scene Tree 初始化失败: {}", e);
+                            // 不阻塞启动，允许后续手动初始化
+                        }
                     }
                 }
+                Ok(false) => {
+                    eprintln!("⚠️ 数据库初始化未完成，跳过启动期 Scene Tree 初始化");
+                }
+                Err(error) => {
+                    eprintln!("⚠️ 数据库初始化任务异常，跳过启动期 Scene Tree 初始化: {error}");
+                }
             }
-            Ok(false) => {
-                eprintln!("⚠️ 数据库初始化未完成，跳过启动期 Scene Tree 初始化");
-            }
-            Err(error) => {
-                eprintln!("⚠️ 数据库初始化任务异常，跳过启动期 Scene Tree 初始化: {error}");
-            }
-        }
+        });
+        println!("🌳 Scene Tree 初始化检查已转为后台执行");
     } else {
         println!("🌳 当前站点未启用模型/空间树生成，跳过启动期 Scene Tree 初始化");
     }

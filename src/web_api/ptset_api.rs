@@ -332,7 +332,8 @@ async fn query_ptset_from_db(refno_str: &str) -> PtsetLookupResult {
         "#
     );
 
-    let rows: Vec<InstRelatePtsetQueryResult> = match project_primary_db().query_take(&sql, 0).await {
+    let rows: Vec<InstRelatePtsetQueryResult> = match project_primary_db().query_take(&sql, 0).await
+    {
         Ok(result) => result,
         Err(error) => {
             return failure_lookup_result(
@@ -508,7 +509,9 @@ fn parse_transform_matrix(trans: Option<serde_json::Value>) -> Option<Vec<f64>> 
             obj.get("translation").and_then(|v| v.as_array()),
             obj.get("rotation").and_then(|v| v.as_array()),
             obj.get("scale").and_then(|v| v.as_array()),
-        ) && t.len() >= 3 && r.len() >= 4 && s.len() >= 3
+        ) && t.len() >= 3
+            && r.len() >= 4
+            && s.len() >= 3
         {
             return Some(compose_transform_matrix(
                 [

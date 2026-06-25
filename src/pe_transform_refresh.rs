@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use aios_core::rs_surreal::pe_transform::{PeTransformEntry, ensure_pe_transform_schema};
 use aios_core::transform::get_local_mat4;
 use aios_core::{
-    RefnoEnum, SurrealQueryExt, Transform, get_children_refnos, get_named_attmap,
+    RefnoEnum, SurrealQueryExt, Transform, get_children_refnos, get_named_attmap, get_type_name,
     project_primary_db,
 };
 use anyhow::{Context, Result};
@@ -12,7 +13,9 @@ use serde_json::Value;
 
 use crate::options::{DbOptionExt, get_db_option_ext};
 
-const PE_TRANSFORM_BATCH_SIZE: usize = 500;
+const PE_TRANSFORM_BATCH_SIZE: usize = 100;
+const PE_TRANSFORM_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+const PE_TRANSFORM_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<usize> {
     let db_option = get_db_option_ext();
@@ -21,28 +24,22 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
 
 /// spec 006 T303：探测 pe_transform 表是否已覆盖指定 dbnum。
 ///
-/// 以「该 dbnum 的任一根节点（SITE/WORL）在 pe_transform 中存在行」为覆盖标志：
-/// 刷新流程从根节点 BFS 写入，根节点行是刷新产物的最早部分。
+/// 生产路径不能只检查根节点：如果上一次刷新在中间批次被取消，根节点
+/// 可能已经存在，但后续 Parquet/模型查询仍会缺少大量 world transform。
+/// 因此这里用 dbnum 下 pe 总数与 pe_transform 命中数做完整覆盖判断。
 /// 表缺失 / 查询失败时返回 Err，由调用方按未覆盖处理。
 pub async fn pe_transform_covers_dbnum(dbnum: u32) -> Result<bool> {
-    let roots = query_root_refnos(dbnum)
+    let expected = query_total_nodes_for_dbnum(dbnum)
         .await
-        .with_context(|| format!("探测 pe_transform 覆盖时查询 dbnum {} 根节点失败", dbnum))?;
-    if roots.is_empty() {
+        .with_context(|| format!("探测 pe_transform 覆盖时统计 dbnum {} 节点失败", dbnum))?;
+    if expected == 0 {
         return Ok(false);
     }
 
-    let ids = roots
-        .iter()
-        .map(|r| r.to_table_key("pe_transform"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT VALUE record::id(id) FROM [{ids}];");
-    let rows: Vec<Value> = aios_core::model_primary_db()
-        .query_take(&sql, 0)
+    let covered = query_pe_transform_count_for_dbnum(dbnum)
         .await
         .with_context(|| format!("探测 pe_transform 覆盖失败: dbnum={dbnum}"))?;
-    Ok(!rows.is_empty())
+    Ok(covered >= expected)
 }
 
 pub async fn refresh_pe_transform_for_dbnums(
@@ -63,8 +60,17 @@ pub async fn refresh_pe_transform_for_dbnums(
     let mut entries: Vec<PeTransformEntry> = Vec::with_capacity(PE_TRANSFORM_BATCH_SIZE);
     let mut total = 0usize;
     let mut total_primed = 0usize;
+    let refresh_started = Instant::now();
+    let mut last_progress = Instant::now();
+    let dbnums_total = dbnums.len();
 
-    for dbnum in dbnums {
+    record_transform_refresh_progress(
+        "refresh_pe_transform_dbnums_started",
+        format!("dbnums_total={dbnums_total} dbnums={dbnums:?}"),
+        refresh_started,
+    );
+
+    for (dbnum_idx, dbnum) in dbnums.iter().enumerate() {
         let total_nodes = match query_total_nodes_for_dbnum(*dbnum).await {
             Ok(count) => count,
             Err(err) => {
@@ -77,6 +83,17 @@ pub async fn refresh_pe_transform_for_dbnums(
         };
 
         println!("📊 dbnum {} 总节点数: {}", dbnum, total_nodes);
+        record_transform_refresh_progress(
+            "refresh_pe_transform_dbnum_started",
+            format!(
+                "dbnum_index={}/{} dbnum={} total_nodes={}",
+                dbnum_idx + 1,
+                dbnums_total,
+                dbnum,
+                total_nodes
+            ),
+            refresh_started,
+        );
 
         let roots = query_root_refnos(*dbnum)
             .await
@@ -95,7 +112,7 @@ pub async fn refresh_pe_transform_for_dbnums(
         for root_refno in roots {
             let mut queue: VecDeque<(RefnoEnum, DMat4)> = VecDeque::new();
 
-            let local_mat = get_sanitized_local_mat4(root_refno).await;
+            let local_mat = get_sanitized_local_mat4(root_refno, refresh_started).await;
             let world_mat = local_mat.unwrap_or(DMat4::IDENTITY);
             push_entry(
                 &mut entries,
@@ -108,16 +125,17 @@ pub async fn refresh_pe_transform_for_dbnums(
             queue.push_back((root_refno, world_mat));
 
             while let Some((parent_refno, parent_world)) = queue.pop_front() {
-                let children = match get_children_refnos(parent_refno).await {
-                    Ok(children) => children,
-                    Err(err) => {
-                        eprintln!("⚠️  获取子节点失败: {} -> {}", parent_refno, err);
-                        continue;
-                    }
-                };
+                let children =
+                    match get_children_refnos_with_timeout(parent_refno, refresh_started).await {
+                        Ok(children) => children,
+                        Err(err) => {
+                            eprintln!("⚠️  获取子节点失败: {} -> {}", parent_refno, err);
+                            continue;
+                        }
+                    };
 
                 for child in children {
-                    let local_mat = get_sanitized_local_mat4(child).await;
+                    let local_mat = get_sanitized_local_mat4(child, refresh_started).await;
                     let world_mat = match local_mat {
                         Some(local) => parent_world * local,
                         None => parent_world,
@@ -131,8 +149,27 @@ pub async fn refresh_pe_transform_for_dbnums(
                         dbnum_last_print = dbnum_processed;
                     }
 
+                    if last_progress.elapsed() >= PE_TRANSFORM_PROGRESS_INTERVAL {
+                        record_transform_refresh_progress(
+                            "refresh_pe_transform_dbnum_progress",
+                            format!(
+                                "dbnum_index={}/{} dbnum={} processed={} dbnum_processed={} total_nodes={} primed={} pending_batch={}",
+                                dbnum_idx + 1,
+                                dbnums_total,
+                                dbnum,
+                                total,
+                                dbnum_processed,
+                                total_nodes,
+                                total_primed,
+                                entries.len()
+                            ),
+                            refresh_started,
+                        );
+                        last_progress = Instant::now();
+                    }
+
                     if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
-                        flush_entries(db_option, &mut entries, &mut total_primed)
+                        flush_entries(db_option, &mut entries, &mut total_primed, refresh_started)
                             .await
                             .with_context(|| {
                                 format!("批量写入 pe_transform 失败: dbnum={}", dbnum)
@@ -140,6 +177,20 @@ pub async fn refresh_pe_transform_for_dbnums(
                         entries.clear();
                         print_progress(dbnum_processed, total_nodes, true);
                         dbnum_last_print = dbnum_processed;
+                        record_transform_refresh_progress(
+                            "refresh_pe_transform_dbnum_batch_saved",
+                            format!(
+                                "dbnum_index={}/{} dbnum={} processed={} dbnum_processed={} primed={}",
+                                dbnum_idx + 1,
+                                dbnums_total,
+                                dbnum,
+                                total,
+                                dbnum_processed,
+                                total_primed
+                            ),
+                            refresh_started,
+                        );
+                        last_progress = Instant::now();
                     }
                 }
             }
@@ -149,7 +200,7 @@ pub async fn refresh_pe_transform_for_dbnums(
     }
 
     if !entries.is_empty() {
-        flush_entries(db_option, &mut entries, &mut total_primed)
+        flush_entries(db_option, &mut entries, &mut total_primed, refresh_started)
             .await
             .context("写入最后一批 pe_transform 失败")?;
     }
@@ -157,6 +208,11 @@ pub async fn refresh_pe_transform_for_dbnums(
     println!(
         "\r✅ 完成！共处理 {} 个节点，预热 transform_cache {} 个节点                    ",
         total, total_primed
+    );
+    record_transform_refresh_progress(
+        "refresh_pe_transform_dbnums_done",
+        format!("processed={total} primed={total_primed}"),
+        refresh_started,
     );
     Ok(total)
 }
@@ -190,10 +246,29 @@ pub async fn refresh_pe_transform_for_root_refnos(
     let mut entries: Vec<PeTransformEntry> = Vec::with_capacity(PE_TRANSFORM_BATCH_SIZE);
     let mut total = 0usize;
     let mut total_primed = 0usize;
+    let refresh_started = Instant::now();
+    let mut last_progress = Instant::now();
+    let roots_total = roots.len();
 
-    for root_refno in roots {
-        let root_local = get_sanitized_local_mat4(root_refno).await;
-        let root_world = compute_world_mat_from_owner_chain(root_refno)
+    record_transform_refresh_progress(
+        "refresh_pe_transform_started",
+        format!("roots_total={roots_total}"),
+        refresh_started,
+    );
+
+    for (root_idx, root_refno) in roots.into_iter().enumerate() {
+        record_transform_refresh_progress(
+            "refresh_pe_transform_root_started",
+            format!(
+                "root_index={}/{} root_refno={}",
+                root_idx + 1,
+                roots_total,
+                root_refno
+            ),
+            refresh_started,
+        );
+        let root_local = get_sanitized_local_mat4(root_refno, refresh_started).await;
+        let root_world = compute_world_mat_from_owner_chain(root_refno, refresh_started)
             .await
             .with_context(|| format!("计算 root 世界变换失败: {}", root_refno))?;
         push_entry(
@@ -208,16 +283,17 @@ pub async fn refresh_pe_transform_for_root_refnos(
         queue.push_back((root_refno, root_world));
 
         while let Some((parent_refno, parent_world)) = queue.pop_front() {
-            let children = match get_children_refnos(parent_refno).await {
-                Ok(children) => children,
-                Err(err) => {
-                    eprintln!("⚠️  获取子节点失败: {} -> {}", parent_refno, err);
-                    continue;
-                }
-            };
+            let children =
+                match get_children_refnos_with_timeout(parent_refno, refresh_started).await {
+                    Ok(children) => children,
+                    Err(err) => {
+                        eprintln!("⚠️  获取子节点失败: {} -> {}", parent_refno, err);
+                        continue;
+                    }
+                };
 
             for child in children {
-                let local_mat = get_sanitized_local_mat4(child).await;
+                let local_mat = get_sanitized_local_mat4(child, refresh_started).await;
                 let world_mat = match local_mat {
                     Some(local) => parent_world * local,
                     None => parent_world,
@@ -225,24 +301,59 @@ pub async fn refresh_pe_transform_for_root_refnos(
                 push_entry(&mut entries, &mut total, child, local_mat, Some(world_mat));
                 queue.push_back((child, world_mat));
 
+                if last_progress.elapsed() >= PE_TRANSFORM_PROGRESS_INTERVAL {
+                    record_transform_refresh_progress(
+                        "refresh_pe_transform_progress",
+                        format!(
+                            "root_index={}/{} root_refno={} processed={} primed={} pending_batch={}",
+                            root_idx + 1,
+                            roots_total,
+                            root_refno,
+                            total,
+                            total_primed,
+                            entries.len()
+                        ),
+                        refresh_started,
+                    );
+                    last_progress = Instant::now();
+                }
+
                 if entries.len() >= PE_TRANSFORM_BATCH_SIZE {
-                    flush_entries(db_option, &mut entries, &mut total_primed)
+                    flush_entries(db_option, &mut entries, &mut total_primed, refresh_started)
                         .await
                         .with_context(|| {
                             format!("批量写入 pe_transform 失败: root_refno={}", root_refno)
                         })?;
                     entries.clear();
+                    record_transform_refresh_progress(
+                        "refresh_pe_transform_batch_saved",
+                        format!(
+                            "root_index={}/{} root_refno={} processed={} primed={}",
+                            root_idx + 1,
+                            roots_total,
+                            root_refno,
+                            total,
+                            total_primed
+                        ),
+                        refresh_started,
+                    );
+                    last_progress = Instant::now();
                 }
             }
         }
     }
 
     if !entries.is_empty() {
-        flush_entries(db_option, &mut entries, &mut total_primed)
+        flush_entries(db_option, &mut entries, &mut total_primed, refresh_started)
             .await
             .context("写入最后一批 pe_transform 失败")?;
     }
 
+    record_transform_refresh_progress(
+        "refresh_pe_transform_done",
+        format!("processed={total} primed={total_primed}"),
+        refresh_started,
+    );
     println!(
         "\r✅ 子树刷新完成！共处理 {} 个节点，预热 transform_cache {} 个节点                    ",
         total, total_primed
@@ -254,12 +365,35 @@ async fn flush_entries(
     db_option: &DbOptionExt,
     entries: &mut Vec<PeTransformEntry>,
     total_primed: &mut usize,
+    refresh_started: Instant,
 ) -> Result<()> {
+    let entry_count = entries.len();
+    record_transform_refresh_progress(
+        "refresh_pe_transform_flush_started",
+        format!("entries={} primed_before={}", entry_count, *total_primed),
+        refresh_started,
+    );
     crate::pe_transform_store::save_entries_with_backend(db_option, entries).await?;
+    record_transform_refresh_progress(
+        "refresh_pe_transform_backend_saved",
+        format!("entries={entry_count}"),
+        refresh_started,
+    );
+    let before_prime = *total_primed;
     *total_primed +=
         crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
             entries,
         );
+    record_transform_refresh_progress(
+        "refresh_pe_transform_flush_done",
+        format!(
+            "entries={} primed_delta={} primed_total={}",
+            entry_count,
+            total_primed.saturating_sub(before_prime),
+            *total_primed
+        ),
+        refresh_started,
+    );
     Ok(())
 }
 
@@ -320,23 +454,140 @@ fn dmat4_to_transform_option(matrix: Option<DMat4>) -> Option<Transform> {
         .filter(|transform| transform.is_finite())
 }
 
-async fn get_sanitized_local_mat4(refno: RefnoEnum) -> Option<DMat4> {
-    match get_local_mat4(refno).await {
-        Ok(mat) => sanitize_dmat4(mat),
-        Err(err) => {
+async fn get_children_refnos_with_timeout(
+    refno: RefnoEnum,
+    refresh_started: Instant,
+) -> Result<Vec<RefnoEnum>> {
+    record_transform_refresh_progress(
+        "refresh_pe_transform_children_query_started",
+        format!(
+            "refno={refno} timeout_secs={}",
+            PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+        ),
+        refresh_started,
+    );
+    match tokio::time::timeout(PE_TRANSFORM_QUERY_TIMEOUT, get_children_refnos(refno)).await {
+        Ok(result) => result,
+        Err(_) => {
+            record_transform_refresh_progress(
+                "refresh_pe_transform_children_query_timeout",
+                format!(
+                    "refno={refno} timeout_secs={}",
+                    PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+                ),
+                refresh_started,
+            );
+            Err(anyhow::anyhow!(
+                "get_children_refnos timed out after {:?}",
+                PE_TRANSFORM_QUERY_TIMEOUT
+            ))
+        }
+    }
+}
+
+async fn get_sanitized_local_mat4(refno: RefnoEnum, refresh_started: Instant) -> Option<DMat4> {
+    record_transform_refresh_progress(
+        "refresh_pe_transform_local_query_started",
+        format!(
+            "refno={refno} timeout_secs={}",
+            PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+        ),
+        refresh_started,
+    );
+    if is_transform_refresh_passthrough_marker(refno, refresh_started).await {
+        record_transform_refresh_progress(
+            "refresh_pe_transform_local_query_skipped_marker",
+            format!("refno={refno}"),
+            refresh_started,
+        );
+        return None;
+    }
+
+    match tokio::time::timeout(PE_TRANSFORM_QUERY_TIMEOUT, get_local_mat4(refno)).await {
+        Ok(Ok(mat)) => sanitize_dmat4(mat),
+        Ok(Err(err)) => {
             eprintln!("⚠️  获取本地变换失败: {} -> {}", refno, err);
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "⚠️  获取本地变换超时: {} after {:?}",
+                refno, PE_TRANSFORM_QUERY_TIMEOUT
+            );
+            record_transform_refresh_progress(
+                "refresh_pe_transform_local_query_timeout",
+                format!(
+                    "refno={refno} timeout_secs={}",
+                    PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+                ),
+                refresh_started,
+            );
             None
         }
     }
 }
 
-async fn compute_world_mat_from_owner_chain(refno: RefnoEnum) -> Result<DMat4> {
+async fn is_transform_refresh_passthrough_marker(
+    refno: RefnoEnum,
+    refresh_started: Instant,
+) -> bool {
+    match tokio::time::timeout(PE_TRANSFORM_QUERY_TIMEOUT, get_type_name(refno)).await {
+        Ok(Ok(noun)) => matches!(noun.as_str(), "JLDATU" | "PLDATU"),
+        Ok(Err(err)) => {
+            eprintln!("⚠️  获取节点类型失败: {} -> {}", refno, err);
+            false
+        }
+        Err(_) => {
+            eprintln!(
+                "⚠️  获取节点类型超时: {} after {:?}",
+                refno, PE_TRANSFORM_QUERY_TIMEOUT
+            );
+            record_transform_refresh_progress(
+                "refresh_pe_transform_type_query_timeout",
+                format!(
+                    "refno={refno} timeout_secs={}",
+                    PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+                ),
+                refresh_started,
+            );
+            false
+        }
+    }
+}
+
+async fn compute_world_mat_from_owner_chain(
+    refno: RefnoEnum,
+    refresh_started: Instant,
+) -> Result<DMat4> {
     let mut chain = vec![refno];
     let mut current = refno;
 
     loop {
-        let att = get_named_attmap(current)
+        record_transform_refresh_progress(
+            "refresh_pe_transform_owner_query_started",
+            format!(
+                "refno={current} timeout_secs={}",
+                PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+            ),
+            refresh_started,
+        );
+        let att = tokio::time::timeout(PE_TRANSFORM_QUERY_TIMEOUT, get_named_attmap(current))
             .await
+            .map_err(|_| {
+                record_transform_refresh_progress(
+                    "refresh_pe_transform_owner_query_timeout",
+                    format!(
+                        "refno={current} timeout_secs={}",
+                        PE_TRANSFORM_QUERY_TIMEOUT.as_secs()
+                    ),
+                    refresh_started,
+                );
+                anyhow::anyhow!(
+                    "读取属性超时: {} after {:?}",
+                    current,
+                    PE_TRANSFORM_QUERY_TIMEOUT
+                )
+            })?
             .with_context(|| format!("读取属性失败: {}", current))?;
         let owner = att.get_owner();
         if owner.is_unset() {
@@ -350,9 +601,8 @@ async fn compute_world_mat_from_owner_chain(refno: RefnoEnum) -> Result<DMat4> {
 
     let mut world = DMat4::IDENTITY;
     for node in chain {
-        let local = get_local_mat4(node)
+        let local = get_sanitized_local_mat4(node, refresh_started)
             .await
-            .with_context(|| format!("计算局部变换失败: {}", node))?
             .unwrap_or(DMat4::IDENTITY);
         world *= local;
     }
@@ -377,6 +627,31 @@ fn print_progress(processed: usize, total_nodes: usize, saved_batch: bool) {
     );
     use std::io::Write;
     std::io::stdout().flush().ok();
+}
+
+async fn query_pe_transform_count_for_dbnum(dbnum: u32) -> Result<usize> {
+    let sql = format!(
+        "SELECT count() AS count FROM pe_transform WHERE record::id(id) INSIDE \
+         (SELECT VALUE record::id(id) FROM pe WHERE dbnum = {}) GROUP ALL",
+        dbnum
+    );
+    let rows: Vec<Value> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .with_context(|| format!("执行 pe_transform 覆盖统计 SQL 失败: {}", sql))?;
+
+    Ok(rows
+        .iter()
+        .find_map(extract_count_from_json_value)
+        .unwrap_or(0) as usize)
+}
+
+fn record_transform_refresh_progress(stage: &str, detail: String, started: Instant) {
+    crate::perf_metrics::record_generate_progress(
+        stage,
+        Some(&detail),
+        started.elapsed().as_millis() as u64,
+    );
 }
 
 pub(crate) fn extract_count_from_json_value(value: &Value) -> Option<u64> {

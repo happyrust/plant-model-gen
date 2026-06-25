@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use aios_core::pdms_types::{RefU64, RefnoEnum};
 use anyhow::{Context, Result, anyhow};
@@ -1770,6 +1775,89 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+struct GenerateProgressHeartbeat {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GenerateProgressHeartbeat {
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &*self.wake;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn stop(mut self) {
+        self.shutdown();
+    }
+}
+
+impl Drop for GenerateProgressHeartbeat {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn start_generate_progress_heartbeat(
+    default_stage: impl Into<String>,
+    default_detail: impl Into<String>,
+    started: Instant,
+) -> GenerateProgressHeartbeat {
+    let default_stage = default_stage.into();
+    let default_detail = default_detail.into();
+    aios_database::perf_metrics::record_generate_heartbeat(
+        &default_stage,
+        Some(&default_detail),
+        started.elapsed().as_millis() as u64,
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    let task_stop = stop.clone();
+    let task_wake = wake.clone();
+
+    let handle = std::thread::spawn(move || {
+        loop {
+            let (lock, cvar) = &*task_wake;
+            let stopped = match lock.lock() {
+                Ok(stopped) => stopped,
+                Err(_) => break,
+            };
+            let stopped = match cvar.wait_timeout_while(
+                stopped,
+                Duration::from_secs(15),
+                |stopped| !*stopped,
+            ) {
+                Ok((stopped, _)) => stopped,
+                Err(_) => break,
+            };
+            if *stopped || task_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            drop(stopped);
+
+            aios_database::perf_metrics::record_generate_heartbeat(
+                &default_stage,
+                Some(&default_detail),
+                started.elapsed().as_millis() as u64,
+            );
+        }
+    });
+
+    GenerateProgressHeartbeat {
+        stop,
+        wake,
+        handle: Some(handle),
+    }
+}
+
 pub async fn run_generate_model(
     config: &ExportConfig,
     db_option_ext: &DbOptionExt,
@@ -1784,9 +1872,20 @@ pub async fn run_generate_model(
     // 方案 B（CLI 第一阶段）：mesh 状态以本地 glb + aabb_cache.rkyv 为准。
     let _mesh_state_guard = ScopedEnvVar::set("MESH_STATE_SOURCE", "file");
 
+    let generate_started = Instant::now();
+    aios_database::perf_metrics::record_generate_progress(
+        "connect_surreal",
+        Some("run_generate_model"),
+        generate_started.elapsed().as_millis() as u64,
+    );
     ensure_surreal_connected(db_option_ext).await?;
 
     use aios_database::fast_model::gen_all_geos_data;
+    aios_database::perf_metrics::record_generate_progress(
+        "collect_transform_refresh_roots",
+        None,
+        generate_started.elapsed().as_millis() as u64,
+    );
     let refresh_roots =
         collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
             .await?;
@@ -1798,6 +1897,11 @@ pub async fn run_generate_model(
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
     }
+    aios_database::perf_metrics::record_generate_progress(
+        "collect_generation_targets",
+        None,
+        generate_started.elapsed().as_millis() as u64,
+    );
     let target_refnos =
         collect_regen_target_refnos(config, db_option_ext.inner.manual_db_nums.as_deref()).await?;
     let mut db_option_override = db_option_ext.clone();
@@ -1809,7 +1913,33 @@ pub async fn run_generate_model(
         );
         db_option_override.inner.manual_db_nums = Some(derived_dbnums);
     }
-    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await?;
+    aios_database::perf_metrics::record_generate_progress(
+        "gen_all_geos_data_started",
+        Some("incremental"),
+        generate_started.elapsed().as_millis() as u64,
+    );
+    let gen_heartbeat = start_generate_progress_heartbeat(
+        "gen_all_geos_data_running",
+        "incremental",
+        generate_started,
+    );
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await;
+    gen_heartbeat.stop();
+    let generate_ms = generate_started.elapsed().as_millis() as u64;
+    match &gen_result {
+        Ok(_) => aios_database::perf_metrics::record_generate_progress(
+            "gen_all_geos_data_finished",
+            Some("incremental"),
+            generate_ms,
+        ),
+        Err(err) => aios_database::perf_metrics::record_generate_progress(
+            "gen_all_geos_data_failed",
+            Some(&err.to_string()),
+            generate_ms,
+        ),
+    }
+    aios_database::perf_metrics::finish_generate_stage_from_model_store(generate_ms).await;
+    let gen_result = gen_result?;
     println!("✅ 模型增量生成完成");
     Ok(gen_result)
 }
@@ -1833,10 +1963,21 @@ pub async fn run_regen_model(
     db_option_override.inner.apply_boolean_operation = true;
 
     // 3. 连接 SurrealDB（gen_all_geos_data 需要读取 PE/属性/世界矩阵等输入数据）
+    let generate_started = Instant::now();
+    aios_database::perf_metrics::record_generate_progress(
+        "connect_surreal",
+        Some("run_regen_model"),
+        generate_started.elapsed().as_millis() as u64,
+    );
     ensure_surreal_connected(db_option_ext).await?;
 
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;
+    aios_database::perf_metrics::record_generate_progress(
+        "collect_transform_refresh_roots",
+        None,
+        generate_started.elapsed().as_millis() as u64,
+    );
     let refresh_roots =
         collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
             .await?;
@@ -1848,10 +1989,20 @@ pub async fn run_regen_model(
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
     }
+    aios_database::perf_metrics::record_generate_progress(
+        "collect_generation_targets",
+        None,
+        generate_started.elapsed().as_millis() as u64,
+    );
     let target_refnos =
         collect_regen_target_refnos(config, db_option_ext.inner.manual_db_nums.as_deref()).await?;
 
     if db_option_override.model_writer_mode.writes_to_surreal() {
+        aios_database::perf_metrics::record_generate_progress(
+            "pre_cleanup_for_regen",
+            None,
+            generate_started.elapsed().as_millis() as u64,
+        );
         // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
         // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
         aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
@@ -1875,7 +2026,30 @@ pub async fn run_regen_model(
             db_option_override.inner.manual_db_nums = Some(derived_dbnums);
         }
     }
-    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await?;
+    aios_database::perf_metrics::record_generate_progress(
+        "gen_all_geos_data_started",
+        Some("regen"),
+        generate_started.elapsed().as_millis() as u64,
+    );
+    let gen_heartbeat =
+        start_generate_progress_heartbeat("gen_all_geos_data_running", "regen", generate_started);
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await;
+    gen_heartbeat.stop();
+    let generate_ms = generate_started.elapsed().as_millis() as u64;
+    match &gen_result {
+        Ok(_) => aios_database::perf_metrics::record_generate_progress(
+            "gen_all_geos_data_finished",
+            Some("regen"),
+            generate_ms,
+        ),
+        Err(err) => aios_database::perf_metrics::record_generate_progress(
+            "gen_all_geos_data_failed",
+            Some(&err.to_string()),
+            generate_ms,
+        ),
+    }
+    aios_database::perf_metrics::finish_generate_stage_from_model_store(generate_ms).await;
+    let gen_result = gen_result?;
     println!("✅ 模型重新生成完成");
     Ok(gen_result)
 }
@@ -3820,6 +3994,10 @@ pub async fn export_dbnum_instances_parquet_mode(
     println!("   - TUBI 数量 (tubings): {}", stats.tubing_count);
     println!("   - 变换矩阵数量 (transforms): {}", stats.transform_count);
     println!("   - 包围盒数量 (aabb): {}", stats.aabb_count);
+    println!(
+        "   - spec_info fallback 数量: {}",
+        stats.spec_info_fallback_count
+    );
     println!("   - 总文件大小: {} 字节", stats.total_bytes);
     println!("   - 耗时: {:?}", stats.elapsed);
     if let Some(ref parquet_name) = parquet_name {

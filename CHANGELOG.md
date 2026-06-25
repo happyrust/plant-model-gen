@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-06-25
+
+### Added — 模型版本发布、增量更新与对比流水线
+
+> 将 E3D 增量 sesno 采集、模型生成、Parquet 导出、版本发布与对比查看串成可审计的本地流水线，支持后续按 release 做运行时场景和资产差异核查。
+
+- 新增 `model-version` 相关 CLI/API 与 `version_management` 模块：覆盖 release 注册、history baseline、history replay、physical snapshot、DuckLake catalog、release package、state machine、scene tree artifact、source observation 与 missing mesh repair。
+- 新增 `/api/model-version/*` 路由与 compare/release viewer 页面入口，支持 release 列表、运行状态、发布历史、reconcile、runtime scene、mesh assets、diff、unit diff 与 component impact 查询。
+- 新增 `incremental-sesno` / `watch-incremental` CLI 流程：从 db index 或指定 db 文件采集 sesno 增量，持久化 PE/ATT 变更，可选触发模型生成、生成后 Parquet 导出与 publication handoff。
+- 新增 `model-version-ducklake` feature，用 DuckDB/DuckLake 作为不可变模型 release 快照 catalog；与实验性的 `model-writer-ducklake` 保持独立。
+- 模型生成与增量流程写入 task/perf progress heartbeat，失败时统一 finalize metrics，便于 web_server 观察长任务阶段和卡点。
+- `export-parquet-after-gen` 从普通导出请求中拆出，支持生成后自动导出 dbnum instances parquet，并报告 `spec_info` fallback 数量。
+- 扩展 MBD pipe、E3D tree、PTSET、SQLite spatial、site task metrics 与 managed project site 相关接口，用于 release 对比、资产索引和现场验证。
+- 增加 Aliyun full-stack deploy workflow、DuckLake/version 设计文档、发布截图与本地验证记录；清理 orphan sidecar 脚本并移除 Office 临时锁文件。
+
 ## 2026-06-23
 
 ### Changed — 房间树保留 E3D 原始子层级

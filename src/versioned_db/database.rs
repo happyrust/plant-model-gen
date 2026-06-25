@@ -40,14 +40,15 @@ use std::mem::take;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncReadExt;
 use tokio::sync::OnceCell;
 // use tokio::sync::mpsc::Sender;
 use std::sync::mpsc::Sender;
-use tokio::time::Instant;
 
 use crate::consts::*;
 use crate::data_interface::tidb_manager::AiosDBManager;
@@ -86,6 +87,14 @@ fn env_usize(key: &str) -> Option<usize> {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
+}
+
+#[inline]
+fn resolve_sync_chunk_size(configured: Option<u32>, default_chunk_size: usize) -> usize {
+    env_usize("AIOS_SYNC_CHUNK_SIZE")
+        .or_else(|| configured.map(|value| value as usize))
+        .unwrap_or(default_chunk_size)
+        .max(1)
 }
 
 #[inline]
@@ -137,6 +146,114 @@ fn parse_tree_output_dir(source_project_name: &str) -> PathBuf {
     }
 
     active_tree_dir
+}
+
+struct ParseProgressHeartbeat {
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParseProgressHeartbeat {
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &*self.wake;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            cvar.notify_one();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn stop(mut self) {
+        self.shutdown();
+    }
+}
+
+impl Drop for ParseProgressHeartbeat {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_parse_progress_heartbeat(
+    project_name: String,
+    file_name: String,
+    dbnum: u32,
+    db_type: String,
+    save_db: bool,
+    refnos_total: usize,
+    chunks_total: usize,
+    chunks_completed: usize,
+    last_chunk: Option<usize>,
+    parsed_attrs: usize,
+    chunk_stage_start: Instant,
+) -> ParseProgressHeartbeat {
+    crate::perf_metrics::record_parse_progress(crate::perf_metrics::ParseProgressUpdate {
+        stage: "chunk_pending",
+        project_name: &project_name,
+        file_name: &file_name,
+        dbnum,
+        db_type: &db_type,
+        save_db,
+        refnos_total,
+        chunks_total,
+        chunks_completed,
+        last_chunk,
+        parsed_attrs,
+        elapsed_ms: chunk_stage_start.elapsed().as_millis() as u64,
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    let task_stop = stop.clone();
+    let task_wake = wake.clone();
+
+    let handle = std::thread::spawn(move || {
+        loop {
+            let (lock, cvar) = &*task_wake;
+            let stopped = match lock.lock() {
+                Ok(stopped) => stopped,
+                Err(_) => break,
+            };
+            let stopped = match cvar.wait_timeout_while(
+                stopped,
+                Duration::from_secs(15),
+                |stopped| !*stopped,
+            ) {
+                Ok((stopped, _)) => stopped,
+                Err(_) => break,
+            };
+            if *stopped || task_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            drop(stopped);
+
+            crate::perf_metrics::record_parse_progress(crate::perf_metrics::ParseProgressUpdate {
+                stage: "chunk_pending",
+                project_name: &project_name,
+                file_name: &file_name,
+                dbnum,
+                db_type: &db_type,
+                save_db,
+                refnos_total,
+                chunks_total,
+                chunks_completed,
+                last_chunk,
+                parsed_attrs,
+                elapsed_ms: chunk_stage_start.elapsed().as_millis() as u64,
+            });
+        }
+    });
+
+    ParseProgressHeartbeat {
+        stop,
+        wake,
+        handle: Some(handle),
+    }
 }
 
 fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow::Result<()> {
@@ -974,7 +1091,7 @@ where
     if b_replace_types {
         is_replace = true;
     }
-    let chunk_size = db_option_arc.sync_chunk_size.unwrap_or(10_0000) as usize;
+    let chunk_size = resolve_sync_chunk_size(db_option_arc.sync_chunk_size, 10_0000);
 
     const CHUNK_SIZE: usize = 100;
     let (sender, receiver) = flume::unbounded();
@@ -1422,6 +1539,7 @@ where
         let debug_refnos = Arc::new(debug_refnos);
         let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
 
+        let chunk_stage_start = Instant::now();
         let mut total_cnt = 0;
         for (chunk_index, chunk) in all_refnos.chunks(chunk_size).enumerate() {
             let db_option_clone = db_option_arc.clone();
@@ -1433,7 +1551,20 @@ where
             let ses_range_map_clone = ses_range_map.clone();
             let ignore_world_refno = true;
 
-            match parse_file_with_chunk(
+            let parse_heartbeat = start_parse_progress_heartbeat(
+                project.as_str().to_string(),
+                file_name.clone(),
+                dbnum,
+                db_type.clone(),
+                is_save_db,
+                all_refnos.len(),
+                total_chunks,
+                chunk_index,
+                chunk_index.checked_sub(1).map(|idx| idx + 1),
+                total_cnt,
+                chunk_stage_start,
+            );
+            let parse_result = parse_file_with_chunk(
                 db_basic_clone.clone(),
                 &file_name_clone,
                 project_name_clone.as_str(),
@@ -1441,8 +1572,9 @@ where
                 &ses_range_map_clone,
                 ignore_world_refno,
             )
-            .await
-            {
+            .await;
+
+            match parse_result {
                 Ok(PdmsDbData {
                     total_attr_map,
                     type_ele_map,
@@ -1545,6 +1677,21 @@ where
                     total_chunks,
                 );
             }
+            crate::perf_metrics::record_parse_progress(crate::perf_metrics::ParseProgressUpdate {
+                stage: "chunk_done",
+                project_name: project.as_str(),
+                file_name: &file_name,
+                dbnum,
+                db_type: &db_type,
+                save_db: is_save_db,
+                refnos_total: all_refnos.len(),
+                chunks_total: total_chunks,
+                chunks_completed: chunk_index + 1,
+                last_chunk: Some(chunk_index + 1),
+                parsed_attrs: total_cnt,
+                elapsed_ms: chunk_stage_start.elapsed().as_millis() as u64,
+            });
+            parse_heartbeat.stop();
         }
         let output_dir = parse_tree_output_dir(&project_name);
         // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
@@ -1732,7 +1879,7 @@ pub async fn sync_total_async_threaded(
     if b_replace_types {
         is_replace = true;
     }
-    let chunk_size = db_option_arc.sync_chunk_size.unwrap_or(1_0000) as usize;
+    let chunk_size = resolve_sync_chunk_size(db_option_arc.sync_chunk_size, 1_0000);
 
     const CHUNK_SIZE: usize = 100;
     // let (sender, receiver) = flume::bounded(CHUNK_SIZE);
@@ -2024,6 +2171,24 @@ pub async fn sync_total_async_threaded(
             }
             // dbg!(dbnum);
             dbno_set.insert(dbnum);
+            println!(
+                "[parse-progress] file_start project={} file={} dbnum={} db_type={} save_db={}",
+                project, file_name, dbnum, db_type, is_save_db
+            );
+            crate::perf_metrics::record_parse_progress(crate::perf_metrics::ParseProgressUpdate {
+                stage: "file_start",
+                project_name: project.as_str(),
+                file_name: &file_name,
+                dbnum,
+                db_type: &db_type,
+                save_db: is_save_db,
+                refnos_total: 0,
+                chunks_total: 0,
+                chunks_completed: 0,
+                last_chunk: None,
+                parsed_attrs: 0,
+                elapsed_ms: 0,
+            });
             // 如果需要解析的文件列表为空或包含当前文件名,则执行以下代码块
             info!("path={:?}", &file_name); // 打印文件路径
             let mut ses_range_map: BTreeMap<i32, Range<u32>> = BTreeMap::new();
@@ -2140,6 +2305,32 @@ pub async fn sync_total_async_threaded(
                     all_refnos,
                 );
                 let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
+                let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
+                println!(
+                    "[parse-progress] db_basic_done project={} file={} dbnum={} refnos={} chunks={} db_basic_ms={}",
+                    project,
+                    file_name,
+                    dbnum,
+                    all_refnos.len(),
+                    total_chunks,
+                    db_basic_parse_ms
+                );
+                crate::perf_metrics::record_parse_progress(
+                    crate::perf_metrics::ParseProgressUpdate {
+                        stage: "db_basic_done",
+                        project_name: project.as_str(),
+                        file_name: &file_name,
+                        dbnum,
+                        db_type: &db_type,
+                        save_db: is_save_db,
+                        refnos_total: all_refnos.len(),
+                        chunks_total: total_chunks,
+                        chunks_completed: 0,
+                        last_chunk: None,
+                        parsed_attrs: 0,
+                        elapsed_ms: time.elapsed().as_millis() as u64,
+                    },
+                );
 
                 let db_basic = Arc::new(db_basic);
                 if is_save_db {
@@ -2175,6 +2366,7 @@ pub async fn sync_total_async_threaded(
                     .enumerate()
                     .map(|(chunk_index, chunk)| (chunk_index, chunk.to_vec()))
                     .collect();
+                let total_chunks = std::cmp::max(1, chunk_jobs.len());
 
                 let mut chunk_stream = futures::stream::iter(
                     chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
@@ -2198,7 +2390,29 @@ pub async fn sync_total_async_threaded(
                 )
                 .buffer_unordered(chunk_concurrency);
 
-                while let Some((chunk_index, parse_result)) = chunk_stream.next().await {
+                let mut completed_chunks = 0usize;
+                let mut last_completed_chunk = None;
+                let mut last_progress_print = Instant::now();
+                while completed_chunks < total_chunks {
+                    let parse_heartbeat = start_parse_progress_heartbeat(
+                        project.as_str().to_string(),
+                        file_name.clone(),
+                        dbnum,
+                        db_type.clone(),
+                        is_save_db,
+                        all_refnos.len(),
+                        total_chunks,
+                        completed_chunks,
+                        last_completed_chunk,
+                        total_cnt,
+                        chunk_stage_start,
+                    );
+                    let next_chunk = chunk_stream.next().await;
+                    let Some((chunk_index, parse_result)) = next_chunk else {
+                        parse_heartbeat.stop();
+                        break;
+                    };
+
                     match parse_result {
                         Ok(PdmsDbData {
                             total_attr_map,
@@ -2316,6 +2530,43 @@ pub async fn sync_total_async_threaded(
                             );
                         }
                     }
+                    completed_chunks += 1;
+                    last_completed_chunk = Some(chunk_index + 1);
+                    if completed_chunks == 1
+                        || completed_chunks == total_chunks
+                        || completed_chunks % 5 == 0
+                        || last_progress_print.elapsed().as_secs() >= 10
+                    {
+                        println!(
+                            "[parse-progress] chunk_done project={} file={} dbnum={} completed_chunks={}/{} last_chunk={} parsed_attrs={} elapsed_s={:.1}",
+                            project,
+                            file_name,
+                            dbnum,
+                            completed_chunks,
+                            total_chunks,
+                            chunk_index + 1,
+                            total_cnt,
+                            chunk_stage_start.elapsed().as_secs_f32()
+                        );
+                        crate::perf_metrics::record_parse_progress(
+                            crate::perf_metrics::ParseProgressUpdate {
+                                stage: "chunk_done",
+                                project_name: project.as_str(),
+                                file_name: &file_name,
+                                dbnum,
+                                db_type: &db_type,
+                                save_db: is_save_db,
+                                refnos_total: all_refnos.len(),
+                                chunks_total: total_chunks,
+                                chunks_completed: completed_chunks,
+                                last_chunk: Some(chunk_index + 1),
+                                parsed_attrs: total_cnt,
+                                elapsed_ms: chunk_stage_start.elapsed().as_millis() as u64,
+                            },
+                        );
+                        last_progress_print = Instant::now();
+                    }
+                    parse_heartbeat.stop();
                 }
                 let chunk_parse_ms = chunk_stage_start.elapsed().as_millis();
 

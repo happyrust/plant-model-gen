@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
@@ -539,6 +539,69 @@ fn build_delete_inst_geo_by_hashes_sql(geo_hashes: &[u64], chunk_size: usize) ->
     sqls
 }
 
+fn dedupe_cleanup_refnos(refnos: impl IntoIterator<Item = RefnoEnum>) -> Vec<RefnoEnum> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for refno in refnos {
+        if refno.is_valid() && seen.insert(refno) {
+            out.push(refno);
+        }
+    }
+    out
+}
+
+async fn query_cleanup_refnos_or_seed(seed_refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
+    match crate::fast_model::query_provider::query_multi_descendants_with_self(
+        seed_refnos,
+        &[],
+        true,
+    )
+    .await
+    {
+        Ok(refnos) => dedupe_cleanup_refnos(refnos.into_iter().chain(seed_refnos.iter().copied())),
+        Err(e) => {
+            eprintln!(
+                "[pre_cleanup_for_regen] TreeIndex 展开全部后代失败，降级清理 seed roots 自身: {}",
+                e
+            );
+            dedupe_cleanup_refnos(seed_refnos.iter().copied())
+        }
+    }
+}
+
+async fn filter_seed_bran_hang_by_attr(seed_refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
+    let mut out = Vec::new();
+    for &refno in seed_refnos {
+        let Ok(att) = aios_core::get_named_attmap(refno).await else {
+            continue;
+        };
+        let noun = att.get_type_str();
+        if noun == "BRAN" || noun == "HANG" {
+            out.push(refno);
+        }
+    }
+    dedupe_cleanup_refnos(out)
+}
+
+async fn query_cleanup_bran_hang_or_seed(seed_refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
+    match crate::fast_model::query_provider::query_multi_descendants_with_self(
+        seed_refnos,
+        &["BRAN", "HANG"],
+        true,
+    )
+    .await
+    {
+        Ok(refnos) => dedupe_cleanup_refnos(refnos),
+        Err(e) => {
+            eprintln!(
+                "[pre_cleanup_for_regen] TreeIndex 展开 BRAN/HANG 后代失败，降级通过属性识别 seed roots: {}",
+                e
+            );
+            filter_seed_bran_hang_by_attr(seed_refnos).await
+        }
+    }
+}
+
 /// 模型重新生成前的预处理清理
 ///
 /// 在 `--regen-model` 等 replace_exist=true 场景下，于生成流程启动前一次性删除
@@ -560,18 +623,8 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
     const CHUNK_SIZE: usize = 200;
 
     // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
-    let all_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
-        seed_refnos,
-        &[],
-        true,
-    )
-    .await?;
-    let bran_refnos = crate::fast_model::query_provider::query_multi_descendants_with_self(
-        seed_refnos,
-        &["BRAN", "HANG"],
-        true,
-    )
-    .await?;
+    let all_refnos = query_cleanup_refnos_or_seed(seed_refnos).await;
+    let bran_refnos = query_cleanup_bran_hang_or_seed(seed_refnos).await;
 
     println!(
         "[pre_cleanup_for_regen] seed_refnos={}, 展开后 all_refnos={}, bran_or_hang={}",
@@ -584,7 +637,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         return Ok(());
     }
 
-    let t = std::time::Instant::now();
+    let t = Instant::now();
 
     // 使用 SurrealDB 3.1 array record id range 作为模型产物主清理路径。
     // inst_geo 不是 range-id 模型产物表，因此先从待删 geo_relate.out 收集 hash，再跳过内置 hash < 10 删除。
@@ -600,6 +653,20 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         .chunks(CHUNK_SIZE)
         .map(|chunk| chunk.to_vec())
         .collect::<Vec<_>>();
+    let total_chunks = chunks.len();
+    let mut completed_chunks = 0usize;
+    let mut last_progress = Instant::now();
+    crate::perf_metrics::record_generate_progress(
+        "pre_cleanup_for_regen_started",
+        Some(&format!(
+            "refnos={} chunks={} bran_or_hang={} concurrency={}",
+            all_refnos.len(),
+            total_chunks,
+            bran_refnos.len(),
+            limit_concurrency
+        )),
+        t.elapsed().as_millis() as u64,
+    );
     let mut chunk_stream = stream::iter(chunks)
         .map(|chunk_vec| {
             tokio::spawn(async move {
@@ -639,17 +706,52 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         .buffer_unordered(limit_concurrency);
 
     while let Some(res) = chunk_stream.next().await {
+        completed_chunks += 1;
         match res {
             Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] range chunk 处理失败返回: {}", e),
             Err(e) => eprintln!("[pre_cleanup_for_regen] range chunk tokio 任务崩溃: {}", e),
             _ => {}
         }
+        if completed_chunks == 1
+            || completed_chunks == total_chunks
+            || last_progress.elapsed() >= Duration::from_secs(10)
+        {
+            crate::perf_metrics::record_generate_progress(
+                "pre_cleanup_for_regen_progress",
+                Some(&format!(
+                    "chunks={}/{} approx_refnos_done={} bran_or_hang={}",
+                    completed_chunks,
+                    total_chunks,
+                    completed_chunks
+                        .saturating_mul(CHUNK_SIZE)
+                        .min(all_refnos.len()),
+                    bran_refnos.len()
+                )),
+                t.elapsed().as_millis() as u64,
+            );
+            last_progress = Instant::now();
+        }
     }
 
     if !bran_refnos.is_empty() {
+        crate::perf_metrics::record_generate_progress(
+            "pre_cleanup_for_regen_tubi_cleanup",
+            Some(&format!("bran_or_hang={}", bran_refnos.len())),
+            t.elapsed().as_millis() as u64,
+        );
         delete_tubi_relate_by_branch_refnos(&bran_refnos, CHUNK_SIZE).await?;
     }
 
+    crate::perf_metrics::record_generate_progress(
+        "pre_cleanup_for_regen_done",
+        Some(&format!(
+            "refnos={} chunks={} bran_or_hang={}",
+            all_refnos.len(),
+            total_chunks,
+            bran_refnos.len()
+        )),
+        t.elapsed().as_millis() as u64,
+    );
     println!(
         "[pre_cleanup_for_regen] 清理完成 (array record-id range 模式)，耗时 {} ms",
         t.elapsed().as_millis()
@@ -1176,6 +1278,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
     let mut inst_info_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
     let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_chunks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
@@ -1232,9 +1335,10 @@ FROM neg_relate WHERE out = {} AND pe = {}",
             .filter(|dbnum| *dbnum != 0)
             .unwrap_or_else(|| inst_relate_precomputed.dbnum(key));
         let dt = inst_relate_precomputed.dt(key);
+        let inst_relate_id = model_refno_id("inst_relate", *key);
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: NONE, spec_value: 0, dt: {4}, has_cata_neg: {5}, solid: {6}, owner_refno: {7}, owner_type: '{8}'}}",
-            model_refno_id("inst_relate", *key),
+            inst_relate_id,
             key.to_pe_key(),
             info.id_str(),
             dbnum,
@@ -1246,13 +1350,17 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         );
 
         inst_relate_buffer.push(relate_sql);
+        inst_relate_ids.push(inst_relate_id);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
-            let statement = format!(
-                "INSERT RELATION IGNORE INTO inst_relate [{}];",
-                inst_relate_buffer.join(",")
+            let statements = build_replace_rows_statements(
+                "inst_relate",
+                true,
+                &inst_relate_buffer,
+                &inst_relate_ids,
             );
-            inst_relate_batcher.push(statement).await?;
+            inst_relate_batcher.push_group(statements).await?;
             inst_relate_buffer.clear();
+            inst_relate_ids.clear();
 
             // 延后处理 inst_relate_aabb（必须在 aabb UPSERT 之后写，避免 aabb_id 侧空记录 d=NONE）
             if !inst_relate_aabb_buffer.is_empty() {
@@ -1265,11 +1373,13 @@ FROM neg_relate WHERE out = {} AND pe = {}",
     }
 
     if !inst_relate_buffer.is_empty() {
-        let statement = format!(
-            "INSERT RELATION IGNORE INTO inst_relate [{}];",
-            inst_relate_buffer.join(",")
+        let statements = build_replace_rows_statements(
+            "inst_relate",
+            true,
+            &inst_relate_buffer,
+            &inst_relate_ids,
         );
-        inst_relate_batcher.push(statement).await?;
+        inst_relate_batcher.push_group(statements).await?;
         debug_model_debug!(
             "save_instance_data_optimize flushing inst_relate from inst_info_map: {}",
             inst_relate_buffer.len()
@@ -1372,14 +1482,17 @@ FROM neg_relate WHERE out = {} AND pe = {}",
         }
         all_rows.extend(inst_relate_aabb_buffer.iter().cloned());
         all_ids.extend(inst_relate_aabb_ids.iter().cloned());
-        let (deduped_rows, _deduped_ids) = dedupe_inst_relate_aabb_rows(&all_rows, &all_ids);
+        let (deduped_rows, deduped_ids) = dedupe_inst_relate_aabb_rows(&all_rows, &all_ids);
         let total = deduped_rows.len();
 
-        // 旧数据由重生成入口整体清理（pre_cleanup），首次部署为空库；
-        // 写入统一 INSERT IGNORE 幂等，不再逐 chunk DELETE+INSERT 替换。
-        for rows in deduped_rows.chunks(CHUNK_SIZE) {
-            let insert_stmt = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", rows.join(","));
-            inst_aabb_batcher.push(insert_stmt).await?;
+        // 同一 refno 在同一轮生成中可能先后产生不同 canonical inst_info。
+        // AABB 必须跟随当前 inst_relate 一起替换，避免保留先到候选的包围盒。
+        for (rows, ids) in deduped_rows
+            .chunks(CHUNK_SIZE)
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
+        {
+            let statements = build_replace_rows_statements("inst_relate_aabb", false, rows, ids);
+            inst_aabb_batcher.push_group(statements).await?;
         }
 
         debug_model_debug!(
@@ -1686,6 +1799,10 @@ pub fn build_inst_relate_aabb_rows(
 }
 
 fn dedupe_inst_relate_aabb_rows(rows: &[String], ids: &[String]) -> (Vec<String>, Vec<String>) {
+    dedupe_rows_by_id(rows, ids)
+}
+
+fn dedupe_rows_by_id(rows: &[String], ids: &[String]) -> (Vec<String>, Vec<String>) {
     debug_assert_eq!(rows.len(), ids.len());
 
     let mut index_by_id: HashMap<&str, usize> = HashMap::with_capacity(ids.len());
@@ -1704,6 +1821,36 @@ fn dedupe_inst_relate_aabb_rows(rows: &[String], ids: &[String]) -> (Vec<String>
     }
 
     (deduped_rows, deduped_ids)
+}
+
+fn build_replace_rows_statements(
+    table: &str,
+    relation: bool,
+    rows: &[String],
+    ids: &[String],
+) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    debug_assert_eq!(rows.len(), ids.len());
+
+    let (deduped_rows, deduped_ids) = dedupe_rows_by_id(rows, ids);
+    if deduped_rows.is_empty() {
+        return Vec::new();
+    }
+
+    let insert_keyword = if relation {
+        "INSERT RELATION"
+    } else {
+        "INSERT"
+    };
+    vec![
+        format!("DELETE [{}];", deduped_ids.join(",")),
+        format!(
+            "{insert_keyword} INTO {table} [{}];",
+            deduped_rows.join(",")
+        ),
+    ]
 }
 
 pub async fn save_inst_relate_aabb_rows(
@@ -1748,12 +1895,14 @@ pub async fn save_inst_relate_aabb_rows(
 
     if !inst_relate_aabb_rows.is_empty() {
         let mut inst_aabb_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
-        let (deduped_rows, _deduped_ids) =
+        let (deduped_rows, deduped_ids) =
             dedupe_inst_relate_aabb_rows(inst_relate_aabb_rows, inst_relate_aabb_ids);
-        // 同上：写入统一 INSERT IGNORE，旧数据由入口整体清理，不做逐行替换。
-        for rows in deduped_rows.chunks(CHUNK_SIZE) {
-            let insert_stmt = format!("INSERT IGNORE INTO inst_relate_aabb [{}];", rows.join(","));
-            inst_aabb_batcher.push(insert_stmt).await?;
+        for (rows, ids) in deduped_rows
+            .chunks(CHUNK_SIZE)
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
+        {
+            let statements = build_replace_rows_statements("inst_relate_aabb", false, rows, ids);
+            inst_aabb_batcher.push_group(statements).await?;
         }
         inst_aabb_batcher.finish().await?;
     }
@@ -1786,6 +1935,26 @@ impl TransactionBatcher {
         }
 
         self.pending.push(statement);
+        if self.pending.len() >= self.max_statements {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn push_group(&mut self, statements: Vec<String>) -> anyhow::Result<()> {
+        let statements = statements
+            .into_iter()
+            .filter(|statement| !statement.trim().is_empty())
+            .collect::<Vec<_>>();
+        if statements.is_empty() {
+            return Ok(());
+        }
+
+        if self.pending.len() + statements.len() > self.max_statements {
+            self.flush().await?;
+        }
+
+        self.pending.extend(statements);
         if self.pending.len() >= self.max_statements {
             self.flush().await?;
         }
@@ -2843,6 +3012,7 @@ pub async fn save_instance_data_to_sql_file(
     // inst_info & inst_relate（使用预计算值替代 fn::*）
     let mut inst_info_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
+    let mut inst_relate_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
     let mut inst_relate_aabb_ids: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
 
@@ -2889,10 +3059,11 @@ pub async fn save_instance_data_to_sql_file(
         let spec_value = precomputed.spec_value(key);
         let dt = precomputed.dt(key);
         let dbnum = precomputed.dbnum(key);
+        let inst_relate_id = model_refno_id("inst_relate", *key);
 
         let relate_sql = format!(
             "{{id: {0}, in: {1}, out: inst_info:⟨{2}⟩, dbnum: {3}, zone_refno: {4}, spec_value: {5}, dt: {6}, has_cata_neg: {7}, solid: {8}, owner_refno: {9}, owner_type: '{10}'}}",
-            model_refno_id("inst_relate", *key),
+            inst_relate_id,
             key.to_pe_key(),
             info.id_str(),
             dbnum,
@@ -2905,12 +3076,18 @@ pub async fn save_instance_data_to_sql_file(
             info.owner_type
         );
         inst_relate_buffer.push(relate_sql);
+        inst_relate_ids.push(inst_relate_id);
         if inst_relate_buffer.len() >= CHUNK_SIZE {
-            writer.write_statement(&format!(
-                "INSERT RELATION INTO inst_relate [{}]",
-                inst_relate_buffer.join(",")
-            ))?;
+            for statement in build_replace_rows_statements(
+                "inst_relate",
+                true,
+                &inst_relate_buffer,
+                &inst_relate_ids,
+            ) {
+                writer.write_statement(&statement)?;
+            }
             inst_relate_buffer.clear();
+            inst_relate_ids.clear();
         }
     }
 
@@ -2924,10 +3101,14 @@ pub async fn save_instance_data_to_sql_file(
 
     // flush remaining inst_relate
     if !inst_relate_buffer.is_empty() {
-        writer.write_statement(&format!(
-            "INSERT RELATION INTO inst_relate [{}]",
-            inst_relate_buffer.join(",")
-        ))?;
+        for statement in build_replace_rows_statements(
+            "inst_relate",
+            true,
+            &inst_relate_buffer,
+            &inst_relate_ids,
+        ) {
+            writer.write_statement(&statement)?;
+        }
     }
 
     // aabb
@@ -2951,16 +3132,17 @@ pub async fn save_instance_data_to_sql_file(
         }
     }
 
-    // inst_relate_aabb：与 DB 直写路径同口径，统一 INSERT IGNORE 幂等，
-    // 旧数据由入口整体清理（pre_cleanup_for_regen / replace_exist DELETE 块）。
+    // inst_relate_aabb：与 DB 直写路径同口径，按当前 refno 状态替换。
     if !inst_relate_aabb_buffer.is_empty() {
-        let (deduped_rows, _deduped_ids) =
+        let (deduped_rows, deduped_ids) =
             dedupe_inst_relate_aabb_rows(&inst_relate_aabb_buffer, &inst_relate_aabb_ids);
-        for rows in deduped_rows.chunks(CHUNK_SIZE) {
-            writer.write_statement(&format!(
-                "INSERT IGNORE INTO inst_relate_aabb [{}]",
-                rows.join(",")
-            ))?;
+        for (rows, ids) in deduped_rows
+            .chunks(CHUNK_SIZE)
+            .zip(deduped_ids.chunks(CHUNK_SIZE))
+        {
+            for statement in build_replace_rows_statements("inst_relate_aabb", false, rows, ids) {
+                writer.write_statement(&statement)?;
+            }
         }
     }
 

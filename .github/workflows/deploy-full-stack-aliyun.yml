@@ -1,0 +1,170 @@
+name: Deploy Full Stack To Aliyun
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: "plant-model-gen ref; empty = workflow ref"
+        required: false
+        default: ""
+        type: string
+      frontend_ref:
+        description: "plant3d-web ref; empty = main"
+        required: false
+        default: ""
+        type: string
+      db_option_file:
+        description: "DbOption uploaded as /root/DbOption.toml"
+        required: true
+        default: "db_options/DbOption-mac.toml"
+        type: string
+      remote_host:
+        description: "Target server; empty = DEPLOY_REMOTE_HOST or 123.57.182.243"
+        required: false
+        default: ""
+        type: string
+      remote_user:
+        description: "SSH user; empty = DEPLOY_REMOTE_USER or root"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-full-stack-aliyun
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTC_WRAPPER: ""
+  BUILD_FEATURES: ws,gen_model,manifold,project_hd,surreal-save,sqlite-index,web_server,parquet-export
+  PROJECT_NAME: AvevaMarineSample
+
+jobs:
+  deploy:
+    name: Build and deploy backend + frontend
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      NODE_VERSION: "20"
+      REMOTE_HOST: ${{ inputs.remote_host != '' && inputs.remote_host || vars.DEPLOY_REMOTE_HOST || '123.57.182.243' }}
+      REMOTE_USER: ${{ inputs.remote_user != '' && inputs.remote_user || vars.DEPLOY_REMOTE_USER || 'root' }}
+      REMOTE_PASS: ${{ secrets.DEPLOY_REMOTE_PASS }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+      DB_OPTION_FILE: ${{ inputs.db_option_file }}
+
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.backend_ref != '' && inputs.backend_ref || github.ref }}
+          path: plant-model-gen
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: happyrust/plant3d-web
+          ref: ${{ inputs.frontend_ref != '' && inputs.frontend_ref || 'main' }}
+          path: plant3d-web
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Validate deployment inputs
+        working-directory: plant-model-gen
+        run: |
+          test -n "$REMOTE_HOST" || { echo "REMOTE_HOST is required"; exit 1; }
+          test -n "$REMOTE_USER" || { echo "REMOTE_USER is required"; exit 1; }
+          test -n "$REMOTE_PASS" || { echo "Missing secret DEPLOY_REMOTE_PASS"; exit 1; }
+          test -f "$DB_OPTION_FILE" || { echo "DbOption file not found: $DB_OPTION_FILE"; exit 1; }
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          path = pathlib.Path(os.environ["DB_OPTION_FILE"])
+          config = tomllib.loads(path.read_text(encoding="utf-8"))
+          got = config.get("project_name")
+          want = os.environ["PROJECT_NAME"]
+          if got != want:
+              raise SystemExit(f"{path}: project_name is {got!r}, expected {want!r}")
+          PY
+
+      - name: Configure git for private dependencies
+        working-directory: plant-model-gen
+        run: |
+          if [ -n "$GH_PAT" ]; then
+            git config --global url."https://$GH_PAT@github.com/".insteadOf "https://github.com/"
+          fi
+          cat > /tmp/git-askpass.sh <<'EOF'
+          #!/usr/bin/env bash
+          printf '%s\n' "${GH_PAT:-}"
+          EOF
+          chmod +x /tmp/git-askpass.sh
+
+      - name: Prepare local patch dependencies
+        working-directory: plant-model-gen
+        run: ./shells/prepare_ci_patch_deps.sh
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-15
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: deploy-full-stack-aliyun-x86_64-unknown-linux-gnu
+          workspaces: plant-model-gen -> target
+          cache-on-failure: true
+
+      - name: Install Linux deploy dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config rsync sshpass
+
+      - name: Build backend
+        working-directory: plant-model-gen
+        run: |
+          cargo build --release --bin web_server --target x86_64-unknown-linux-gnu --no-default-features --features "$BUILD_FEATURES"
+        env:
+          GIT_ASKPASS: /tmp/git-askpass.sh
+          GIT_TERMINAL_PROMPT: 0
+
+      - name: Deploy backend
+        working-directory: plant-model-gen
+        env:
+          BINARY_SOURCE: local
+          BUILD_BINARY: "false"
+          LOCAL_BIN_OVERRIDE: ${{ github.workspace }}/plant-model-gen/target/x86_64-unknown-linux-gnu/release/web_server
+        run: |
+          chmod +x ./shells/deploy/deploy_web_server_bundle.sh
+          ./shells/deploy/deploy_web_server_bundle.sh
+
+      - name: Verify backend
+        run: |
+          sshpass -p "$REMOTE_PASS" ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            "$REMOTE_USER@$REMOTE_HOST" \
+            "set -e; systemctl is-active web-server; curl -fsS http://127.0.0.1:3100/api/health >/dev/null"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: plant3d-web/package-lock.json
+
+      - name: Deploy frontend
+        working-directory: plant3d-web
+        env:
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/var/www/plant3d-web' }}
+          SERVER_NAME: ${{ vars.SERVER_NAME || inputs.remote_host || vars.DEPLOY_REMOTE_HOST || '123.57.182.243' }}
+          BACKEND_ORIGIN: ${{ vars.BACKEND_ORIGIN || 'http://127.0.0.1:3100' }}
+          SERVICE_NAME: nginx
+        run: bash deploy/deploy_frontend_bundle.sh

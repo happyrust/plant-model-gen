@@ -529,6 +529,19 @@ fn normalize_path_str(path: &Path) -> String {
     }
 }
 
+fn path_is_under_normalized_root(path: &Path, root_norm: &str) -> bool {
+    let path_norm = normalize_path_str(path);
+    if path_norm == root_norm {
+        return true;
+    }
+    let root_prefix = if root_norm.ends_with('/') {
+        root_norm.to_string()
+    } else {
+        format!("{root_norm}/")
+    };
+    path_norm.starts_with(&root_prefix)
+}
+
 fn process_is_aios_database(process: &sysinfo::Process) -> bool {
     if let Some(name) = process
         .exe()
@@ -566,7 +579,7 @@ fn find_owned_serve_sidecars(root: &Path) -> Vec<SidecarHandle> {
             let runtime_dir = args
                 .windows(2)
                 .find_map(|pair| (pair[0] == "--runtime-dir").then(|| pair[1].clone()))?;
-            if !normalize_path_str(Path::new(&runtime_dir)).starts_with(&root_norm) {
+            if !path_is_under_normalized_root(Path::new(&runtime_dir), &root_norm) {
                 return None;
             }
             let pid = pid.as_u32();
@@ -651,7 +664,7 @@ async fn reap_dead_owner_sidecars() -> usize {
                 let runtime_dir = args
                     .windows(2)
                     .find_map(|pair| (pair[0] == "--runtime-dir").then(|| pair[1].clone()))?;
-                if !normalize_path_str(Path::new(&runtime_dir)).starts_with(&root_norm) {
+                if !path_is_under_normalized_root(Path::new(&runtime_dir), &root_norm) {
                     return None;
                 }
                 let pid = pid.as_u32();

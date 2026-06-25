@@ -5,6 +5,22 @@ use serde::{Deserialize, Serialize};
 pub mod set_status;
 pub mod update_log;
 // pub mod query_status;
+pub mod baseline_state;
+pub mod bounded_runner;
+pub mod cli;
+pub mod ducklake_store;
+pub mod hashing;
+pub mod history_baseline;
+pub mod history_replay_plan;
+pub mod history_replay_validation;
+pub mod missing_mesh_repair;
+pub mod model_release;
+pub mod physical_baseline_snapshot;
+pub mod release_package;
+pub mod release_state_machine;
+pub mod scene_tree_artifact;
+pub mod source_observation;
+pub mod types;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SetStatusData {

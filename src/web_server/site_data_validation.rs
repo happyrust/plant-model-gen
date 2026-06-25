@@ -388,7 +388,7 @@ fn mesh_sample_check(
 
 #[cfg(feature = "parquet-export")]
 fn is_builtin_geo_hash(geo_hash: &str) -> bool {
-    matches!(geo_hash.trim(), "1" | "2" | "3")
+    matches!(geo_hash.trim(), "0" | "1" | "2" | "3")
 }
 
 #[cfg(feature = "parquet-export")]

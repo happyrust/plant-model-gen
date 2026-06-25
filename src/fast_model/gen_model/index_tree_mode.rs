@@ -36,6 +36,7 @@ use super::prim_processor::process_prim_refno_page;
 use super::tree_index_manager::TreeIndexManager;
 use super::utilities::build_cata_hash_map_from_tree;
 use crate::data_interface::db_meta;
+use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::model_cache::cata_resolve_cache;
 use crate::fast_model::model_cache::geom_input_cache;
@@ -658,6 +659,135 @@ pub async fn gen_index_tree_geos_optimized(
     // ============================================================================
     for r in &bran_generated_refnos {
         // BRAN 的管件子代统一视为 Cate (元件) 类型
+        categorized.insert(*r, super::models::NounCategory::Cate);
+    }
+
+    categorized.print_statistics();
+    Ok(categorized)
+}
+
+/// 增量日志直入模式：直接使用已分类的 refno 集合生成模型。
+///
+/// `gen_index_tree_geos_optimized(seed_roots=Some(...))` 会先通过 TreeIndex BFS
+/// 重新收集目标 noun；在站点缺少 tree 文件时，增量 roots 会被过滤成空。
+/// 增量日志已经完成分类，这里复用同一套 LOOP/CATE/PRIM 处理阶段，跳过 BFS。
+#[cfg_attr(feature = "profile", instrument(skip(db_option, config, sender, log)))]
+pub async fn gen_index_tree_geos_for_incremental_log(
+    db_option: Arc<DbOptionExt>,
+    config: &IndexTreeConfig,
+    sender: flume::Sender<ShapeInstancesData>,
+    log: &IncrGeoUpdateLog,
+) -> Result<CategorizedRefnos> {
+    let total_start = Instant::now();
+
+    println!("🚀 启动 IndexTree 增量直入模式");
+    config.print_info();
+
+    let dbnums = get_filtered_dbnums(&db_option).await?;
+    if !dbnums.is_empty() {
+        println!("🗂️  数据库过滤: 仅查询 dbnum = {:?}", dbnums);
+    }
+
+    let loop_sjus_map_arc = Arc::new(DashMap::new());
+    validate_sjus_map(&loop_sjus_map_arc, config)?;
+
+    let mut categorized = CategorizedRefnos::new();
+    let mut bran_generated_refnos = HashSet::new();
+    let mut bran_duration = Duration::ZERO;
+
+    let mut bran_roots_vec: Vec<RefnoEnum> = log.bran_hanger_refnos.iter().copied().collect();
+    bran_roots_vec.sort_by_key(|r| r.to_string());
+    if !bran_roots_vec.is_empty() {
+        let ctx_bran_prefetch = NounProcessContext::new(
+            db_option.clone(),
+            config.batch_size.get(),
+            config.concurrency.get(),
+        )
+        .with_stage(GenStage::Prefetch);
+        let ctx_bran_generate = ctx_bran_prefetch.with_stage(GenStage::Generate);
+
+        let bran_start = Instant::now();
+        process_bran_hang_core_logic(
+            &ctx_bran_prefetch,
+            &ctx_bran_generate,
+            &bran_roots_vec,
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+            &mut bran_generated_refnos,
+        )
+        .await?;
+        bran_duration = bran_start.elapsed();
+
+        for r in &bran_roots_vec {
+            categorized.insert(*r, super::models::NounCategory::Cate);
+        }
+    }
+
+    let loop_refnos: HashSet<RefnoEnum> = log.loop_owner_refnos.iter().copied().collect();
+    let cate_refnos: HashSet<RefnoEnum> = log.basic_cata_refnos.iter().copied().collect();
+    let prim_refnos: HashSet<RefnoEnum> = log.prim_refnos.iter().copied().collect();
+    println!(
+        "[Pipeline][incremental] direct roots: loop={} cate={} prim={} bran_hanger={} delete={}",
+        loop_refnos.len(),
+        cate_refnos.len(),
+        prim_refnos.len(),
+        bran_roots_vec.len(),
+        log.delete_refnos.len()
+    );
+
+    if !loop_refnos.is_empty() || !prim_refnos.is_empty() || !cate_refnos.is_empty() {
+        let ctx = NounProcessContext::new(
+            db_option.clone(),
+            config.batch_size.get(),
+            config.concurrency.get(),
+        )
+        .with_stage(GenStage::Generate);
+
+        let (loop_vec, loop_dur) = process_loop_stage(
+            &ctx,
+            loop_refnos,
+            config,
+            &dbnums,
+            &bran_generated_refnos,
+            loop_sjus_map_arc.clone(),
+            sender.clone(),
+            true,
+        )
+        .await?;
+        let (cate_vec, cate_dur) = process_cate_stage(
+            &ctx,
+            cate_refnos,
+            config,
+            &dbnums,
+            &bran_generated_refnos,
+            loop_sjus_map_arc,
+            sender.clone(),
+            true,
+        )
+        .await?;
+        let (prim_vec, prim_dur) =
+            process_prim_stage(&ctx, prim_refnos, config, &dbnums, sender.clone(), true).await?;
+
+        for r in &cate_vec {
+            categorized.insert(*r, super::models::NounCategory::Cate);
+        }
+        for r in &loop_vec {
+            categorized.insert(*r, super::models::NounCategory::LoopOwner);
+        }
+        for r in &prim_vec {
+            categorized.insert(*r, super::models::NounCategory::Prim);
+        }
+
+        print_final_summary(
+            total_start.elapsed(),
+            loop_dur,
+            cate_dur,
+            prim_dur,
+            bran_duration,
+        );
+    }
+
+    for r in &bran_generated_refnos {
         categorized.insert(*r, super::models::NounCategory::Cate);
     }
 

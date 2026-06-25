@@ -395,6 +395,15 @@ fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
     if !out.is_empty() {
         return out;
     }
+
+    if is_offline_world_refno(parent_refno) {
+        out = offline_top_level_children_from_index(parent_refno, &tree_dir);
+        if !out.is_empty() {
+            out.sort_by_key(|node| node.refno.refno().0);
+            return out;
+        }
+    }
+
     out = offline_world_children_by_scan(parent_refno, &tree_dir);
     out.sort_by_key(|node| node.refno.refno().0);
     out
@@ -441,6 +450,96 @@ fn offline_world_children_from_index(
             })
         })
         .collect()
+}
+
+fn offline_top_level_children_from_index(
+    synthetic_world_refno: RefnoEnum,
+    tree_dir: &std::path::Path,
+) -> Vec<TreeNodeDto> {
+    let mut dbnums = aios_core::get_db_option()
+        .manual_db_nums
+        .clone()
+        .unwrap_or_default();
+    if dbnums.is_empty() {
+        if let Ok(entries) = fs::read_dir(tree_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(stem) = name.strip_suffix(".tree") else {
+                    continue;
+                };
+                if let Ok(dbnum) = stem.parse::<u32>() {
+                    dbnums.push(dbnum);
+                }
+            }
+        }
+    }
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    let mut roots = Vec::new();
+    for dbnum in dbnums {
+        let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
+            continue;
+        };
+
+        let refnos = index.all_refnos();
+        let refno_set: HashSet<RefU64> = refnos.iter().copied().collect();
+        let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
+        for refno in &refnos {
+            if let Some(meta) = index.node_meta(*refno) {
+                if meta.owner.0 != 0 {
+                    *child_counts.entry(meta.owner).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut db_roots = Vec::new();
+        for refno in refnos {
+            let Some(meta) = index.node_meta(refno) else {
+                continue;
+            };
+            let owner_missing = meta.owner.0 == 0 || !refno_set.contains(&meta.owner);
+            if !owner_missing {
+                continue;
+            }
+
+            let noun = db1_dehash(meta.noun).to_string();
+            db_roots.push(TreeNodeDto {
+                refno: RefnoEnum::from(meta.refno),
+                name: RefnoEnum::from(meta.refno).to_string(),
+                noun,
+                owner: Some(synthetic_world_refno),
+                children_count: Some(*child_counts.get(&meta.refno).unwrap_or(&0)),
+            });
+        }
+
+        if let Some(best_rank) = db_roots
+            .iter()
+            .map(|node| offline_root_noun_rank(&node.noun))
+            .min()
+        {
+            db_roots.retain(|node| offline_root_noun_rank(&node.noun) == best_rank);
+        }
+        roots.extend(db_roots);
+    }
+
+    roots
+}
+
+fn offline_root_noun_rank(noun: &str) -> u8 {
+    match noun.trim().to_ascii_uppercase().as_str() {
+        "SITE" => 0,
+        "ZONE" => 1,
+        "PIPE" | "EQUI" | "STRU" | "FRMW" => 2,
+        "BRAN" | "HANG" => 3,
+        _ => 4,
+    }
 }
 
 fn offline_world_children_by_scan(
@@ -514,6 +613,97 @@ fn offline_world_children_by_scan(
     }
 
     out
+}
+
+fn configured_project_output_root() -> std::path::PathBuf {
+    crate::versioned_db::db_meta_info::get_current_project_name()
+        .map(|project_name| {
+            crate::versioned_db::db_meta_info::get_project_output_dir(&project_name)
+        })
+        .unwrap_or_else(crate::versioned_db::db_meta_info::get_output_root)
+}
+
+fn legacy_project_output_root() -> std::path::PathBuf {
+    let db_option = aios_core::get_db_option();
+    if db_option.project_name.trim().is_empty() {
+        std::path::PathBuf::from("output")
+    } else {
+        std::path::PathBuf::from("output").join(db_option.project_name.trim())
+    }
+}
+
+fn resolve_local_dbnum_dir(dbnum: u32, required_file: &str) -> Option<std::path::PathBuf> {
+    let project_output_root = configured_project_output_root();
+    let legacy_project_output_root = legacy_project_output_root();
+    let mut candidates = vec![
+        project_output_root.join("parquet").join(dbnum.to_string()),
+        project_output_root
+            .join("instances")
+            .join(dbnum.to_string()),
+    ];
+    if legacy_project_output_root != project_output_root {
+        candidates.push(
+            legacy_project_output_root
+                .join("parquet")
+                .join(dbnum.to_string()),
+        );
+        candidates.push(
+            legacy_project_output_root
+                .join("instances")
+                .join(dbnum.to_string()),
+        );
+    }
+    candidates.push(std::path::PathBuf::from("output/parquet").join(dbnum.to_string()));
+    candidates.push(std::path::PathBuf::from("output/instances").join(dbnum.to_string()));
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join(required_file).exists())
+}
+
+fn filter_visible_candidates_from_parquet(
+    candidates: &[RefnoEnum],
+    dbnum: u32,
+    bran_hang_load_roots: &HashSet<RefnoEnum>,
+) -> Option<(Vec<RefnoEnum>, String)> {
+    use polars::prelude::*;
+
+    let (path, source) = if let Some(dir) = resolve_local_dbnum_dir(dbnum, "geo_instances.parquet")
+    {
+        (dir.join("geo_instances.parquet"), "parquet_geo_instances")
+    } else if let Some(dir) = resolve_local_dbnum_dir(dbnum, "instances.parquet") {
+        (dir.join("instances.parquet"), "parquet_instances")
+    } else {
+        return None;
+    };
+
+    let file = std::fs::File::open(&path).ok()?;
+    let df = ParquetReader::new(file).finish().ok()?;
+    let refno_col = df.column("refno_str").ok()?.str().ok()?;
+    let wanted = candidates
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<HashSet<_>>();
+    let mut available = HashSet::<String>::new();
+    for value in refno_col.into_iter().flatten() {
+        if wanted.contains(value) {
+            available.insert(value.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    for r in candidates.iter().copied() {
+        let key = r.to_string();
+        let matched = bran_hang_load_roots.contains(&r)
+            || available.contains(&key)
+            || (key.contains('/') && available.contains(&key.replace('/', "_")));
+        if matched {
+            out.push(r);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Some((out, source.to_string()))
 }
 
 async fn get_ancestors(
@@ -700,20 +890,26 @@ async fn get_visible_insts(
     }
 
     // NOTE:
-    // - instances_{dbnum}.json 位于项目输出目录：output/<project_name>/instances/
-    // - 历史兼容：也支持旧路径 output/instances/
+    // - instances_{dbnum}.json 位于当前配置项目输出目录：<output_root>/<project_name>/instances/
+    // - 历史兼容：也支持旧路径 output/<project_name>/instances/ 与 output/instances/
     // - 文件读取/解析成功时：即使结果为空，也不回退 inst_relate（避免 inst_relate 缺失时接口直接报错）
-    let (refnos, file_ok) = if let Some(dbnum) = parse_dbno(refno) {
-        let project_name = state.db_manager.db_option.project_name.clone();
-        let instances_path_new = std::path::Path::new("output")
-            .join(&project_name)
+    let visible_dbnum = parse_dbno(refno);
+    let (refnos, file_ok) = if let Some(dbnum) = visible_dbnum {
+        let project_output_root = configured_project_output_root();
+        let legacy_project_output_root = legacy_project_output_root();
+        let instances_path_new = project_output_root
+            .join("instances")
+            .join(format!("instances_{dbnum}.json"));
+        let instances_path_legacy_project = legacy_project_output_root
             .join("instances")
             .join(format!("instances_{dbnum}.json"));
         let instances_path_old = std::path::Path::new("output")
             .join("instances")
             .join(format!("instances_{dbnum}.json"));
 
-        let bytes = fs::read(&instances_path_new).or_else(|_| fs::read(&instances_path_old));
+        let bytes = fs::read(&instances_path_new)
+            .or_else(|_| fs::read(&instances_path_legacy_project))
+            .or_else(|_| fs::read(&instances_path_old));
         if let Ok(bytes) = bytes {
             match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(json) => {
@@ -751,9 +947,40 @@ async fn get_visible_insts(
     };
 
     // 文件读取/解析成功时：直接使用文件过滤结果（允许为空）
-    // 文件缺失/解析失败：回退到 inst_relate 几何实例过滤。
+    // 文件缺失/解析失败：优先使用同一 output_root 下的 parquet 过滤，再回退 inst_relate 几何实例过滤。
     let (refnos, source) = if file_ok {
-        (refnos, "instances_json")
+        (refnos, "instances_json".to_string())
+    } else if let Some(dbnum) = visible_dbnum {
+        if let Some((parquet_refnos, parquet_source)) =
+            filter_visible_candidates_from_parquet(&candidates, dbnum, &bran_hang_load_roots)
+        {
+            (parquet_refnos, parquet_source)
+        } else {
+            match crate::fast_model::export_model::model_exporter::query_geometry_instances(
+                &candidates,
+                true,  // enable_holes：这里只用于过滤是否存在几何实例
+                false, // verbose
+            )
+            .await
+            {
+                Ok(v) => {
+                    let mut out = v.into_iter().map(|q| q.refno).collect::<Vec<_>>();
+                    out.extend(bran_hang_load_roots.iter().copied());
+                    out.sort();
+                    out.dedup();
+                    (out, "surreal_geometry".to_string())
+                }
+                Err(e) => {
+                    return Ok(Json(VisibleInstsResponse {
+                        success: false,
+                        refno,
+                        refnos: vec![],
+                        error_message: Some(format!("query_geometry_instances failed: {e}")),
+                        debug: None,
+                    }));
+                }
+            }
+        }
     } else {
         match crate::fast_model::export_model::model_exporter::query_geometry_instances(
             &candidates,
@@ -767,7 +994,7 @@ async fn get_visible_insts(
                 out.extend(bran_hang_load_roots.iter().copied());
                 out.sort();
                 out.dedup();
-                (out, "surreal_geometry")
+                (out, "surreal_geometry".to_string())
             }
             Err(e) => {
                 return Ok(Json(VisibleInstsResponse {
@@ -791,7 +1018,7 @@ async fn get_visible_insts(
             candidates_count,
             filtered_count: candidates_count.saturating_sub(visible_count),
             visible_count,
-            source: source.to_string(),
+            source,
         }),
     }))
 }

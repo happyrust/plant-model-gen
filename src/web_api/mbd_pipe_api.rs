@@ -32,7 +32,7 @@ pub enum MbdPipeSource {
 
 impl Default for MbdPipeSource {
     fn default() -> Self {
-        Self::Db
+        Self::Cache
     }
 }
 
@@ -57,7 +57,7 @@ impl Default for MbdPipeMode {
 pub struct MbdPipeQuery {
     /// 语义模式：layout_first=排版优先（默认聚焦 BRAN 长度尺寸），construction=施工表达，inspection=几何校核
     pub mode: Option<MbdPipeMode>,
-    /// 数据来源：parquet=Parquet 文件（默认），db=SurrealDB，cache=model cache
+    /// 数据来源：cache=model cache（默认，失败后回退 parquet），parquet=Parquet 文件，db=SurrealDB
     pub source: MbdPipeSource,
     /// dbno（可选；若不传则尝试从 output/scene_tree/db_meta_info.json 推导）
     pub dbno: Option<u32>,
@@ -119,7 +119,7 @@ impl Default for MbdPipeQuery {
     fn default() -> Self {
         Self {
             mode: None,
-            source: MbdPipeSource::Db,
+            source: MbdPipeSource::Cache,
             dbno: None,
             batch_id: None,
             debug: false,
@@ -184,7 +184,7 @@ impl MbdPipeModeDefaults {
                 include_slopes: false,
                 include_bends: false,
                 include_cut_tubis: true,
-                include_fittings: false,
+                include_fittings: true,
                 include_tags: false,
                 include_position_tags: false,
                 include_elevation_marks: false,
@@ -506,6 +506,9 @@ pub enum MbdFittingKind {
     Tee,
     Olet,
     Flan,
+    Redu,
+    Valv,
+    Gask,
     Unknown,
 }
 
@@ -851,7 +854,6 @@ async fn get_mbd_pipe_v2_direct(input_refno_enum: RefnoEnum, branch_refno: Refno
 
 fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
     query.mode = Some(MbdPipeMode::LayoutFirst);
-    query.source = MbdPipeSource::Db;
     // V2 layout_first 的首期目标是 BRAN 长度尺寸标注：
     // 只默认输出 chain/port/cut-tubi 这些长度类 linear_dim。
     //
@@ -868,7 +870,7 @@ fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
     query.include_slopes = query.include_slopes.or(Some(false));
     query.include_bends = query.include_bends.or(Some(false));
     query.include_cut_tubis = query.include_cut_tubis.or(Some(true));
-    query.include_fittings = query.include_fittings.or(Some(false));
+    query.include_fittings = query.include_fittings.or(Some(true));
     query.include_tags = query.include_tags.or(Some(false));
     query.include_position_tags = query.include_position_tags.or(Some(false));
     query.include_elevation_marks = query.include_elevation_marks.or(Some(false));
@@ -876,7 +878,6 @@ fn mbd_v2_layout_query(mut query: MbdPipeQuery) -> MbdPipeQuery {
     query.include_material_balloons = query.include_material_balloons.or(Some(false));
     query.include_material_table = query.include_material_table.or(Some(false));
     query.include_layout_hints = query.include_layout_hints.or(Some(true));
-    query.include_branch_attrs = true;
     query.include_weld_nouns = query.include_weld_nouns || query.include_welds.unwrap_or(false);
     query
 }
@@ -1096,6 +1097,48 @@ struct RawFittingElement {
     radius: Option<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct BranchConnectionPoint {
+    point: Vec3,
+}
+
+#[derive(Debug, Clone)]
+struct ParquetBranchChildInstance {
+    refno: RefnoEnum,
+    noun: String,
+    cata_hash: String,
+    trans_hash: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParquetPtsetPoint {
+    number: i32,
+    point: Vec3,
+    pbore: f32,
+}
+
+#[derive(Debug, Clone)]
+struct BranchProjectedDimLineGroup {
+    axis: Vec3,
+    origin: Vec3,
+    segment_indices: Vec<usize>,
+    points: Vec<BranchProjectedDimPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchProjectedDimPointKind {
+    SegmentEnd,
+    FittingAnchor,
+    FittingEnd,
+    Corner,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BranchProjectedDimPoint {
+    point: Vec3,
+    kind: BranchProjectedDimPointKind,
+}
+
 #[derive(Debug, Clone, Default)]
 struct BranchMeasurementOutput {
     segments: Vec<MbdPipeSegmentDto>,
@@ -1230,6 +1273,7 @@ struct BranchMeasurementPlanner<'a> {
     topology: &'a BranchTopology,
     branch_name: &'a str,
     fitting_elements: &'a [RawFittingElement],
+    connection_points: &'a [BranchConnectionPoint],
     bends: &'a [MbdBendDto],
     pipe_item_code: Option<String>,
 }
@@ -1240,6 +1284,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
         topology: &'a BranchTopology,
         branch_name: &'a str,
         fitting_elements: &'a [RawFittingElement],
+        connection_points: &'a [BranchConnectionPoint],
         bends: &'a [MbdBendDto],
         pipe_item_code: Option<String>,
     ) -> Self {
@@ -1248,6 +1293,7 @@ impl<'a> BranchMeasurementPlanner<'a> {
             topology,
             branch_name,
             fitting_elements,
+            connection_points,
             bends,
             pipe_item_code,
         }
@@ -1335,7 +1381,9 @@ impl<'a> BranchMeasurementPlanner<'a> {
 
         if self.query.include_port_dims {
             for (i, seg) in self.topology.segments.iter().enumerate() {
-                let (start, end) = segment_port_points(seg);
+                let Some((start, end)) = explicit_segment_port_points(seg) else {
+                    continue;
+                };
                 let length = start.distance(end);
                 if length < self.query.dim_min_length {
                     continue;
@@ -1385,7 +1433,10 @@ impl<'a> BranchMeasurementPlanner<'a> {
 
         if self.query.include_chain_dims {
             let group_id = Some(format!("chain:{}", self.topology.branch_refno));
-            if weld_joints.is_empty() {
+            let projected_chain_dims = self.build_projected_chain_dims(group_id.clone());
+            if !projected_chain_dims.is_empty() {
+                dims.extend(projected_chain_dims);
+            } else if weld_joints.is_empty() {
                 // 没有可合并的焊口时，不能把“下一段 start”当作上一段 chain 的终点。
                 // 24381_145712 这类带弯头/异径件的 BRAN 会因此把尺寸线斜拉到错误端口。
                 // 此时 chain 语义退化为按有序 TUBI 段逐段标注，但仍归入 chain 分组，
@@ -1491,6 +1542,104 @@ impl<'a> BranchMeasurementPlanner<'a> {
                     }),
                 });
             }
+        }
+
+        dims
+    }
+
+    fn build_projected_chain_dims(&self, group_id: Option<String>) -> Vec<MbdDimDto> {
+        let groups = build_branch_projected_dim_line_groups(self.topology, self.fitting_elements);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+
+        let mut dims = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        for (i, group) in groups.iter().enumerate() {
+            let scalars = sorted_projected_dim_scalars(group);
+            let Some((min_t, max_t)) = scalars.first().copied().zip(scalars.last().copied()) else {
+                continue;
+            };
+
+            if scalars.len() > 2 {
+                let detail_min = branch_projected_chain_detail_min_length(
+                    max_t - min_t,
+                    self.query.dim_min_length,
+                );
+                for (piece_index, a_t, b_t) in
+                    branch_projected_chain_detail_spans(&scalars, detail_min)
+                {
+                    let length = (b_t - a_t).abs();
+                    let start = group.origin + group.axis * a_t;
+                    let end = group.origin + group.axis * b_t;
+                    if !start.is_finite() || !end.is_finite() {
+                        continue;
+                    }
+                    let span_key = branch_dim_span_key(start, end);
+                    if !seen.insert(span_key) {
+                        continue;
+                    }
+
+                    dims.push(MbdDimDto {
+                        id: format!(
+                            "dim:chain:{}:axis:{i}:piece:{piece_index}",
+                            self.topology.branch_refno
+                        ),
+                        kind: MbdDimKind::Chain,
+                        group_id: group_id.clone(),
+                        seq: Some((i * 100 + piece_index) as u32),
+                        start: start.to_array(),
+                        end: end.to_array(),
+                        length,
+                        text: format_dim_length_text_mm(length),
+                        layout_hint: self.query.include_layout_hints.then(|| {
+                            AnnotationLayoutPlanner::linear_hint(
+                                self.topology,
+                                start,
+                                end,
+                                "chain",
+                                1,
+                                None,
+                            )
+                        }),
+                    });
+                }
+            }
+
+            let length = (max_t - min_t).abs();
+            if length < self.query.dim_min_length {
+                continue;
+            }
+            let start = group.origin + group.axis * min_t;
+            let end = group.origin + group.axis * max_t;
+            if !start.is_finite() || !end.is_finite() {
+                continue;
+            }
+            let span_key = branch_dim_span_key(start, end);
+            if !seen.insert(span_key) {
+                continue;
+            }
+
+            dims.push(MbdDimDto {
+                id: format!("dim:chain:{}:axis:{i}", self.topology.branch_refno),
+                kind: MbdDimKind::Chain,
+                group_id: group_id.clone(),
+                seq: Some((i * 100 + 99) as u32),
+                start: start.to_array(),
+                end: end.to_array(),
+                length,
+                text: format_dim_length_text_mm(length),
+                layout_hint: self.query.include_layout_hints.then(|| {
+                    AnnotationLayoutPlanner::linear_hint(
+                        self.topology,
+                        start,
+                        end,
+                        "chain-overall",
+                        2,
+                        None,
+                    )
+                }),
+            });
         }
 
         dims
@@ -1750,6 +1899,9 @@ impl<'a> BranchMeasurementPlanner<'a> {
             }
         }
         for fitting in fittings {
+            if !should_emit_fitting_tag(fitting.kind) {
+                continue;
+            }
             let radius = fitting
                 .radius
                 .filter(|value| value.is_finite() && *value > 1e-3);
@@ -1907,6 +2059,10 @@ impl<'a> BranchMeasurementPlanner<'a> {
     }
 }
 
+fn should_emit_fitting_tag(_kind: MbdFittingKind) -> bool {
+    false
+}
+
 fn fitting_kind_from_noun(noun: &str) -> MbdFittingKind {
     match noun {
         "ELBO" => MbdFittingKind::Elbo,
@@ -1914,6 +2070,9 @@ fn fitting_kind_from_noun(noun: &str) -> MbdFittingKind {
         "TEE" => MbdFittingKind::Tee,
         "OLET" => MbdFittingKind::Olet,
         "FLAN" | "FLNG" => MbdFittingKind::Flan,
+        "REDU" => MbdFittingKind::Redu,
+        "VALV" | "GATE" | "GLOV" | "BALL" | "CHECK" | "CVAV" => MbdFittingKind::Valv,
+        "GASK" => MbdFittingKind::Gask,
         _ => MbdFittingKind::Unknown,
     }
 }
@@ -1923,6 +2082,9 @@ fn fitting_label_role(kind: MbdFittingKind) -> &'static str {
         MbdFittingKind::Elbo | MbdFittingKind::Bend => "fitting_bend",
         MbdFittingKind::Tee | MbdFittingKind::Olet => "fitting_branch",
         MbdFittingKind::Flan => "fitting_flan",
+        MbdFittingKind::Redu => "fitting_reducer",
+        MbdFittingKind::Valv => "fitting_valve",
+        MbdFittingKind::Gask => "fitting_gasket",
         MbdFittingKind::Unknown => "fitting",
     }
 }
@@ -1935,6 +2097,416 @@ fn segment_port_points(seg: &CacheTubiSeg) -> (Vec3, Vec3) {
     let start = seg.leave_axis.unwrap_or(seg.start);
     let end = seg.arrive_axis.unwrap_or(seg.end);
     (start, end)
+}
+
+#[inline]
+fn explicit_segment_port_points(seg: &CacheTubiSeg) -> Option<(Vec3, Vec3)> {
+    let start = seg.leave_axis?;
+    let end = seg.arrive_axis?;
+    (start.is_finite() && end.is_finite()).then_some((start, end))
+}
+
+const BRANCH_DIM_AXIS_ALIGN_COS: f32 = 0.985;
+const BRANCH_DIM_COLLINEAR_TOLERANCE_MM: f32 = 25.0;
+const BRANCH_DIM_CORNER_AXIS_DOT_MAX: f32 = 0.15;
+const BRANCH_DIM_CORNER_LINE_GAP_TOLERANCE_MM: f32 = 5.0;
+const BRANCH_DIM_CORNER_SPAN_MARGIN_MM: f32 = 500.0;
+const BRANCH_PROJECTED_CHAIN_DETAIL_MIN_MM: f32 = 200.0;
+const BRANCH_PROJECTED_CHAIN_POINT_TOLERANCE_MM: f32 = 0.5;
+fn build_branch_projected_dim_line_groups(
+    topology: &BranchTopology,
+    fitting_elements: &[RawFittingElement],
+) -> Vec<BranchProjectedDimLineGroup> {
+    let mut groups: Vec<BranchProjectedDimLineGroup> = Vec::new();
+    for (index, seg) in topology.segments.iter().enumerate() {
+        let Some(axis) = normalized_branch_dim_axis(seg.start, seg.end) else {
+            continue;
+        };
+        if let Some(group) = groups.iter_mut().find(|group| {
+            same_branch_dim_axis(group.axis, axis)
+                && point_to_line_distance(seg.start, group.origin, group.axis)
+                    <= BRANCH_DIM_COLLINEAR_TOLERANCE_MM
+        }) {
+            group.segment_indices.push(index);
+            push_unique_branch_dim_point(
+                &mut group.points,
+                seg.start,
+                BranchProjectedDimPointKind::SegmentEnd,
+            );
+            push_unique_branch_dim_point(
+                &mut group.points,
+                seg.end,
+                BranchProjectedDimPointKind::SegmentEnd,
+            );
+            continue;
+        }
+
+        groups.push(BranchProjectedDimLineGroup {
+            axis,
+            origin: seg.start,
+            segment_indices: vec![index],
+            points: vec![
+                BranchProjectedDimPoint {
+                    point: seg.start,
+                    kind: BranchProjectedDimPointKind::SegmentEnd,
+                },
+                BranchProjectedDimPoint {
+                    point: seg.end,
+                    kind: BranchProjectedDimPointKind::SegmentEnd,
+                },
+            ],
+        });
+    }
+
+    for fitting in fitting_elements {
+        if !fitting.has_anchor || branch_projected_dim_noun_is_excluded(&fitting.noun) {
+            continue;
+        }
+        let mut candidate_points = Vec::<(Vec3, BranchProjectedDimPointKind)>::new();
+        if branch_projected_dim_noun_uses_two_ends(&fitting.noun) {
+            for point in [fitting.face_center_1, fitting.face_center_2]
+                .into_iter()
+                .flatten()
+            {
+                candidate_points.push((point, BranchProjectedDimPointKind::FittingEnd));
+            }
+        }
+        if candidate_points.is_empty() && fitting.anchor_point.is_finite() {
+            candidate_points.push((
+                fitting.anchor_point,
+                BranchProjectedDimPointKind::FittingAnchor,
+            ));
+        }
+
+        for group in &mut groups {
+            for (point, kind) in &candidate_points {
+                if point_to_line_distance(*point, group.origin, group.axis)
+                    <= BRANCH_DIM_COLLINEAR_TOLERANCE_MM
+                {
+                    push_unique_branch_dim_point(&mut group.points, *point, *kind);
+                }
+            }
+        }
+    }
+
+    add_branch_projected_corner_points(&mut groups);
+
+    groups
+}
+
+fn branch_projected_dim_noun_is_excluded(noun: &str) -> bool {
+    matches!(noun.to_ascii_uppercase().as_str(), "ATTA" | "TUBI" | "GASK")
+}
+
+fn branch_projected_dim_noun_uses_two_ends(noun: &str) -> bool {
+    matches!(
+        noun.to_ascii_uppercase().as_str(),
+        "FLAN" | "FLNG" | "FBLI" | "REDU"
+    )
+}
+
+fn add_branch_projected_corner_points(groups: &mut [BranchProjectedDimLineGroup]) {
+    for i in 0..groups.len() {
+        for j in (i + 1)..groups.len() {
+            let a_axis = groups[i].axis.normalize_or_zero();
+            let b_axis = groups[j].axis.normalize_or_zero();
+            if a_axis.length_squared() <= 1e-9 || b_axis.length_squared() <= 1e-9 {
+                continue;
+            }
+            if a_axis.dot(b_axis).abs() > BRANCH_DIM_CORNER_AXIS_DOT_MAX {
+                continue;
+            }
+            if !branch_projected_groups_are_topology_neighbors(&groups[i], &groups[j]) {
+                continue;
+            }
+
+            let Some((a_point, b_point)) = closest_points_on_branch_dim_lines(
+                groups[i].origin,
+                a_axis,
+                groups[j].origin,
+                b_axis,
+            ) else {
+                continue;
+            };
+            if a_point.distance(b_point) > BRANCH_DIM_CORNER_LINE_GAP_TOLERANCE_MM {
+                continue;
+            }
+
+            let corner = (a_point + b_point) * 0.5;
+            if !corner.is_finite() {
+                continue;
+            }
+            if !branch_projected_point_near_span(
+                &groups[i],
+                corner,
+                BRANCH_DIM_CORNER_SPAN_MARGIN_MM,
+            ) || !branch_projected_point_near_span(
+                &groups[j],
+                corner,
+                BRANCH_DIM_CORNER_SPAN_MARGIN_MM,
+            ) {
+                continue;
+            }
+
+            push_unique_branch_dim_point(
+                &mut groups[i].points,
+                corner,
+                BranchProjectedDimPointKind::Corner,
+            );
+            push_unique_branch_dim_point(
+                &mut groups[j].points,
+                corner,
+                BranchProjectedDimPointKind::Corner,
+            );
+        }
+    }
+}
+
+fn branch_projected_groups_are_topology_neighbors(
+    a: &BranchProjectedDimLineGroup,
+    b: &BranchProjectedDimLineGroup,
+) -> bool {
+    a.segment_indices
+        .iter()
+        .any(|ia| b.segment_indices.iter().any(|ib| ia.abs_diff(*ib) <= 1))
+}
+
+fn closest_points_on_branch_dim_lines(
+    a_origin: Vec3,
+    a_axis: Vec3,
+    b_origin: Vec3,
+    b_axis: Vec3,
+) -> Option<(Vec3, Vec3)> {
+    let r = a_origin - b_origin;
+    let axis_dot = a_axis.dot(b_axis);
+    let denom = 1.0 - axis_dot * axis_dot;
+    if denom.abs() <= 1e-6 {
+        return None;
+    }
+    let c = a_axis.dot(r);
+    let f = b_axis.dot(r);
+    let a_t = (axis_dot * f - c) / denom;
+    let b_t = (f - axis_dot * c) / denom;
+    Some((a_origin + a_axis * a_t, b_origin + b_axis * b_t))
+}
+
+fn branch_projected_point_near_span(
+    group: &BranchProjectedDimLineGroup,
+    point: Vec3,
+    margin: f32,
+) -> bool {
+    let Some((min_t, max_t)) = projected_dim_projection_range(group) else {
+        return false;
+    };
+    let t = (point - group.origin).dot(group.axis.normalize_or_zero());
+    t >= min_t - margin && t <= max_t + margin
+}
+
+fn sorted_projected_dim_segment_scalars(
+    group: &BranchProjectedDimLineGroup,
+    topology: &BranchTopology,
+) -> Vec<f32> {
+    let axis = group.axis.normalize_or_zero();
+    if axis.length_squared() <= 1e-9 {
+        return Vec::new();
+    }
+
+    let mut scalars = Vec::<f32>::new();
+    for index in &group.segment_indices {
+        let Some(seg) = topology.segments.get(*index) else {
+            continue;
+        };
+        for point in [seg.start, seg.end] {
+            if point.is_finite() {
+                scalars.push((point - group.origin).dot(axis));
+            }
+        }
+    }
+    scalars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut unique = Vec::<f32>::new();
+    for value in scalars {
+        if unique.last().map_or(false, |last| {
+            (value - *last).abs() <= BRANCH_PROJECTED_CHAIN_POINT_TOLERANCE_MM
+        }) {
+            continue;
+        }
+        unique.push(value);
+    }
+    unique
+}
+
+fn sorted_projected_dim_scalars(group: &BranchProjectedDimLineGroup) -> Vec<f32> {
+    let axis = group.axis.normalize_or_zero();
+    if axis.length_squared() <= 1e-9 {
+        return Vec::new();
+    }
+
+    let mut scalars = group
+        .points
+        .iter()
+        .filter(|point| point.point.is_finite())
+        .map(|point| (point.point - group.origin).dot(axis))
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    scalars.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut unique = Vec::<f32>::new();
+    for value in scalars {
+        if unique.last().map_or(false, |last| {
+            (value - *last).abs() <= BRANCH_PROJECTED_CHAIN_POINT_TOLERANCE_MM
+        }) {
+            continue;
+        }
+        unique.push(value);
+    }
+    unique
+}
+
+fn branch_projected_chain_detail_min_length(overall_length: f32, query_min_length: f32) -> f32 {
+    let dynamic_floor = if overall_length.is_finite() && overall_length > 0.0 {
+        overall_length * 0.08
+    } else {
+        0.0
+    };
+    query_min_length
+        .max(BRANCH_PROJECTED_CHAIN_DETAIL_MIN_MM)
+        .max(dynamic_floor)
+}
+
+fn branch_projected_chain_detail_spans(scalars: &[f32], min_length: f32) -> Vec<(usize, f32, f32)> {
+    let Some((first, last)) = scalars.first().copied().zip(scalars.last().copied()) else {
+        return Vec::new();
+    };
+    let overall_length = (last - first).abs();
+    scalars
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let (a_t, b_t) = (pair[0], pair[1]);
+            let length = (b_t - a_t).abs();
+            if length < min_length {
+                return None;
+            }
+            if (overall_length - length).abs() <= BRANCH_PROJECTED_CHAIN_POINT_TOLERANCE_MM {
+                return None;
+            }
+            Some((index, a_t, b_t))
+        })
+        .collect()
+}
+
+#[inline]
+fn normalized_branch_dim_axis(start: Vec3, end: Vec3) -> Option<Vec3> {
+    let axis = end - start;
+    if axis.length_squared() <= 1e-6 {
+        return None;
+    }
+    Some(canonical_branch_dim_axis(axis.normalize()))
+}
+
+fn canonical_branch_dim_axis(axis: Vec3) -> Vec3 {
+    let mut axis = axis.normalize_or_zero();
+    if axis.length_squared() <= 1e-9 {
+        return Vec3::X;
+    }
+    let first_non_zero = [axis.x, axis.y, axis.z]
+        .into_iter()
+        .find(|v| v.abs() > 1e-5)
+        .unwrap_or(axis.x);
+    if first_non_zero < 0.0 {
+        axis = -axis;
+    }
+    axis
+}
+
+#[inline]
+fn same_branch_dim_axis(a: Vec3, b: Vec3) -> bool {
+    a.normalize_or_zero().dot(b.normalize_or_zero()).abs() >= BRANCH_DIM_AXIS_ALIGN_COS
+}
+
+#[inline]
+fn project_point_to_line(point: Vec3, origin: Vec3, axis: Vec3) -> Vec3 {
+    let axis = axis.normalize_or_zero();
+    if axis.length_squared() <= 1e-9 {
+        return origin;
+    }
+    origin + axis * (point - origin).dot(axis)
+}
+
+#[inline]
+fn point_to_line_distance(point: Vec3, origin: Vec3, axis: Vec3) -> f32 {
+    project_point_to_line(point, origin, axis).distance(point)
+}
+
+fn projected_dim_projection_range(group: &BranchProjectedDimLineGroup) -> Option<(f32, f32)> {
+    let axis = group.axis.normalize_or_zero();
+    if axis.length_squared() <= 1e-9 {
+        return None;
+    }
+    let mut min_t = f32::INFINITY;
+    let mut max_t = f32::NEG_INFINITY;
+    let mut seen = false;
+    for point in &group.points {
+        if !point.point.is_finite() {
+            continue;
+        }
+        let t = (point.point - group.origin).dot(axis);
+        min_t = min_t.min(t);
+        max_t = max_t.max(t);
+        seen = true;
+    }
+    seen.then_some((min_t, max_t))
+}
+
+fn push_unique_branch_dim_point(
+    points: &mut Vec<BranchProjectedDimPoint>,
+    point: Vec3,
+    kind: BranchProjectedDimPointKind,
+) {
+    if !point.is_finite() {
+        return;
+    }
+    if let Some(existing) = points
+        .iter_mut()
+        .find(|existing| existing.point.distance(point) <= 0.5)
+    {
+        if branch_projected_point_kind_priority(kind)
+            > branch_projected_point_kind_priority(existing.kind)
+        {
+            existing.kind = kind;
+            existing.point = point;
+        }
+        return;
+    }
+    points.push(BranchProjectedDimPoint { point, kind });
+}
+
+fn branch_projected_point_kind_priority(kind: BranchProjectedDimPointKind) -> u8 {
+    match kind {
+        BranchProjectedDimPointKind::SegmentEnd => 4,
+        BranchProjectedDimPointKind::FittingEnd => 3,
+        BranchProjectedDimPointKind::FittingAnchor => 2,
+        BranchProjectedDimPointKind::Corner => 1,
+    }
+}
+
+fn branch_dim_span_key(start: Vec3, end: Vec3) -> String {
+    let encode = |point: Vec3| -> String {
+        format!(
+            "{:.1},{:.1},{:.1}",
+            (point.x * 10.0).round() / 10.0,
+            (point.y * 10.0).round() / 10.0,
+            (point.z * 10.0).round() / 10.0
+        )
+    };
+    let a = encode(start);
+    let b = encode(end);
+    if a <= b {
+        format!("{a}|{b}")
+    } else {
+        format!("{b}|{a}")
+    }
 }
 
 fn format_material_ns(bore_mm: Option<f32>, outside_diameter_mm: Option<f32>) -> String {
@@ -2142,12 +2714,29 @@ async fn get_mbd_pipe(
         .await
         {
             Ok(v) => v,
-            Err(e) => {
-                return json_utf8(MbdPipeResponse {
-                    success: false,
-                    error_message: Some(format!("从 model cache 读取分支管段失败: {e}")),
-                    data: None,
-                });
+            Err(cache_err) => {
+                match fetch_tubi_segments_from_parquet_with_debug(branch_refno.clone(), query.dbno)
+                    .await
+                {
+                    Ok((segs, mut parquet_debug)) => {
+                        parquet_debug.fallback_used = true;
+                        parquet_debug.fallback_reason =
+                            Some(format!("cache 失败({cache_err})，已自动回退到 parquet"));
+                        parquet_debug
+                            .notes
+                            .push("auto-fallback: cache→parquet".into());
+                        (segs, parquet_debug)
+                    }
+                    Err(parquet_err) => {
+                        return json_utf8(MbdPipeResponse {
+                            success: false,
+                            error_message: Some(format!(
+                                "Cache 失败({cache_err})，Parquet 也失败({parquet_err})"
+                            )),
+                            data: None,
+                        });
+                    }
+                }
             }
         },
     };
@@ -2319,6 +2908,61 @@ async fn trigger_async_parquet_export(dbnum: u32) -> anyhow::Result<()> {
     result
 }
 
+fn current_project_output_root() -> PathBuf {
+    crate::versioned_db::db_meta_info::get_current_project_name()
+        .map(|project_name| {
+            crate::versioned_db::db_meta_info::get_project_output_dir(&project_name)
+        })
+        .unwrap_or_else(crate::versioned_db::db_meta_info::get_output_root)
+}
+
+fn resolve_dbnum_parquet_dir(dbnum: u32, required_file: &str) -> anyhow::Result<PathBuf> {
+    let db_option = aios_core::get_db_option();
+    let project_output_root = current_project_output_root();
+    let legacy_project_output_root = db_option
+        .project_name
+        .trim()
+        .is_empty()
+        .then(|| PathBuf::from("output"))
+        .unwrap_or_else(|| PathBuf::from("output").join(db_option.project_name.trim()));
+    let mut candidates = vec![
+        project_output_root.join("parquet").join(dbnum.to_string()),
+        project_output_root
+            .join("instances")
+            .join(dbnum.to_string()),
+    ];
+
+    if project_output_root != PathBuf::from("output") {
+        if legacy_project_output_root != project_output_root {
+            candidates.push(
+                legacy_project_output_root
+                    .join("parquet")
+                    .join(dbnum.to_string()),
+            );
+            candidates.push(
+                legacy_project_output_root
+                    .join("instances")
+                    .join(dbnum.to_string()),
+            );
+        }
+        candidates.push(PathBuf::from("output/parquet").join(dbnum.to_string()));
+        candidates.push(PathBuf::from("output/instances").join(dbnum.to_string()));
+    }
+
+    for candidate in &candidates {
+        if candidate.join(required_file).exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.join(required_file).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!("{required_file} 文件不存在，已搜索: {searched}");
+}
+
 async fn fetch_tubi_segments_from_parquet_with_debug(
     branch_refno: RefnoEnum,
     dbno: Option<u32>,
@@ -2341,21 +2985,13 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     }
     debug.inferred_dbnum = Some(inferred_dbnum);
 
-    // 确定 parquet 输出目录：仅使用 output/{project}/instances/{dbnum}
-    let db_option = aios_core::get_db_option();
-    let project_name = &db_option.project_name;
-    let instances_root = if project_name.is_empty() {
-        PathBuf::from("output/instances")
-    } else {
-        PathBuf::from(format!("output/{project_name}/instances"))
-    };
-    let instances_dir = instances_root.join(inferred_dbnum.to_string());
+    let instances_dir = resolve_dbnum_parquet_dir(inferred_dbnum, "tubings.parquet")?;
     debug.cache_dir = Some(instances_dir.display().to_string());
+    debug
+        .notes
+        .push(format!("parquet_dir={}", instances_dir.display()));
 
     let tubings_path = instances_dir.join("tubings.parquet");
-    if !tubings_path.exists() {
-        anyhow::bail!("tubings parquet 文件不存在: {}", tubings_path.display());
-    }
     let transforms_path = instances_dir.join("transforms.parquet");
 
     // 读取 tubings parquet，按 owner_refno_str 过滤
@@ -2476,6 +3112,475 @@ async fn fetch_tubi_segments_from_parquet_with_debug(
     Ok((segs, debug))
 }
 
+async fn fetch_branch_connection_points_from_parquet(
+    branch_refno: RefnoEnum,
+    dbno: Option<u32>,
+) -> anyhow::Result<Vec<BranchConnectionPoint>> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use polars::prelude::*;
+
+    let inferred_dbnum = if let Some(d) = dbno {
+        d
+    } else {
+        db_meta().ensure_loaded()?;
+        db_meta()
+            .get_dbnum_by_refno(branch_refno.clone())
+            .unwrap_or(0)
+    };
+    if inferred_dbnum == 0 {
+        anyhow::bail!("无法推导 dbno（请传 dbno 或先生成 output/scene_tree/db_meta_info.json）");
+    }
+
+    let instances_dir = resolve_dbnum_parquet_dir(inferred_dbnum, "instances.parquet")?;
+    let instances_path = instances_dir.join("instances.parquet");
+    let transforms_path = instances_dir.join("transforms.parquet");
+    let ptsets_path = instances_dir.join("ptsets.parquet");
+
+    if !transforms_path.exists() {
+        anyhow::bail!(
+            "transforms parquet 文件不存在: {}",
+            transforms_path.display()
+        );
+    }
+    if !ptsets_path.exists() {
+        anyhow::bail!("ptsets parquet 文件不存在: {}", ptsets_path.display());
+    }
+
+    let owner_refno_str = branch_refno.to_string();
+    let instances_df = {
+        let file = std::fs::File::open(&instances_path)?;
+        ParquetReader::new(file).finish()?
+    };
+    let refno_col = instances_df.column("refno_str")?.str()?;
+    let noun_col = instances_df.column("noun")?.str()?;
+    let owner_refno_col = instances_df.column("owner_refno_str")?.str()?;
+    let cata_hash_col = instances_df.column("cata_hash")?.str()?;
+    let trans_hash_col = instances_df.column("trans_hash")?.str()?;
+
+    let mut child_instances = Vec::<ParquetBranchChildInstance>::new();
+    let mut cata_hashes = HashSet::<String>::new();
+    let mut trans_hashes = HashSet::<String>::new();
+    for row in 0..instances_df.height() {
+        if owner_refno_col.get(row) != Some(owner_refno_str.as_str()) {
+            continue;
+        }
+        let noun = noun_col.get(row).unwrap_or_default().to_ascii_uppercase();
+        if !branch_connection_noun_has_ptset(&noun) {
+            continue;
+        }
+        let Some(cata_hash) = cata_hash_col
+            .get(row)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(trans_hash) = trans_hash_col
+            .get(row)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let refno = RefnoEnum::from(refno_col.get(row).unwrap_or_default());
+        child_instances.push(ParquetBranchChildInstance {
+            refno,
+            noun,
+            cata_hash: cata_hash.to_string(),
+            trans_hash: trans_hash.to_string(),
+        });
+        cata_hashes.insert(cata_hash.to_string());
+        trans_hashes.insert(trans_hash.to_string());
+    }
+
+    if child_instances.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let trans_map: HashMap<String, glam::Mat4> = {
+        let file = std::fs::File::open(&transforms_path)?;
+        let trans_df = ParquetReader::new(file).finish()?;
+        let hash_col = trans_df.column("trans_hash")?.str()?;
+        let mut m = HashMap::new();
+        for row in 0..trans_df.height() {
+            let Some(hash) = hash_col.get(row) else {
+                continue;
+            };
+            if !trans_hashes.contains(hash) {
+                continue;
+            }
+            let get_f = |name: &str| -> f32 {
+                trans_df
+                    .column(name)
+                    .ok()
+                    .and_then(|c| c.f64().ok())
+                    .and_then(|ca| ca.get(row))
+                    .unwrap_or(0.0) as f32
+            };
+            let mat = glam::Mat4::from_cols(
+                glam::Vec4::new(get_f("m00"), get_f("m10"), get_f("m20"), get_f("m30")),
+                glam::Vec4::new(get_f("m01"), get_f("m11"), get_f("m21"), get_f("m31")),
+                glam::Vec4::new(get_f("m02"), get_f("m12"), get_f("m22"), get_f("m32")),
+                glam::Vec4::new(get_f("m03"), get_f("m13"), get_f("m23"), get_f("m33")),
+            );
+            m.insert(hash.to_string(), mat);
+        }
+        m
+    };
+
+    let ptset_map: HashMap<String, Vec<ParquetPtsetPoint>> = {
+        let file = std::fs::File::open(&ptsets_path)?;
+        let ptsets_df = ParquetReader::new(file).finish()?;
+        let cata_hash_col = ptsets_df.column("cata_hash")?.str()?;
+        let number_col = ptsets_df.column("point_number")?.i32()?;
+        let pt_x_col = ptsets_df.column("pt_x")?.f64()?;
+        let pt_y_col = ptsets_df.column("pt_y")?.f64()?;
+        let pt_z_col = ptsets_df.column("pt_z")?.f64()?;
+        let pbore_col = ptsets_df.column("pbore")?.f64()?;
+        let mut m = HashMap::<String, Vec<ParquetPtsetPoint>>::new();
+        for row in 0..ptsets_df.height() {
+            let Some(cata_hash) = cata_hash_col.get(row) else {
+                continue;
+            };
+            if !cata_hashes.contains(cata_hash) {
+                continue;
+            }
+            let number = number_col.get(row).unwrap_or(0);
+            let pbore = pbore_col.get(row).unwrap_or(0.0) as f32;
+            if !is_branch_connection_ptset_point(number, pbore) {
+                continue;
+            }
+            let point = Vec3::new(
+                pt_x_col.get(row).unwrap_or(0.0) as f32,
+                pt_y_col.get(row).unwrap_or(0.0) as f32,
+                pt_z_col.get(row).unwrap_or(0.0) as f32,
+            );
+            if !point.is_finite() {
+                continue;
+            }
+            m.entry(cata_hash.to_string())
+                .or_default()
+                .push(ParquetPtsetPoint {
+                    number,
+                    point,
+                    pbore,
+                });
+        }
+        m
+    };
+
+    let mut points = Vec::<BranchConnectionPoint>::new();
+    let mut seen = HashSet::<String>::new();
+    for child in child_instances {
+        let Some(mat) = trans_map.get(&child.trans_hash).copied() else {
+            continue;
+        };
+        let Some(local_points) = ptset_map.get(&child.cata_hash) else {
+            continue;
+        };
+        for local_point in local_points {
+            let point = mat.transform_point3(local_point.point);
+            if !point.is_finite() {
+                continue;
+            }
+            let key = format!(
+                "{}:{}:{:.1}:{:.1}:{:.1}",
+                child.refno,
+                local_point.number,
+                (point.x * 10.0).round() / 10.0,
+                (point.y * 10.0).round() / 10.0,
+                (point.z * 10.0).round() / 10.0
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            points.push(BranchConnectionPoint { point });
+        }
+    }
+
+    Ok(points)
+}
+
+async fn fetch_discrete_fitting_elements_from_parquet(
+    branch_refno: RefnoEnum,
+    dbno: Option<u32>,
+) -> anyhow::Result<Vec<RawFittingElement>> {
+    use crate::data_interface::db_meta_manager::db_meta;
+    use polars::prelude::*;
+
+    let inferred_dbnum = if let Some(d) = dbno {
+        d
+    } else {
+        db_meta().ensure_loaded()?;
+        db_meta()
+            .get_dbnum_by_refno(branch_refno.clone())
+            .unwrap_or(0)
+    };
+    if inferred_dbnum == 0 {
+        anyhow::bail!("无法推导 dbno（请传 dbno 或先生成 output/scene_tree/db_meta_info.json）");
+    }
+
+    let instances_dir = resolve_dbnum_parquet_dir(inferred_dbnum, "instances.parquet")?;
+    let instances_path = instances_dir.join("instances.parquet");
+    let transforms_path = instances_dir.join("transforms.parquet");
+    let ptsets_path = instances_dir.join("ptsets.parquet");
+
+    if !transforms_path.exists() {
+        anyhow::bail!(
+            "transforms parquet 文件不存在: {}",
+            transforms_path.display()
+        );
+    }
+    if !ptsets_path.exists() {
+        anyhow::bail!("ptsets parquet 文件不存在: {}", ptsets_path.display());
+    }
+
+    let owner_refno_str = branch_refno.to_string();
+    let instances_df = {
+        let file = std::fs::File::open(&instances_path)?;
+        ParquetReader::new(file).finish()?
+    };
+    let refno_col = instances_df.column("refno_str")?.str()?;
+    let noun_col = instances_df.column("noun")?.str()?;
+    let owner_refno_col = instances_df.column("owner_refno_str")?.str()?;
+    let cata_hash_col = instances_df.column("cata_hash")?.str()?;
+    let trans_hash_col = instances_df.column("trans_hash")?.str()?;
+
+    let mut child_instances = Vec::<ParquetBranchChildInstance>::new();
+    let mut cata_hashes = HashSet::<String>::new();
+    let mut trans_hashes = HashSet::<String>::new();
+    for row in 0..instances_df.height() {
+        if owner_refno_col.get(row) != Some(owner_refno_str.as_str()) {
+            continue;
+        }
+        let noun = noun_col.get(row).unwrap_or_default().to_ascii_uppercase();
+        if !parquet_fitting_noun_has_label(&noun) {
+            continue;
+        }
+        let Some(cata_hash) = cata_hash_col
+            .get(row)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(trans_hash) = trans_hash_col
+            .get(row)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let refno = RefnoEnum::from(refno_col.get(row).unwrap_or_default());
+        child_instances.push(ParquetBranchChildInstance {
+            refno,
+            noun,
+            cata_hash: cata_hash.to_string(),
+            trans_hash: trans_hash.to_string(),
+        });
+        cata_hashes.insert(cata_hash.to_string());
+        trans_hashes.insert(trans_hash.to_string());
+    }
+
+    if child_instances.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let trans_map: HashMap<String, glam::Mat4> = {
+        let file = std::fs::File::open(&transforms_path)?;
+        let trans_df = ParquetReader::new(file).finish()?;
+        let hash_col = trans_df.column("trans_hash")?.str()?;
+        let mut m = HashMap::new();
+        for row in 0..trans_df.height() {
+            let Some(hash) = hash_col.get(row) else {
+                continue;
+            };
+            if !trans_hashes.contains(hash) {
+                continue;
+            }
+            let get_f = |name: &str| -> f32 {
+                trans_df
+                    .column(name)
+                    .ok()
+                    .and_then(|c| c.f64().ok())
+                    .and_then(|ca| ca.get(row))
+                    .unwrap_or(0.0) as f32
+            };
+            let mat = glam::Mat4::from_cols(
+                glam::Vec4::new(get_f("m00"), get_f("m10"), get_f("m20"), get_f("m30")),
+                glam::Vec4::new(get_f("m01"), get_f("m11"), get_f("m21"), get_f("m31")),
+                glam::Vec4::new(get_f("m02"), get_f("m12"), get_f("m22"), get_f("m32")),
+                glam::Vec4::new(get_f("m03"), get_f("m13"), get_f("m23"), get_f("m33")),
+            );
+            m.insert(hash.to_string(), mat);
+        }
+        m
+    };
+
+    let ptset_map: HashMap<String, Vec<ParquetPtsetPoint>> = {
+        let file = std::fs::File::open(&ptsets_path)?;
+        let ptsets_df = ParquetReader::new(file).finish()?;
+        let cata_hash_col = ptsets_df.column("cata_hash")?.str()?;
+        let number_col = ptsets_df.column("point_number")?.i32()?;
+        let pt_x_col = ptsets_df.column("pt_x")?.f64()?;
+        let pt_y_col = ptsets_df.column("pt_y")?.f64()?;
+        let pt_z_col = ptsets_df.column("pt_z")?.f64()?;
+        let pbore_col = ptsets_df.column("pbore")?.f64()?;
+        let mut m = HashMap::<String, Vec<ParquetPtsetPoint>>::new();
+        for row in 0..ptsets_df.height() {
+            let Some(cata_hash) = cata_hash_col.get(row) else {
+                continue;
+            };
+            if !cata_hashes.contains(cata_hash) {
+                continue;
+            }
+            let number = number_col.get(row).unwrap_or(0);
+            if !(1..=9).contains(&number) {
+                continue;
+            }
+            let point = Vec3::new(
+                pt_x_col.get(row).unwrap_or(0.0) as f32,
+                pt_y_col.get(row).unwrap_or(0.0) as f32,
+                pt_z_col.get(row).unwrap_or(0.0) as f32,
+            );
+            if !point.is_finite() {
+                continue;
+            }
+            m.entry(cata_hash.to_string())
+                .or_default()
+                .push(ParquetPtsetPoint {
+                    number,
+                    point,
+                    pbore: pbore_col.get(row).unwrap_or(0.0) as f32,
+                });
+        }
+        for points in m.values_mut() {
+            points.sort_by_key(|point| point.number);
+        }
+        m
+    };
+
+    let mut items = Vec::with_capacity(child_instances.len());
+    let mut seen = HashSet::<String>::new();
+    for child in child_instances {
+        let Some(mat) = trans_map.get(&child.trans_hash).copied() else {
+            continue;
+        };
+        let Some(local_points) = ptset_map.get(&child.cata_hash) else {
+            continue;
+        };
+        let face_centers = local_points
+            .iter()
+            .filter(|point| is_branch_connection_ptset_point(point.number, point.pbore))
+            .map(|point| mat.transform_point3(point.point))
+            .filter(|point| point.is_finite())
+            .collect::<Vec<_>>();
+        let world_origin = mat.transform_point3(Vec3::ZERO);
+        let anchor_point = world_origin
+            .is_finite()
+            .then_some(world_origin)
+            .or_else(|| {
+                face_centers
+                    .first()
+                    .copied()
+                    .filter(|point| point.is_finite())
+            })
+            .unwrap_or(Vec3::ZERO);
+        let has_anchor = anchor_point.is_finite();
+        if !has_anchor {
+            continue;
+        }
+        let key = format!(
+            "{}:{:.1}:{:.1}:{:.1}",
+            child.refno,
+            (anchor_point.x * 10.0).round() / 10.0,
+            (anchor_point.y * 10.0).round() / 10.0,
+            (anchor_point.z * 10.0).round() / 10.0
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let face_center_1 = face_centers.first().copied();
+        let face_center_2 = face_centers.get(1).copied();
+        items.push(RawFittingElement {
+            refno: child.refno,
+            noun: child.noun.clone(),
+            anchor_point,
+            has_anchor,
+            face_center_1,
+            face_center_2,
+            angle: infer_parquet_fitting_angle(
+                &child.noun,
+                world_origin,
+                face_center_1,
+                face_center_2,
+            ),
+            radius: None,
+        });
+    }
+
+    Ok(items)
+}
+
+fn parquet_fitting_noun_has_label(noun: &str) -> bool {
+    branch_connection_noun_has_ptset(noun)
+}
+
+fn infer_parquet_fitting_angle(
+    noun: &str,
+    origin: Vec3,
+    face_center_1: Option<Vec3>,
+    face_center_2: Option<Vec3>,
+) -> Option<f32> {
+    if !matches!(noun, "ELBO" | "BEND") {
+        return None;
+    }
+    let Some(fc1) = face_center_1 else {
+        return Some(90.0);
+    };
+    let Some(fc2) = face_center_2 else {
+        return Some(90.0);
+    };
+    if !origin.is_finite() || !fc1.is_finite() || !fc2.is_finite() {
+        return Some(90.0);
+    }
+    let v1 = (fc1 - origin).normalize_or_zero();
+    let v2 = (fc2 - origin).normalize_or_zero();
+    if v1.length_squared() <= 1e-9 || v2.length_squared() <= 1e-9 {
+        return Some(90.0);
+    }
+    let angle = v1.dot(v2).clamp(-1.0, 1.0).acos().to_degrees();
+    if angle.is_finite() && angle > 5.0 && angle < 175.0 {
+        Some(angle)
+    } else {
+        Some(90.0)
+    }
+}
+
+fn branch_connection_noun_has_ptset(noun: &str) -> bool {
+    matches!(
+        noun,
+        "BEND"
+            | "ELBO"
+            | "TEE"
+            | "OLET"
+            | "FLAN"
+            | "FLNG"
+            | "FBLI"
+            | "REDU"
+            | "VALV"
+            | "GATE"
+            | "GLOV"
+            | "BALL"
+            | "CHECK"
+            | "CVAV"
+            | "GASK"
+            | "PCOM"
+            | "COUP"
+    )
+}
+
+fn is_branch_connection_ptset_point(number: i32, pbore: f32) -> bool {
+    (1..=9).contains(&number) && pbore.is_finite() && pbore > 0.0
+}
+
 async fn fetch_tubi_segments_from_cache(
     branch_refno: RefnoEnum,
     dbno: Option<u32>,
@@ -2518,15 +3623,16 @@ async fn fetch_tubi_segments_from_cache_with_debug(
 
     // 运行时约定：
     // - 若 MODEL_CACHE_DIR 指定，则优先使用
-    // - 否则优先尝试项目内默认输出目录（AvevaMarineSample），再回退到 output/instance_cache
+    // - 否则使用当前 DbOption 的模型缓存目录，即 <output_root>/<project>/instance_cache
+    // - 最后保留旧版 output/instance_cache 兼容路径
+    let configured_cache_dir = current_project_output_root().join("instance_cache");
     let cache_dir = std::env::var("MODEL_CACHE_DIR")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let p1 = PathBuf::from("output/AvevaMarineSample/instance_cache");
-            if FsPath::new(&p1).exists() {
-                return p1;
+            if FsPath::new(&configured_cache_dir).exists() {
+                return configured_cache_dir;
             }
             PathBuf::from("output/instance_cache")
         });
@@ -2955,7 +4061,7 @@ async fn fetch_bend_elements_for_branch(
     Ok(bends)
 }
 
-/// 查询分支下的 TEE/OLET/FLAN 元件，返回第一阶段离散标注目标
+/// 查询分支下的离散管件，返回第一阶段 MBD fitting 标注目标。
 async fn fetch_discrete_fitting_elements_for_branch(
     branch_refno: RefnoEnum,
 ) -> anyhow::Result<Vec<RawFittingElement>> {
@@ -2978,7 +4084,13 @@ async fn fetch_discrete_fitting_elements_for_branch(
     }
 
     let pe_key = branch_refno.to_pe_key();
-    let sql = build_branch_child_element_query(&pe_key, &["TEE", "OLET", "FLAN", "FLNG"]);
+    let sql = build_branch_child_element_query(
+        &pe_key,
+        &[
+            "ELBO", "BEND", "TEE", "OLET", "FLAN", "FLNG", "REDU", "VALV", "GATE", "GLOV", "BALL",
+            "CHECK", "CVAV", "GASK",
+        ],
+    );
 
     let rows: Vec<FittingRow> = match mbd_query_take(&sql, 0).await {
         Ok(v) => v,
@@ -3210,11 +4322,11 @@ struct MbdGenerateRequest {
     refno: Option<String>,
 }
 
-/// 预生成默认查询参数（全量，source=Db）
+/// 预生成默认查询参数（全量，source=cache→parquet）
 fn export_default_query() -> MbdPipeQuery {
     MbdPipeQuery {
         mode: Some(MbdPipeMode::Construction),
-        source: MbdPipeSource::Db,
+        source: MbdPipeSource::Cache,
         include_dims: Some(true),
         include_chain_dims: Some(true),
         include_overall_dim: Some(false),
@@ -3244,7 +4356,7 @@ async fn build_mbd_pipe_data_from_segments(
     segments: Vec<CacheTubiSeg>,
     branch_name: String,
     branch_attrs: BranchAttrsDto,
-    debug_info: MbdPipeDebugInfo,
+    mut debug_info: MbdPipeDebugInfo,
 ) -> anyhow::Result<MbdPipeData> {
     let topology = BranchTopologyBuilder::build(branch_refno.clone(), segments);
 
@@ -3258,9 +4370,38 @@ async fn build_mbd_pipe_data_from_segments(
         };
 
     let mut fitting_elements = if query.include_fittings || query.include_tags {
-        fetch_discrete_fitting_elements_for_branch(branch_refno.clone())
-            .await
-            .unwrap_or_default()
+        if matches!(query.source, MbdPipeSource::Parquet) {
+            match fetch_discrete_fitting_elements_from_parquet(branch_refno.clone(), query.dbno)
+                .await
+            {
+                Ok(items) if !items.is_empty() => {
+                    debug_info
+                        .notes
+                        .push(format!("parquet fitting elements loaded={}", items.len()));
+                    items
+                }
+                Ok(_) => {
+                    debug_info
+                        .notes
+                        .push("parquet fitting elements loaded=0".to_string());
+                    fetch_discrete_fitting_elements_for_branch(branch_refno.clone())
+                        .await
+                        .unwrap_or_default()
+                }
+                Err(e) => {
+                    debug_info
+                        .notes
+                        .push(format!("parquet fitting elements unavailable: {e}"));
+                    fetch_discrete_fitting_elements_for_branch(branch_refno.clone())
+                        .await
+                        .unwrap_or_default()
+                }
+            }
+        } else {
+            fetch_discrete_fitting_elements_for_branch(branch_refno.clone())
+                .await
+                .unwrap_or_default()
+        }
     } else {
         Vec::new()
     };
@@ -3282,6 +4423,26 @@ async fn build_mbd_pipe_data_from_segments(
         });
     }
 
+    let connection_points = if matches!(query.source, MbdPipeSource::Parquet) {
+        match fetch_branch_connection_points_from_parquet(branch_refno.clone(), query.dbno).await {
+            Ok(points) => {
+                debug_info.notes.push(format!(
+                    "branch child connection points loaded={}",
+                    points.len()
+                ));
+                points
+            }
+            Err(e) => {
+                debug_info
+                    .notes
+                    .push(format!("branch child connection points unavailable: {e}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let pipe_item_code = if query.include_material_table || query.include_material_balloons {
         infer_branch_pipe_item_code(branch_refno.clone()).await
     } else {
@@ -3293,6 +4454,7 @@ async fn build_mbd_pipe_data_from_segments(
         &topology,
         &branch_name,
         &fitting_elements,
+        &connection_points,
         &bends,
         pipe_item_code,
     )
@@ -3546,9 +4708,68 @@ fn compute_branch_layout_result(
     };
 
     let mut layout = BranchCalculator::assemble_prelaid_out(&request, sections);
+    apply_linear_dim_layout_hints(&mut layout, data, default_od, iso_params.cheight);
     apply_linear_dim_suppression_hints(&mut layout, data);
     suppress_invalid_straight_overall_dims(&mut layout);
     layout
+}
+
+#[cfg(feature = "mbd-iso")]
+fn apply_linear_dim_layout_hints(
+    layout: &mut aios_core::mbd::LayoutResult,
+    data: &MbdPipeData,
+    default_od: f32,
+    cheight: f32,
+) {
+    let dim_hints: HashMap<String, MbdLayoutHint> = data
+        .dims
+        .iter()
+        .filter_map(|dim| dim.layout_hint.clone().map(|hint| (dim.id.clone(), hint)))
+        .collect();
+    let cut_hints: HashMap<String, MbdLayoutHint> = data
+        .cut_tubis
+        .iter()
+        .filter_map(|cut| cut.layout_hint.clone().map(|hint| (cut.id.clone(), hint)))
+        .collect();
+
+    for dim in &mut layout.linear_dims {
+        if let Some(hint) = dim_hints.get(&dim.id) {
+            apply_layout_hint_to_placed_linear_dim(dim, hint, default_od, cheight);
+        }
+    }
+    for cut in &mut layout.cut_tubis {
+        if let Some(hint) = cut_hints.get(&cut.id) {
+            apply_layout_hint_to_placed_linear_dim(cut, hint, default_od, cheight);
+        }
+    }
+}
+
+#[cfg(feature = "mbd-iso")]
+fn apply_layout_hint_to_placed_linear_dim(
+    dim: &mut aios_core::mbd::PlacedLinearDim,
+    hint: &MbdLayoutHint,
+    default_od: f32,
+    cheight: f32,
+) {
+    let dir = Vec3::from_array(hint.offset_dir).normalize_or_zero();
+    if dir.length_squared() <= 1e-9 || !dir.is_finite() {
+        return;
+    }
+    let lane = hint.offset_level.max(1) as f32;
+    let offset = default_od + cheight * 1.2 * (lane - 1.0);
+    let start = Vec3::from_array(dim.start);
+    let end = Vec3::from_array(dim.end);
+    let text_anchor = midpoint(start, end) + dir * offset;
+    dim.direction = dir.to_array();
+    dim.offset = offset;
+    dim.text_anchor = Some(text_anchor.to_array());
+    dim.label_offset_world = None;
+    dim.dim_line_start = None;
+    dim.dim_line_end = None;
+    dim.extension_line_1_start = None;
+    dim.extension_line_1_end = None;
+    dim.extension_line_2_start = None;
+    dim.extension_line_2_end = None;
 }
 
 #[cfg(feature = "mbd-iso")]
@@ -3685,13 +4906,12 @@ pub async fn generate_mbd_data(
     branch_refno: RefnoEnum,
     query: &MbdPipeQuery,
 ) -> anyhow::Result<MbdPipeData> {
-    ensure_mbd_surreal_context().await?;
     let query = query.resolve();
     let (segments, mut debug_info) =
-        fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await?;
+        fetch_tubi_segments_for_query(branch_refno.clone(), &query).await?;
 
     let (branch_name, branch_attrs) = if query.include_branch_attrs {
-        match try_fill_branch_name_and_attrs(branch_refno).await {
+        match try_fill_branch_name_and_attrs(branch_refno.clone()).await {
             Ok(v) => v,
             Err(e) => {
                 debug_info
@@ -3713,6 +4933,120 @@ pub async fn generate_mbd_data(
         debug_info,
     )
     .await
+}
+
+async fn fetch_tubi_segments_for_query(
+    branch_refno: RefnoEnum,
+    query: &ResolvedMbdPipeQuery,
+) -> anyhow::Result<(Vec<CacheTubiSeg>, MbdPipeDebugInfo)> {
+    let (segments, mut debug_info) = match query.source {
+        MbdPipeSource::Parquet => {
+            match fetch_tubi_segments_from_parquet_with_debug(branch_refno.clone(), query.dbno)
+                .await
+            {
+                Ok(v) => v,
+                Err(parquet_err) => {
+                    match fetch_tubi_segments_from_surreal_with_debug(branch_refno.clone()).await {
+                        Ok((segs, mut db_debug)) => {
+                            db_debug.fallback_used = true;
+                            db_debug.fallback_reason = Some(format!(
+                                "parquet 失败({parquet_err})，已自动回退到 SurrealDB"
+                            ));
+                            db_debug.notes.push("auto-fallback: parquet→db".into());
+
+                            let dbno_for_export = query.dbno.or_else(|| {
+                                use crate::data_interface::db_meta_manager::db_meta;
+                                let _ = db_meta().ensure_loaded();
+                                let d = db_meta()
+                                    .get_dbnum_by_refno(branch_refno.clone())
+                                    .unwrap_or(0);
+                                if d > 0 { Some(d) } else { None }
+                            });
+                            if let Some(dbnum) = dbno_for_export {
+                                tokio::spawn(async move {
+                                    if let Err(e) = trigger_async_parquet_export(dbnum).await {
+                                        eprintln!("[mbd-pipe] 后台 parquet 导出失败: {e}");
+                                    }
+                                });
+                                db_debug
+                                    .notes
+                                    .push(format!("已触发后台 parquet 导出 dbnum={dbnum}"));
+                            }
+
+                            (segs, db_debug)
+                        }
+                        Err(db_err) => {
+                            anyhow::bail!(
+                                "Parquet 失败({parquet_err})，SurrealDB 也失败({db_err})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        MbdPipeSource::Db => {
+            match fetch_tubi_segments_from_surreal_with_debug(branch_refno).await {
+                Ok(v) => v,
+                Err(e) => {
+                    anyhow::bail!(
+                        "从 SurrealDB 读取分支管段失败: {e}（可尝试 ?source=cache 走 model cache）"
+                    );
+                }
+            }
+        }
+        MbdPipeSource::Cache => match fetch_tubi_segments_from_cache_with_debug(
+            branch_refno.clone(),
+            query.dbno,
+            query.batch_id.as_deref(),
+            query.strict_dbno,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(cache_err) => {
+                match fetch_tubi_segments_from_parquet_with_debug(branch_refno.clone(), query.dbno)
+                    .await
+                {
+                    Ok((segs, mut parquet_debug)) => {
+                        parquet_debug.fallback_used = true;
+                        parquet_debug.fallback_reason =
+                            Some(format!("cache 失败({cache_err})，已自动回退到 parquet"));
+                        parquet_debug
+                            .notes
+                            .push("auto-fallback: cache→parquet".into());
+                        (segs, parquet_debug)
+                    }
+                    Err(parquet_err) => {
+                        anyhow::bail!("Cache 失败({cache_err})，Parquet 也失败({parquet_err})");
+                    }
+                }
+            }
+        },
+    };
+
+    if matches!(query.source, MbdPipeSource::Db) {
+        if query.dbno.is_some() || query.batch_id.is_some() || query.strict_dbno {
+            debug_info.notes.push(format!(
+                "db 模式已忽略 dbno={:?} batch_id={:?} strict_dbno={}",
+                query.dbno, query.batch_id, query.strict_dbno
+            ));
+        }
+    }
+
+    if matches!(query.source, MbdPipeSource::Parquet) {
+        if query.batch_id.is_some() || query.strict_dbno {
+            debug_info.notes.push(format!(
+                "parquet 模式已忽略 batch_id={:?} strict_dbno={}",
+                query.batch_id, query.strict_dbno
+            ));
+        }
+    }
+
+    debug_info.inferred_dbnum = debug_info.inferred_dbnum.or(query.dbno);
+    debug_info.requested_dbno = query.dbno;
+    debug_info.requested_batch_id = query.batch_id.clone();
+
+    Ok((segments, debug_info))
 }
 
 /// 生成单个 BRAN 的 MBD JSON 并写入磁盘
@@ -4117,7 +5451,7 @@ mod tests {
         let resolved = mbd_v2_layout_query(MbdPipeQuery::default()).resolve();
 
         assert_eq!(resolved.mode, MbdPipeMode::LayoutFirst);
-        assert!(matches!(resolved.source, MbdPipeSource::Db));
+        assert!(matches!(resolved.source, MbdPipeSource::Cache));
         assert!(!resolved.include_dims);
         assert!(resolved.include_chain_dims);
         assert!(!resolved.include_overall_dim);
@@ -4282,7 +5616,7 @@ mod tests {
         );
 
         let output =
-            BranchMeasurementPlanner::new(&query, &topology, "demo", &[], &[], None).build();
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &[], &[], &[], None).build();
 
         assert_eq!(output.cut_tubis.len(), 2);
         assert!(output.dims.iter().all(|dim| {
@@ -4301,7 +5635,64 @@ mod tests {
     }
 
     #[test]
-    fn test_measurement_planner_generates_fittings_and_tags_with_layout_hints() {
+    fn test_measurement_planner_keeps_cut_tubi_when_segment_refno_matches_fitting() {
+        let query = MbdPipeQuery {
+            include_cut_tubis: Some(true),
+            include_fittings: Some(true),
+            include_material_balloons: Some(true),
+            include_material_table: Some(true),
+            ..Default::default()
+        }
+        .resolve();
+        let shared_refno = RefnoEnum::from("2013286704_479");
+        let topology = BranchTopologyBuilder::build(
+            RefnoEnum::from("2013286704_476"),
+            vec![CacheTubiSeg {
+                refno: shared_refno.clone(),
+                arrive_refno: None,
+                order: Some(0),
+                start: Vec3::new(0.0, 0.0, 0.0),
+                end: Vec3::new(600.0, 0.0, 0.0),
+                arrive_axis: None,
+                leave_axis: None,
+                outside_diameter: Some(88.9),
+                bore: Some(80.0),
+            }],
+        );
+        let fittings = vec![RawFittingElement {
+            refno: shared_refno,
+            noun: "TEE".to_string(),
+            anchor_point: Vec3::new(300.0, 0.0, 0.0),
+            has_anchor: true,
+            face_center_1: None,
+            face_center_2: None,
+            angle: None,
+            radius: None,
+        }];
+
+        let output =
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], &[], None)
+                .build();
+
+        assert_eq!(output.cut_tubis.len(), 1);
+        assert_eq!(output.cut_tubis[0].refno, "2013286704_479");
+        assert_eq!(output.material_rows.len(), 1);
+        assert!(
+            output
+                .tags
+                .iter()
+                .any(|tag| tag.id.starts_with("tag:material:"))
+        );
+        assert!(
+            output
+                .tags
+                .iter()
+                .all(|tag| !tag.id.starts_with("tag:fitting:"))
+        );
+    }
+
+    #[test]
+    fn test_measurement_planner_generates_fittings_with_layout_hints_without_default_tags() {
         let query = MbdPipeQuery::default().resolve();
         let topology = BranchTopologyBuilder::build(
             RefnoEnum::from("24381_145018"),
@@ -4341,11 +5732,12 @@ mod tests {
         ];
 
         let output =
-            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], None).build();
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], &[], None)
+                .build();
 
         assert_eq!(output.fittings.len(), 2);
-        assert!(output.tags.iter().any(|tag| tag.noun == "TEE"));
-        assert!(output.tags.iter().any(|tag| tag.noun == "FLAN"));
+        assert!(!output.tags.iter().any(|tag| tag.noun == "TEE"));
+        assert!(!output.tags.iter().any(|tag| tag.noun == "FLAN"));
         assert!(output.fittings.iter().all(|item| {
             item.layout_hint
                 .as_ref()
@@ -4423,14 +5815,21 @@ mod tests {
         }];
 
         let output =
-            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], None).build();
-        let tag = output
-            .tags
+            BranchMeasurementPlanner::new(&query, &topology, "demo", &fittings, &[], &[], None)
+                .build();
+        let fitting = output
+            .fittings
             .iter()
-            .find(|tag| tag.id == "tag:fitting:2013286704_480")
-            .expect("ELBO fitting tag");
+            .find(|item| item.id == "fitting:2013286704_480")
+            .expect("ELBO fitting");
 
-        assert_eq!(tag.text, "ELBO 90.0°");
+        assert_eq!(fitting.angle, Some(90.0));
+        assert!(
+            output
+                .tags
+                .iter()
+                .all(|tag| !tag.id.starts_with("tag:fitting:"))
+        );
     }
 
     #[test]
@@ -4460,6 +5859,7 @@ mod tests {
             &query,
             &topology,
             "/03SKID1-PIPE-SUCTION/B1",
+            &[],
             &[],
             &[],
             None,

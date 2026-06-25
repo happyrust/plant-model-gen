@@ -1701,7 +1701,28 @@ pub async fn gen_inst_meshes_by_geo_ids(
     geo_ids: &[RecordId],
     mesh_formats: &[MeshFormat],
 ) -> anyhow::Result<()> {
-    let use_file_state = use_file_mesh_state();
+    gen_inst_meshes_by_geo_ids_with_state(
+        dir,
+        precision,
+        geo_ids,
+        mesh_formats,
+        !use_file_mesh_state(),
+    )
+    .await
+}
+
+/// 直接基于 inst_geo id 列表生成网格，并允许调用方显式控制是否回写 mesh 状态。
+///
+/// 默认 file mesh state 路径会跳过 DB 回写，但修复/审计命令需要在不持久化 GLB
+/// body 的前提下记录 success/bad/aabb/pts 状态，避免导出阶段留下无法解释的
+/// `inst_geo` 语义行。
+pub async fn gen_inst_meshes_by_geo_ids_with_state(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
+    geo_ids: &[RecordId],
+    mesh_formats: &[MeshFormat],
+    persist_state: bool,
+) -> anyhow::Result<()> {
     if geo_ids.is_empty() {
         return Ok(());
     }
@@ -1800,9 +1821,7 @@ pub async fn gen_inst_meshes_by_geo_ids(
     }
 
     // 执行批量更新
-    if use_file_state {
-        println!("[gen_inst_meshes_by_geo_ids] file 模式：跳过 inst_geo 状态回写");
-    } else if !update_sql.is_empty() {
+    if persist_state && !update_sql.is_empty() {
         println!(
             "[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)",
             update_sql.len()
@@ -1812,15 +1831,22 @@ pub async fn gen_inst_meshes_by_geo_ids(
             Err(e) => eprintln!("[gen_inst_meshes_by_geo_ids] 更新数据库失败: {}", e),
         }
     } else {
-        println!("[gen_inst_meshes_by_geo_ids] update_sql 为空，没有需要更新的记录");
+        println!(
+            "[gen_inst_meshes_by_geo_ids] {}",
+            if persist_state {
+                "update_sql 为空，没有需要更新的记录"
+            } else {
+                "file/state-less 模式：跳过 inst_geo 状态回写"
+            }
+        );
     }
 
-    if use_file_state {
-        flush_aabb_cache();
-    } else {
+    if persist_state {
         // 保存 aabb 和 pts 数据
         utils::save_pts_to_surreal(&pts_json_map).await;
         utils::save_aabb_to_surreal(&aabb_map).await;
+    } else {
+        flush_aabb_cache();
     }
 
     Ok(())

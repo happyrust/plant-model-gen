@@ -39,6 +39,7 @@ impl IncrGeoUpdateLog {
             + self.loop_owner_refnos.len()
             + self.basic_cata_refnos.len()
             + self.bran_hanger_refnos.len()
+            + self.delete_refnos.len()
     }
 
     #[inline]

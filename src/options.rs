@@ -18,6 +18,35 @@ fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
     BooleanPipelineMode::DbLegacy
 }
 
+fn default_version_retention() -> String {
+    "90d".to_string()
+}
+
+/// 构造 SurrealDB RocksDB 连接串（用于 `surreal start` 与嵌入式 open）。
+///
+/// `versioned=true` 时追加 `?versioned=true&retention=<r>`，开启 fork 的
+/// RocksDB user-defined-timestamps 版本化存储（specs/022）。
+///
+/// 注意：versioned 是建库属性——已存在的非版本化数据目录不能以
+/// `versioned=true` 重新打开（UDT comparator 不匹配），必须新建数据目录重灌。
+pub fn rocksdb_conn_str(data_path: &str, versioned: bool, retention: &str) -> String {
+    debug_assert!(
+        !data_path.contains('?'),
+        "data_path 不应包含 query 参数: {data_path}"
+    );
+    if versioned {
+        let retention = retention.trim();
+        let retention = if retention.is_empty() {
+            "90d"
+        } else {
+            retention
+        };
+        format!("rocksdb://{data_path}?versioned=true&retention={retention}")
+    } else {
+        format!("rocksdb://{data_path}")
+    }
+}
+
 fn default_model_writer_mode() -> ModelWriterMode {
     ModelWriterMode::Surreal
 }
@@ -405,6 +434,20 @@ pub struct DbOptionExt {
     /// inst_relate_aabb 写入并发度
     #[serde(default = "default_inst_aabb_write_concurrency")]
     pub inst_aabb_write_concurrency: usize,
+
+    /// 是否为本项目的 SurrealDB(RocksDB) 实例开启 MVCC 版本化存储（specs/022）。
+    ///
+    /// 开启后 PE/ATT 历史可通过 `SELECT ... VERSION $t` 时间旅行查询。
+    /// 注意：versioned 是建库属性，已存在的非版本化数据目录不能直接以
+    /// versioned=true 打开（会因 comparator 不匹配失败），必须新建数据目录并
+    /// 重新解析灌库。因此默认 false，仅新站点/新数据目录显式开启。
+    #[serde(default = "default_false")]
+    pub versioned_storage: bool,
+
+    /// 版本保留期，透传给启动参数 retention（fork 的 datastore_retention 语法，
+    /// 如 "90d"/"30d"；"0" 表示无限保留——磁盘只增不减，需谨慎）。默认 "90d"。
+    #[serde(default = "default_version_retention")]
+    pub version_retention: String,
 }
 
 impl Deref for DbOptionExt {
@@ -665,7 +708,23 @@ impl From<DbOption> for DbOptionExt {
             base_write_concurrency: default_base_write_concurrency(),
             mesh_compute_concurrency: default_mesh_compute_concurrency(),
             inst_aabb_write_concurrency: default_inst_aabb_write_concurrency(),
+            versioned_storage: false,
+            version_retention: default_version_retention(),
         }
+    }
+}
+
+/// 读取当前运行时配置中的 versioned 存储参数（specs/022）。
+///
+/// versioned_storage/version_retention 是 DbOptionExt 扩展字段，
+/// `aios_core::get_db_option()` 拿不到；这里优先从 DB_OPTION_FILE 指向的
+/// toml 提取，失败时按关闭处理（不影响存量启动路径）。
+pub fn current_versioned_params() -> (bool, String) {
+    let raw = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".into());
+    let config_path = raw.strip_suffix(".toml").unwrap_or(&raw).to_string();
+    match get_db_option_ext_from_path(&config_path) {
+        Ok(ext) => (ext.versioned_storage, ext.version_retention),
+        Err(_) => (false, default_version_retention()),
     }
 }
 
@@ -933,6 +992,18 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let versioned_storage = toml_value
+        .get("versioned_storage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let version_retention = toml_value
+        .get("version_retention")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_version_retention);
+
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {
         inner: db_option,
@@ -969,6 +1040,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         base_write_concurrency,
         mesh_compute_concurrency,
         inst_aabb_write_concurrency,
+        versioned_storage,
+        version_retention,
     };
 
     validate_data_source_mode(db_option_ext.use_surrealdb)

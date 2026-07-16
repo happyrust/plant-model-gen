@@ -279,7 +279,13 @@ pub async fn start_database_with_progress(
         // 如果没有 .db 后缀，直接添加端口号和后缀
         format!("{}-{}.db", db_file, port)
     };
-    let db_path = format!("file:{}", db_file_with_port);
+    // versioned 开启时改用带参数的 rocksdb:// 连接串（file: 是 rocksdb 的旧别名）
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let db_path = if versioned_storage {
+        crate::options::rocksdb_conn_str(&db_file_with_port, true, &version_retention)
+    } else {
+        format!("file:{}", db_file_with_port)
+    };
 
     // 更新进度：30% - 启动进程
     {

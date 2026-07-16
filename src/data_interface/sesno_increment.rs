@@ -212,6 +212,15 @@ pub struct PdmsSesnoCollectedOutcome {
     pub files: Vec<PdmsSesnoCollectedFile>,
 }
 
+/// specs/022：已写入 `sesno_version_anchor` 表的锚点记录（用于汇总 JSON 与日志）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionAnchorRecord {
+    pub dbnum: u32,
+    pub sesno: u32,
+    pub source: String,
+    pub anchored_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PdmsIncrementPersistStats {
     pub file_count: usize,
@@ -222,6 +231,9 @@ pub struct PdmsIncrementPersistStats {
     pub att_rows: usize,
     pub uda_rows: usize,
     pub dbnum_info_updates: usize,
+    /// specs/022：本批增量落库固化的 sesno 锚点（成功路径末尾写入）。
+    #[serde(default)]
+    pub anchors: Vec<VersionAnchorRecord>,
 }
 
 impl PdmsIncrementPersistStats {
@@ -234,6 +246,7 @@ impl PdmsIncrementPersistStats {
         self.att_rows += other.att_rows;
         self.uda_rows += other.uda_rows;
         self.dbnum_info_updates += other.dbnum_info_updates;
+        self.anchors.extend(other.anchors);
     }
 }
 
@@ -566,6 +579,31 @@ async fn exec_statements(sqls: &[String], chunk_size: usize) -> anyhow::Result<(
     Ok(())
 }
 
+/// specs/022 T009：把本批 (dbnum, sesno) 固化为 `sesno_version_anchor` 锚点。
+///
+/// 幂等：UPSERT 到定长 record id `sesno_version_anchor:[dbnum, sesno]`，同一
+/// (dbnum, sesno) 重跑增量时覆盖 anchored_at；`source` 取 "incremental" / "full"。
+/// 调用点必须在本批全部 UPSERT/DELETE flush 完成之后，任何前序错误经 `?` 提前返回
+/// 都不会触达锚点写入（满足 FR-004：落库失败不写锚点）。
+pub(crate) async fn write_sesno_version_anchor(
+    dbnum: u32,
+    sesno: u32,
+    source: &str,
+) -> anyhow::Result<VersionAnchorRecord> {
+    crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
+    let sql = format!(
+        "UPSERT sesno_version_anchor:[{dbnum}, {sesno}] SET dbnum = {dbnum}, sesno = {sesno}, source = '{source}', anchored_at = time::now() RETURN anchored_at;"
+    );
+    let mut response = project_primary_db().query(sql).await?;
+    let anchored_at: Option<Datetime> = response.take((0, "anchored_at")).unwrap_or_default();
+    Ok(VersionAnchorRecord {
+        dbnum,
+        sesno,
+        source: source.to_string(),
+        anchored_at: anchored_at.map(|dt| dt.to_string()),
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct Ref0PersistInfo {
     dbnum: i32,
@@ -726,6 +764,12 @@ async fn persist_pdms_increment_grouped(
     }
     stats.dbnum_info_updates = dbnum_sqls.len();
     exec_statements(&dbnum_sqls, 200).await?;
+
+    // specs/022 T009：成功路径末尾（全部 UPSERT/DELETE + dbnum_info flush 完成后）固化锚点。
+    // 空批已在函数开头提前返回，不会到这里，故空批不写锚点。
+    let anchor =
+        write_sesno_version_anchor(report.dbnum, report.actual_end_sesno, "incremental").await?;
+    stats.anchors.push(anchor);
 
     Ok(stats)
 }

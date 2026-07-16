@@ -39,12 +39,27 @@ async fn main() -> anyhow::Result<()> {
     let config_file = format!("{}.toml", config_path);
     let cwd = std::env::current_dir().unwrap_or_default();
     let config_path_full = cwd.join(&config_file);
-    let db_option: aios_core::options::DbOption = {
-        let content = std::fs::read_to_string(&config_file).unwrap_or_else(|e| {
-            panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e)
-        });
-        toml::from_str(&content)
-            .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e))
+    let config_content = std::fs::read_to_string(&config_file).unwrap_or_else(|e| {
+        panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e)
+    });
+    let db_option: aios_core::options::DbOption = toml::from_str(&config_content)
+        .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
+    // versioned 存储参数是 DbOptionExt 扩展字段（specs/022），从同一 toml 直接提取
+    let (versioned_storage, version_retention) = {
+        let value: toml::Value = toml::from_str(&config_content)
+            .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
+        let versioned = value
+            .get("versioned_storage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let retention = value
+            .get("version_retention")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("90d")
+            .to_string();
+        (versioned, retention)
     };
 
     let ws_cfg = &db_option.web_server;
@@ -64,9 +79,14 @@ async fn main() -> anyhow::Result<()> {
     // 自启动 SurrealDB
     let _surreal_child = if ws_cfg.auto_start_surreal {
         let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
+        let db_uri = aios_database::options::rocksdb_conn_str(
+            data_path,
+            versioned_storage,
+            &version_retention,
+        );
         println!("🗄️  自启动 SurrealDB...");
         println!("   - 可执行文件: {}", ws_cfg.surreal_bin);
-        println!("   - 数据路径: rocksdb://{}", data_path);
+        println!("   - 数据路径: {}", db_uri);
         println!("   - 监听地址: {}", ws_cfg.surreal_bind);
         println!("   - 用户: {}", ws_cfg.surreal_user);
 
@@ -78,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             .arg(&ws_cfg.surreal_user)
             .arg("--pass")
             .arg(&ws_cfg.surreal_password)
-            .arg(format!("rocksdb://{}", data_path))
+            .arg(&db_uri)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();

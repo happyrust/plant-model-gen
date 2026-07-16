@@ -522,6 +522,68 @@ async fn ensure_ele_reuse_relate_relation_schema() {
         .await;
 }
 
+static SESNO_VERSION_ANCHOR_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
+
+/// 确保 sesno_version_anchor 锚点表 schema 存在（specs/022 T008）。
+///
+/// 表用途：把业务版本号 sesno 固化为存储时间戳锚点（dbnum + sesno → anchored_at），
+/// 供按 sesno 的历史查询（`SELECT ... VERSION`）换算时间戳；增量落库收尾写
+/// `source='incremental'`，全量重灌收尾写 `source='full'`。
+///
+/// 幂等：DDL 全部使用 IF NOT EXISTS；进程内经 OnceCell 成功后只执行一次，
+/// 失败不缓存、下次调用重试并向调用方传播错误（锚点写入前必须 schema 就绪）。
+pub async fn ensure_sesno_version_anchor_schema() -> anyhow::Result<()> {
+    SESNO_VERSION_ANCHOR_SCHEMA_INIT
+        .get_or_try_init(|| async {
+            let sql = r#"
+DEFINE TABLE IF NOT EXISTS sesno_version_anchor SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS dbnum ON TABLE sesno_version_anchor TYPE int;
+DEFINE FIELD IF NOT EXISTS sesno ON TABLE sesno_version_anchor TYPE int;
+DEFINE FIELD IF NOT EXISTS anchored_at ON TABLE sesno_version_anchor TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS source ON TABLE sesno_version_anchor TYPE string ASSERT $value IN ['full', 'incremental'];
+DEFINE FIELD IF NOT EXISTS note ON TABLE sesno_version_anchor TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno ON TABLE sesno_version_anchor FIELDS dbnum, sesno UNIQUE;
+"#;
+            aios_core::project_primary_db()
+                .query(sql)
+                .await
+                .map_err(|e| anyhow::anyhow!("定义 sesno_version_anchor schema 失败: {e}"))?
+                .check()
+                .map_err(|e| anyhow::anyhow!("sesno_version_anchor schema 语句执行失败: {e}"))?;
+            info!("sesno_version_anchor 锚点表 schema 已就绪");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+/// specs/022 T010：把本轮全量解析成功的 (dbnum, latest_sesno) 固化为 `source='full'` 锚点。
+///
+/// 调用时机约束：必须在本轮写库任务全部 join 之后（sync_total_async_threaded* 内
+/// `drop(sender)` + 等待 insert_handles 排空之后）调用，保证 anchored_at 晚于该
+/// dbnum 本轮全部 PE/ATT 写入；不能在解析循环里逐文件写（写库经 flume channel
+/// 异步 flush，逐文件时刻数据未必已落库）。
+///
+/// 失败仅告警不中断：全量解析本体已成功，缺锚点可由 quickstart 的「首条锚点确认」
+/// 步骤发现并重跑补写，不值得让多小时的全量重灌因锚点写入失败而整体报错重来。
+async fn write_full_version_anchors(pending: &[(u32, u32)]) {
+    for &(dbnum, sesno) in pending {
+        match crate::data_interface::sesno_increment::write_sesno_version_anchor(
+            dbnum, sesno, "full",
+        )
+        .await
+        {
+            Ok(record) => info!(
+                "sesno_version_anchor(full) 已写入: dbnum={} sesno={} anchored_at={:?}",
+                record.dbnum, record.sesno, record.anchored_at
+            ),
+            Err(e) => {
+                warn!("sesno_version_anchor(full) 写入失败(dbnum={dbnum} sesno={sesno}): {e:?}")
+            }
+        }
+    }
+}
+
 #[cfg(feature = "sql")]
 pub trait MySqlMethods {
     fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments);
@@ -632,6 +694,11 @@ where
         match project_primary_db().query(remove_event_sql).await {
             Ok(_) => info!("成功移除update_dbnum_event"),
             Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
+        }
+
+        // 项目库 schema 初始化：sesno 版本锚点表（specs/022 T008）
+        if let Err(e) = ensure_sesno_version_anchor_schema().await {
+            warn!("初始化 sesno_version_anchor schema 失败（锚点写入前会重试）: {e:?}");
         }
     }
 
@@ -802,6 +869,11 @@ pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
         match project_primary_db().query(remove_event_sql).await {
             Ok(_) => info!("成功移除update_dbnum_event"),
             Err(e) => info!("移除update_dbnum_event失败（可能不存在）: {:?}", e),
+        }
+
+        // 项目库 schema 初始化：sesno 版本锚点表（specs/022 T008）
+        if let Err(e) = ensure_sesno_version_anchor_schema().await {
+            warn!("初始化 sesno_version_anchor schema 失败（锚点写入前会重试）: {e:?}");
         }
     }
 
@@ -1323,6 +1395,8 @@ where
     let cata_filter =
         crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
+    // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
+    let mut pending_full_version_anchors: Vec<(u32, u32)> = Vec::new();
     // spec 004：解析阶段总耗时计时起点。
     let sync_stage_started = Instant::now();
 
@@ -1734,6 +1808,11 @@ where
             )
         })?;
 
+        // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
+        if is_save_db && sesno > 0 {
+            pending_full_version_anchors.push((dbnum, sesno as u32));
+        }
+
         if tree_nodes.is_empty() {
             warn!(
                 "[tree_export] dbnum={} file={} 解析得到 0 个 tree node，跳过 .tree 导出",
@@ -1790,6 +1869,8 @@ where
     while let Some(_result) = insert_handles.next().await {
         // 可在此加入错误处理或日志
     }
+    // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
+    write_full_version_anchors(&pending_full_version_anchors).await;
     validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
     crate::perf_metrics::finish_parse_stage(
         parse_failed_sql_count(),
@@ -2125,8 +2206,11 @@ pub async fn sync_total_async_threaded(
     let children_files_len = children_files.len();
     let db_file_progress_chunk = (proj_progress_chunk as f32 / children_files_len as f32) as usize;
     // let progress_sender_clone = progress_sender.clone();
-    let parse_handle = tokio::spawn(async move {
+    // 解析任务返回本轮成功解析的 (dbnum, latest_sesno)，供收尾固化 full 锚点（specs/022 T010）。
+    let pending_full_version_anchors = tokio::spawn(async move {
         let mut parsed_artifacts = Vec::new();
+        // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
+        let mut pending_full_version_anchors: Vec<(u32, u32)> = Vec::new();
         // spec 004：解析阶段总耗时计时起点。
         let sync_stage_started = Instant::now();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
@@ -2623,6 +2707,11 @@ pub async fn sync_total_async_threaded(
                         )
                     })?;
                 }
+
+                // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
+                if is_save_db && sesno > 0 {
+                    pending_full_version_anchors.push((dbnum, sesno as u32));
+                }
                 let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
                 let tree_export_stage_start = Instant::now();
@@ -2693,7 +2782,7 @@ pub async fn sync_total_async_threaded(
             parse_failed_sql_count(),
             sync_stage_started.elapsed().as_millis() as u64,
         );
-        anyhow::Ok(())
+        anyhow::Ok(pending_full_version_anchors)
     })
     .await
     .map_err(|e| anyhow::anyhow!("解析任务 join 失败: {}", e))??;
@@ -2703,6 +2792,8 @@ pub async fn sync_total_async_threaded(
         // 处理每个完成的 future 的结果
         // dbg!(&result);
     }
+    // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
+    write_full_version_anchors(&pending_full_version_anchors).await;
     // all_handles.push(parse_handle);
     // futures::future::join_all(take(&mut all_handles)).await;
     // futures::future::join_all(&mut [parse_handle]).await;

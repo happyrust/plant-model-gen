@@ -613,6 +613,7 @@ async fn run_incremental_sesno_once(
         "data_persist_enabled": options.persist_data,
         "data_persist_skipped_reason": if options.persist_data { serde_json::Value::Null } else { serde_json::json!("--no-persist requested") },
         "data_persist": persist_stats,
+        "version_anchor": persist_stats.anchors,
         "generation_dbnums": generation_dbnums,
         "generation_success": generation_success,
         "parquet_export": parquet_export,

@@ -524,13 +524,18 @@ pub async fn ensure_surreal_connected(db_option_ext: &DbOptionExt) -> Result<()>
                     "\n⚠️  SurrealDB 未在 {} 运行，尝试自动启动（auto_start_surreal = true）...",
                     addr
                 );
-                auto_start_surreal(&db_option_ext.inner).await?;
+                auto_start_surreal(db_option_ext).await?;
             } else {
                 anyhow::bail!(
                     "SurrealDB 未在 {} 运行。请手动启动 SurrealDB，或设置 [web_server] auto_start_surreal = true 以自动启动。\n   \
-                    手动启动示例: surreal start --user root --pass root --bind 0.0.0.0:{} rocksdb://<数据路径>",
+                    手动启动示例: surreal start --user root --pass root --bind 0.0.0.0:{} {}",
                     addr,
-                    sdb_cfg.port
+                    sdb_cfg.port,
+                    aios_database::options::rocksdb_conn_str(
+                        "<数据路径>",
+                        db_option_ext.versioned_storage,
+                        &db_option_ext.version_retention,
+                    )
                 );
             }
         } else {
@@ -567,7 +572,7 @@ fn surreal_start_test_command(
     bind: &str,
     user: &str,
     pass: &str,
-    data_path: &str,
+    db_uri: &str,
 ) -> String {
     format!(
         "{} start --user {} --pass {} --bind {} {}",
@@ -575,7 +580,7 @@ fn surreal_start_test_command(
         powershell_quote(user),
         powershell_quote(pass),
         powershell_quote(bind),
-        powershell_quote(&format!("rocksdb://{}", data_path)),
+        powershell_quote(db_uri),
     )
 }
 
@@ -590,12 +595,17 @@ fn print_surreal_startup_diagnostics(db_option_ext: &DbOptionExt) {
         .clone()
         .unwrap_or_else(|| option.surrealdb_data_path());
     let startup_data_path = ws_cfg.effective_data_path(sdb_cfg.path.as_deref());
+    let startup_db_uri = aios_database::options::rocksdb_conn_str(
+        startup_data_path,
+        db_option_ext.versioned_storage,
+        &db_option_ext.version_retention,
+    );
     let startup_cmd = surreal_start_test_command(
         &ws_cfg.surreal_bin,
         &ws_cfg.surreal_bind,
         &ws_cfg.surreal_user,
         &ws_cfg.surreal_password,
-        startup_data_path,
+        &startup_db_uri,
     );
 
     println!("🔎 SurrealDB 启动诊断:");
@@ -606,7 +616,14 @@ fn print_surreal_startup_diagnostics(db_option_ext: &DbOptionExt) {
     println!("   - [web_server].surreal_data_path: {}", startup_data_path);
     println!("   - [web_server].surreal_bind: {}", ws_cfg.surreal_bind);
     if sdb_cfg.mode == DbConnMode::File {
-        println!("   - 嵌入式 open 目标: rocksdb://{}", surrealdb_path);
+        println!(
+            "   - 嵌入式 open 目标: {}",
+            aios_database::options::rocksdb_conn_str(
+                &surrealdb_path,
+                db_option_ext.versioned_storage,
+                &db_option_ext.version_retention,
+            )
+        );
     } else {
         println!("   - WS 连接目标: {}:{}", sdb_cfg.ip, sdb_cfg.port);
     }
@@ -748,12 +765,17 @@ fn cleanup_stale_rocksdb_lock_local(data_path: &str) {
 }
 
 /// 启动前会检测 RocksDB LOCK 文件：若无 surreal 进程持有则自动清理残留锁，避免崩溃后无法重启。
-async fn auto_start_surreal(db_option: &aios_core::options::DbOption) -> Result<()> {
+async fn auto_start_surreal(db_option_ext: &DbOptionExt) -> Result<()> {
+    let db_option = &db_option_ext.inner;
     let sdb_cfg = db_option.effective_surrealdb();
     let ws_cfg = &db_option.web_server;
 
     let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
-    let db_uri = format!("rocksdb://{}", data_path);
+    let db_uri = aios_database::options::rocksdb_conn_str(
+        data_path,
+        db_option_ext.versioned_storage,
+        &db_option_ext.version_retention,
+    );
     let bind = ws_cfg.surreal_bind.clone();
     let surreal_bin = std::env::var("SURREAL_BIN").unwrap_or_else(|_| ws_cfg.surreal_bin.clone());
 
@@ -1896,6 +1918,10 @@ pub async fn run_generate_model(
             )
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
+        // ponytail: generation already refreshed the exact roots; skip later dbnum-wide refresh.
+        unsafe {
+            std::env::set_var("AIOS_SKIP_DBNUM_PE_TRANSFORM_REFRESH", "1");
+        }
     }
     aios_database::perf_metrics::record_generate_progress(
         "collect_generation_targets",
@@ -1988,6 +2014,10 @@ pub async fn run_regen_model(
             )
             .await?;
         println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
+        // ponytail: generation already refreshed the exact roots; skip later dbnum-wide refresh.
+        unsafe {
+            std::env::set_var("AIOS_SKIP_DBNUM_PE_TRANSFORM_REFRESH", "1");
+        }
     }
     aios_database::perf_metrics::record_generate_progress(
         "collect_generation_targets",
@@ -5489,7 +5519,7 @@ mod tests {
             "127.0.0.1:18651",
             "root",
             "root",
-            "runtime/admin_sites/demo/data/surreal.db",
+            "rocksdb://runtime/admin_sites/demo/data/surreal.db",
         );
 
         assert_eq!(

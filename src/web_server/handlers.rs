@@ -4188,7 +4188,12 @@ async fn start_surreal_process_improved(
         }
     }
 
-    let db_path = format!("rocksdb://{}.rdb", project);
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let db_path = crate::options::rocksdb_conn_str(
+        &format!("{}.rdb", project),
+        versioned_storage,
+        &version_retention,
+    );
     println!("📁 数据库路径: {}", db_path);
 
     // 3. 创建启动命令，捕获输出用于诊断
@@ -4328,7 +4333,7 @@ async fn start_surreal_process_improved(
                 "message": format!("无法启动 SurrealDB 进程: {}", e),
                 "error_details": e.to_string(),
                 "bind_addr": final_bind_addr,
-                "db_path": format!("rocksdb://{}.rdb", project),
+                "db_path": db_path,
                 "troubleshooting": [
                     "检查 surreal 命令是否在 PATH 中",
                     "验证当前用户是否有执行权限",
@@ -7951,10 +7956,16 @@ async fn create_default_startup_script(
     // 确保cmd目录存在
     std::fs::create_dir_all("cmd")?;
 
-    // 创建脚本内容
+    // 创建脚本内容（连接串加引号：versioned 参数含 & 与 ?，bash 下必须留在引号内）
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let db_uri = crate::options::rocksdb_conn_str(
+        &format!("ams-{}-test.db", port),
+        versioned_storage,
+        &version_retention,
+    );
     let script_content = format!(
-        "#!/bin/bash\nsurreal start --user {} --pass {} --bind {}:{} rocksdb://ams-{}-test.db\n",
-        opt.surreal_user, opt.surreal_password, opt.surreal_ip, port, port
+        "#!/bin/bash\nsurreal start --user {} --pass {} --bind {}:{} '{}'\n",
+        opt.surreal_user, opt.surreal_password, opt.surreal_ip, port, db_uri
     );
 
     // 写入脚本文件

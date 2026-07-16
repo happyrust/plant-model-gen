@@ -8860,6 +8860,38 @@ async fn wait_for_business_status_ok(site: &ManagedProjectSite) -> bool {
     false
 }
 
+/// 从站点 DbOption.toml 读取 versioned 存储参数（specs/022）。
+/// 站点进程与远端部署模板拿不到 DbOptionExt，按 site_config_meshes_path
+/// 的先例直接读站点配置文件；缺省为关闭（versioned 是建库属性，
+/// 存量数据目录不能直接以 versioned=true 打开）。
+fn site_versioned_params(site: &ManagedProjectSite) -> (bool, String) {
+    let default_retention = "90d".to_string();
+    let Ok(raw) = fs::read_to_string(&site.config_path) else {
+        return (false, default_retention);
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
+        return (false, default_retention);
+    };
+    let versioned = value
+        .get("versioned_storage")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let retention = value
+        .get("version_retention")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or(default_retention);
+    (versioned, retention)
+}
+
+/// 站点 SurrealDB 连接串（含 versioned 参数透传）。
+fn site_rocksdb_conn_str(site: &ManagedProjectSite, data_path: &str) -> String {
+    let (versioned, retention) = site_versioned_params(site);
+    crate::options::rocksdb_conn_str(data_path, versioned, &retention)
+}
+
 fn site_config_meshes_path(site: &ManagedProjectSite) -> Option<PathBuf> {
     let raw = fs::read_to_string(&site.config_path).ok()?;
     let value = toml::from_str::<toml::Value>(&raw).ok()?;
@@ -10480,7 +10512,7 @@ async fn spawn_db_process(site: &ManagedProjectSite) -> Result<u32> {
             access_host_from_bind_host(&site.bind_host),
             site.db_port
         ))
-        .arg(format!("rocksdb://{}", site.db_data_path))
+        .arg(site_rocksdb_conn_str(site, &site.db_data_path))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     isolate_process_group(&mut command);
@@ -13491,7 +13523,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} rocksdb://{db_path}
+ExecStart={surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} {db_uri}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -13505,7 +13537,7 @@ WantedBy=multi-user.target
         db_password = db_password,
         db_bind = target.db_bind_host,
         db_port = target.remote_db_port,
-        db_path = target.remote_db_path
+        db_uri = site_rocksdb_conn_str(site, &target.remote_db_path)
     );
     let web_unit_content = format!(
         r#"[Unit]
@@ -13606,7 +13638,7 @@ if is_running "$DB_PID_FILE"; then
   echo "surreal already running: $(cat "$DB_PID_FILE")"
 else
   rm -f "$DB_PID_FILE"
-  nohup {surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} rocksdb://{db_path} >> "$LOG_DIR/surreal.log" 2>&1 &
+  nohup {surreal_bin} start --log info --user {db_user} --pass {db_password} --bind {db_bind}:{db_port} {db_uri} >> "$LOG_DIR/surreal.log" 2>&1 &
   echo $! > "$DB_PID_FILE"
 fi
 
@@ -13632,7 +13664,8 @@ fi
         db_password = sh_quote(db_password),
         db_bind = sh_quote(&target.db_bind_host),
         db_port = target.remote_db_port,
-        db_path = sh_quote(&target.remote_db_path),
+        // 连接串整体 sh_quote：versioned 参数含 & 与 ?，必须留在引号内
+        db_uri = sh_quote(&site_rocksdb_conn_str(site, &target.remote_db_path)),
         deploy_id = sh_quote(deploy_id),
         site_token = sh_quote(&site_token),
         web_bin = sh_quote(&target.remote_web_bin),

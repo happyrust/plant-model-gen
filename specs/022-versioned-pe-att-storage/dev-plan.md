@@ -6,25 +6,76 @@
 
 ---
 
-## 0. 现状核对(与 tasks.md 的偏差)
+## 0. 现状核对(2026-07-16 二次核对，修正 07-13 版本的重大偏差)
 
-逐项对照代码后,实际进度比 tasks.md 勾选状态更靠前:
+> **07-13 dev-plan 的判断"进度比 tasks.md 更靠前"是对的，但漏了一个致命事实：M1+M2 的代码从未提交，全部躺在 `git stash@{0}`（`dirty-wt-before-narrow-023`，07-16 18:59 创建）里。当前分支 HEAD 上没有任何 022 代码。** 下面是修正后的实况。
 
-| 任务 | tasks.md 状态 | 代码实况 |
+| 任务 | tasks.md 原状态 | 真实代码状态（2026-07-16） |
 |------|--------------|---------|
-| T001~T007 (M1) | 已勾选 | 属实。`options.rs` 有 `versioned_storage`/`version_retention`/`rocksdb_conn_str`;冒烟已过(8031 versioned / 8032 对照) |
-| T008 锚点表 schema | 未勾选 | **已实现**:`src/versioned_db/database.rs:537` `ensure_sesno_version_anchor_schema()`,SCHEMAFULL + UNIQUE INDEX (dbnum,sesno),额外加了 `note: option<string>` 字段与 `source ASSERT IN ['full','incremental']`;已挂进 `sync_pdms`(L850)与 `sync_pdms_with_callback`(L675)入口 |
-| T009~T012 | 未做 | 属实,未发现任何锚点 UPSERT 写入代码 |
-| T013~T020 (M3) | 未做 | 属实。rs-core 无 `version_query` 模块;`model-version` CLI 存在但无 `history` 子命令组 |
-| T021~T026 (M4/Polish) | 未做 | 属实 |
+| T001~T007 (M1 实例级开关) | 已勾选 | **已实现但仅在 stash@{0}，HEAD 上没有**。`options.rs` 的 `versioned_storage`/`version_retention`/`rocksdb_conn_str`/`current_versioned_params` + 5 处启动串透传;冒烟 07-13 已过(8031 versioned / 8032 对照)——但那次冒烟基于 stash 基线，落定后需重跑 |
+| T008 锚点表 schema | 未勾选 | **已实现但仅在 stash@{0}**:`ensure_sesno_version_anchor_schema()`,SCHEMAFULL + UNIQUE INDEX (dbnum,sesno) + `note: option<string>` + `source ASSERT IN ['full','incremental']`;已挂进 `sync_pdms`/`sync_pdms_with_callback` 入口 |
+| T009 增量锚点 | 未做 | **已实现但仅在 stash@{0}**:`write_sesno_version_anchor()` + `persist_pdms_increment_grouped` 成功路径调用 + `PdmsIncrementPersistStats.anchors` |
+| T010 全量锚点 | 未做 | **已实现但仅在 stash@{0}**:`write_full_version_anchors()`,sender drop + insert 排空后写(anchored_at 晚于本批);`parse_single_db_file` 单文件路径待复核(R1) |
+| T011 汇总 JSON | 未做 | **已实现但仅在 stash@{0}**:`main.rs` `"version_anchor": persist_stats.anchors` |
+| T012 M2 验证 | 未做 | 属实，未做 |
+| T013~T020 (M3) | 未做 | 属实。rs-core 只有旧 `version.rs`(`backup_data`)，无 `version_query` 模块;`model-version` CLI 存在但无 `history` 子命令组(stash 也没碰 `version_management/cli.rs`) |
+| T021~T026 (M4/Polish) | 未做 | 属实。`specs/022` 下**没有 quickstart.md** |
 
-**待替代的"之前的版本存储方式"已定位**:rs-core `src/rs_surreal/version.rs` 的 `backup_data()`/`backup_owner_relate()`(`fn::backup_data` 写 history 表),本仓唯一调用方 `src/data_interface/increment_manager.rs:11`;另有 `db_option.is_sync_history()` 驱动的 ses 历史索引路径(`database.rs:882/1362/2160`)。退役动作排在迭代 3,MVP 前不动它。
+### 0.1 stash@{0} 的构成（落定前必读）
+
+`stash@{0}` 共 **349 个文件**，绝大多数与 022 无关，必须挑拣，**不能 `stash pop`**：
+- **纯 022、可 `git apply --3way` 独立落定的 6 个文件**：`src/options.rs`(+74)、`src/cli_modes.rs`(+41/-11)、`src/web_server/db_startup_manager.rs`(+8/-2)、`src/web_server/handlers.rs`(+17/-6)、`src/bin/web_server.rs`(+29/-9)、`src/versioned_db/database.rs`(+94/-3)。
+- **022 与其它 WIP 交织、需逐 hunk 拣选的 3 个文件**：
+  - `src/data_interface/sesno_increment.rs`(+417/-27)：022 锚点(`VersionAnchorRecord`/`write_sesno_version_anchor`) + 非 022 的 session-scan 扫描(`PdmsSesnoSessionScanOutcome`/`scan_pdms_increment_sessions_*`) + 依赖 `increment_record.rs` 的 `cleanup_refnos` 字段。且 HEAD 已被 `ed16d8ab` 改过此文件(删除 `IncrementCollectProgress` 用法)，stash 基线更旧——**必然三方冲突，需手工合**。
+  - `src/main.rs`(+333/-11)：022 的 `version_anchor` 汇总(1 行) + 大量 session-scan 汇总/打印 + 023 的 `affected_delivery_units`/`build_incremental_affected_delivery_units`。**022 部分极小，其余都不是 022**。
+  - `src/web_server/managed_project_sites.rs`(+44/-9)：022 的 `site_versioned_params`/`site_rocksdb_conn_str`;HEAD 侧 `ed16d8ab` 也动过此文件(preset)，但区域不同，`--3way` 应能自动合。
+- **另有 8 个 src 文件**(`mbd_pipe_api`/`e3d_tree_api`/`post_gen_export`/`spec_info`/`orchestrator`/`pdms_inst`/`tree_index_manager`/`increment_record`)属 023 收窄或其它 WIP，**不属于 022**（`increment_record.rs` 的 `cleanup_refnos` 是 `sesno_increment` session-scan 的依赖，属"非 022 但被交织文件牵连"）。
+- **其余 ~332 个是文档/skill 删除**，与本 feature 无关，落定 022 时一律不带。
+
+### 0.2 落定策略（迭代 0，见 §1）
+
+对 6 个纯 022 文件用 `git stash show -p stash@{0} -- <file> | git apply --3way`；对 3 个交织文件走逐 hunk 手工拣选（只取带 `versioned`/`retention`/`anchor`/`version_anchor` 标记的 hunk，session-scan 与 023 的 hunk 留在 stash 里）。**stash 不 drop**，直到落定分支 cargo check 全绿 + 冒烟通过后再决定是否保留。
+
+**待替代的"之前的版本存储方式"已定位**:rs-core `src/rs_surreal/version.rs` 的 `backup_data()`/`backup_owner_relate()`(`fn::backup_data` 写 history 表),本仓唯一调用方 `src/data_interface/increment_manager.rs:11`;另有 `db_option.is_sync_history()` 驱动的 ses 历史索引路径(`database.rs:835/1315/2113`)。退役动作排在迭代 3,MVP 前不动它。
 
 ---
 
 ## 1. 迭代划分与排期
 
-### 迭代 1 —— M2 锚点固化(P1,预计 0.5 天,单人串行)
+### 迭代 0 —— 抢救并落定 M1+M2(最高优先,预计 0.5 天,单人串行) 【新增，2026-07-16】
+
+**动机**：M1+M2 代码只存在于 `stash@{0}`，一旦误 drop 全丢；且 tasks.md 谎报 M1 已完成。必须先把它干净落定到分支，后续 M3/M4 才有地基。
+
+**步骤**：
+1. 从当前 HEAD(`ed16d8ab`) 切新分支 `feat/022-versioned-pe-att-storage`。
+2. 6 个纯 022 文件三方合并：
+   ```
+   git stash show -p "stash@{0}" -- src/options.rs src/cli_modes.rs \
+     src/web_server/db_startup_manager.rs src/web_server/handlers.rs \
+     src/bin/web_server.rs src/versioned_db/database.rs | git apply --3way
+   ```
+3. 3 个交织文件逐 hunk 拣选（`git apply --3way` 失败的 hunk 手工处理）：
+   - `managed_project_sites.rs`：优先整体 `--3way`，区域不同应自动合；冲突则只取 `site_versioned_params`/`site_rocksdb_conn_str`/三处启动透传。
+   - `sesno_increment.rs`：只取 022 锚点相关（`VersionAnchorRecord`、`write_sesno_version_anchor`、`PdmsIncrementPersistStats.anchors`、`persist_pdms_increment_grouped` 尾部锚点调用），**放弃** session-scan 全套（`PdmsSesnoSessionScan*`、`scan_pdms_increment_sessions_*`）与 `IncrementCollectProgress` 回退（HEAD 已删）。
+   - `main.rs`：只取 `"version_anchor": persist_stats.anchors` 一行汇总；**放弃** session-scan 汇总/打印与 023 `affected_delivery_units`。
+   - 交织文件如牵连 `increment_record.rs` 的 `cleanup_refnos`：仅当锚点代码不依赖它时不带；若编译需要则单独加该字段（2 行）。
+4. `cargo check` 全绿（仓库规则：不跑 cargo test）。修复三方合并残留。
+5. **补 T012 验证**：8031/8030 起 versioned 实例 → `incremental-sesno --json` → `SELECT * FROM sesno_version_anchor` 核对 (dbnum,sesno,anchored_at) 时间序晚于本批写入；模拟失败路径确认无残留锚点。
+6. 提交（feat: 022 M1+M2 落定），勾正 tasks.md 的 `[s]`→`[x]`、订正 M1「已提交」事实。**stash 暂不 drop**，确认无误后再清。
+
+**产出**：M1+M2 真正进入分支，SC-002 可验收。
+
+### 迭代 1 —— M3 查询封装 + history CLI(原迭代 2，P1/P2，预计 1~1.5 天，双人并行)
+
+见 §1 下方原「迭代 2」小节（rs-core `version_query` + 本仓 history CLI）。
+
+### 迭代 2 —— M4 存量切换 + 旧机制退役 + Polish(原迭代 3，P2，预计 1 天)
+
+见 §1 下方原「迭代 3」小节。
+
+---
+
+### （原）迭代 1 —— M2 锚点固化：**已并入迭代 0**，以下为原始落点记录，落定时按此逐行核对
 
 T009→T011 改动集中在同一条数据流上,不宜拆分并行,一人承接。
 

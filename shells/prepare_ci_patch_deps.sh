@@ -12,7 +12,9 @@ prepare_repo() {
   local target_dir="$3"
 
   if [[ -d "$target_dir/.git" ]]; then
-    printf '[prepare-ci-patch-deps] reuse %s\n' "$target_dir"
+    printf '[prepare-ci-patch-deps] update %s (%s)\n' "$target_dir" "$branch"
+    git -C "$target_dir" fetch --depth 1 origin "$branch"
+    git -C "$target_dir" checkout -B "$branch" "FETCH_HEAD"
     return 0
   fi
 

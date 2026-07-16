@@ -826,6 +826,7 @@ async fn spawn_sidecar(key: &str) -> Result<SidecarHandle> {
 fn isolate_sidecar_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     #[cfg(windows)]

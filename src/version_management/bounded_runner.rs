@@ -515,6 +515,7 @@ fn spawn_child(
 fn isolate_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     #[cfg(windows)]

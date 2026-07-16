@@ -13,7 +13,7 @@ use anyhow::Context;
 use once_cell::sync::Lazy;
 use parse_pdms_db::parse::EleData;
 use pdms_io::PdmsIO;
-use pdms_io::io::{EleOperationData, EleOperationDetail, IncrementCollectProgress};
+use pdms_io::io::{EleOperationData, EleOperationDetail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -295,41 +295,6 @@ fn collected_outcome_for_file(
             grouped_operations,
         }],
     }
-}
-
-fn record_pdms_collect_progress(file_path: &Path, progress: &IncrementCollectProgress) {
-    let current_sesno = progress
-        .current_sesno
-        .map(|sesno| sesno.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let current_refno = progress
-        .session_current_refno
-        .map(|refno| refno.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let current_offset = progress
-        .session_current_offset
-        .map(|offset| format!("0x{offset:X}"))
-        .unwrap_or_else(|| "-".to_string());
-    let detail = format!(
-        "file={} phase={} sesno={} sessions={}/{} refno_locs={} unique_refnos={} processed_refnos={} duplicate_refnos={} operations={} current_refno={} current_offset={}",
-        file_path.display(),
-        progress.phase,
-        current_sesno,
-        progress.processed_sessions,
-        progress.total_sessions,
-        progress.session_refno_locations,
-        progress.session_unique_refnos,
-        progress.session_processed_refnos,
-        progress.session_duplicate_refnos,
-        progress.session_operation_count,
-        current_refno,
-        current_offset
-    );
-    crate::perf_metrics::record_generate_progress(
-        "incremental_sesno_collecting_file_progress",
-        Some(&detail),
-        0,
-    );
 }
 
 fn valid_ref0_from_index_refno(refno: &RefU64) -> Option<u32> {
@@ -926,11 +891,10 @@ pub fn collect_pdms_increment_for_file_with_operations(
         ));
     }
 
+    // Use collect_increment_eles (published pdms-io dev-3.1). Local forks may also expose
+    // collect_increment_eles_with_progress; keep CI aligned with the git branch pin.
     let grouped = io
-        .collect_increment_eles_with_progress(Some(actual_start..=actual_end), |progress| {
-            record_pdms_collect_progress(file_path, &progress);
-            Ok(())
-        })
+        .collect_increment_eles(Some(actual_start..=actual_end))
         .with_context(|| {
             format!(
                 "收集 PDMS 增量失败: dbnum={} sesno={}..={} file={}",

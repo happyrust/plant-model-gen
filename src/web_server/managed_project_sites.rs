@@ -7919,6 +7919,7 @@ fn sidecar_job_event_log_line(label: &str, event: &Value) -> String {
 fn isolate_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     #[cfg(windows)]

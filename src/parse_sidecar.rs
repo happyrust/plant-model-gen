@@ -953,6 +953,7 @@ fn spawn_cli_child(payload: RunCliJobRequest) -> Result<Child> {
 fn isolate_cli_job_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     #[cfg(windows)]

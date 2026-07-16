@@ -2086,6 +2086,125 @@ pub fn model_version_command() -> Command {
                         .action(clap::ArgAction::SetTrue),
                 ),
         )
+        .subcommand(
+            Command::new("history")
+                .about("specs/022: PE/ATT time-travel by sesno (SurrealDB versioned)")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("snapshot")
+                        .about("Fetch PE(+ATT) snapshot at a sesno anchor")
+                        .arg(
+                            Arg::new("refno")
+                                .long("refno")
+                                .value_name("REFNO")
+                                .required_unless_present("pe-key")
+                                .help("Element refno (u64 or a/b form)"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Override PE record id (e.g. pe:equi_001 for fixtures)"),
+                        )
+                        .arg(
+                            Arg::new("sesno")
+                                .long("sesno")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("dbnum")
+                                .long("dbnum")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("json")
+                                .long("json")
+                                .action(clap::ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("timeline")
+                        .about("List content-changing anchors for one element in a sesno range")
+                        .arg(
+                            Arg::new("refno")
+                                .long("refno")
+                                .value_name("REFNO")
+                                .required_unless_present("pe-key"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Override PE record id for fixtures"),
+                        )
+                        .arg(
+                            Arg::new("from-sesno")
+                                .long("from-sesno")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("to-sesno")
+                                .long("to-sesno")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("dbnum")
+                                .long("dbnum")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("json")
+                                .long("json")
+                                .action(clap::ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("diff")
+                        .about("Field-level PE/ATT diff for refnos between two sesnos")
+                        .arg(
+                            Arg::new("refnos")
+                                .long("refnos")
+                                .value_name("CSV")
+                                .required_unless_present("pe-key")
+                                .help("Comma-separated refnos"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Single-element fixture PE key (implies one synthetic refno)"),
+                        )
+                        .arg(
+                            Arg::new("from-sesno")
+                                .long("from-sesno")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("to-sesno")
+                                .long("to-sesno")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("dbnum")
+                                .long("dbnum")
+                                .value_parser(clap::value_parser!(u32))
+                                .required(true),
+                        )
+                        .arg(
+                            Arg::new("json")
+                                .long("json")
+                                .action(clap::ArgAction::SetTrue),
+                        ),
+                ),
+        )
 }
 
 pub async fn handle_model_version_command(
@@ -3065,6 +3184,9 @@ pub async fn handle_model_version_command(
                 );
             }
         }
+        Some(("history", hist)) => {
+            handle_history_command(hist, db_option_ext).await?;
+        }
         _ => unreachable!("subcommand_required by clap"),
     }
 
@@ -3984,6 +4106,141 @@ fn parse_metadata_json(sub: &ArgMatches) -> anyhow::Result<Value> {
         }
         None => Ok(serde_json::json!({})),
     }
+}
+
+async fn handle_history_command(
+    hist: &ArgMatches,
+    _db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    // Surreal 连接由 main 在进入 model-version history 前 ensure_surreal_connected。
+    match hist.subcommand() {
+        Some(("snapshot", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let refno = parse_history_refno(sub.get_one::<String>("refno"), pe_key)?;
+            match aios_core::snapshot_at(refno, sesno, Some(dbnum), pe_key).await {
+                Ok(snap) => {
+                    if sub.get_flag("json") {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        println!(
+                            "snapshot pe_key={} requested_sesno={} resolved_sesno={} exact={} exists={} anchored_at={}",
+                            snap.pe_key,
+                            snap.requested_sesno,
+                            snap.resolved_sesno,
+                            snap.exact_anchor,
+                            snap.exists,
+                            snap.anchored_at
+                        );
+                        if let Some(pe) = &snap.pe {
+                            println!("pe={}", serde_json::to_string_pretty(pe)?);
+                        }
+                    }
+                }
+                Err(e) => anyhow::bail!("{}", aios_core::format_history_error(&e)),
+            }
+        }
+        Some(("timeline", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let refno = parse_history_refno(sub.get_one::<String>("refno"), pe_key)?;
+            match aios_core::timeline_with_pe_key(refno, from_sesno, to_sesno, dbnum, pe_key).await
+            {
+                Ok(points) => {
+                    if sub.get_flag("json") {
+                        println!("{}", serde_json::to_string_pretty(&points)?);
+                    } else {
+                        println!("timeline points={}", points.len());
+                        for p in points {
+                            println!(
+                                "sesno={} changed={} exists={} hash={} at={}",
+                                p.sesno,
+                                p.changed_from_prev,
+                                p.exists,
+                                p.content_hash,
+                                p.anchored_at
+                            );
+                        }
+                    }
+                }
+                Err(e) => anyhow::bail!("{}", aios_core::format_history_error(&e)),
+            }
+        }
+        Some(("diff", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let mut refnos = Vec::new();
+            if let Some(csv) = sub.get_one::<String>("refnos") {
+                for part in csv.split(',') {
+                    let t = part.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    refnos.push(parse_history_refno(Some(&t.to_string()), None)?);
+                }
+            } else if pe_key.is_some() {
+                refnos.push(parse_history_refno(None, pe_key)?);
+            }
+            if refnos.is_empty() {
+                anyhow::bail!("--refnos or --pe-key is required");
+            }
+            match aios_core::diff_range_with_pe_keys(
+                &refnos,
+                from_sesno,
+                to_sesno,
+                dbnum,
+                pe_key,
+            )
+            .await
+            {
+                Ok(rows) => {
+                    if sub.get_flag("json") {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        for row in rows {
+                            println!(
+                                "{:?} refno={} changes={}",
+                                row.kind,
+                                row.refno_u64,
+                                row.changes.len()
+                            );
+                            for c in row.changes {
+                                println!(
+                                    "  {} old={:?} new={:?}",
+                                    c.path, c.old, c.new
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => anyhow::bail!("{}", aios_core::format_history_error(&e)),
+            }
+        }
+        _ => unreachable!("history subcommand_required by clap"),
+    }
+    Ok(())
+}
+
+fn parse_history_refno(
+    refno: Option<&String>,
+    pe_key: Option<&str>,
+) -> anyhow::Result<aios_core::RefnoEnum> {
+    use std::str::FromStr;
+    if let Some(r) = refno {
+        let normalized = r.trim().trim_start_matches('/').replace('\\', "/");
+        return aios_core::RefnoEnum::from_str(&normalized)
+            .map_err(|e| anyhow::anyhow!("invalid --refno '{r}': {e}"));
+    }
+    if pe_key.is_some() {
+        // 夹具路径：无真实 refno 时用 0 占位，snapshot 走 pe_key_override
+        return Ok(aios_core::RefnoEnum::from(aios_core::RefU64(0)));
+    }
+    anyhow::bail!("--refno or --pe-key is required");
 }
 
 fn component_key_filter_from_matches(sub: &ArgMatches) -> anyhow::Result<Option<String>> {

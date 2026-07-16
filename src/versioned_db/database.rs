@@ -3227,5 +3227,7 @@ pub async fn parse_single_db_file(
         time.elapsed().as_millis() as u64,
     );
 
+    // specs/022 R1：本路径只导出 tree / 更新 db_meta，不向 Surreal 写入 PE/ATT，
+    // 因此不写 sesno_version_anchor。full 锚点由 sync_pdms* 在写库 join 完成后固化。
     Ok(())
 }

@@ -2526,6 +2526,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(mv) = matches.subcommand_matches("model-version") {
+        if mv.subcommand_matches("history").is_some() {
+            crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
+        }
+    }
     if aios_database::version_management::cli::handle_model_version_command(
         &matches,
         &db_option_ext,

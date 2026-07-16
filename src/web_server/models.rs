@@ -1132,6 +1132,12 @@ pub struct CreateManagedSiteRequest {
     pub db_user: Option<String>,
     #[serde(default)]
     pub db_password: Option<String>,
+    /// specs/022：新建站点时是否开启 versioned（建库属性；默认 false）。
+    #[serde(default)]
+    pub versioned_storage: Option<bool>,
+    /// specs/022：新建站点 retention，默认 "90d"。
+    #[serde(default)]
+    pub version_retention: Option<String>,
 }
 
 /// 更新管理后台项目站点请求
@@ -1205,6 +1211,13 @@ pub struct UpdateManagedSiteRequest {
     pub db_user: Option<String>,
     #[serde(default)]
     pub db_password: Option<String>,
+    /// specs/022：是否开启 SUL_DB RocksDB versioned。None=不修改。
+    /// 已初始化站点（parse_status=Parsed/Failed）改此值会被拒绝，需按 quickstart 新建目录重灌。
+    #[serde(default)]
+    pub versioned_storage: Option<bool>,
+    /// specs/022：retention（如 "90d"）。None=不修改。
+    #[serde(default)]
+    pub version_retention: Option<String>,
 }
 
 /// 管理后台解析计划预览请求

@@ -95,11 +95,11 @@
 
 **Independent Test**: 测试站点全流程切换后当前态一致、增量回归通过。
 
-- [ ] T021 [US4] `specs/022-versioned-pe-att-storage/quickstart.md`：切换手册——新建 versioned 数据目录 → 站点配置改 versioned_storage=true → sync_pdms 重灌 → 确认首条锚点 → 抽样 refno 当前态比对（旧库 vs 新库）→ 切流 → 跑一次 incremental-sesno 回归
-- [ ] T022 [US4] `src/web_server/managed_project_sites.rs`：站点编辑接口允许修改 versioned 开关;已初始化站点修改时返回明确提示"需要重灌数据目录"（不静默改参数）
-- [ ] T023 [US4] 验证（SC-004）：按 quickstart 对测试站点走全流程,记录抽样比对与增量回归结果到 quickstart 附录
+- [x] T021 [US4] `specs/022-versioned-pe-att-storage/quickstart.md`：切换手册已刷新——新建 versioned 数据目录 → 配置开关 → sync_pdms 重灌 → 锚点确认 → 抽样比对 → 切流 → incremental + history CLI；含 T022 管理端行为表。2026-07-16
+- [x] T022 [US4] `CreateManagedSiteRequest` / `UpdateManagedSiteRequest` 增加 `versioned_storage` / `version_retention`；`update_site` 对 Parsed/Failed 改参拒绝（文案含重灌指引）；`build_site_config` 保留既有开关；create 可显式开启。2026-07-16
+- [ ] T023 [US4] 验证（SC-004）：按 quickstart 对测试站点走全流程,记录抽样比对与增量回归结果到 quickstart 附录（**阻塞**：需真实 managed 测试站点）
 
-**Checkpoint**: 全部故事可独立验收。
+**Checkpoint**: T021/T022 落地；T023 待真站演练后关闭。
 
 ---
 

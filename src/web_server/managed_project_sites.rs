@@ -2177,6 +2177,10 @@ fn build_site_config(
         "export_parquet_after_gen",
         runtime_cfg.export_parquet,
     );
+    // specs/022：重建配置时保留已有 versioned 开关（避免 write_site_files 静默抹掉）。
+    let (versioned, retention) = read_versioned_params_from_path(&site_config_path(site));
+    set_toml_bool(table, "versioned_storage", versioned);
+    set_toml_string(table, "version_retention", retention);
 
     let web_server = ensure_table(table, "web_server");
     set_toml_integer(web_server, "port", site.web_port as i64);
@@ -4052,6 +4056,24 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         return Err(err);
     }
 
+    // specs/022：新建站点可显式开启 versioned（建库属性，默认关）。
+    let create_versioned = req.versioned_storage.unwrap_or(false);
+    let create_retention = req
+        .version_retention
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("90d");
+    if create_versioned || req.version_retention.is_some() {
+        if let Err(err) =
+            apply_versioned_params_to_site_config(&site, create_versioned, create_retention)
+        {
+            tracing::error!(site = %site.site_id, "写入 versioned 参数失败: {err}");
+            let _ = fs::remove_dir_all(site_runtime_dir_for_site(&site));
+            return Err(err);
+        }
+    }
+
     let mut site = site;
     annotate_site_parse_plan(&mut site);
 
@@ -5125,6 +5147,8 @@ async fn quick_create_deploy_config(
         associated_project: None,
         db_user: Some(db_user.clone()),
         db_password: Some(db_password.clone()),
+        versioned_storage: None,
+        version_retention: None,
     })?;
 
     let parse_plan = load_parse_plan_from_sidecar(&site).await?;
@@ -5271,6 +5295,8 @@ async fn quick_deploy(
         associated_project: None,
         db_user: Some(db_user),
         db_password: Some(db_password),
+        versioned_storage: None,
+        version_retention: None,
     };
 
     // 4) quick deploy 遇到同名站点时只自动加后缀创建新站点，不删除/替换旧站点。
@@ -5619,6 +5645,27 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         bail!("站点运行中，不能修改配置");
     }
 
+    // specs/022 T022：已初始化站点禁止静默改 versioned / retention。
+    let (current_versioned, current_retention) = site_versioned_params(&site);
+    let next_versioned = req.versioned_storage.unwrap_or(current_versioned);
+    let next_retention = req
+        .version_retention
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| current_retention.clone());
+    let versioned_params_changing =
+        next_versioned != current_versioned || next_retention != current_retention;
+    if versioned_params_changing && site_versioned_change_requires_rebuild(&site) {
+        bail!(
+            "已初始化站点不能静默修改 versioned 存储参数（当前 versioned_storage={} retention={} → 请求 versioned_storage={} retention={}）。请按 specs/022-versioned-pe-att-storage/quickstart.md 新建 versioned 数据目录并 sync_pdms 重灌后再切换；当前不会改写配置。",
+            current_versioned,
+            current_retention,
+            next_versioned,
+            next_retention
+        );
+    }
+
     let old_site = site.clone();
     let old_project_name = site.project_name.clone();
     let mut project_name_changed = false;
@@ -5794,6 +5841,21 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
             Ok(())
         });
         return Err(err);
+    }
+    // build_site_config 会保留盘上旧 versioned；未初始化站点允许改时，写盘后再 patch。
+    if versioned_params_changing {
+        if let Err(err) =
+            apply_versioned_params_to_site_config(&site, next_versioned, &next_retention)
+        {
+            if runtime_migrated {
+                let _ = migrate_site_runtime_dir(&site, &old_site);
+            }
+            let _ = with_tx(|conn| {
+                persist_site_with_conn(conn, &old_site, &rollback_db_user, &rollback_db_password)?;
+                Ok(())
+            });
+            return Err(err);
+        }
     }
     annotate_site_parse_plan(&mut site);
 
@@ -8865,8 +8927,12 @@ async fn wait_for_business_status_ok(site: &ManagedProjectSite) -> bool {
 /// 的先例直接读站点配置文件；缺省为关闭（versioned 是建库属性，
 /// 存量数据目录不能直接以 versioned=true 打开）。
 fn site_versioned_params(site: &ManagedProjectSite) -> (bool, String) {
+    read_versioned_params_from_path(Path::new(&site.config_path))
+}
+
+fn read_versioned_params_from_path(path: &Path) -> (bool, String) {
     let default_retention = "90d".to_string();
-    let Ok(raw) = fs::read_to_string(&site.config_path) else {
+    let Ok(raw) = fs::read_to_string(path) else {
         return (false, default_retention);
     };
     let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
@@ -8884,6 +8950,38 @@ fn site_versioned_params(site: &ManagedProjectSite) -> (bool, String) {
         .map(str::to_string)
         .unwrap_or(default_retention);
     (versioned, retention)
+}
+
+/// 已解析或解析失败过的站点视为「已初始化」：改 versioned 需新建目录重灌。
+fn site_versioned_change_requires_rebuild(site: &ManagedProjectSite) -> bool {
+    matches!(
+        site.parse_status,
+        ManagedSiteParseStatus::Parsed | ManagedSiteParseStatus::Failed
+    )
+}
+
+/// 把 versioned 参数写回站点 DbOption.toml（保留其余字段）。
+fn apply_versioned_params_to_site_config(
+    site: &ManagedProjectSite,
+    versioned: bool,
+    retention: &str,
+) -> Result<()> {
+    let path = site_config_path(site);
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("读取站点配置失败: {}", path.display()))?;
+    let mut value = toml::from_str::<toml::Value>(&raw)
+        .with_context(|| format!("解析站点配置失败: {}", path.display()))?;
+    let table = value
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("站点 DbOption 不是 table 结构"))?;
+    set_toml_bool(table, "versioned_storage", versioned);
+    set_toml_string(table, "version_retention", retention.trim());
+    let content = toml::to_string_pretty(&value)?;
+    write_file_atomic(&path, &content)?;
+    Ok(())
 }
 
 /// 站点 SurrealDB 连接串（含 versioned 参数透传）。

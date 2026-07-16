@@ -16,7 +16,7 @@ use crate::version_management::types::{
     ModelVersionDuckLakeConfig, UnitMembershipV2Record, UnitVersionStatusEventV2,
     UnitVersionV2DiffResponse, UnitVersionV2DiffRow, UnitVersionV2Record,
     UnitVersionV2SmokeReport, UpsertUnitVersionV2Outcome, UpsertUnitVersionV2Request,
-    legacy_batch_id_for_sesno, parse_legacy_batch_id, unit_sesno_from_member_sesnos,
+    unit_sesno_from_member_sesnos,
 };
 
 #[cfg(feature = "model-version-ducklake")]
@@ -4425,7 +4425,8 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
                         req.package_relpath,
                         req.status,
                         req.label,
-                        req.legacy_release_id,
+                        // specs/023 E4: stop writing legacy_release_id (column retained nullable).
+                        Option::<String>::None,
                         indexed_at,
                     ],
                 )
@@ -4471,40 +4472,8 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
             unit_refno_u64: u64,
             sesno: u32,
         ) -> anyhow::Result<Option<UnitVersionV2Record>> {
-            if let Some(record) =
-                self.get_unit_version_v2_exact(dbnum, unit_refno_u64, sesno)?
-            {
-                return Ok(Some(record));
-            }
-            self.get_unit_version_v2_legacy_fallback(dbnum, unit_refno_u64, sesno)
-        }
-
-        fn get_unit_version_v2_legacy_fallback(
-            &self,
-            dbnum: u32,
-            unit_refno_u64: u64,
-            sesno: u32,
-        ) -> anyhow::Result<Option<UnitVersionV2Record>> {
-            let release_id = legacy_batch_id_for_sesno(dbnum, sesno);
-            let sql = format!(
-                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
-                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
-                 unresolved_member_count, member_signature, indexed_at \
-                 FROM \"{}\".\"unit_versions\" \
-                 WHERE release_id = ? AND dbnum = ? AND unit_refno_u64 = ? \
-                 LIMIT 1",
-                SCHEMA
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut rows = stmt.query(params![
-                release_id,
-                i64::from(dbnum),
-                u64_to_i64(unit_refno_u64, "unit_refno_u64")?
-            ])?;
-            match rows.next()? {
-                Some(row) => Ok(Some(legacy_unit_row_to_v2(row, sesno)?)),
-                None => Ok(None),
-            }
+            // specs/023 E4: dual-read removed; only unit_versions_v2 is authoritative.
+            self.get_unit_version_v2_exact(dbnum, unit_refno_u64, sesno)
         }
 
         pub fn list_unit_versions_v2(
@@ -4512,15 +4481,14 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
             dbnum: u32,
             unit_refno_u64: u64,
         ) -> anyhow::Result<Vec<UnitVersionV2Record>> {
-            let mut by_sesno: BTreeMap<u32, UnitVersionV2Record> = BTreeMap::new();
-
             let sql = format!(
                 "SELECT dbnum, unit_refno_u64, sesno, project_name, unit_refno_str, unit_noun, \
                  unit_key, aggregate_hash, hash_version, rule_set_hash, member_count, \
                  unresolved_member_count, member_signature, package_relpath, status, label, \
                  legacy_release_id, indexed_at \
                  FROM \"{}\".\"unit_versions_v2\" \
-                 WHERE dbnum = ? AND unit_refno_u64 = ?",
+                 WHERE dbnum = ? AND unit_refno_u64 = ? \
+                 ORDER BY sesno DESC",
                 SCHEMA
             );
             let mut stmt = self.conn.prepare(&sql)?;
@@ -4531,45 +4499,10 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
                 ],
                 |row| row_to_unit_version_v2(row),
             )?;
+            let mut out = Vec::new();
             for row in rows {
-                let record = row?;
-                by_sesno.insert(record.sesno, record);
+                out.push(row?);
             }
-
-            let legacy_sql = format!(
-                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
-                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
-                 unresolved_member_count, member_signature, indexed_at \
-                 FROM \"{}\".\"unit_versions\" \
-                 WHERE dbnum = ? AND unit_refno_u64 = ?",
-                SCHEMA
-            );
-            let mut legacy_stmt = self.conn.prepare(&legacy_sql)?;
-            let legacy_rows = legacy_stmt.query_map(
-                params![
-                    i64::from(dbnum),
-                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?
-                ],
-                |row| {
-                    let release_id: String = row.get(0)?;
-                    Ok((release_id, row_to_legacy_unit_fields(row)?))
-                },
-            )?;
-            for row in legacy_rows {
-                let (release_id, fields) = row?;
-                let Some((parsed_dbnum, sesno)) = parse_legacy_batch_id(&release_id) else {
-                    continue;
-                };
-                if parsed_dbnum != dbnum {
-                    continue;
-                }
-                by_sesno.entry(sesno).or_insert_with(|| {
-                    legacy_fields_to_v2(fields, sesno, Some(release_id))
-                });
-            }
-
-            let mut out: Vec<_> = by_sesno.into_values().collect();
-            out.sort_by(|a, b| b.sesno.cmp(&a.sesno));
             Ok(out)
         }
 
@@ -4661,7 +4594,8 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
                             member.unresolved_reason,
                             member.membership_hash,
                             member.hash_version,
-                            member.legacy_release_id,
+                            // specs/023 E4: do not persist legacy_release_id on new memberships.
+                            Option::<String>::None,
                             member_indexed_at,
                         ],
                     )?;
@@ -4726,7 +4660,7 @@ SELECT
     ) AS package_relpath,
     NULL AS status,
     NULL AS label,
-    release_id AS legacy_release_id,
+    NULL AS legacy_release_id,
     '{indexed_at}' AS indexed_at
 FROM "{schema}"."unit_versions"
 WHERE release_id = '{release_id}'
@@ -4759,7 +4693,7 @@ SELECT
     unresolved_reason,
     membership_hash,
     hash_version,
-    release_id AS legacy_release_id,
+    NULL AS legacy_release_id,
     '{indexed_at}' AS indexed_at
 FROM "{schema}"."delivery_unit_memberships"
 WHERE release_id = '{release_id}'
@@ -4780,14 +4714,13 @@ WHERE release_id = '{release_id}'
                     .execute_batch(&sql)
                     .context("sync legacy unit versions into v2")?;
                 let count_sql = format!(
-                    "SELECT COUNT(*) FROM \"{}\".\"unit_versions_v2\" WHERE sesno = ? AND legacy_release_id = ?",
+                    "SELECT COUNT(*) FROM \"{}\".\"unit_versions\" \
+                     WHERE release_id = ? AND unit_refno_u64 IS NOT NULL",
                     SCHEMA
                 );
                 let count: i64 = self
                     .conn
-                    .query_row(&count_sql, params![i64::from(sesno), release_id], |row| {
-                        row.get(0)
-                    })?;
+                    .query_row(&count_sql, params![release_id], |row| row.get(0))?;
                 let synced = i64_to_u64(count, "synced_unit_count").map_err(anyhow::Error::from)?;
                 Ok(synced as usize)
             })();
@@ -4833,38 +4766,6 @@ WHERE release_id = '{release_id}'
             for row in rows {
                 let record = row?;
                 map.insert(record.unit_refno_u64, record);
-            }
-
-            let release_id = legacy_batch_id_for_sesno(dbnum, sesno);
-            let legacy_filter = match unit_refno_u64 {
-                Some(refno) => format!(" AND unit_refno_u64 = {}", refno),
-                None => String::new(),
-            };
-            let legacy_sql = format!(
-                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
-                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
-                 unresolved_member_count, member_signature, indexed_at \
-                 FROM \"{}\".\"unit_versions\" \
-                 WHERE release_id = ? AND dbnum = ?{legacy_filter}",
-                SCHEMA,
-                legacy_filter = legacy_filter
-            );
-            let mut legacy_stmt = self.conn.prepare(&legacy_sql)?;
-            let legacy_rows = legacy_stmt.query_map(
-                params![release_id, i64::from(dbnum)],
-                |row| {
-                    let release_id: String = row.get(0)?;
-                    Ok((release_id, row_to_legacy_unit_fields(row)?))
-                },
-            )?;
-            for row in legacy_rows {
-                let (release_id, fields) = row?;
-                let Some(refno) = fields.unit_refno_u64 else {
-                    continue;
-                };
-                map.entry(refno).or_insert_with(|| {
-                    legacy_fields_to_v2(fields, sesno, Some(release_id))
-                });
             }
             Ok(map)
         }
@@ -5249,24 +5150,6 @@ WHERE release_id = '{release_id}'
             let diff = store.diff_unit_versions_v2(dbnum, derived_sesno, 30, Some(unit_refno), 20)?;
             let diff_ok = diff.summary.changed == 1;
 
-            let legacy_sesno = 40u32;
-            let legacy_release_id = legacy_batch_id_for_sesno(dbnum, legacy_sesno);
-            store.insert_legacy_unit_version_row(
-                &legacy_release_id,
-                &project,
-                dbnum,
-                unit_refno,
-                "BRAN",
-                Some("=/SMOKE/U1"),
-                "agg-legacy",
-                "sig-legacy",
-            )?;
-            let legacy = store
-                .get_unit_version_v2(dbnum, unit_refno, legacy_sesno)?
-                .context("smoke C3 legacy dual-read")?;
-            let legacy_ok = legacy.status.as_deref() == Some("legacy_fallback")
-                && legacy.legacy_release_id.as_deref() == Some(legacy_release_id.as_str());
-
             store.set_unit_version_status_v2(
                 dbnum,
                 unit_refno,
@@ -5285,7 +5168,6 @@ WHERE release_id = '{release_id}'
                 && package_ok
                 && package_dir_ok
                 && diff_ok
-                && legacy_ok
                 && events_ok;
 
             if !ok {
@@ -5293,7 +5175,7 @@ WHERE release_id = '{release_id}'
                     "unit-v2-smoke checks failed: derived={derived_sesno} expected={expected_sesno} \
                      first={first_outcome} second={second_outcome} conflict={conflict_rejected} \
                      listed={listed_count} package_ok={package_ok} package_dir_ok={package_dir_ok} \
-                     diff_ok={diff_ok} legacy_ok={legacy_ok} events_ok={events_ok}"
+                     diff_ok={diff_ok} events_ok={events_ok}"
                 );
             }
 
@@ -5309,69 +5191,12 @@ WHERE release_id = '{release_id}'
             })
         }
 
-        fn insert_legacy_unit_version_row(
-            &self,
-            release_id: &str,
-            project_name: &str,
-            dbnum: u32,
-            unit_refno_u64: u64,
-            unit_noun: &str,
-            unit_refno_str: Option<&str>,
-            aggregate_hash: &str,
-            member_signature: &str,
-        ) -> anyhow::Result<()> {
-            let unit_key = format!("{project_name}|{dbnum}|{unit_noun}|{unit_refno_u64}");
-            let indexed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-            let sql = format!(
-                "INSERT INTO \"{}\".\"unit_versions\" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                SCHEMA
-            );
-            self.conn.execute(
-                &sql,
-                params![
-                    release_id,
-                    project_name,
-                    i64::from(dbnum),
-                    unit_key,
-                    unit_noun,
-                    unit_refno_str,
-                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
-                    format!("unit_version_id:v1|{release_id}|{unit_key}|{aggregate_hash}"),
-                    aggregate_hash,
-                    UNIT_HASH_VERSION,
-                    UNIT_RULE_SET_HASH,
-                    1i64,
-                    0i64,
-                    member_signature,
-                    indexed_at,
-                ],
-            )?;
-            Ok(())
-        }
-
     }
 
     impl ModelReleaseRecord {
         fn row_count(&self, table: &str) -> Option<u64> {
             self.rows_by_table.get(table).copied()
         }
-    }
-
-    struct LegacyUnitVersionFields {
-        release_id: String,
-        project_name: String,
-        dbnum: u32,
-        unit_key: Option<String>,
-        unit_noun: Option<String>,
-        unit_refno_str: Option<String>,
-        unit_refno_u64: Option<u64>,
-        aggregate_hash: String,
-        hash_version: String,
-        rule_set_hash: Option<String>,
-        member_count: u64,
-        unresolved_member_count: u64,
-        member_signature: Option<String>,
-        indexed_at: String,
     }
 
     fn row_to_unit_version_v2(row: &duckdb::Row<'_>) -> duckdb::Result<UnitVersionV2Record> {
@@ -5395,64 +5220,6 @@ WHERE release_id = '{release_id}'
             legacy_release_id: clean_string(row.get(16)?),
             indexed_at: row.get(17)?,
         })
-    }
-
-    fn row_to_legacy_unit_fields(
-        row: &duckdb::Row<'_>,
-    ) -> duckdb::Result<LegacyUnitVersionFields> {
-        let unit_refno_u64: Option<i64> = row.get(6)?;
-        Ok(LegacyUnitVersionFields {
-            release_id: row.get(0)?,
-            project_name: row.get(1)?,
-            dbnum: i64_to_u32(row.get(2)?, "dbnum")?,
-            unit_key: clean_string(row.get(3)?),
-            unit_noun: clean_string(row.get(4)?),
-            unit_refno_str: clean_string(row.get(5)?),
-            unit_refno_u64: opt_i64_to_u64(unit_refno_u64, "unit_refno_u64")?,
-            aggregate_hash: row.get(7)?,
-            hash_version: row.get(8)?,
-            rule_set_hash: clean_string(row.get(9)?),
-            member_count: i64_to_u64(row.get(10)?, "member_count")?,
-            unresolved_member_count: i64_to_u64(row.get(11)?, "unresolved_member_count")?,
-            member_signature: clean_string(row.get(12)?),
-            indexed_at: row.get(13)?,
-        })
-    }
-
-    fn legacy_unit_row_to_v2(
-        row: &duckdb::Row<'_>,
-        sesno: u32,
-    ) -> duckdb::Result<UnitVersionV2Record> {
-        let fields = row_to_legacy_unit_fields(row)?;
-        let release_id = fields.release_id.clone();
-        Ok(legacy_fields_to_v2(fields, sesno, Some(release_id)))
-    }
-
-    fn legacy_fields_to_v2(
-        fields: LegacyUnitVersionFields,
-        sesno: u32,
-        legacy_release_id: Option<String>,
-    ) -> UnitVersionV2Record {
-        UnitVersionV2Record {
-            dbnum: fields.dbnum,
-            unit_refno_u64: fields.unit_refno_u64.unwrap_or(0),
-            sesno,
-            project_name: fields.project_name,
-            unit_refno_str: fields.unit_refno_str,
-            unit_noun: fields.unit_noun,
-            unit_key: fields.unit_key,
-            aggregate_hash: fields.aggregate_hash,
-            hash_version: fields.hash_version,
-            rule_set_hash: fields.rule_set_hash,
-            member_count: fields.member_count,
-            unresolved_member_count: fields.unresolved_member_count,
-            member_signature: fields.member_signature,
-            package_relpath: None,
-            status: Some("legacy_fallback".to_string()),
-            label: None,
-            legacy_release_id,
-            indexed_at: fields.indexed_at,
-        }
     }
 
     fn row_to_release(row: &duckdb::Row<'_>) -> duckdb::Result<ModelReleaseRecord> {

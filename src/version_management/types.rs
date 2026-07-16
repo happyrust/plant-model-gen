@@ -1276,7 +1276,8 @@ pub struct UnitVersionV2Record {
     pub package_relpath: Option<String>,
     pub status: Option<String>,
     pub label: Option<String>,
-    /// 过渡期只读兼容；新写入应保持 None。
+    /// Deprecated (specs/023 E4): no longer written; retained for old catalog rows until DROP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_release_id: Option<String>,
     pub indexed_at: String,
 }

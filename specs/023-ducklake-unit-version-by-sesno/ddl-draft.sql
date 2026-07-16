@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS "model_version"."unit_versions_v2" (
     package_relpath TEXT,
     status TEXT,
     label TEXT,
-    -- 过渡期只读兼容；新写入应 NULL
+    -- E4：新写入必须 NULL；列暂保留兼容旧 catalog，后续可 DROP
     legacy_release_id TEXT,
     indexed_at TEXT
 );

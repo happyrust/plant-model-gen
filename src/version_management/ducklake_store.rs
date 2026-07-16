@@ -1,3 +1,6 @@
+use crate::version_management::release_package::{
+    materialize_unit_version_package_dir, unit_version_package_relpath,
+};
 use crate::version_management::types::{
     ModelComponentDiffResponse, ModelComponentDiffRow, ModelComponentDiffSummary,
     ModelComponentSnapshotStats, ModelComponentUnitImpactResponse, ModelComponentUnitImpactRow,
@@ -10,7 +13,10 @@ use crate::version_management::types::{
     ModelReleaseSceneGeometry, ModelReleaseSceneMeshAssetEvidence, ModelReleaseSceneResponse,
     ModelReleaseStatus, ModelReleaseStatusEvent, ModelUnitDiffResponse, ModelUnitDiffRow,
     ModelUnitDiffSummary, ModelUnitIndexStats, ModelVersionCatalogMigrationReport,
-    ModelVersionDuckLakeConfig,
+    ModelVersionDuckLakeConfig, UnitMembershipV2Record, UnitVersionStatusEventV2,
+    UnitVersionV2DiffResponse, UnitVersionV2DiffRow, UnitVersionV2Record,
+    UnitVersionV2SmokeReport, UpsertUnitVersionV2Outcome, UpsertUnitVersionV2Request,
+    legacy_batch_id_for_sesno, parse_legacy_batch_id, unit_sesno_from_member_sesnos,
 };
 
 #[cfg(feature = "model-version-ducklake")]
@@ -49,6 +55,13 @@ mod imp {
             "delivery_unit_memberships",
             "unit_versions",
             "unit_index_runs",
+            "export_batches",
+            "unit_versions_v2",
+            "component_snapshots_v2",
+            "unit_memberships_v2",
+            "unit_index_runs_v2",
+            "component_index_runs_v2",
+            "unit_version_status_events_v2",
         ]
     }
 
@@ -80,6 +93,8 @@ mod imp {
         "0005_release_status_lifecycle_quality_backfill";
     const MIGRATION_MESH_ASSET_GLB_READABILITY_COLUMNS: &str =
         "0006_mesh_asset_glb_readability_columns";
+    const MIGRATION_UNIT_VERSION_BY_REFNO_SESNO: &str = "0007_unit_version_by_refno_sesno";
+    const MIGRATION_UNIT_VERSION_EVENTS_V2: &str = "0008_unit_version_events_v2";
 
     fn required_schema_migrations() -> &'static [(&'static str, &'static str)] {
         &[
@@ -106,6 +121,14 @@ mod imp {
             (
                 MIGRATION_MESH_ASSET_GLB_READABILITY_COLUMNS,
                 "Mesh asset indexes record GLB readability evidence.",
+            ),
+            (
+                MIGRATION_UNIT_VERSION_BY_REFNO_SESNO,
+                "Unit versions keyed by (dbnum, unit_refno_u64, sesno) and related v2 tables.",
+            ),
+            (
+                MIGRATION_UNIT_VERSION_EVENTS_V2,
+                "Unit version status events keyed by (dbnum, unit_refno_u64, sesno).",
             ),
         ]
     }
@@ -429,6 +452,117 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs" (
     unresolved_member_count BIGINT,
     indexed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS "{schema}"."export_batches" (
+    dbnum INTEGER,
+    batch_sesno INTEGER,
+    project_name TEXT,
+    package_relpath TEXT,
+    package_hash TEXT,
+    generation_job_id TEXT,
+    created_at TEXT,
+    note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_versions_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    project_name TEXT,
+    unit_refno_str TEXT,
+    unit_noun TEXT,
+    unit_key TEXT,
+    aggregate_hash TEXT,
+    hash_version TEXT,
+    rule_set_hash TEXT,
+    member_count BIGINT,
+    unresolved_member_count BIGINT,
+    member_signature TEXT,
+    package_relpath TEXT,
+    status TEXT,
+    label TEXT,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."component_snapshots_v2" (
+    dbnum INTEGER,
+    component_refno_u64 BIGINT,
+    sesno INTEGER,
+    project_name TEXT,
+    component_refno_str TEXT,
+    component_key TEXT,
+    noun TEXT,
+    unit_refno_u64 BIGINT,
+    unit_refno_str TEXT,
+    owner_refno_u64 BIGINT,
+    owner_refno_str TEXT,
+    owner_noun TEXT,
+    cata_hash TEXT,
+    trans_hash TEXT,
+    aabb_hash TEXT,
+    spec_value BIGINT,
+    has_neg BOOLEAN,
+    geo_signature TEXT,
+    component_hash TEXT,
+    hash_version TEXT,
+    member_sesno INTEGER,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_memberships_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    member_refno_u64 BIGINT,
+    project_name TEXT,
+    unit_refno_str TEXT,
+    unit_noun TEXT,
+    unit_key TEXT,
+    member_refno_str TEXT,
+    member_noun TEXT,
+    member_sesno INTEGER,
+    component_hash TEXT,
+    membership_kind TEXT,
+    path_confidence DOUBLE,
+    unresolved_reason TEXT,
+    membership_hash TEXT,
+    hash_version TEXT,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs_v2" (
+    dbnum INTEGER,
+    sesno INTEGER,
+    project_name TEXT,
+    hash_version TEXT,
+    rule_set_hash TEXT,
+    unit_count BIGINT,
+    member_count BIGINT,
+    unresolved_member_count BIGINT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."component_index_runs_v2" (
+    dbnum INTEGER,
+    sesno INTEGER,
+    project_name TEXT,
+    hash_version TEXT,
+    component_count BIGINT,
+    distinct_component_hashes BIGINT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    status TEXT,
+    reason TEXT,
+    created_at TEXT
+);
 "#,
                 schema = SCHEMA
             );
@@ -517,6 +651,10 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs" (
                 "BIGINT",
             )?;
             self.record_required_schema_migration(MIGRATION_MESH_ASSET_GLB_READABILITY_COLUMNS)?;
+            self.ensure_unit_version_v2_tables()?;
+            self.record_required_schema_migration(MIGRATION_UNIT_VERSION_BY_REFNO_SESNO)?;
+            self.ensure_unit_version_events_v2_table()?;
+            self.record_required_schema_migration(MIGRATION_UNIT_VERSION_EVENTS_V2)?;
             Ok(())
         }
 
@@ -796,6 +934,7 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs" (
                     ducklake_metadata_path: self.cfg.metadata_path.clone(),
                     ducklake_data_path: self.cfg.data_path.clone(),
                     component_index: None,
+                    unit_index: None,
                 });
             }
 
@@ -829,6 +968,7 @@ CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs" (
                 ducklake_metadata_path: self.cfg.metadata_path.clone(),
                 ducklake_data_path: self.cfg.data_path.clone(),
                 component_index: None,
+                unit_index: None,
             })
         }
 
@@ -4094,11 +4234,1224 @@ LIMIT {limit}
             )?;
             collect_rows(rows).map_err(Into::into)
         }
+
+        fn ensure_unit_version_v2_tables(&self) -> anyhow::Result<()> {
+            let ddl = format!(
+                r#"
+CREATE TABLE IF NOT EXISTS "{schema}"."export_batches" (
+    dbnum INTEGER,
+    batch_sesno INTEGER,
+    project_name TEXT,
+    package_relpath TEXT,
+    package_hash TEXT,
+    generation_job_id TEXT,
+    created_at TEXT,
+    note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_versions_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    project_name TEXT,
+    unit_refno_str TEXT,
+    unit_noun TEXT,
+    unit_key TEXT,
+    aggregate_hash TEXT,
+    hash_version TEXT,
+    rule_set_hash TEXT,
+    member_count BIGINT,
+    unresolved_member_count BIGINT,
+    member_signature TEXT,
+    package_relpath TEXT,
+    status TEXT,
+    label TEXT,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."component_snapshots_v2" (
+    dbnum INTEGER,
+    component_refno_u64 BIGINT,
+    sesno INTEGER,
+    project_name TEXT,
+    component_refno_str TEXT,
+    component_key TEXT,
+    noun TEXT,
+    unit_refno_u64 BIGINT,
+    unit_refno_str TEXT,
+    owner_refno_u64 BIGINT,
+    owner_refno_str TEXT,
+    owner_noun TEXT,
+    cata_hash TEXT,
+    trans_hash TEXT,
+    aabb_hash TEXT,
+    spec_value BIGINT,
+    has_neg BOOLEAN,
+    geo_signature TEXT,
+    component_hash TEXT,
+    hash_version TEXT,
+    member_sesno INTEGER,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_memberships_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    member_refno_u64 BIGINT,
+    project_name TEXT,
+    unit_refno_str TEXT,
+    unit_noun TEXT,
+    unit_key TEXT,
+    member_refno_str TEXT,
+    member_noun TEXT,
+    member_sesno INTEGER,
+    component_hash TEXT,
+    membership_kind TEXT,
+    path_confidence DOUBLE,
+    unresolved_reason TEXT,
+    membership_hash TEXT,
+    hash_version TEXT,
+    legacy_release_id TEXT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_index_runs_v2" (
+    dbnum INTEGER,
+    sesno INTEGER,
+    project_name TEXT,
+    hash_version TEXT,
+    rule_set_hash TEXT,
+    unit_count BIGINT,
+    member_count BIGINT,
+    unresolved_member_count BIGINT,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS "{schema}"."component_index_runs_v2" (
+    dbnum INTEGER,
+    sesno INTEGER,
+    project_name TEXT,
+    hash_version TEXT,
+    component_count BIGINT,
+    distinct_component_hashes BIGINT,
+    indexed_at TEXT
+);
+"#,
+                schema = SCHEMA
+            );
+            self.conn
+                .execute_batch(&ddl)
+                .context("create unit version v2 tables")?;
+            Ok(())
+        }
+
+        fn ensure_unit_version_events_v2_table(&self) -> anyhow::Result<()> {
+            let ddl = format!(
+                r#"
+CREATE TABLE IF NOT EXISTS "{schema}"."unit_version_status_events_v2" (
+    dbnum INTEGER,
+    unit_refno_u64 BIGINT,
+    sesno INTEGER,
+    status TEXT,
+    reason TEXT,
+    created_at TEXT
+);
+"#,
+                schema = SCHEMA
+            );
+            self.conn
+                .execute_batch(&ddl)
+                .context("create unit_version_status_events_v2")?;
+            Ok(())
+        }
+
+        pub fn upsert_unit_version_v2(
+            &self,
+            mut req: UpsertUnitVersionV2Request,
+        ) -> anyhow::Result<UpsertUnitVersionV2Outcome> {
+            if req.package_relpath
+                .as_ref()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+            {
+                req.package_relpath = Some(unit_version_package_relpath(
+                    req.dbnum,
+                    req.unit_refno_u64,
+                    req.sesno,
+                ));
+            }
+
+            if let Some(existing) =
+                self.get_unit_version_v2_exact(req.dbnum, req.unit_refno_u64, req.sesno)?
+            {
+                if existing.aggregate_hash == req.aggregate_hash {
+                    return Ok(UpsertUnitVersionV2Outcome::Unchanged { record: existing });
+                }
+                anyhow::bail!(
+                    "unit version conflict for dbnum={} refno={} sesno={}: existing hash '{}' != new hash '{}'",
+                    req.dbnum,
+                    req.unit_refno_u64,
+                    req.sesno,
+                    existing.aggregate_hash,
+                    req.aggregate_hash
+                );
+            }
+
+            let indexed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let sql = format!(
+                "INSERT INTO \"{}\".\"unit_versions_v2\" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                SCHEMA
+            );
+            self.conn
+                .execute(
+                    &sql,
+                    params![
+                        i64::from(req.dbnum),
+                        u64_to_i64(req.unit_refno_u64, "unit_refno_u64")?,
+                        i64::from(req.sesno),
+                        req.project_name,
+                        req.unit_refno_str,
+                        req.unit_noun,
+                        req.unit_key,
+                        req.aggregate_hash,
+                        req.hash_version,
+                        req.rule_set_hash,
+                        u64_to_i64(req.member_count, "member_count")?,
+                        u64_to_i64(req.unresolved_member_count, "unresolved_member_count")?,
+                        req.member_signature,
+                        req.package_relpath,
+                        req.status,
+                        req.label,
+                        req.legacy_release_id,
+                        indexed_at,
+                    ],
+                )
+                .context("insert unit_versions_v2")?;
+
+            let record = self
+                .get_unit_version_v2_exact(req.dbnum, req.unit_refno_u64, req.sesno)?
+                .context("unit_versions_v2 row missing after insert")?;
+            Ok(UpsertUnitVersionV2Outcome::Inserted { record })
+        }
+
+        fn get_unit_version_v2_exact(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+        ) -> anyhow::Result<Option<UnitVersionV2Record>> {
+            let sql = format!(
+                "SELECT dbnum, unit_refno_u64, sesno, project_name, unit_refno_str, unit_noun, \
+                 unit_key, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, package_relpath, status, label, \
+                 legacy_release_id, indexed_at \
+                 FROM \"{}\".\"unit_versions_v2\" \
+                 WHERE dbnum = ? AND unit_refno_u64 = ? AND sesno = ? \
+                 LIMIT 1",
+                SCHEMA
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params![
+                i64::from(dbnum),
+                u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                i64::from(sesno)
+            ])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(row_to_unit_version_v2(row)?)),
+                None => Ok(None),
+            }
+        }
+
+        pub fn get_unit_version_v2(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+        ) -> anyhow::Result<Option<UnitVersionV2Record>> {
+            if let Some(record) =
+                self.get_unit_version_v2_exact(dbnum, unit_refno_u64, sesno)?
+            {
+                return Ok(Some(record));
+            }
+            self.get_unit_version_v2_legacy_fallback(dbnum, unit_refno_u64, sesno)
+        }
+
+        fn get_unit_version_v2_legacy_fallback(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+        ) -> anyhow::Result<Option<UnitVersionV2Record>> {
+            let release_id = legacy_batch_id_for_sesno(dbnum, sesno);
+            let sql = format!(
+                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
+                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, indexed_at \
+                 FROM \"{}\".\"unit_versions\" \
+                 WHERE release_id = ? AND dbnum = ? AND unit_refno_u64 = ? \
+                 LIMIT 1",
+                SCHEMA
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut rows = stmt.query(params![
+                release_id,
+                i64::from(dbnum),
+                u64_to_i64(unit_refno_u64, "unit_refno_u64")?
+            ])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(legacy_unit_row_to_v2(row, sesno)?)),
+                None => Ok(None),
+            }
+        }
+
+        pub fn list_unit_versions_v2(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+        ) -> anyhow::Result<Vec<UnitVersionV2Record>> {
+            let mut by_sesno: BTreeMap<u32, UnitVersionV2Record> = BTreeMap::new();
+
+            let sql = format!(
+                "SELECT dbnum, unit_refno_u64, sesno, project_name, unit_refno_str, unit_noun, \
+                 unit_key, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, package_relpath, status, label, \
+                 legacy_release_id, indexed_at \
+                 FROM \"{}\".\"unit_versions_v2\" \
+                 WHERE dbnum = ? AND unit_refno_u64 = ?",
+                SCHEMA
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    i64::from(dbnum),
+                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?
+                ],
+                |row| row_to_unit_version_v2(row),
+            )?;
+            for row in rows {
+                let record = row?;
+                by_sesno.insert(record.sesno, record);
+            }
+
+            let legacy_sql = format!(
+                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
+                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, indexed_at \
+                 FROM \"{}\".\"unit_versions\" \
+                 WHERE dbnum = ? AND unit_refno_u64 = ?",
+                SCHEMA
+            );
+            let mut legacy_stmt = self.conn.prepare(&legacy_sql)?;
+            let legacy_rows = legacy_stmt.query_map(
+                params![
+                    i64::from(dbnum),
+                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?
+                ],
+                |row| {
+                    let release_id: String = row.get(0)?;
+                    Ok((release_id, row_to_legacy_unit_fields(row)?))
+                },
+            )?;
+            for row in legacy_rows {
+                let (release_id, fields) = row?;
+                let Some((parsed_dbnum, sesno)) = parse_legacy_batch_id(&release_id) else {
+                    continue;
+                };
+                if parsed_dbnum != dbnum {
+                    continue;
+                }
+                by_sesno.entry(sesno).or_insert_with(|| {
+                    legacy_fields_to_v2(fields, sesno, Some(release_id))
+                });
+            }
+
+            let mut out: Vec<_> = by_sesno.into_values().collect();
+            out.sort_by(|a, b| b.sesno.cmp(&a.sesno));
+            Ok(out)
+        }
+
+        pub fn write_unit_version_with_members_v2(
+            &self,
+            mut unit: UpsertUnitVersionV2Request,
+            members: &[UnitMembershipV2Record],
+        ) -> anyhow::Result<(UpsertUnitVersionV2Outcome, u32)> {
+            let unit_sesno = unit_sesno_from_member_sesnos(members.iter().map(|m| m.member_sesno))
+                .context(
+                    "write_unit_version_with_members_v2 requires at least one member_sesno",
+                )?;
+            unit.sesno = unit_sesno;
+            unit.member_count = members.len() as u64;
+            unit.unresolved_member_count = members
+                .iter()
+                .filter(|m| {
+                    m.unresolved_reason
+                        .as_ref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false)
+                })
+                .count() as u64;
+            let outcome = self.upsert_unit_version_v2(unit)?;
+            let (dbnum, unit_refno_u64) = match &outcome {
+                UpsertUnitVersionV2Outcome::Inserted { record }
+                | UpsertUnitVersionV2Outcome::Unchanged { record } => {
+                    (record.dbnum, record.unit_refno_u64)
+                }
+            };
+            self.replace_unit_memberships_v2(dbnum, unit_refno_u64, unit_sesno, members)?;
+            Ok((outcome, unit_sesno))
+        }
+
+        pub fn replace_unit_memberships_v2(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+            members: &[UnitMembershipV2Record],
+        ) -> anyhow::Result<usize> {
+            let indexed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            self.conn
+                .execute_batch("BEGIN TRANSACTION")
+                .context("begin replace_unit_memberships_v2")?;
+            let result = (|| -> anyhow::Result<usize> {
+                let delete_sql = format!(
+                    "DELETE FROM \"{}\".\"unit_memberships_v2\" \
+                     WHERE dbnum = ? AND unit_refno_u64 = ? AND sesno = ?",
+                    SCHEMA
+                );
+                self.conn.execute(
+                    &delete_sql,
+                    params![
+                        i64::from(dbnum),
+                        u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                        i64::from(sesno)
+                    ],
+                )?;
+
+                let insert_sql = format!(
+                    "INSERT INTO \"{}\".\"unit_memberships_v2\" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    SCHEMA
+                );
+                let mut count = 0usize;
+                for member in members {
+                    let member_indexed_at = if member.indexed_at.trim().is_empty() {
+                        indexed_at.clone()
+                    } else {
+                        member.indexed_at.clone()
+                    };
+                    self.conn.execute(
+                        &insert_sql,
+                        params![
+                            i64::from(dbnum),
+                            u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                            i64::from(sesno),
+                            u64_to_i64(member.member_refno_u64, "member_refno_u64")?,
+                            member.project_name,
+                            member.unit_refno_str,
+                            member.unit_noun,
+                            member.unit_key,
+                            member.member_refno_str,
+                            member.member_noun,
+                            i64::from(member.member_sesno),
+                            member.component_hash,
+                            member.membership_kind,
+                            member.path_confidence,
+                            member.unresolved_reason,
+                            member.membership_hash,
+                            member.hash_version,
+                            member.legacy_release_id,
+                            member_indexed_at,
+                        ],
+                    )?;
+                    count += 1;
+                }
+                Ok(count)
+            })();
+            match result {
+                Ok(count) => {
+                    self.conn
+                        .execute_batch("COMMIT")
+                        .context("commit replace_unit_memberships_v2")?;
+                    Ok(count)
+                }
+                Err(err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(err)
+                }
+            }
+        }
+
+        pub fn sync_release_units_into_v2(
+            &self,
+            release_id: &str,
+            sesno: u32,
+        ) -> anyhow::Result<usize> {
+            let indexed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let release_id_sql = escape_sql_string(release_id);
+            let indexed_at_sql = escape_sql_string(&indexed_at);
+            let sql = format!(
+                r#"
+DELETE FROM "{schema}"."unit_versions_v2"
+ WHERE legacy_release_id = '{release_id}' OR (
+    sesno = {sesno} AND (dbnum, unit_refno_u64) IN (
+        SELECT dbnum, unit_refno_u64 FROM "{schema}"."unit_versions"
+         WHERE release_id = '{release_id}' AND unit_refno_u64 IS NOT NULL
+    )
+);
+
+INSERT INTO "{schema}"."unit_versions_v2"
+SELECT
+    dbnum,
+    unit_refno_u64,
+    {sesno} AS sesno,
+    project_name,
+    unit_refno_str,
+    unit_noun,
+    unit_key,
+    aggregate_hash,
+    hash_version,
+    rule_set_hash,
+    member_count,
+    unresolved_member_count,
+    member_signature,
+    concat(
+        'units/',
+        CAST(dbnum AS VARCHAR),
+        '/',
+        CAST(unit_refno_u64 AS VARCHAR),
+        '/sesno-',
+        CAST({sesno} AS VARCHAR)
+    ) AS package_relpath,
+    NULL AS status,
+    NULL AS label,
+    release_id AS legacy_release_id,
+    '{indexed_at}' AS indexed_at
+FROM "{schema}"."unit_versions"
+WHERE release_id = '{release_id}'
+  AND unit_refno_u64 IS NOT NULL;
+
+DELETE FROM "{schema}"."unit_memberships_v2"
+ WHERE legacy_release_id = '{release_id}' OR (
+    sesno = {sesno} AND (dbnum, unit_refno_u64) IN (
+        SELECT dbnum, unit_refno_u64 FROM "{schema}"."delivery_unit_memberships"
+         WHERE release_id = '{release_id}' AND unit_refno_u64 IS NOT NULL
+    )
+);
+
+INSERT INTO "{schema}"."unit_memberships_v2"
+SELECT
+    dbnum,
+    unit_refno_u64,
+    {sesno} AS sesno,
+    component_refno_u64 AS member_refno_u64,
+    project_name,
+    unit_refno_str,
+    unit_noun,
+    unit_key,
+    component_refno_str AS member_refno_str,
+    component_noun AS member_noun,
+    {sesno} AS member_sesno,
+    component_hash,
+    membership_kind,
+    path_confidence,
+    unresolved_reason,
+    membership_hash,
+    hash_version,
+    release_id AS legacy_release_id,
+    '{indexed_at}' AS indexed_at
+FROM "{schema}"."delivery_unit_memberships"
+WHERE release_id = '{release_id}'
+  AND unit_refno_u64 IS NOT NULL
+  AND component_refno_u64 IS NOT NULL;
+"#,
+                schema = SCHEMA,
+                release_id = release_id_sql,
+                sesno = sesno,
+                indexed_at = indexed_at_sql,
+            );
+
+            self.conn
+                .execute_batch("BEGIN TRANSACTION")
+                .context("begin sync_release_units_into_v2")?;
+            let result = (|| -> anyhow::Result<usize> {
+                self.conn
+                    .execute_batch(&sql)
+                    .context("sync legacy unit versions into v2")?;
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM \"{}\".\"unit_versions_v2\" WHERE sesno = ? AND legacy_release_id = ?",
+                    SCHEMA
+                );
+                let count: i64 = self
+                    .conn
+                    .query_row(&count_sql, params![i64::from(sesno), release_id], |row| {
+                        row.get(0)
+                    })?;
+                let synced = i64_to_u64(count, "synced_unit_count").map_err(anyhow::Error::from)?;
+                Ok(synced as usize)
+            })();
+            match result {
+                Ok(count) => {
+                    self.conn
+                        .execute_batch("COMMIT")
+                        .context("commit sync_release_units_into_v2")?;
+                    Ok(count)
+                }
+                Err(err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(err)
+                }
+            }
+        }
+
+        fn list_unit_refnos_at_sesno_v2(
+            &self,
+            dbnum: u32,
+            sesno: u32,
+            unit_refno_u64: Option<u64>,
+        ) -> anyhow::Result<BTreeMap<u64, UnitVersionV2Record>> {
+            let mut map = BTreeMap::new();
+            let filter = match unit_refno_u64 {
+                Some(refno) => format!(" AND unit_refno_u64 = {}", refno),
+                None => String::new(),
+            };
+            let sql = format!(
+                "SELECT dbnum, unit_refno_u64, sesno, project_name, unit_refno_str, unit_noun, \
+                 unit_key, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, package_relpath, status, label, \
+                 legacy_release_id, indexed_at \
+                 FROM \"{}\".\"unit_versions_v2\" \
+                 WHERE dbnum = ? AND sesno = ?{filter}",
+                SCHEMA,
+                filter = filter
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![i64::from(dbnum), i64::from(sesno)], |row| {
+                row_to_unit_version_v2(row)
+            })?;
+            for row in rows {
+                let record = row?;
+                map.insert(record.unit_refno_u64, record);
+            }
+
+            let release_id = legacy_batch_id_for_sesno(dbnum, sesno);
+            let legacy_filter = match unit_refno_u64 {
+                Some(refno) => format!(" AND unit_refno_u64 = {}", refno),
+                None => String::new(),
+            };
+            let legacy_sql = format!(
+                "SELECT release_id, project_name, dbnum, unit_key, unit_noun, unit_refno_str, \
+                 unit_refno_u64, aggregate_hash, hash_version, rule_set_hash, member_count, \
+                 unresolved_member_count, member_signature, indexed_at \
+                 FROM \"{}\".\"unit_versions\" \
+                 WHERE release_id = ? AND dbnum = ?{legacy_filter}",
+                SCHEMA,
+                legacy_filter = legacy_filter
+            );
+            let mut legacy_stmt = self.conn.prepare(&legacy_sql)?;
+            let legacy_rows = legacy_stmt.query_map(
+                params![release_id, i64::from(dbnum)],
+                |row| {
+                    let release_id: String = row.get(0)?;
+                    Ok((release_id, row_to_legacy_unit_fields(row)?))
+                },
+            )?;
+            for row in legacy_rows {
+                let (release_id, fields) = row?;
+                let Some(refno) = fields.unit_refno_u64 else {
+                    continue;
+                };
+                map.entry(refno).or_insert_with(|| {
+                    legacy_fields_to_v2(fields, sesno, Some(release_id))
+                });
+            }
+            Ok(map)
+        }
+
+        pub fn diff_unit_versions_v2(
+            &self,
+            dbnum: u32,
+            from_sesno: u32,
+            to_sesno: u32,
+            unit_refno_u64: Option<u64>,
+            limit: usize,
+        ) -> anyhow::Result<UnitVersionV2DiffResponse> {
+            let old_map = self.list_unit_refnos_at_sesno_v2(dbnum, from_sesno, unit_refno_u64)?;
+            let new_map = self.list_unit_refnos_at_sesno_v2(dbnum, to_sesno, unit_refno_u64)?;
+            let mut keys: BTreeSet<u64> = BTreeSet::new();
+            keys.extend(old_map.keys().copied());
+            keys.extend(new_map.keys().copied());
+
+            let mut added = 0u64;
+            let mut deleted = 0u64;
+            let mut changed = 0u64;
+            let mut unchanged = 0u64;
+            let mut rows = Vec::new();
+
+            for key in keys {
+                let old = old_map.get(&key);
+                let new = new_map.get(&key);
+                let (change_type, row) = match (old, new) {
+                    (None, Some(new)) => {
+                        added += 1;
+                        (
+                            "added",
+                            UnitVersionV2DiffRow {
+                                change_type: "added".to_string(),
+                                unit_refno_u64: new.unit_refno_u64,
+                                unit_refno_str: new.unit_refno_str.clone(),
+                                unit_noun: new.unit_noun.clone(),
+                                unit_key: new.unit_key.clone(),
+                                from_sesno: None,
+                                to_sesno: Some(new.sesno),
+                                old_aggregate_hash: None,
+                                new_aggregate_hash: Some(new.aggregate_hash.clone()),
+                                old_member_count: None,
+                                new_member_count: Some(new.member_count),
+                            },
+                        )
+                    }
+                    (Some(old), None) => {
+                        deleted += 1;
+                        (
+                            "deleted",
+                            UnitVersionV2DiffRow {
+                                change_type: "deleted".to_string(),
+                                unit_refno_u64: old.unit_refno_u64,
+                                unit_refno_str: old.unit_refno_str.clone(),
+                                unit_noun: old.unit_noun.clone(),
+                                unit_key: old.unit_key.clone(),
+                                from_sesno: Some(old.sesno),
+                                to_sesno: None,
+                                old_aggregate_hash: Some(old.aggregate_hash.clone()),
+                                new_aggregate_hash: None,
+                                old_member_count: Some(old.member_count),
+                                new_member_count: None,
+                            },
+                        )
+                    }
+                    (Some(old), Some(new)) if old.aggregate_hash != new.aggregate_hash => {
+                        changed += 1;
+                        (
+                            "changed",
+                            UnitVersionV2DiffRow {
+                                change_type: "changed".to_string(),
+                                unit_refno_u64: new.unit_refno_u64,
+                                unit_refno_str: new
+                                    .unit_refno_str
+                                    .clone()
+                                    .or_else(|| old.unit_refno_str.clone()),
+                                unit_noun: new.unit_noun.clone().or_else(|| old.unit_noun.clone()),
+                                unit_key: new.unit_key.clone().or_else(|| old.unit_key.clone()),
+                                from_sesno: Some(old.sesno),
+                                to_sesno: Some(new.sesno),
+                                old_aggregate_hash: Some(old.aggregate_hash.clone()),
+                                new_aggregate_hash: Some(new.aggregate_hash.clone()),
+                                old_member_count: Some(old.member_count),
+                                new_member_count: Some(new.member_count),
+                            },
+                        )
+                    }
+                    (Some(old), Some(new)) => {
+                        unchanged += 1;
+                        (
+                            "unchanged",
+                            UnitVersionV2DiffRow {
+                                change_type: "unchanged".to_string(),
+                                unit_refno_u64: new.unit_refno_u64,
+                                unit_refno_str: new
+                                    .unit_refno_str
+                                    .clone()
+                                    .or_else(|| old.unit_refno_str.clone()),
+                                unit_noun: new.unit_noun.clone().or_else(|| old.unit_noun.clone()),
+                                unit_key: new.unit_key.clone().or_else(|| old.unit_key.clone()),
+                                from_sesno: Some(old.sesno),
+                                to_sesno: Some(new.sesno),
+                                old_aggregate_hash: Some(old.aggregate_hash.clone()),
+                                new_aggregate_hash: Some(new.aggregate_hash.clone()),
+                                old_member_count: Some(old.member_count),
+                                new_member_count: Some(new.member_count),
+                            },
+                        )
+                    }
+                    (None, None) => continue,
+                };
+                let _ = change_type;
+                if rows.len() < limit {
+                    rows.push(row);
+                }
+            }
+
+            Ok(UnitVersionV2DiffResponse {
+                dbnum,
+                from_sesno,
+                to_sesno,
+                unit_refno_u64,
+                summary: ModelUnitDiffSummary {
+                    added,
+                    deleted,
+                    changed,
+                    unchanged,
+                    total_old: old_map.len() as u64,
+                    total_new: new_map.len() as u64,
+                    emitted: rows.len(),
+                },
+                rows,
+            })
+        }
+
+        pub fn set_unit_version_status_v2(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+            status: &str,
+            reason: Option<&str>,
+        ) -> anyhow::Result<UnitVersionV2Record> {
+            let exact = self
+                .get_unit_version_v2_exact(dbnum, unit_refno_u64, sesno)?
+                .with_context(|| {
+                    format!(
+                        "unit version v2 missing for dbnum={dbnum} refno={unit_refno_u64} sesno={sesno}"
+                    )
+                })?;
+            let created_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            self.conn
+                .execute_batch("BEGIN TRANSACTION")
+                .context("begin set_unit_version_status_v2")?;
+            let result = (|| -> anyhow::Result<()> {
+                let update_sql = format!(
+                    "UPDATE \"{}\".\"unit_versions_v2\" SET status = ? \
+                     WHERE dbnum = ? AND unit_refno_u64 = ? AND sesno = ?",
+                    SCHEMA
+                );
+                let updated = self.conn.execute(
+                    &update_sql,
+                    params![
+                        status,
+                        i64::from(dbnum),
+                        u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                        i64::from(sesno)
+                    ],
+                )?;
+                if updated == 0 {
+                    anyhow::bail!(
+                        "unit version v2 disappeared while updating status for dbnum={dbnum} refno={unit_refno_u64} sesno={sesno}"
+                    );
+                }
+                let event_sql = format!(
+                    "INSERT INTO \"{}\".\"unit_version_status_events_v2\" VALUES (?, ?, ?, ?, ?, ?)",
+                    SCHEMA
+                );
+                self.conn.execute(
+                    &event_sql,
+                    params![
+                        i64::from(dbnum),
+                        u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                        i64::from(sesno),
+                        status,
+                        reason,
+                        created_at
+                    ],
+                )?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    self.conn
+                        .execute_batch("COMMIT")
+                        .context("commit set_unit_version_status_v2")?;
+                }
+                Err(err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(err);
+                }
+            }
+            let _ = exact;
+            self.get_unit_version_v2_exact(dbnum, unit_refno_u64, sesno)?
+                .context("unit version v2 missing after status update")
+        }
+
+        pub fn list_unit_version_events_v2(
+            &self,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            sesno: u32,
+        ) -> anyhow::Result<Vec<UnitVersionStatusEventV2>> {
+            let sql = format!(
+                "SELECT dbnum, unit_refno_u64, sesno, status, reason, created_at \
+                 FROM \"{}\".\"unit_version_status_events_v2\" \
+                 WHERE dbnum = ? AND unit_refno_u64 = ? AND sesno = ? \
+                 ORDER BY created_at DESC",
+                SCHEMA
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    i64::from(dbnum),
+                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                    i64::from(sesno)
+                ],
+                |row| {
+                    Ok(UnitVersionStatusEventV2 {
+                        dbnum: i64_to_u32(row.get(0)?, "dbnum")?,
+                        unit_refno_u64: i64_to_u64(row.get(1)?, "unit_refno_u64")?,
+                        sesno: i64_to_u32(row.get(2)?, "sesno")?,
+                        status: row.get(3)?,
+                        reason: clean_string(row.get(4)?),
+                        created_at: row.get(5)?,
+                    })
+                },
+            )?;
+            collect_rows(rows).map_err(Into::into)
+        }
+
+        pub fn smoke_unit_version_v2(work_dir: &Path) -> anyhow::Result<UnitVersionV2SmokeReport> {
+            fs::create_dir_all(work_dir).with_context(|| {
+                format!("create unit-v2 smoke work_dir failed: {}", work_dir.display())
+            })?;
+            let cfg = ModelVersionDuckLakeConfig::new(
+                work_dir.join("metadata.ducklake"),
+                work_dir.join("data"),
+            );
+            let store = Self::open_writer(cfg)?;
+
+            let dbnum = 7u32;
+            let unit_refno = 1001u64;
+            let expected_sesno = 20u32;
+            let project = "smoke-023".to_string();
+            let members = vec![
+                UnitMembershipV2Record {
+                    dbnum,
+                    unit_refno_u64: unit_refno,
+                    sesno: 0,
+                    member_refno_u64: 2001,
+                    project_name: project.clone(),
+                    unit_refno_str: Some("=/SMOKE/U1".into()),
+                    unit_noun: Some("BRAN".into()),
+                    unit_key: Some(format!("{project}|{dbnum}|BRAN|{unit_refno}")),
+                    member_refno_str: Some("=/SMOKE/M1".into()),
+                    member_noun: Some("TUBI".into()),
+                    member_sesno: 10,
+                    component_hash: Some("h-m1".into()),
+                    membership_kind: Some("direct_owner".into()),
+                    path_confidence: Some(0.8),
+                    unresolved_reason: None,
+                    membership_hash: Some("mh1".into()),
+                    hash_version: Some(MEMBERSHIP_HASH_VERSION.into()),
+                    legacy_release_id: None,
+                    indexed_at: String::new(),
+                },
+                UnitMembershipV2Record {
+                    dbnum,
+                    unit_refno_u64: unit_refno,
+                    sesno: 0,
+                    member_refno_u64: 2002,
+                    project_name: project.clone(),
+                    unit_refno_str: Some("=/SMOKE/U1".into()),
+                    unit_noun: Some("BRAN".into()),
+                    unit_key: Some(format!("{project}|{dbnum}|BRAN|{unit_refno}")),
+                    member_refno_str: Some("=/SMOKE/M2".into()),
+                    member_noun: Some("TUBI".into()),
+                    member_sesno: expected_sesno,
+                    component_hash: Some("h-m2".into()),
+                    membership_kind: Some("direct_owner".into()),
+                    path_confidence: Some(0.8),
+                    unresolved_reason: None,
+                    membership_hash: Some("mh2".into()),
+                    hash_version: Some(MEMBERSHIP_HASH_VERSION.into()),
+                    legacy_release_id: None,
+                    indexed_at: String::new(),
+                },
+                UnitMembershipV2Record {
+                    dbnum,
+                    unit_refno_u64: unit_refno,
+                    sesno: 0,
+                    member_refno_u64: 2003,
+                    project_name: project.clone(),
+                    unit_refno_str: Some("=/SMOKE/U1".into()),
+                    unit_noun: Some("BRAN".into()),
+                    unit_key: Some(format!("{project}|{dbnum}|BRAN|{unit_refno}")),
+                    member_refno_str: Some("=/SMOKE/M3".into()),
+                    member_noun: Some("TUBI".into()),
+                    member_sesno: 15,
+                    component_hash: Some("h-m3".into()),
+                    membership_kind: Some("direct_owner".into()),
+                    path_confidence: Some(0.8),
+                    unresolved_reason: None,
+                    membership_hash: Some("mh3".into()),
+                    hash_version: Some(MEMBERSHIP_HASH_VERSION.into()),
+                    legacy_release_id: None,
+                    indexed_at: String::new(),
+                },
+            ];
+
+            let unit_req = UpsertUnitVersionV2Request {
+                dbnum,
+                unit_refno_u64: unit_refno,
+                sesno: 0,
+                project_name: project.clone(),
+                unit_refno_str: Some("=/SMOKE/U1".into()),
+                unit_noun: Some("BRAN".into()),
+                unit_key: Some(format!("{project}|{dbnum}|BRAN|{unit_refno}")),
+                aggregate_hash: "agg-v1".into(),
+                hash_version: UNIT_HASH_VERSION.into(),
+                rule_set_hash: Some(UNIT_RULE_SET_HASH.into()),
+                member_count: 0,
+                unresolved_member_count: 0,
+                member_signature: Some("sig-v1".into()),
+                package_relpath: None,
+                status: Some("indexed".into()),
+                label: Some("smoke".into()),
+                legacy_release_id: None,
+            };
+
+            let (first, derived_sesno) =
+                store.write_unit_version_with_members_v2(unit_req.clone(), &members)?;
+            let first_outcome = match &first {
+                UpsertUnitVersionV2Outcome::Inserted { .. } => "inserted",
+                UpsertUnitVersionV2Outcome::Unchanged { .. } => "unchanged",
+            }
+            .to_string();
+
+            let (second, _) = store.write_unit_version_with_members_v2(unit_req.clone(), &members)?;
+            let second_outcome = match &second {
+                UpsertUnitVersionV2Outcome::Inserted { .. } => "inserted",
+                UpsertUnitVersionV2Outcome::Unchanged { .. } => "unchanged",
+            }
+            .to_string();
+
+            let mut conflict_req = unit_req.clone();
+            conflict_req.sesno = derived_sesno;
+            conflict_req.aggregate_hash = "agg-conflict".into();
+            let conflict_rejected = store.upsert_unit_version_v2(conflict_req).is_err();
+
+            let listed = store.list_unit_versions_v2(dbnum, unit_refno)?;
+            let listed_count = listed.len();
+
+            let got = store
+                .get_unit_version_v2(dbnum, unit_refno, derived_sesno)?
+                .context("smoke get after write")?;
+            let expected_relpath =
+                unit_version_package_relpath(dbnum, unit_refno, derived_sesno);
+            let package_ok = got.package_relpath.as_deref() == Some(expected_relpath.as_str());
+            let package_dir =
+                materialize_unit_version_package_dir(work_dir, dbnum, unit_refno, derived_sesno)?;
+            let package_dir_ok = package_dir.is_dir();
+
+            let mut later = unit_req.clone();
+            later.sesno = 30;
+            later.aggregate_hash = "agg-v2".into();
+            later.member_signature = Some("sig-v2".into());
+            later.member_count = 1;
+            store.upsert_unit_version_v2(later)?;
+            let diff = store.diff_unit_versions_v2(dbnum, derived_sesno, 30, Some(unit_refno), 20)?;
+            let diff_ok = diff.summary.changed == 1;
+
+            let legacy_sesno = 40u32;
+            let legacy_release_id = legacy_batch_id_for_sesno(dbnum, legacy_sesno);
+            store.insert_legacy_unit_version_row(
+                &legacy_release_id,
+                &project,
+                dbnum,
+                unit_refno,
+                "BRAN",
+                Some("=/SMOKE/U1"),
+                "agg-legacy",
+                "sig-legacy",
+            )?;
+            let legacy = store
+                .get_unit_version_v2(dbnum, unit_refno, legacy_sesno)?
+                .context("smoke C3 legacy dual-read")?;
+            let legacy_ok = legacy.status.as_deref() == Some("legacy_fallback")
+                && legacy.legacy_release_id.as_deref() == Some(legacy_release_id.as_str());
+
+            store.set_unit_version_status_v2(
+                dbnum,
+                unit_refno,
+                derived_sesno,
+                "published",
+                Some("smoke e2"),
+            )?;
+            let events = store.list_unit_version_events_v2(dbnum, unit_refno, derived_sesno)?;
+            let events_ok = !events.is_empty() && events[0].status == "published";
+
+            let ok = derived_sesno == expected_sesno
+                && first_outcome == "inserted"
+                && second_outcome == "unchanged"
+                && conflict_rejected
+                && listed_count >= 1
+                && package_ok
+                && package_dir_ok
+                && diff_ok
+                && legacy_ok
+                && events_ok;
+
+            if !ok {
+                anyhow::bail!(
+                    "unit-v2-smoke checks failed: derived={derived_sesno} expected={expected_sesno} \
+                     first={first_outcome} second={second_outcome} conflict={conflict_rejected} \
+                     listed={listed_count} package_ok={package_ok} package_dir_ok={package_dir_ok} \
+                     diff_ok={diff_ok} legacy_ok={legacy_ok} events_ok={events_ok}"
+                );
+            }
+
+            Ok(UnitVersionV2SmokeReport {
+                ok,
+                work_dir: work_dir.to_path_buf(),
+                derived_sesno,
+                expected_sesno,
+                first_outcome,
+                second_outcome,
+                conflict_rejected,
+                listed_count,
+            })
+        }
+
+        fn insert_legacy_unit_version_row(
+            &self,
+            release_id: &str,
+            project_name: &str,
+            dbnum: u32,
+            unit_refno_u64: u64,
+            unit_noun: &str,
+            unit_refno_str: Option<&str>,
+            aggregate_hash: &str,
+            member_signature: &str,
+        ) -> anyhow::Result<()> {
+            let unit_key = format!("{project_name}|{dbnum}|{unit_noun}|{unit_refno_u64}");
+            let indexed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            let sql = format!(
+                "INSERT INTO \"{}\".\"unit_versions\" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                SCHEMA
+            );
+            self.conn.execute(
+                &sql,
+                params![
+                    release_id,
+                    project_name,
+                    i64::from(dbnum),
+                    unit_key,
+                    unit_noun,
+                    unit_refno_str,
+                    u64_to_i64(unit_refno_u64, "unit_refno_u64")?,
+                    format!("unit_version_id:v1|{release_id}|{unit_key}|{aggregate_hash}"),
+                    aggregate_hash,
+                    UNIT_HASH_VERSION,
+                    UNIT_RULE_SET_HASH,
+                    1i64,
+                    0i64,
+                    member_signature,
+                    indexed_at,
+                ],
+            )?;
+            Ok(())
+        }
+
     }
 
     impl ModelReleaseRecord {
         fn row_count(&self, table: &str) -> Option<u64> {
             self.rows_by_table.get(table).copied()
+        }
+    }
+
+    struct LegacyUnitVersionFields {
+        release_id: String,
+        project_name: String,
+        dbnum: u32,
+        unit_key: Option<String>,
+        unit_noun: Option<String>,
+        unit_refno_str: Option<String>,
+        unit_refno_u64: Option<u64>,
+        aggregate_hash: String,
+        hash_version: String,
+        rule_set_hash: Option<String>,
+        member_count: u64,
+        unresolved_member_count: u64,
+        member_signature: Option<String>,
+        indexed_at: String,
+    }
+
+    fn row_to_unit_version_v2(row: &duckdb::Row<'_>) -> duckdb::Result<UnitVersionV2Record> {
+        Ok(UnitVersionV2Record {
+            dbnum: i64_to_u32(row.get(0)?, "dbnum")?,
+            unit_refno_u64: i64_to_u64(row.get(1)?, "unit_refno_u64")?,
+            sesno: i64_to_u32(row.get(2)?, "sesno")?,
+            project_name: row.get(3)?,
+            unit_refno_str: clean_string(row.get(4)?),
+            unit_noun: clean_string(row.get(5)?),
+            unit_key: clean_string(row.get(6)?),
+            aggregate_hash: row.get(7)?,
+            hash_version: row.get(8)?,
+            rule_set_hash: clean_string(row.get(9)?),
+            member_count: i64_to_u64(row.get(10)?, "member_count")?,
+            unresolved_member_count: i64_to_u64(row.get(11)?, "unresolved_member_count")?,
+            member_signature: clean_string(row.get(12)?),
+            package_relpath: clean_string(row.get(13)?),
+            status: clean_string(row.get(14)?),
+            label: clean_string(row.get(15)?),
+            legacy_release_id: clean_string(row.get(16)?),
+            indexed_at: row.get(17)?,
+        })
+    }
+
+    fn row_to_legacy_unit_fields(
+        row: &duckdb::Row<'_>,
+    ) -> duckdb::Result<LegacyUnitVersionFields> {
+        let unit_refno_u64: Option<i64> = row.get(6)?;
+        Ok(LegacyUnitVersionFields {
+            release_id: row.get(0)?,
+            project_name: row.get(1)?,
+            dbnum: i64_to_u32(row.get(2)?, "dbnum")?,
+            unit_key: clean_string(row.get(3)?),
+            unit_noun: clean_string(row.get(4)?),
+            unit_refno_str: clean_string(row.get(5)?),
+            unit_refno_u64: opt_i64_to_u64(unit_refno_u64, "unit_refno_u64")?,
+            aggregate_hash: row.get(7)?,
+            hash_version: row.get(8)?,
+            rule_set_hash: clean_string(row.get(9)?),
+            member_count: i64_to_u64(row.get(10)?, "member_count")?,
+            unresolved_member_count: i64_to_u64(row.get(11)?, "unresolved_member_count")?,
+            member_signature: clean_string(row.get(12)?),
+            indexed_at: row.get(13)?,
+        })
+    }
+
+    fn legacy_unit_row_to_v2(
+        row: &duckdb::Row<'_>,
+        sesno: u32,
+    ) -> duckdb::Result<UnitVersionV2Record> {
+        let fields = row_to_legacy_unit_fields(row)?;
+        let release_id = fields.release_id.clone();
+        Ok(legacy_fields_to_v2(fields, sesno, Some(release_id)))
+    }
+
+    fn legacy_fields_to_v2(
+        fields: LegacyUnitVersionFields,
+        sesno: u32,
+        legacy_release_id: Option<String>,
+    ) -> UnitVersionV2Record {
+        UnitVersionV2Record {
+            dbnum: fields.dbnum,
+            unit_refno_u64: fields.unit_refno_u64.unwrap_or(0),
+            sesno,
+            project_name: fields.project_name,
+            unit_refno_str: fields.unit_refno_str,
+            unit_noun: fields.unit_noun,
+            unit_key: fields.unit_key,
+            aggregate_hash: fields.aggregate_hash,
+            hash_version: fields.hash_version,
+            rule_set_hash: fields.rule_set_hash,
+            member_count: fields.member_count,
+            unresolved_member_count: fields.unresolved_member_count,
+            member_signature: fields.member_signature,
+            package_relpath: None,
+            status: Some("legacy_fallback".to_string()),
+            label: None,
+            legacy_release_id,
+            indexed_at: fields.indexed_at,
         }
     }
 
@@ -5566,6 +6919,113 @@ mod imp {
             _offset: usize,
             _component_key: Option<&str>,
         ) -> anyhow::Result<ModelReleaseSceneResponse> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn upsert_unit_version_v2(
+            &self,
+            _req: UpsertUnitVersionV2Request,
+        ) -> anyhow::Result<UpsertUnitVersionV2Outcome> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn get_unit_version_v2(
+            &self,
+            _dbnum: u32,
+            _unit_refno_u64: u64,
+            _sesno: u32,
+        ) -> anyhow::Result<Option<UnitVersionV2Record>> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn list_unit_versions_v2(
+            &self,
+            _dbnum: u32,
+            _unit_refno_u64: u64,
+        ) -> anyhow::Result<Vec<UnitVersionV2Record>> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn write_unit_version_with_members_v2(
+            &self,
+            _unit: UpsertUnitVersionV2Request,
+            _members: &[UnitMembershipV2Record],
+        ) -> anyhow::Result<(UpsertUnitVersionV2Outcome, u32)> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn replace_unit_memberships_v2(
+            &self,
+            _dbnum: u32,
+            _unit_refno_u64: u64,
+            _sesno: u32,
+            _members: &[UnitMembershipV2Record],
+        ) -> anyhow::Result<usize> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn sync_release_units_into_v2(
+            &self,
+            _release_id: &str,
+            _sesno: u32,
+        ) -> anyhow::Result<usize> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn diff_unit_versions_v2(
+            &self,
+            _dbnum: u32,
+            _from_sesno: u32,
+            _to_sesno: u32,
+            _unit_refno_u64: Option<u64>,
+            _limit: usize,
+        ) -> anyhow::Result<UnitVersionV2DiffResponse> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn set_unit_version_status_v2(
+            &self,
+            _dbnum: u32,
+            _unit_refno_u64: u64,
+            _sesno: u32,
+            _status: &str,
+            _reason: Option<&str>,
+        ) -> anyhow::Result<UnitVersionV2Record> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn list_unit_version_events_v2(
+            &self,
+            _dbnum: u32,
+            _unit_refno_u64: u64,
+            _sesno: u32,
+        ) -> anyhow::Result<Vec<UnitVersionStatusEventV2>> {
+            anyhow::bail!(
+                "model-version DuckLake commands require feature `model-version-ducklake`"
+            )
+        }
+
+        pub fn smoke_unit_version_v2(
+            _work_dir: &std::path::Path,
+        ) -> anyhow::Result<UnitVersionV2SmokeReport> {
             anyhow::bail!(
                 "model-version DuckLake commands require feature `model-version-ducklake`"
             )

@@ -42,6 +42,43 @@ pub fn default_release_package_dir(release_root: &Path, release_id: &str, dbnum:
         .join(dbnum.to_string())
 }
 
+/// specs/023 E1：单元版本包相对路径（正斜杠，写入 `package_relpath`）。
+/// 形如 `units/<dbnum>/<refno>/sesno-<N>`。
+pub fn unit_version_package_relpath(dbnum: u32, unit_refno_u64: u64, sesno: u32) -> String {
+    format!("units/{dbnum}/{unit_refno_u64}/sesno-{sesno}")
+}
+
+/// specs/023 E1：单元版本包绝对目录 = `units_root` + relpath。
+pub fn default_unit_version_package_dir(
+    units_root: &Path,
+    dbnum: u32,
+    unit_refno_u64: u64,
+    sesno: u32,
+) -> PathBuf {
+    units_root
+        .join("units")
+        .join(dbnum.to_string())
+        .join(unit_refno_u64.to_string())
+        .join(format!("sesno-{sesno}"))
+}
+
+/// 物化（创建）单元版本包目录，返回绝对路径。
+pub fn materialize_unit_version_package_dir(
+    units_root: impl AsRef<Path>,
+    dbnum: u32,
+    unit_refno_u64: u64,
+    sesno: u32,
+) -> anyhow::Result<PathBuf> {
+    let dir = default_unit_version_package_dir(units_root.as_ref(), dbnum, unit_refno_u64, sesno);
+    fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "create unit version package dir failed: {}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
 fn release_storage_dir_name(release_id: &str) -> String {
     if release_id.chars().count() <= MAX_RELEASE_STORAGE_DIR_CHARS {
         return release_id.to_string();

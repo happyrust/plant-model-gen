@@ -144,6 +144,8 @@ pub fn publish_history_model_release(
         ducklake: request.ducklake.clone(),
         extra_metadata: history_metadata,
         initial_status: ModelReleaseStatus::Staged,
+        index_units: false,
+        export_sesno: Some(request.to_sesno),
     })?;
 
     update_release_status(
@@ -182,6 +184,8 @@ pub fn publish_history_model_release(
 
         let unit_index = if request.index_units {
             let stats = index_model_release_units(request.ducklake.clone(), &request.release_id)?;
+            let store = ModelVersionDuckLakeStore::open_writer(request.ducklake.clone())?;
+            store.sync_release_units_into_v2(&request.release_id, request.to_sesno)?;
             update_release_status(
                 request.ducklake.clone(),
                 &request.release_id,
@@ -416,6 +420,26 @@ pub fn register_model_release(
         }
     };
     registration.component_index = Some(component_index);
+    if request.index_units {
+        let unit_index = match store.index_release_units(&registration.release) {
+            Ok(stats) => stats,
+            Err(error) => {
+                if registration.status == ModelReleaseRegistrationStatus::Created {
+                    let _ = store.update_release_status(
+                        &registration.release.release_id,
+                        ModelReleaseStatus::Failed,
+                        Some(&error.to_string()),
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(sesno) = request.export_sesno {
+            // specs/023: project legacy release_id unit index into sesno-keyed v2 tables.
+            store.sync_release_units_into_v2(&registration.release.release_id, sesno)?;
+        }
+        registration.unit_index = Some(unit_index);
+    }
     if registration.status == ModelReleaseRegistrationStatus::Created
         && registration.release.release_status != target_status
     {

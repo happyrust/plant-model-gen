@@ -1,5 +1,10 @@
 # Goal: E3D Incremental Model Versioning
 
+> **OUTDATED (2026-07-16)**：下文多处以 `release_id` 作为「用户可见版本」与 DuckLake 版本身份。  
+> 已被 **`specs/023-ducklake-unit-version-by-sesno/`** 取代：交付单元真相键为 `(dbnum, refno, sesno)`；  
+> `release_id` 仅作 export-batch 过渡别名。PE/ATT 源行历史见 **`specs/022-versioned-pe-att-storage/`**。  
+> 读本 planning 目录时请以 023 ADR / inventory 为准，勿再按 release 图设计新功能。
+
 ## Objective
 
 Build a production-grade incremental model versioning path for the E3D site model workflow.

@@ -107,11 +107,16 @@ pub struct ModelReleaseRegisterRequest {
     pub parent_release_id: Option<String>,
     pub derivation_type: String,
     pub dbnum: u32,
+    /// specs/023：导出/登记对应的业务 sesno；用于同步写入 unit_versions_v2。
+    #[serde(default)]
+    pub export_sesno: Option<u32>,
     pub source_parquet_dir: PathBuf,
     pub release_root: PathBuf,
     pub ducklake: ModelVersionDuckLakeConfig,
     pub extra_metadata: Value,
     pub initial_status: ModelReleaseStatus,
+    #[serde(default)]
+    pub index_units: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -873,6 +878,7 @@ pub struct ModelReleaseRegistration {
     pub ducklake_metadata_path: PathBuf,
     pub ducklake_data_path: PathBuf,
     pub component_index: Option<ModelComponentSnapshotStats>,
+    pub unit_index: Option<ModelUnitIndexStats>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1249,4 +1255,151 @@ pub struct ModelComponentUnitImpactResponse {
     pub component_diff_summary: ModelComponentDiffSummary,
     pub summary: ModelComponentUnitImpactSummary,
     pub rows: Vec<ModelComponentUnitImpactRow>,
+}
+
+/// specs/023：交付单元版本主键 `(dbnum, unit_refno_u64, sesno)`。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitVersionV2Record {
+    pub dbnum: u32,
+    pub unit_refno_u64: u64,
+    pub sesno: u32,
+    pub project_name: String,
+    pub unit_refno_str: Option<String>,
+    pub unit_noun: Option<String>,
+    pub unit_key: Option<String>,
+    pub aggregate_hash: String,
+    pub hash_version: String,
+    pub rule_set_hash: Option<String>,
+    pub member_count: u64,
+    pub unresolved_member_count: u64,
+    pub member_signature: Option<String>,
+    pub package_relpath: Option<String>,
+    pub status: Option<String>,
+    pub label: Option<String>,
+    /// 过渡期只读兼容；新写入应保持 None。
+    pub legacy_release_id: Option<String>,
+    pub indexed_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpsertUnitVersionV2Request {
+    pub dbnum: u32,
+    pub unit_refno_u64: u64,
+    pub sesno: u32,
+    pub project_name: String,
+    pub unit_refno_str: Option<String>,
+    pub unit_noun: Option<String>,
+    pub unit_key: Option<String>,
+    pub aggregate_hash: String,
+    pub hash_version: String,
+    pub rule_set_hash: Option<String>,
+    pub member_count: u64,
+    pub unresolved_member_count: u64,
+    pub member_signature: Option<String>,
+    pub package_relpath: Option<String>,
+    pub status: Option<String>,
+    pub label: Option<String>,
+    pub legacy_release_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum UpsertUnitVersionV2Outcome {
+    Inserted { record: UnitVersionV2Record },
+    Unchanged { record: UnitVersionV2Record },
+}
+
+/// specs/023：单元成员行；`sesno` 为所属单元版本号（= max(member_sesno)）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitMembershipV2Record {
+    pub dbnum: u32,
+    pub unit_refno_u64: u64,
+    pub sesno: u32,
+    pub member_refno_u64: u64,
+    pub project_name: String,
+    pub unit_refno_str: Option<String>,
+    pub unit_noun: Option<String>,
+    pub unit_key: Option<String>,
+    pub member_refno_str: Option<String>,
+    pub member_noun: Option<String>,
+    pub member_sesno: u32,
+    pub component_hash: Option<String>,
+    pub membership_kind: Option<String>,
+    pub path_confidence: Option<f64>,
+    pub unresolved_reason: Option<String>,
+    pub membership_hash: Option<String>,
+    pub hash_version: Option<String>,
+    pub legacy_release_id: Option<String>,
+    pub indexed_at: String,
+}
+
+/// 单元 sesno = 成员组件 sesno 的最大值（specs/023 ADR）。
+pub fn unit_sesno_from_member_sesnos(member_sesnos: impl IntoIterator<Item = u32>) -> Option<u32> {
+    member_sesnos.into_iter().max()
+}
+
+/// specs/023：当 CLI 未传 `--release-id` 时，用 sesno 生成**遗留批次元数据**别名。
+/// 这不是版本身份真相源；真相键仍是 `(dbnum, refno, sesno)`。
+pub fn legacy_batch_id_for_sesno(dbnum: u32, sesno: u32) -> String {
+    format!("db{dbnum}-s{sesno}")
+}
+
+/// 解析 `legacy_batch_id_for_sesno` 生成的别名：`db{dbnum}-s{sesno}`。
+/// 用于 C3 dual-read：v2 未命中时从遗留 `unit_versions.release_id` 回退。
+pub fn parse_legacy_batch_id(release_id: &str) -> Option<(u32, u32)> {
+    let rest = release_id.trim().strip_prefix("db")?;
+    let (dbnum_str, sesno_str) = rest.split_once("-s")?;
+    let dbnum = dbnum_str.parse::<u32>().ok()?;
+    let sesno = sesno_str.parse::<u32>().ok()?;
+    Some((dbnum, sesno))
+}
+
+/// specs/023 E2：挂在 `(dbnum, refno, sesno)` 上的单元状态事件（非 release_id）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitVersionStatusEventV2 {
+    pub dbnum: u32,
+    pub unit_refno_u64: u64,
+    pub sesno: u32,
+    pub status: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+/// `model-version unit-v2-smoke` 输出（specs/023 B5）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitVersionV2SmokeReport {
+    pub ok: bool,
+    pub work_dir: PathBuf,
+    pub derived_sesno: u32,
+    pub expected_sesno: u32,
+    pub first_outcome: String,
+    pub second_outcome: String,
+    pub conflict_rejected: bool,
+    pub listed_count: usize,
+}
+
+/// specs/023 C2：按 sesno 对比单元版本。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitVersionV2DiffRow {
+    pub change_type: String,
+    pub unit_refno_u64: u64,
+    pub unit_refno_str: Option<String>,
+    pub unit_noun: Option<String>,
+    pub unit_key: Option<String>,
+    pub from_sesno: Option<u32>,
+    pub to_sesno: Option<u32>,
+    pub old_aggregate_hash: Option<String>,
+    pub new_aggregate_hash: Option<String>,
+    pub old_member_count: Option<u64>,
+    pub new_member_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnitVersionV2DiffResponse {
+    pub dbnum: u32,
+    pub from_sesno: u32,
+    pub to_sesno: u32,
+    pub unit_refno_u64: Option<u64>,
+    pub summary: ModelUnitDiffSummary,
+    pub rows: Vec<UnitVersionV2DiffRow>,
 }

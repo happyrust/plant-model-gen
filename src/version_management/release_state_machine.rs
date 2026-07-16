@@ -37,9 +37,12 @@ impl ModelReleaseStateMachineAction {
     }
 }
 
+/// specs/023 E2：状态机仍操作 **export-batch**（`release_id` / `db{N}-s{M}`），
+/// 不是交付单元版本身份。单元状态请用 `set_unit_version_status_v2`。
 #[derive(Clone, Debug)]
 pub struct ModelReleaseStateMachineRequest {
     pub ducklake: ModelVersionDuckLakeConfig,
+    /// Export-batch id（过渡别名），非 `(dbnum, refno, sesno)` 真相键。
     pub release_id: String,
     pub action: ModelReleaseStateMachineAction,
     pub reason: Option<String>,
@@ -73,7 +76,7 @@ pub fn run_model_release_state_machine(
     request: ModelReleaseStateMachineRequest,
 ) -> anyhow::Result<ModelReleaseStateMachineReport> {
     if request.release_id.trim().is_empty() {
-        anyhow::bail!("release_id is required");
+        anyhow::bail!("export-batch release_id is required (unit versions use unit-v2-set-status)");
     }
 
     let store = ModelVersionDuckLakeStore::open_writer(request.ducklake)?;

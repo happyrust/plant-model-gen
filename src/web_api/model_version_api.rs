@@ -176,9 +176,12 @@ struct RegisterReleaseRequest {
     parent_release_id: Option<String>,
     derivation_type: Option<String>,
     dbnum: u32,
+    /// specs/023: export sesno for unit_versions_v2 sync after index-units.
+    sesno: Option<u32>,
     parquet_dir: Option<PathBuf>,
     release_root: Option<PathBuf>,
     metadata_json: Option<Value>,
+    index_units: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +225,7 @@ struct IncrementalHandoffRequest {
     release_quality_reason: Option<String>,
     validation_flags: Option<Vec<String>>,
     metadata_json: Option<Value>,
+    index_units: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1927,6 +1931,8 @@ fn build_register_release_request(
         ducklake: context.ducklake.clone(),
         extra_metadata: metadata_json_object(request.metadata_json)?,
         initial_status: ModelReleaseStatus::Staged,
+        index_units: request.index_units.unwrap_or(false),
+        export_sesno: request.sesno,
     })
 }
 
@@ -2214,6 +2220,8 @@ fn build_incremental_handoff_register_request(
             ducklake: context.ducklake.clone(),
             extra_metadata,
             initial_status: ModelReleaseStatus::Staged,
+            index_units: request.index_units.unwrap_or(true),
+            export_sesno: Some(to_sesno),
         },
         handoff_manifest_path,
         handoff_manifest_hash,

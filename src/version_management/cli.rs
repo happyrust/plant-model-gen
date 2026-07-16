@@ -31,7 +31,8 @@ use crate::version_management::types::{
     ModelHistoryReplayPrepareRequest, ModelHistoryReplayValidationRequest,
     ModelMissingMeshRepairRequest, ModelPhysicalBaselineSnapshotRequest,
     ModelReleaseRegisterRequest, ModelSceneTreeArtifactRestoreRequest,
-    ModelSourceObservationResponse, ModelVersionDuckLakeConfig,
+    ModelSourceObservationResponse, ModelVersionDuckLakeConfig, legacy_batch_id_for_sesno,
+    parse_legacy_batch_id,
 };
 use crate::version_management::types::{ModelReleaseQuality, ModelReleaseStatus};
 use anyhow::Context;
@@ -51,9 +52,15 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Stable user-facing release id, e.g. ams-1112-sesno-897"),
+                        .help("DEPRECATED alias for package folder / legacy catalog row. Prefer omit and pass --sesno (auto db{dbnum}-s{sesno})"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("Export sesno for unit_versions_v2 sync (required when --release-id omitted)"),
                 )
                 .arg(
                     Arg::new("release-label")
@@ -152,6 +159,12 @@ pub fn model_version_command() -> Command {
                         .help("Optional extra metadata JSON object stored with the release"),
                 )
                 .arg(
+                    Arg::new("index-units")
+                        .long("index-units")
+                        .help("Rebuild delivery-unit membership and unit aggregate index after registration")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("json")
                         .long("json")
                         .help("Print pretty JSON")
@@ -164,9 +177,8 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Stable user-facing release id, e.g. ams-1112-sesno-897"),
+                        .help("DEPRECATED legacy catalog alias. Prefer omit; defaults to db{dbnum}-s{to-sesno}"),
                 )
                 .arg(
                     Arg::new("release-label")
@@ -544,13 +556,26 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("release-events")
-                .about("List lifecycle/status events for a model release")
+                .about("List lifecycle/status events for an export-batch release (not unit version identity)")
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Release id to inspect"),
+                        .help("Export-batch id; optional if --dbnum --sesno provided (db{N}-s{M})"),
+                )
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("With --sesno, resolve batch id as db{N}-s{M}"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("With --dbnum, resolve batch id as db{N}-s{M}"),
                 )
                 .arg(
                     Arg::new("project")
@@ -579,13 +604,24 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("reconcile-release")
-                .about("Explain or safely repair a release lifecycle after interrupted publish/index work")
+                .about("Reconcile export-batch release lifecycle (specs/023: not unit version identity; prefer unit-v2-set-status for units)")
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Release id to reconcile"),
+                        .help("Export-batch id; optional if --dbnum --sesno provided"),
+                )
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
                 )
                 .arg(
                     Arg::new("project")
@@ -1400,13 +1436,13 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("index-units")
-                .about("Rebuild delivery-unit memberships and aggregate unit versions for a model release")
+                .about("DEPRECATED (specs/023): rebuild unit versions keyed by release_id; prefer unit-v2-* / write_unit_version_with_members_v2")
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
                         .required(true)
                         .value_name("ID")
-                        .help("Release id to index"),
+                        .help("DEPRECATED release id; if db{N}-s{M}, sesno identity is preferred after sync"),
                 )
                 .arg(
                     Arg::new("project")
@@ -1430,6 +1466,270 @@ pub fn model_version_command() -> Command {
                     Arg::new("json")
                         .long("json")
                         .help("Print pretty JSON")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-smoke")
+                .about("specs/023 B5: smoke-test unit_versions_v2 upsert (max member sesno, idempotent, hash conflict)")
+                .arg(
+                    Arg::new("work-dir")
+                        .long("work-dir")
+                        .value_name("DIR")
+                        .help("Working directory for a temporary DuckLake catalog; defaults under std::env::temp_dir()"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .help("Print pretty JSON")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-get")
+                .alias("unit-get")
+                .about("specs/023: get one unit version by dbnum+refno+sesno")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64")
+                        .help("unit_refno_u64"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .value_name("PROJECT")
+                        .help("Project name override; defaults to DbOption project_name"),
+                )
+                .arg(
+                    Arg::new("ducklake-metadata")
+                        .long("ducklake-metadata")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ducklake-data")
+                        .long("ducklake-data")
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-list")
+                .alias("unit-list")
+                .about("specs/023: list unit versions for one refno ordered by sesno desc")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .value_name("PROJECT"),
+                )
+                .arg(
+                    Arg::new("ducklake-metadata")
+                        .long("ducklake-metadata")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ducklake-data")
+                        .long("ducklake-data")
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-diff")
+                .about("specs/023: diff unit versions between two sesnos (optional single --refno); also via unit-diff --dbnum --from-sesno --to-sesno")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("from-sesno")
+                        .long("from-sesno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("to-sesno")
+                        .long("to-sesno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64")
+                        .help("Optional: only diff this unit_refno_u64"),
+                )
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .default_value("200")
+                        .value_parser(clap::value_parser!(usize))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .value_name("PROJECT"),
+                )
+                .arg(
+                    Arg::new("ducklake-metadata")
+                        .long("ducklake-metadata")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ducklake-data")
+                        .long("ducklake-data")
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-set-status")
+                .about("specs/023 E2: set unit_versions_v2.status and append unit_version_status_events_v2")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("status")
+                        .long("status")
+                        .required(true)
+                        .value_name("STATUS")
+                        .help("e.g. indexed, published, quarantined"),
+                )
+                .arg(
+                    Arg::new("reason")
+                        .long("reason")
+                        .value_name("TEXT"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .value_name("PROJECT"),
+                )
+                .arg(
+                    Arg::new("ducklake-metadata")
+                        .long("ducklake-metadata")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ducklake-data")
+                        .long("ducklake-data")
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("unit-v2-events")
+                .about("specs/023 E2: list unit version status events by dbnum+refno+sesno")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64"),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .required(true)
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N"),
+                )
+                .arg(
+                    Arg::new("project")
+                        .long("project")
+                        .value_name("PROJECT"),
+                )
+                .arg(
+                    Arg::new("ducklake-metadata")
+                        .long("ducklake-metadata")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ducklake-data")
+                        .long("ducklake-data")
+                        .value_name("DIR"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
                         .action(clap::ArgAction::SetTrue),
                 ),
         )
@@ -1636,26 +1936,52 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-diff")
-                .about("Diff aggregate delivery-unit versions between two model releases")
+                .about("specs/023: diff delivery units by sesno (preferred) or legacy release_id")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("Required with --from-sesno/--to-sesno (specs/023 preferred path)"),
+                )
+                .arg(
+                    Arg::new("from-sesno")
+                        .long("from-sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("Baseline sesno (preferred; pairs with --to-sesno --dbnum)"),
+                )
+                .arg(
+                    Arg::new("to-sesno")
+                        .long("to-sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .value_name("N")
+                        .help("Target sesno (preferred; pairs with --from-sesno --dbnum)"),
+                )
+                .arg(
+                    Arg::new("refno")
+                        .long("refno")
+                        .value_parser(clap::value_parser!(u64))
+                        .value_name("U64")
+                        .help("Optional: only diff this unit_refno_u64 (sesno mode)"),
+                )
                 .arg(
                     Arg::new("from-release-id")
                         .long("from-release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Baseline release id"),
+                        .help("DEPRECATED: baseline release id; prefer --from-sesno. db{N}-s{M} maps to v2"),
                 )
                 .arg(
                     Arg::new("to-release-id")
                         .long("to-release-id")
-                        .required(true)
                         .value_name("ID")
-                        .help("Target release id"),
+                        .help("DEPRECATED: target release id; prefer --to-sesno. db{N}-s{M} maps to v2"),
                 )
                 .arg(
                     Arg::new("unit-noun")
                         .long("unit-noun")
                         .value_name("NOUN")
-                        .help("Optional delivery-unit noun filter: BRAN, HANG, EQUI/EQUIP, WALL, FLOOR, UNASSIGNED"),
+                        .help("Legacy release_id mode only: BRAN, HANG, EQUI/EQUIP, WALL, FLOOR, UNASSIGNED"),
                 )
                 .arg(
                     Arg::new("limit")
@@ -1785,6 +2111,14 @@ pub async fn handle_model_version_command(
                     response.release.release_status.as_str(),
                     response.release.immutable_package_dir.display()
                 );
+                if let Some(unit_index) = &response.unit_index {
+                    println!(
+                        "unit_index units={} members={} unresolved={}",
+                        unit_index.unit_count,
+                        unit_index.member_count,
+                        unit_index.unresolved_member_count
+                    );
+                }
             }
         }
         Some(("publish-history", sub)) => {
@@ -1940,10 +2274,8 @@ pub async fn handle_model_version_command(
         Some(("release-events", sub)) => {
             let project_name = project_name_from_matches(sub, db_option_ext);
             let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
-            let release_id = sub
-                .get_one::<String>("release-id")
-                .expect("required by clap");
-            let response = get_model_release_events(ducklake, release_id)?;
+            let release_id = resolve_export_batch_id(sub)?;
+            let response = get_model_release_events(ducklake, &release_id)?;
             if sub.get_flag("json") {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
@@ -1967,12 +2299,13 @@ pub async fn handle_model_version_command(
         Some(("reconcile-release", sub)) => {
             let project_name = project_name_from_matches(sub, db_option_ext);
             let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
-            let release_id = sub
-                .get_one::<String>("release-id")
-                .expect("required by clap");
+            let release_id = resolve_export_batch_id(sub)?;
+            eprintln!(
+                "info: reconcile-release operates on export-batch identity '{release_id}' (specs/023); unit status uses unit-v2-set-status"
+            );
             let report = reconcile_model_release(
                 ducklake,
-                release_id,
+                &release_id,
                 sub.get_flag("publish-if-complete"),
                 sub.get_flag("fail-if-unusable"),
             )?;
@@ -2286,6 +2619,14 @@ pub async fn handle_model_version_command(
             let release_id = sub
                 .get_one::<String>("release-id")
                 .expect("required by clap");
+            eprintln!(
+                "warning: index-units is DEPRECATED (specs/023); prefer write_unit_version_with_members_v2 / unit-v2-*"
+            );
+            if let Some((dbnum, sesno)) = parse_legacy_batch_id(release_id) {
+                eprintln!(
+                    "info: release_id parses as dbnum={dbnum} sesno={sesno}; register --index-units --sesno will sync into unit_versions_v2"
+                );
+            }
             let response = index_model_release_units(ducklake, release_id)?;
             if sub.get_flag("json") {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -2297,6 +2638,147 @@ pub async fn handle_model_version_command(
                     response.member_count,
                     response.unresolved_member_count
                 );
+            }
+        }
+        Some(("unit-v2-smoke", sub)) => {
+            let work_dir = sub
+                .get_one::<String>("work-dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!(
+                        "aios-unit-v2-smoke-{}",
+                        chrono::Utc::now().timestamp_millis()
+                    ))
+                });
+            let report = ModelVersionDuckLakeStore::smoke_unit_version_v2(&work_dir)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "unit-v2-smoke ok={} derived_sesno={} first={} second={} conflict_rejected={} listed={} work_dir={}",
+                    report.ok,
+                    report.derived_sesno,
+                    report.first_outcome,
+                    report.second_outcome,
+                    report.conflict_rejected,
+                    report.listed_count,
+                    report.work_dir.display()
+                );
+            }
+        }
+        Some(("unit-v2-get", sub)) => {
+            let project_name = project_name_from_matches(sub, db_option_ext);
+            let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
+            let store = ModelVersionDuckLakeStore::open(ducklake)?;
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let refno = *sub.get_one::<u64>("refno").expect("required");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required");
+            let record = store.get_unit_version_v2(dbnum, refno, sesno)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else {
+                match record {
+                    Some(r) => println!(
+                        "unit dbnum={} refno={} sesno={} hash={} members={}",
+                        r.dbnum, r.unit_refno_u64, r.sesno, r.aggregate_hash, r.member_count
+                    ),
+                    None => println!("unit version not found"),
+                }
+            }
+        }
+        Some(("unit-v2-list", sub)) => {
+            let project_name = project_name_from_matches(sub, db_option_ext);
+            let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
+            let store = ModelVersionDuckLakeStore::open(ducklake)?;
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let refno = *sub.get_one::<u64>("refno").expect("required");
+            let rows = store.list_unit_versions_v2(dbnum, refno)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for r in rows {
+                    println!(
+                        "sesno={} hash={} members={} indexed_at={}",
+                        r.sesno, r.aggregate_hash, r.member_count, r.indexed_at
+                    );
+                }
+            }
+        }
+        Some(("unit-v2-diff", sub)) => {
+            let project_name = project_name_from_matches(sub, db_option_ext);
+            let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
+            let store = ModelVersionDuckLakeStore::open(ducklake)?;
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required");
+            let refno = sub.get_one::<u64>("refno").copied();
+            let limit = *sub.get_one::<usize>("limit").expect("default");
+            let response =
+                store.diff_unit_versions_v2(dbnum, from_sesno, to_sesno, refno, limit)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!(
+                    "diff dbnum={} {}->{} added={} deleted={} changed={} unchanged={} emitted={}",
+                    response.dbnum,
+                    response.from_sesno,
+                    response.to_sesno,
+                    response.summary.added,
+                    response.summary.deleted,
+                    response.summary.changed,
+                    response.summary.unchanged,
+                    response.summary.emitted
+                );
+                for row in response.rows {
+                    println!(
+                        "{} refno={} old_hash={:?} new_hash={:?}",
+                        row.change_type, row.unit_refno_u64, row.old_aggregate_hash, row.new_aggregate_hash
+                    );
+                }
+            }
+        }
+        Some(("unit-v2-set-status", sub)) => {
+            let project_name = project_name_from_matches(sub, db_option_ext);
+            let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
+            let store = ModelVersionDuckLakeStore::open_writer(ducklake)?;
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let refno = *sub.get_one::<u64>("refno").expect("required");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required");
+            let status = sub.get_one::<String>("status").expect("required");
+            let reason = sub.get_one::<String>("reason").map(String::as_str);
+            let record = store.set_unit_version_status_v2(dbnum, refno, sesno, status, reason)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else {
+                println!(
+                    "unit status dbnum={} refno={} sesno={} status={}",
+                    record.dbnum,
+                    record.unit_refno_u64,
+                    record.sesno,
+                    record.status.unwrap_or_default()
+                );
+            }
+        }
+        Some(("unit-v2-events", sub)) => {
+            let project_name = project_name_from_matches(sub, db_option_ext);
+            let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
+            let store = ModelVersionDuckLakeStore::open(ducklake)?;
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+            let refno = *sub.get_one::<u64>("refno").expect("required");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required");
+            let events = store.list_unit_version_events_v2(dbnum, refno, sesno)?;
+            if sub.get_flag("json") {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                println!("events={}", events.len());
+                for event in events {
+                    println!(
+                        "{} status={} reason={}",
+                        event.created_at,
+                        event.status,
+                        event.reason.unwrap_or_default()
+                    );
+                }
             }
         }
         Some(("index-assets", sub)) => {
@@ -2423,37 +2905,130 @@ pub async fn handle_model_version_command(
         Some(("unit-diff", sub)) => {
             let project_name = project_name_from_matches(sub, db_option_ext);
             let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
-            let from_release_id = sub
-                .get_one::<String>("from-release-id")
-                .expect("required by clap");
-            let to_release_id = sub
-                .get_one::<String>("to-release-id")
-                .expect("required by clap");
             let limit = sub
                 .get_one::<usize>("limit")
                 .copied()
                 .expect("default value ensures this exists");
-            let unit_noun = sub.get_one::<String>("unit-noun").map(String::as_str);
-            let response = diff_model_release_units(
-                ducklake,
-                from_release_id,
-                to_release_id,
-                limit,
-                unit_noun,
-            )?;
-            if sub.get_flag("json") {
-                println!("{}", serde_json::to_string_pretty(&response)?);
+            let from_sesno = sub.get_one::<u32>("from-sesno").copied();
+            let to_sesno = sub.get_one::<u32>("to-sesno").copied();
+            let dbnum = sub.get_one::<u32>("dbnum").copied();
+            let refno = sub.get_one::<u64>("refno").copied();
+            let from_release_id = sub.get_one::<String>("from-release-id").cloned();
+            let to_release_id = sub.get_one::<String>("to-release-id").cloned();
+
+            let sesno_mode = match (dbnum, from_sesno, to_sesno) {
+                (Some(db), Some(from), Some(to)) => Some((db, from, to)),
+                (None, None, None) => None,
+                _ => anyhow::bail!(
+                    "unit-diff sesno mode requires --dbnum --from-sesno --to-sesno together (specs/023)"
+                ),
+            };
+
+            if let Some((db, from, to)) = sesno_mode {
+                if from_release_id.is_some() || to_release_id.is_some() {
+                    eprintln!(
+                        "warning: unit-diff ignoring deprecated --from-release-id/--to-release-id because sesno mode is set"
+                    );
+                }
+                if sub.get_one::<String>("unit-noun").is_some() {
+                    eprintln!(
+                        "warning: --unit-noun is not applied in sesno mode; use unit-v2-diff filters later if needed"
+                    );
+                }
+                let store = ModelVersionDuckLakeStore::open(ducklake)?;
+                let response = store.diff_unit_versions_v2(db, from, to, refno, limit)?;
+                if sub.get_flag("json") {
+                    println!("{}", serde_json::to_string_pretty(&response)?);
+                } else {
+                    println!(
+                        "diff dbnum={} {}->{} added={} deleted={} changed={} unchanged={} emitted={}",
+                        response.dbnum,
+                        response.from_sesno,
+                        response.to_sesno,
+                        response.summary.added,
+                        response.summary.deleted,
+                        response.summary.changed,
+                        response.summary.unchanged,
+                        response.summary.emitted
+                    );
+                    for row in response.rows {
+                        println!(
+                            "{} refno={} old_hash={:?} new_hash={:?}",
+                            row.change_type,
+                            row.unit_refno_u64,
+                            row.old_aggregate_hash,
+                            row.new_aggregate_hash
+                        );
+                    }
+                }
             } else {
-                println!(
-                    "{} -> {} unit_added={} unit_deleted={} unit_changed={} unit_unchanged={} emitted={}",
-                    response.from_release_id,
-                    response.to_release_id,
-                    response.summary.added,
-                    response.summary.deleted,
-                    response.summary.changed,
-                    response.summary.unchanged,
-                    response.summary.emitted
+                let from_release_id = from_release_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unit-diff requires either (--dbnum --from-sesno --to-sesno) or (--from-release-id --to-release-id)"
+                    )
+                })?;
+                let to_release_id = to_release_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unit-diff requires either (--dbnum --from-sesno --to-sesno) or (--from-release-id --to-release-id)"
+                    )
+                })?;
+                eprintln!(
+                    "warning: unit-diff --from-release-id/--to-release-id is DEPRECATED (specs/023); prefer --dbnum --from-sesno --to-sesno"
                 );
+                // Map parseable db{{N}}-s{{M}} aliases onto v2 diff when both sides agree on dbnum.
+                match (
+                    parse_legacy_batch_id(&from_release_id),
+                    parse_legacy_batch_id(&to_release_id),
+                ) {
+                    (Some((from_db, from)), Some((to_db, to))) if from_db == to_db => {
+                        eprintln!(
+                            "info: mapped release_id aliases to sesno mode dbnum={from_db} {from}->{to}"
+                        );
+                        let store = ModelVersionDuckLakeStore::open(ducklake)?;
+                        let response =
+                            store.diff_unit_versions_v2(from_db, from, to, refno, limit)?;
+                        if sub.get_flag("json") {
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        } else {
+                            println!(
+                                "diff dbnum={} {}->{} added={} deleted={} changed={} unchanged={} emitted={}",
+                                response.dbnum,
+                                response.from_sesno,
+                                response.to_sesno,
+                                response.summary.added,
+                                response.summary.deleted,
+                                response.summary.changed,
+                                response.summary.unchanged,
+                                response.summary.emitted
+                            );
+                        }
+                    }
+                    _ => {
+                        let unit_noun =
+                            sub.get_one::<String>("unit-noun").map(String::as_str);
+                        let response = diff_model_release_units(
+                            ducklake,
+                            &from_release_id,
+                            &to_release_id,
+                            limit,
+                            unit_noun,
+                        )?;
+                        if sub.get_flag("json") {
+                            println!("{}", serde_json::to_string_pretty(&response)?);
+                        } else {
+                            println!(
+                                "{} -> {} unit_added={} unit_deleted={} unit_changed={} unit_unchanged={} emitted={}",
+                                response.from_release_id,
+                                response.to_release_id,
+                                response.summary.added,
+                                response.summary.deleted,
+                                response.summary.changed,
+                                response.summary.unchanged,
+                                response.summary.emitted
+                            );
+                        }
+                    }
+                }
             }
         }
         Some(("impact", sub)) => {
@@ -2819,10 +3394,16 @@ fn build_register_request(
         .get_one::<u32>("dbnum")
         .copied()
         .expect("required by clap");
-    let release_id = sub
-        .get_one::<String>("release-id")
-        .expect("required by clap")
-        .to_string();
+    let export_sesno = sub.get_one::<u32>("sesno").copied();
+    let release_id = match sub.get_one::<String>("release-id") {
+        Some(id) => id.to_string(),
+        None => {
+            let sesno = export_sesno.ok_or_else(|| {
+                anyhow::anyhow!("register requires --sesno when --release-id is omitted (specs/023)")
+            })?;
+            legacy_batch_id_for_sesno(dbnum, sesno)
+        }
+    };
     let source_parquet_dir = sub
         .get_one::<String>("parquet-dir")
         .map(PathBuf::from)
@@ -2860,11 +3441,13 @@ fn build_register_request(
             .expect("default value ensures this exists")
             .to_string(),
         dbnum,
+        export_sesno,
         source_parquet_dir,
         release_root,
         ducklake,
         extra_metadata,
         initial_status: ModelReleaseStatus::Staged,
+        index_units: sub.get_flag("index-units"),
     })
 }
 
@@ -2877,10 +3460,14 @@ fn build_publish_history_request(
         .get_one::<u32>("dbnum")
         .copied()
         .expect("required by clap");
+    let to_sesno = sub
+        .get_one::<u32>("to-sesno")
+        .copied()
+        .expect("required by clap");
     let release_id = sub
         .get_one::<String>("release-id")
-        .expect("required by clap")
-        .to_string();
+        .cloned()
+        .unwrap_or_else(|| legacy_batch_id_for_sesno(dbnum, to_sesno));
     let source_parquet_dir = sub
         .get_one::<String>("parquet-dir")
         .map(PathBuf::from)
@@ -2932,10 +3519,7 @@ fn build_publish_history_request(
             .get_one::<u32>("from-sesno")
             .copied()
             .expect("required by clap"),
-        to_sesno: sub
-            .get_one::<u32>("to-sesno")
-            .copied()
-            .expect("required by clap"),
+        to_sesno,
         source_parquet_dir,
         current_parquet_dir,
         scene_tree_dir: sub.get_one::<String>("scene-tree-dir").map(PathBuf::from),
@@ -3285,6 +3869,25 @@ fn build_scene_tree_artifact_restore_request(
         overwrite_tree: sub.get_flag("overwrite-tree"),
         dry_run: sub.get_flag("dry-run"),
     })
+}
+
+/// specs/023：export-batch id = `--release-id` 或 `db{dbnum}-s{sesno}`。
+fn resolve_export_batch_id(sub: &ArgMatches) -> anyhow::Result<String> {
+    if let Some(id) = sub.get_one::<String>("release-id") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    match (
+        sub.get_one::<u32>("dbnum").copied(),
+        sub.get_one::<u32>("sesno").copied(),
+    ) {
+        (Some(dbnum), Some(sesno)) => Ok(legacy_batch_id_for_sesno(dbnum, sesno)),
+        _ => anyhow::bail!(
+            "require --release-id, or both --dbnum and --sesno (maps to db{{N}}-s{{M}} export batch)"
+        ),
+    }
 }
 
 fn project_name_from_matches(sub: &ArgMatches, db_option_ext: &DbOptionExt) -> String {

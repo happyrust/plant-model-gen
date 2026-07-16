@@ -105,9 +105,9 @@
 
 ## Phase 5: Polish & Cross-Cutting
 
-- [ ] T024 [P] 把七项 grill 决策要点沉淀到 AGENTS.md（versioned 实例约束:同 dbnum 增量串行、retention 语义、锚点是唯一业务入口）
-- [ ] T025 [P] `docs/` 或 spec 目录补一页运维说明:磁盘水位观察建议、retention 调整方式（改配置重启即可,无需重建库）、未开 MODEL_KV 站点的磁盘代价警示
-- [ ] T026 跑一遍 quickstart.md 全流程终验
+- [x] T024 [P] 七项决策要点与运维约束精简版已写入根 `AGENTS.md`（建库属性 / 串行增量 / 锚点入口 / retention / MODEL_KV / 023 共存）；全文见 `ops-notes.md`。2026-07-16
+- [x] T025 [P] `specs/022-versioned-pe-att-storage/ops-notes.md`：磁盘水位观察、retention 调整（改 toml 重启、无需重建库）、未开 MODEL_KV 警示、与 T022 管理端行为对齐。2026-07-16
+- [ ] T026 跑一遍 quickstart.md 全流程终验（依赖 T023 真站；契约级冒烟已由 T012/T020 覆盖）
 
 ---
 

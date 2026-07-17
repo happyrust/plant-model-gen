@@ -550,7 +550,7 @@ pub async fn start_web_server_with_config(
 
     // 所有"无状态" web_api 路由（room_tree / pdms_attr / pdms_transform / ptset /
     // pdms_model_query / review_integration / platform_api / jwt_auth / review_api /
-    // scene_tree / mbd_pipe / pipeline_annotation(nest) / version(nest)）
+    // scene_tree / pipeline_annotation(nest) / version(nest)）
     // 统一交给 assemble_stateless_web_api_routes 装配，避免新增路由忘记 .merge() 的静默遗漏
     // （历史教训：2026-04-23 pdms_transform 漏挂载，详见 docs/plans/2026-04-23-*）
     let stateless_web_api_routes = assemble_stateless_web_api_routes();

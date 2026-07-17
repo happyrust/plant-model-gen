@@ -196,7 +196,7 @@ async fn get_children(Query(query): Query<RefnoQuery>) -> Result<Response, Statu
         if let Ok(Some(pe)) = aios_core::get_pe(refno_enum.clone()).await {
             let noun = pe.noun.trim().to_uppercase();
             if noun == "BRAN" || noun == "HANG" {
-                // 复用 mbd_pipe_api 的 SurrealQL 口径：tubi_relate 的 in 即 leave_refno，id[1] 为顺序
+                // tubi_relate 的 in 即 leave_refno，id[1] 为顺序
                 aios_core::init_surreal()
                     .await
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

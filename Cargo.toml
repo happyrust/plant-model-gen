@@ -182,7 +182,6 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"]
 #   web_server      基础 Web HTTP 服务（axum + 周边，不带业务扩展）
 #   gen_model       模型几何生成开关（aios_core 转发）
 #   parquet-export  Parquet 列式导出（拉 polars/arrow/ethnum，重）
-#   mbd-pipe        MBD 管线读 parquet（mbd_pipe_api.rs，依赖 parquet-export）
 #   excel-export    Excel 数据导出（data_to_excel，已弃用但保留 hook）
 #   kv-rocksdb      RocksDB 嵌入后端（C++ 编译重）
 #   full            完整产物，默认仍使用 SurrealDB ws 模式；RocksDB/file 需显式启用 review-rocksdb 或 kv-rocksdb。
@@ -228,9 +227,6 @@ transform-store-parquet = ["parquet-export"]
 transform-store-ducklake = ["transform-store-parquet"]
 transform-store-compare = []
 
-# MBD 管线读 parquet（web_api/mbd_pipe_api.rs）
-mbd-pipe = ["parquet-export", "mbd-iso"]
-
 # Excel 数据导出（data_to_excel/，目前模块已注释，保留 hook）
 excel-export = ["dep:rust_xlsxwriter"]
 
@@ -243,7 +239,6 @@ spec-loader = ["dep:calamine", "aios_core/spec-loader"]
 full = [
     "review",
     "parquet-export",
-    "mbd-pipe",
     "excel-export",
     "spec-loader",
     "mqtt",
@@ -278,13 +273,9 @@ kv-rocksdb = [
 ] # 嵌入式 RocksDB 后端，默认不编译以加快构建
 project_hd = []
 project_hh = []
-# mbd-iso: 启用 rs-core (`aios_core::mbd`) 的 branch-level solver。
-# V1 的 `layout_result` 与 V2 `/api/mbd/v2/pipe/{refno}` 都依赖它。
-# 未开启时 MBD 数据里的 `layout_result` 字段会降级为 None，V2 API 会返回失败。
-mbd-iso = []
 profile = ["dep:tracing-chrome"] #性能分析，包含tracing功能
 
-# Web HTTP 服务（axum + 周边）。仅基础能力，不带 parquet/mbd 等业务扩展。
+# Web HTTP 服务（axum + 周边）。仅基础能力，不带 parquet 等业务扩展。
 web_server = [
     "dep:axum",
     "dep:axum-extra",

@@ -34,7 +34,6 @@ set -euo pipefail
 #   REMOTE_MESHES_PATH         默认 /root/assets/meshes     → 顶层 meshes_path
 #   REMOTE_SURREAL_SCRIPT_DIR  默认 /root/resource/surreal   → 顶层 surreal_script_dir
 #   REMOTE_SURREAL_DATA_PATH   默认 /root/surreal_data/ams-8020.db → [web_server].surreal_data_path、[surrealdb].path
-#   REMOTE_SURREALKV_DATA_PATH 默认 /root/surreal_data/ams-8020.db.kv → [surrealkv].path
 #   DEPLOY_APPLY_DB_PATH_OVERRIDES 默认 true；设为 false 则原样上传 DbOption（不写上述键）
 
 REMOTE_HOST="${REMOTE_HOST:-123.57.182.243}"
@@ -85,7 +84,6 @@ REMOTE_DB_OPTION="/root/DbOption.toml"
 # 使用 := 以便 CI 传入空字符串时仍回落到默认
 : "${REMOTE_PROJECT_PATH:=/root/e3d_models}"
 : "${REMOTE_SURREAL_DATA_PATH:=/root/surreal_data/ams-8020.db}"
-: "${REMOTE_SURREALKV_DATA_PATH:=/root/surreal_data/ams-8020.db.kv}"
 : "${REMOTE_MESHES_PATH:=/root/assets/meshes}"
 : "${REMOTE_SURREAL_SCRIPT_DIR:=/root/resource/surreal}"
 : "${DEPLOY_APPLY_DB_PATH_OVERRIDES:=true}"
@@ -251,10 +249,9 @@ apply_dboption_deploy_paths_from_env() {
     --project-path "$REMOTE_PROJECT_PATH" \
     --meshes-path "$REMOTE_MESHES_PATH" \
     --surreal-script-dir "$REMOTE_SURREAL_SCRIPT_DIR" \
-    --surreal-data-path "$REMOTE_SURREAL_DATA_PATH" \
-    --surrealkv-path "$REMOTE_SURREALKV_DATA_PATH"
+    --surreal-data-path "$REMOTE_SURREAL_DATA_PATH"
   mv "$out" "$f"
-  log "DbOption 已按环境变量写入路径: project_path meshes_path surreal_script_dir + [web_server]/[surrealdb]/[surrealkv]"
+  log "DbOption 已按环境变量写入路径: project_path meshes_path surreal_script_dir + [web_server]/[surrealdb]"
 }
 
 resolve_target_dir() {

@@ -164,14 +164,6 @@ user = "root"
 password = "root"
 path = "D:/backup-dbs/ams-8020.db"
 
-# SurrealKV 连接配置 (模型数据写入)
-# 默认关闭独立 SurrealKV，模型写回主 SurrealDB。
-[surrealkv]
-enabled = false
-mode = "ws"
-path = "D:/backup-dbs/ams-8020.db.kv"
-
-
 # 精度配置（LOD 分级：数字越大，几何更粗，用于远距渲染）
 [mesh_precision]
 default_lod = "L2"

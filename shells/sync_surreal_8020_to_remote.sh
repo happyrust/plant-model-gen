@@ -8,7 +8,6 @@
 #
 # 可选环境变量：
 #   LOCAL_SURREAL_DB   本地 rocksdb 目录，默认 /Volumes/DPC/work/db-data/ams-8020.db
-#   LOCAL_SURREAL_KV   本地 surrealkv 路径（文件或目录），默认同目录下 ams-8020.db.kv（存在才同步）
 #   REMOTE_SURREAL_DATA_DIR  远端父目录，默认 /root/surreal_data
 #   REMOTE_SURREAL_BIN  远端 surreal 绝对路径，默认 /usr/bin/surreal
 #   INSTALL_SYSTEMD   是否写入并启用 systemd，默认 true
@@ -26,7 +25,6 @@ REMOTE_USER="${REMOTE_USER:-root}"
 REMOTE_PASS="${REMOTE_PASS:-}"
 
 LOCAL_SURREAL_DB="${LOCAL_SURREAL_DB:-/Volumes/DPC/work/db-data/ams-8020.db}"
-LOCAL_SURREAL_KV="${LOCAL_SURREAL_KV:-/Volumes/DPC/work/db-data/ams-8020.db.kv}"
 REMOTE_SURREAL_DATA_DIR="${REMOTE_SURREAL_DATA_DIR:-/root/surreal_data}"
 REMOTE_DB_DIR_NAME="${REMOTE_DB_DIR_NAME:-ams-8020.db}"
 # 多数手动安装的 surreal 在 /usr/local/bin；包管理器可能在 /usr/bin
@@ -112,15 +110,6 @@ if [[ -d "$LOCAL_SURREAL_DB" ]]; then
 else
   log "rsync 单文件"
   retry_rsync "$LOCAL_SURREAL_DB" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DB_PATH}"
-fi
-
-if [[ -e "$LOCAL_SURREAL_KV" ]]; then
-  log "同步 SurrealKV: $LOCAL_SURREAL_KV"
-  if [[ -d "$LOCAL_SURREAL_KV" ]]; then
-    retry_rsync "${LOCAL_SURREAL_KV}/" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_SURREAL_DATA_DIR}/$(basename "$LOCAL_SURREAL_KV")/"
-  else
-    retry_rsync "$LOCAL_SURREAL_KV" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_SURREAL_DATA_DIR}/$(basename "$LOCAL_SURREAL_KV")"
-  fi
 fi
 
 log "安装远端启动脚本"

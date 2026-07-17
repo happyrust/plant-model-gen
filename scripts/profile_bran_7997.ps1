@@ -242,7 +242,7 @@ try {
 
   $perfDir = ("output/{0}/profile" -f $projectName).Replace('\', '/')
 
-  # 嵌入式 SurrealKV 模式：自动停掉占用数据目录的 SurrealDB 服务进程
+  # 嵌入式 SurrealDB(RocksDB) 模式：自动停掉占用数据目录的 SurrealDB 服务进程
   $skvPath = Get-TomlStringValue $toml "surreal_local_path"
   if ($skvPath) {
     $vPort = Get-TomlStringValue $baseToml "v_port"

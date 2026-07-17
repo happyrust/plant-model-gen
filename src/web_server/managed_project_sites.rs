@@ -2218,14 +2218,6 @@ fn build_site_config(
 
     apply_site_db_mode_config(table, site, db_user, db_password, ManagedSiteDbMode::Ws);
 
-    let surrealkv = ensure_table(table, "surrealkv");
-    set_toml_bool(surrealkv, "enabled", false);
-    set_toml_string(
-        surrealkv,
-        "path",
-        format!("{}.kv", site.db_data_path.replace('\\', "/")),
-    );
-
     Ok(toml::to_string_pretty(&value)?)
 }
 

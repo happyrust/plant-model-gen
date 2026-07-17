@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-17
+
+### Removed — 移除 SurrealKV/MODEL_KV 模型库分离机制
+
+> 「SurrealKV」双库分离（模型数据写独立 KV 实例）自 KV 引擎换 RocksDB 后仅剩配置壳，且所有现行配置均为 `enabled=false`；本次连同 rs-core（`2a03db7d`）一起整体移除，模型数据固定与 PE/ATT 同库写 SUL_DB，`model_primary_db()` 保留为兼容别名。
+
+- `managed_project_sites.rs` 站点配置生成不再写 `[surrealkv]` 段；`db_options/`、`runtime/local-collab/`、`runtime/admin_verify/` 共 19 个 DbOption toml 清除 `[surrealkv]` 段（旧 toml 残留该段仍可被忽略解析，不影响启动）。
+- 修正 `db-data/DbOption-t020-history.toml`：`versioned_storage/version_retention` 原误置于 `[surrealkv]` 段内（TOML 语义下从未生效），上移到根级；`DbOption-aba.toml` 中同样误置于该段内的一批调试键随段删除（本就未生效）。
+- 打包/部署脚本同步：`build-windows-bundle.ps1` 去掉 surrealkv 键组；`apply_dboption_deploy_paths.py` 去掉 `--surrealkv-path`；`deploy_web_server_bundle.sh` 去掉 `REMOTE_SURREALKV_DATA_PATH`；`sync_surreal_8020_to_remote.sh` 去掉 `.kv` 目录同步。
+- 文档口径更新：`AGENTS.md` 022 段改为「模型数据同库、versioned 站点模型表一并版本化」；`specs/022 ops-notes.md` 决策 #1 与磁盘水位条目加更新注记；`docs/guides/SURREAL_REMOTE_SYNC.md`、归档计划 `2026-02-25-surrealkv-model-write-separation.md` 同步。
+- 验证：rs-core 与本仓 `cargo check` 通过；全部改动 toml 经 tomllib 语法校验（22/22）。注：`shells/systemd` 与 `apply_surreal_rocks_8020_remote.sh` 中的 “surrealkv” 指远端旧存储引擎服务，与本机制无关，未改动。
+
 ## 2026-06-25
 
 ### Added — 模型版本发布、增量更新与对比流水线

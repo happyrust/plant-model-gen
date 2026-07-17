@@ -136,8 +136,3 @@ password = "root"
 path = "runtime/bran-closure/surreal.db"
 port = 8031
 user = "root"
-
-[surrealkv]
-enabled = false
-mode = "ws"
-path = "runtime/bran-closure/surreal.db.kv"

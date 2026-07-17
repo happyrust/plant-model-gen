@@ -265,14 +265,3 @@ ip = "127.0.0.1"
 port = 8020
 user = "root"
 password = "root"
-
-# ====== SurrealKV 连接配置 (phase7 持久化写入对比专用 sidecar) ======
-# enabled = true + mode = "ws" + port = 8030 → 模型写入流向独立 sidecar，
-# 不污染共享 1516/AvevaMarineSample 主库
-[surrealkv]
-enabled = true
-mode = "ws"
-ip = "127.0.0.1"
-port = 8030
-user = "root"
-password = "root"

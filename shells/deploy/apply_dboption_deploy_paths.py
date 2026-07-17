@@ -32,11 +32,6 @@ def main() -> int:
         dest="surreal_data_path",
         help="[web_server].surreal_data_path 与 [surrealdb].path",
     )
-    ap.add_argument(
-        "--surrealkv-path",
-        dest="surrealkv_path",
-        help="[surrealkv].path",
-    )
     args = ap.parse_args()
 
     section = "_root_"
@@ -78,10 +73,6 @@ def main() -> int:
             elif section == "surrealdb" and args.surreal_data_path:
                 if re.match(r"^\s*path\s*=", line):
                     out_lines.append(_assignment_line("path", args.surreal_data_path))
-                    replaced = True
-            elif section == "surrealkv" and args.surrealkv_path:
-                if re.match(r"^\s*path\s*=", line):
-                    out_lines.append(_assignment_line("path", args.surrealkv_path))
                     replaced = True
 
             if not replaced:

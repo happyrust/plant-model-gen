@@ -11,6 +11,11 @@ sync_live = false
 enable_index = false
 sync_chunk_size = 10_0000
 
+# specs/022: versioned 存储开关（建库属性，仅配合全新数据目录使用）
+# 注：原先误置于文件尾部 [surrealkv] 段内（TOML 语义下不生效），现移到根级
+versioned_storage = true
+version_retention = "30d"
+
 # ====== 项目设置 ======
 project_path = "D:/AVEVA/Projects/E3D2.1"
 admin_allowed_project_roots = ["D:/AVEVA/Projects"]
@@ -265,14 +270,3 @@ ip = "127.0.0.1"
 port = 8030
 user = "root"
 password = "root"
-
-# ====== SurrealKV 连接配置 (模型数据写入) ======
-# enabled = false 时模型数据写回主 SurrealDB，避免跨库 pe 表缺失
-[surrealkv]
-enabled = false
-mode = "ws"
-path = "D:/backup-dbs/ams-8020.db.kv"
-
-versioned_storage = true
-version_retention = "30d"
-

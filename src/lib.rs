@@ -10,20 +10,25 @@
 
 use crate::data_interface::tidb_manager::AiosDBManager;
 
-use crate::fast_model::cal_model::{update_cal_bran_component, update_cal_equip};
-
 #[cfg(feature = "gen_model")]
 use crate::fast_model::gen_all_geos_data;
 
-// build_room_relations 支持 CLI/web_server + sqlite-index
+// build_room_relations 支持 CLI/web_server + sqlite-index（实现依赖 gen_model 的 fast_model）
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "sqlite-index",
+    feature = "gen_model"
+))]
 use crate::fast_model::room_model::build_room_relations;
 
 // 当条件不满足时提供 stub
 
-#[cfg(not(all(not(target_arch = "wasm32"), feature = "sqlite-index")))]
-
+#[cfg(not(all(
+    not(target_arch = "wasm32"),
+    feature = "sqlite-index",
+    feature = "gen_model"
+)))]
 pub async fn build_room_relations(
     _db_option: &aios_core::options::DbOption,
 
@@ -31,12 +36,10 @@ pub async fn build_room_relations(
 
     _refno_root: Option<aios_core::RefnoEnum>,
 ) -> anyhow::Result<()> {
-    log::info!("⚠️ build_room_relations 功能需要 sqlite-index 特性");
+    log::info!("⚠️ build_room_relations 功能需要 sqlite-index + gen_model 特性");
 
     Ok(())
 }
-
-use crate::fast_model::mesh_generate::{gen_inst_meshes, process_meshes_update_db_deep};
 
 use crate::versioned_db::database::*;
 
@@ -399,6 +402,12 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
     //如果没有生成完，需要等待
 
+    #[cfg(not(feature = "gen_model"))]
+    if db_option.is_gen_mesh_or_model() {
+        anyhow::bail!("gen_mesh/gen_model 需要 gen_model feature（sync-cli 瘦构建不含模型生成）");
+    }
+
+    #[cfg(feature = "gen_model")]
     if db_option.is_gen_mesh_or_model() {
         log::info!("正在生成模型");
 
@@ -623,8 +632,6 @@ pub fn init_logging(enable_log: bool) {
 pub async fn run_app(option: Option<DbOptionExt>) -> anyhow::Result<()> {
     use std::sync::mpsc;
 
-    use crate::fast_model::aabb_tree::manual_update_aabbs;
-
     // 如果传入的是DbOptionExt，则使用它，否则从配置文件加载
 
     let db_option_ext = option.unwrap_or_else(|| get_db_option_ext());
@@ -671,8 +678,6 @@ pub async fn run_app(option: Option<DbOptionExt>) -> anyhow::Result<()> {
 /// 内部应用运行逻辑
 
 async fn run_app_internal(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> {
-    use crate::fast_model::aabb_tree::manual_update_aabbs;
-
     // 初始化日志系统（在所有操作之前）
 
     init_logging(db_option_ext.inner.enable_log);

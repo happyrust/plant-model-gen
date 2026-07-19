@@ -19,7 +19,8 @@ fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
 }
 
 fn default_version_retention() -> String {
-    "90d".to_string()
+    // specs/022：用户决策默认无限保留（"0"）；磁盘只增不减，站点需评估盘余量。
+    "0".to_string()
 }
 
 /// 构造 SurrealDB RocksDB 连接串（用于 `surreal start` 与嵌入式 open）。
@@ -81,7 +82,9 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
             ModelWriterMode::DrainOnly
         }
         Some(mode) if mode == "ducklake" || mode == "duck-lake" || mode == "duck_lake" => {
-            ModelWriterMode::DuckLake
+            // DuckLake backend removed; fall back to Surreal so old configs still load.
+            eprintln!("警告: model_writer=ducklake 已移除，回退为 surreal");
+            ModelWriterMode::Surreal
         }
         Some(_) | None => ModelWriterMode::Surreal,
     }
@@ -90,7 +93,10 @@ fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
 pub fn parse_transform_write_backend(raw: Option<&str>) -> TransformWriteBackend {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
         Some(mode) if mode == "parquet" => TransformWriteBackend::Parquet,
-        Some(mode) if mode == "ducklake" => TransformWriteBackend::DuckLake,
+        Some(mode) if mode == "ducklake" => {
+            eprintln!("警告: transform_write_backend=ducklake 已移除，回退为 parquet");
+            TransformWriteBackend::Parquet
+        }
         Some(mode) if mode == "dual" => TransformWriteBackend::Dual,
         Some(_) | None => TransformWriteBackend::Surreal,
     }
@@ -100,7 +106,10 @@ pub fn parse_transform_read_backend(raw: Option<&str>) -> TransformReadBackend {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
         Some(mode) if mode == "surreal" => TransformReadBackend::Surreal,
         Some(mode) if mode == "parquet" => TransformReadBackend::Parquet,
-        Some(mode) if mode == "ducklake" => TransformReadBackend::DuckLake,
+        Some(mode) if mode == "ducklake" => {
+            eprintln!("警告: transform_read_backend=ducklake 已移除，回退为 parquet");
+            TransformReadBackend::Parquet
+        }
         Some(mode) if mode == "rkyv" => TransformReadBackend::Rkyv,
         Some(mode) if mode == "memory" => TransformReadBackend::Memory,
         Some(_) | None => TransformReadBackend::Auto,
@@ -157,12 +166,6 @@ pub enum ModelWriterMode {
     Surreal,
     /// 只消费生成端 batch 并输出统计，不持久化，用于压测生成吞吐。
     DrainOnly,
-    /// 通过 Rust duckdb crate 直接挂载 DuckLake，把 trait 已覆盖的 9 张 Phase 1 raw 表
-    /// 写入 `ducklake-canonical` schema。需启用 feature `model-writer-ducklake`。
-    /// 4 类 Phase 1 trait gap 表（tubi/transforms/refno_assoc）本期不写入。
-    /// 参考 `goals/ducklake-model-writer/`。
-    #[serde(alias = "ducklake", alias = "duck_lake")]
-    DuckLake,
 }
 
 impl Default for ModelWriterMode {
@@ -176,7 +179,6 @@ impl ModelWriterMode {
         match self {
             Self::Surreal => "surreal",
             Self::DrainOnly => "drain-only",
-            Self::DuckLake => "ducklake",
         }
     }
 
@@ -193,9 +195,7 @@ pub enum TransformWriteBackend {
     Surreal,
     /// 写入独立 pe_transform Parquet 文件。
     Parquet,
-    /// 写入 Parquet 后生成/执行 DuckLake 注册。
-    DuckLake,
-    /// 双写 SurrealDB + Parquet/DuckLake，用于对比。
+    /// 双写 SurrealDB + Parquet，用于对比。
     Dual,
 }
 
@@ -210,7 +210,6 @@ impl TransformWriteBackend {
         match self {
             Self::Surreal => "surreal",
             Self::Parquet => "parquet",
-            Self::DuckLake => "ducklake",
             Self::Dual => "dual",
         }
     }
@@ -220,11 +219,7 @@ impl TransformWriteBackend {
     }
 
     pub fn writes_to_parquet(&self) -> bool {
-        matches!(self, Self::Parquet | Self::DuckLake | Self::Dual)
-    }
-
-    pub fn uses_ducklake(&self) -> bool {
-        matches!(self, Self::DuckLake)
+        matches!(self, Self::Parquet | Self::Dual)
     }
 }
 
@@ -235,7 +230,6 @@ pub enum TransformReadBackend {
     Auto,
     Surreal,
     Parquet,
-    DuckLake,
     Rkyv,
     Memory,
 }
@@ -252,18 +246,13 @@ impl TransformReadBackend {
             Self::Auto => "auto",
             Self::Surreal => "surreal",
             Self::Parquet => "parquet",
-            Self::DuckLake => "ducklake",
             Self::Rkyv => "rkyv",
             Self::Memory => "memory",
         }
     }
 
     pub fn needs_parquet_feature(&self) -> bool {
-        matches!(self, Self::Parquet | Self::DuckLake)
-    }
-
-    pub fn needs_ducklake_feature(&self) -> bool {
-        matches!(self, Self::DuckLake)
+        matches!(self, Self::Parquet)
     }
 }
 
@@ -403,14 +392,6 @@ pub struct DbOptionExt {
     #[serde(default)]
     pub transform_parquet_dir: Option<String>,
 
-    /// DuckLake metadata.ducklake 路径。
-    #[serde(default)]
-    pub transform_ducklake_metadata: Option<String>,
-
-    /// DuckLake 数据文件根目录。
-    #[serde(default)]
-    pub transform_ducklake_data_path: Option<String>,
-
     /// 刷新前是否清理目标 dbnum 的历史 pe_transform。
     #[serde(default)]
     pub clear_transform_before_refresh: bool,
@@ -445,7 +426,7 @@ pub struct DbOptionExt {
     pub versioned_storage: bool,
 
     /// 版本保留期，透传给启动参数 retention（fork 的 datastore_retention 语法，
-    /// 如 "90d"/"30d"；"0" 表示无限保留——磁盘只增不减，需谨慎）。默认 "90d"。
+    /// 如 "90d"/"30d"；"0" 表示无限保留——磁盘只增不减）。默认 `"0"`（全量历史）。
     #[serde(default = "default_version_retention")]
     pub version_retention: String,
 }
@@ -477,9 +458,12 @@ impl DbOptionExt {
     /// 获取 IndexTree 模式下的实际批次大小
     /// 如果未配置，复用 gen_model_batch_size
     pub fn get_index_tree_batch_size(&self) -> usize {
+        // 与 fast_model::gen_model::config::BatchSize::DEFAULT 保持一致；
+        // 独立成常量以免瘦构建（无 gen_model）无法引用该模块。
+        const INDEX_TREE_BATCH_SIZE_DEFAULT: usize = 100;
         self.index_tree_batch_size
             .unwrap_or(self.inner.gen_model_batch_size)
-            .max(super::fast_model::gen_model::config::BatchSize::DEFAULT)
+            .max(INDEX_TREE_BATCH_SIZE_DEFAULT)
     }
 
     pub fn get_batch_channel_capacity(&self) -> usize {
@@ -580,24 +564,6 @@ impl DbOptionExt {
             .unwrap_or_else(|| self.get_project_output_dir().join("pe_transform"))
     }
 
-    pub fn get_transform_ducklake_metadata_path(&self) -> std::path::PathBuf {
-        self.transform_ducklake_metadata
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                self.get_project_output_dir()
-                    .join("ducklake")
-                    .join("metadata.ducklake")
-            })
-    }
-
-    pub fn get_transform_ducklake_data_path(&self) -> std::path::PathBuf {
-        self.transform_ducklake_data_path
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| self.get_project_output_dir().join("ducklake").join("data"))
-    }
-
     /// 获取 scene_tree 目录，默认为 output/{project_name}/scene_tree
     pub fn get_scene_tree_dir(&self) -> std::path::PathBuf {
         self.get_project_output_dir().join("scene_tree")
@@ -625,11 +591,6 @@ impl DbOptionExt {
                     "model_writer=drain-only 需要编译 feature `model-writer-drain`；例如 --features \"review,model-writer-drain\""
                 )
             }
-            ModelWriterMode::DuckLake if !cfg!(feature = "model-writer-ducklake") => {
-                anyhow::bail!(
-                    "model_writer=ducklake 需要编译 feature `model-writer-ducklake`；例如 --features \"review,model-writer-ducklake\"（参考 goals/ducklake-model-writer/）"
-                )
-            }
             _ => Ok(()),
         }
     }
@@ -643,19 +604,7 @@ impl DbOptionExt {
                 .any(TransformReadBackend::needs_parquet_feature);
         if parquet_requested && !cfg!(feature = "transform-store-parquet") {
             anyhow::bail!(
-                "pe_transform parquet/ducklake 后端需要编译 feature `transform-store-parquet`；例如 --features \"review,transform-store-parquet\""
-            );
-        }
-
-        let ducklake_requested = self.transform_write_backend.uses_ducklake()
-            || self.transform_read_backend.needs_ducklake_feature()
-            || self
-                .transform_compare_backends
-                .iter()
-                .any(TransformReadBackend::needs_ducklake_feature);
-        if ducklake_requested && !cfg!(feature = "transform-store-ducklake") {
-            anyhow::bail!(
-                "pe_transform ducklake 后端需要编译 feature `transform-store-ducklake`；例如 --features \"review,transform-store-ducklake\""
+                "pe_transform parquet 后端需要编译 feature `transform-store-parquet`；例如 --features \"review,transform-store-parquet\""
             );
         }
 
@@ -699,8 +648,6 @@ impl From<DbOption> for DbOptionExt {
             transform_read_backend: TransformReadBackend::Auto,
             transform_compare_backends: Vec::new(),
             transform_parquet_dir: None,
-            transform_ducklake_metadata: None,
-            transform_ducklake_data_path: None,
             clear_transform_before_refresh: false,
             enable_db_backfill: false,
             gen_model_dry_run: false,
@@ -932,16 +879,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let transform_ducklake_metadata = toml_value
-        .get("transform_ducklake_metadata")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let transform_ducklake_data_path = toml_value
-        .get("transform_ducklake_data_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     let clear_transform_before_refresh = toml_value
         .get("clear_transform_before_refresh")
         .and_then(|v| v.as_bool())
@@ -1031,8 +968,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         transform_read_backend,
         transform_compare_backends,
         transform_parquet_dir,
-        transform_ducklake_metadata,
-        transform_ducklake_data_path,
         clear_transform_before_refresh,
         enable_db_backfill,
         gen_model_dry_run,

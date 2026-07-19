@@ -380,10 +380,14 @@ async fn flush_entries(
         refresh_started,
     );
     let before_prime = *total_primed;
-    *total_primed +=
-        crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
-            entries,
-        );
+    // 全局 transform 缓存预热属于 gen_model 网格管线；瘦构建（无 gen_model）跳过。
+    #[cfg(feature = "gen_model")]
+    {
+        *total_primed +=
+            crate::fast_model::gen_model::transform_cache::prime_global_transform_cache_from_pe_entries(
+                entries,
+            );
+    }
     record_transform_refresh_progress(
         "refresh_pe_transform_flush_done",
         format!(

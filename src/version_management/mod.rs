@@ -14,6 +14,8 @@ pub mod history_baseline;
 pub mod history_replay_plan;
 pub mod history_replay_validation;
 pub mod increment_run;
+/// 缺失网格修复：依赖 gen_model 的网格生成管线，瘦构建（sync-cli）不含。
+#[cfg(feature = "gen_model")]
 pub mod missing_mesh_repair;
 pub mod model_release;
 pub mod physical_baseline_snapshot;

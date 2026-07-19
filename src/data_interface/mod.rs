@@ -20,7 +20,9 @@ pub mod cata_closure;
 pub mod mdb_candidates;
 
 /// T008 离线校验：按需闭包站点 vs 全量基准站点的生成结果一致性对比（spec 002）。
-#[cfg(feature = "surreal-save")]
+/// 依赖 gen_model 的 fast_model::utils 与 reqwest HTTP 基准直连；reqwest 仅由
+/// web_server feature 提供，故瘦构建（sync-cli，无 web_server）不含该校验工具。
+#[cfg(all(feature = "surreal-save", feature = "gen_model", feature = "web_server"))]
 pub mod cata_closure_verify;
 
 pub mod increment_manager;

@@ -3491,7 +3491,12 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 verify-cata-closure 子命令（T008 离线校验）==========
     if let Some(verify_matches) = matches.subcommand_matches("verify-cata-closure") {
-        #[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+        #[cfg(all(
+            feature = "sqlite-index",
+            feature = "surreal-save",
+            feature = "gen_model",
+            feature = "web_server"
+        ))]
         {
             use aios_database::data_interface::cata_closure_verify::{
                 BaselineEndpoint, run_verify_from_cli,
@@ -3558,10 +3563,17 @@ async fn main() -> anyhow::Result<()> {
                 report.hash_mismatched.len()
             );
         }
-        #[cfg(not(all(feature = "sqlite-index", feature = "surreal-save")))]
+        #[cfg(not(all(
+            feature = "sqlite-index",
+            feature = "surreal-save",
+            feature = "gen_model",
+            feature = "web_server"
+        )))]
         {
             let _ = verify_matches;
-            anyhow::bail!("verify-cata-closure 需要 sqlite-index + surreal-save feature");
+            anyhow::bail!(
+                "verify-cata-closure 需要 sqlite-index + surreal-save + gen_model + web_server feature（reqwest 基准直连）"
+            );
         }
     }
 

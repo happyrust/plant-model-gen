@@ -12,6 +12,7 @@ use crate::version_management::history_replay_plan::prepare_history_replay;
 use crate::version_management::history_replay_validation::{
     ensure_history_replay_publishable, validate_history_replay_package,
 };
+#[cfg(feature = "gen_model")]
 use crate::version_management::missing_mesh_repair::repair_missing_meshes;
 use crate::version_management::model_release::{
     annotate_model_release, diff_model_release_units, diff_model_releases,
@@ -43,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 pub fn model_version_command() -> Command {
     Command::new("model-version")
-        .about("Register and query immutable model releases backed by DuckLake")
+        .about("Register and query immutable model releases (catalog backend removed; commands fail fast)")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
@@ -143,14 +144,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("metadata-json")
@@ -296,14 +299,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("metadata-json")
@@ -387,14 +392,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -422,14 +429,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -440,7 +449,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("migrate")
-                .about("Apply DuckLake model-version catalog migrations and print a schema report")
+                .about("Apply model-version catalog migrations and print a schema report (backend removed)")
                 .arg(
                     Arg::new("project")
                         .long("project")
@@ -450,14 +459,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -586,14 +597,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -604,7 +617,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("reconcile-release")
-                .about("Reconcile export-batch release lifecycle (specs/023: not unit version identity; prefer unit-v2-set-status for units)")
+                .about("Reconcile export-batch release lifecycle (not unit version identity; prefer unit-v2-set-status for units)")
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
@@ -644,14 +657,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1383,14 +1398,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1418,14 +1435,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1436,7 +1455,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("index-units")
-                .about("DEPRECATED (specs/023): rebuild unit versions keyed by release_id; prefer unit-v2-* / write_unit_version_with_members_v2")
+                .about("DEPRECATED (model-version unit catalog): rebuild unit versions keyed by release_id; prefer unit-v2-* / write_unit_version_with_members_v2")
                 .arg(
                     Arg::new("release-id")
                         .long("release-id")
@@ -1453,14 +1472,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1471,12 +1492,12 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-v2-smoke")
-                .about("specs/023 B5: smoke-test unit_versions_v2 upsert (max member sesno, idempotent, hash conflict)")
+                .about("model-version unit catalog B5: smoke-test unit_versions_v2 upsert (max member sesno, idempotent, hash conflict)")
                 .arg(
                     Arg::new("work-dir")
                         .long("work-dir")
                         .value_name("DIR")
-                        .help("Working directory for a temporary DuckLake catalog; defaults under std::env::temp_dir()"),
+                        .help("Working directory for a temporary model-version catalog; defaults under std::env::temp_dir()"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1488,7 +1509,7 @@ pub fn model_version_command() -> Command {
         .subcommand(
             Command::new("unit-v2-get")
                 .alias("unit-get")
-                .about("specs/023: get one unit version by dbnum+refno+sesno")
+                .about("model-version unit catalog get one unit version by dbnum+refno+sesno")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -1520,11 +1541,13 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR"),
                 )
                 .arg(
@@ -1536,7 +1559,7 @@ pub fn model_version_command() -> Command {
         .subcommand(
             Command::new("unit-v2-list")
                 .alias("unit-list")
-                .about("specs/023: list unit versions for one refno ordered by sesno desc")
+                .about("model-version unit catalog list unit versions for one refno ordered by sesno desc")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -1559,11 +1582,13 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR"),
                 )
                 .arg(
@@ -1574,7 +1599,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-v2-diff")
-                .about("specs/023: diff unit versions between two sesnos (optional single --refno); also via unit-diff --dbnum --from-sesno --to-sesno")
+                .about("model-version unit catalog diff unit versions between two sesnos (optional single --refno); also via unit-diff --dbnum --from-sesno --to-sesno")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -1618,11 +1643,13 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR"),
                 )
                 .arg(
@@ -1633,7 +1660,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-v2-set-status")
-                .about("specs/023 E2: set unit_versions_v2.status and append unit_version_status_events_v2")
+                .about("model-version unit catalog E2: set unit_versions_v2.status and append unit_version_status_events_v2")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -1675,11 +1702,13 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR"),
                 )
                 .arg(
@@ -1690,7 +1719,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-v2-events")
-                .about("specs/023 E2: list unit version status events by dbnum+refno+sesno")
+                .about("model-version unit catalog E2: list unit version status events by dbnum+refno+sesno")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -1720,11 +1749,13 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR"),
                 )
                 .arg(
@@ -1770,14 +1801,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1819,14 +1852,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1861,14 +1896,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1918,14 +1955,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1936,13 +1975,13 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-diff")
-                .about("specs/023: diff delivery units by sesno (preferred) or legacy release_id")
+                .about("model-version unit catalog diff delivery units by sesno (preferred) or legacy release_id")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
                         .value_parser(clap::value_parser!(u32))
                         .value_name("N")
-                        .help("Required with --from-sesno/--to-sesno (specs/023 preferred path)"),
+                        .help("Required with --from-sesno/--to-sesno (model-version unit catalog preferred path)"),
                 )
                 .arg(
                     Arg::new("from-sesno")
@@ -2000,14 +2039,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -2070,14 +2111,16 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("ducklake-metadata")
                         .long("ducklake-metadata")
+                        .alias("catalog-metadata")
                         .value_name("FILE")
-                        .help("DuckLake metadata path; defaults to output/<project>/model_versions/metadata.ducklake"),
+                        .help("Model-version catalog metadata path (backend removed); default under output/<project>/model_versions/"),
                 )
                 .arg(
                     Arg::new("ducklake-data")
                         .long("ducklake-data")
+                        .alias("catalog-data")
                         .value_name("DIR")
-                        .help("DuckLake data path; defaults to output/<project>/model_versions/data"),
+                        .help("Model-version catalog data path (backend removed); default output/<project>/model_versions/data"),
                 )
                 .arg(
                     Arg::new("json")
@@ -2203,6 +2246,35 @@ pub fn model_version_command() -> Command {
                                 .long("json")
                                 .action(clap::ArgAction::SetTrue),
                         ),
+                ),
+        )
+        .subcommand(
+            Command::new("resolve-anchor")
+                .about(
+                    "specs/022: map (dbnum, sesno) → anchored_at (same semantics as resolve_anchor / fn::sesno_version_hit)",
+                )
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("sesno")
+                        .long("sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("exact-only")
+                        .long("exact-only")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Fail if there is no exact (dbnum, sesno) anchor (do not fall back to nearest ≤ sesno)"),
+                )
+                .arg(
+                    Arg::new("json")
+                        .long("json")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
 }
@@ -2341,7 +2413,7 @@ pub async fn handle_model_version_command(
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "migrated DuckLake catalog project={} schema={} releases={} migrations={} metadata={} data={}",
+                    "migrated model-version catalog project={} schema={} releases={} migrations={} metadata={} data={}",
                     report.project_name,
                     report.schema_name,
                     report.release_count,
@@ -2420,7 +2492,7 @@ pub async fn handle_model_version_command(
             let ducklake = ducklake_config_from_matches(sub, db_option_ext, &project_name);
             let release_id = resolve_export_batch_id(sub)?;
             eprintln!(
-                "info: reconcile-release operates on export-batch identity '{release_id}' (specs/023); unit status uses unit-v2-set-status"
+                "info: reconcile-release operates on export-batch identity '{release_id}' (model-version unit catalog); unit status uses unit-v2-set-status"
             );
             let report = reconcile_model_release(
                 ducklake,
@@ -2645,6 +2717,13 @@ pub async fn handle_model_version_command(
                 ensure_history_replay_publishable(&response)?;
             }
         }
+        #[cfg(not(feature = "gen_model"))]
+        Some(("repair-missing-meshes", _sub)) => {
+            anyhow::bail!(
+                "repair-missing-meshes 需要 gen_model feature（sync-cli 瘦构建不含网格生成管线）"
+            );
+        }
+        #[cfg(feature = "gen_model")]
         Some(("repair-missing-meshes", sub)) => {
             let request = build_missing_mesh_repair_request(sub, db_option_ext)?;
             let json_output = sub.get_flag("json");
@@ -2739,7 +2818,7 @@ pub async fn handle_model_version_command(
                 .get_one::<String>("release-id")
                 .expect("required by clap");
             eprintln!(
-                "warning: index-units is DEPRECATED (specs/023); prefer write_unit_version_with_members_v2 / unit-v2-*"
+                "warning: index-units is DEPRECATED (model-version unit catalog); prefer write_unit_version_with_members_v2 / unit-v2-*"
             );
             if let Some((dbnum, sesno)) = parse_legacy_batch_id(release_id) {
                 eprintln!(
@@ -3039,7 +3118,7 @@ pub async fn handle_model_version_command(
                 (Some(db), Some(from), Some(to)) => Some((db, from, to)),
                 (None, None, None) => None,
                 _ => anyhow::bail!(
-                    "unit-diff sesno mode requires --dbnum --from-sesno --to-sesno together (specs/023)"
+                    "unit-diff sesno mode requires --dbnum --from-sesno --to-sesno together (model-version unit catalog)"
                 ),
             };
 
@@ -3092,7 +3171,7 @@ pub async fn handle_model_version_command(
                     )
                 })?;
                 eprintln!(
-                    "warning: unit-diff --from-release-id/--to-release-id is DEPRECATED (specs/023); prefer --dbnum --from-sesno --to-sesno"
+                    "warning: unit-diff --from-release-id/--to-release-id is DEPRECATED (model-version unit catalog); prefer --dbnum --from-sesno --to-sesno"
                 );
                 // Map parseable db{{N}}-s{{M}} aliases onto v2 diff when both sides agree on dbnum.
                 match (
@@ -3186,6 +3265,9 @@ pub async fn handle_model_version_command(
         }
         Some(("history", hist)) => {
             handle_history_command(hist, db_option_ext).await?;
+        }
+        Some(("resolve-anchor", sub)) => {
+            handle_resolve_anchor_command(sub).await?;
         }
         _ => unreachable!("subcommand_required by clap"),
     }
@@ -3460,6 +3542,15 @@ fn manifest_u64_at(value: &Value, path: &[&str]) -> Option<u64> {
     current.as_u64()
 }
 
+#[cfg(not(feature = "parquet-export"))]
+fn count_zero_spec_values(path: &Path, table_name: &str) -> anyhow::Result<SpecValueZeroCount> {
+    anyhow::bail!(
+        "audit-spec-info 需要读取 {table_name} parquet（{}），请以 --features parquet-export 编译后重试",
+        path.display()
+    )
+}
+
+#[cfg(feature = "parquet-export")]
 fn count_zero_spec_values(path: &Path, table_name: &str) -> anyhow::Result<SpecValueZeroCount> {
     use arrow_array::{Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -3521,7 +3612,7 @@ fn build_register_request(
         Some(id) => id.to_string(),
         None => {
             let sesno = export_sesno.ok_or_else(|| {
-                anyhow::anyhow!("register requires --sesno when --release-id is omitted (specs/023)")
+                anyhow::anyhow!("register requires --sesno when --release-id is omitted (model-version unit catalog)")
             })?;
             legacy_batch_id_for_sesno(dbnum, sesno)
         }
@@ -3993,7 +4084,7 @@ fn build_scene_tree_artifact_restore_request(
     })
 }
 
-/// specs/023：export-batch id = `--release-id` 或 `db{dbnum}-s{sesno}`。
+/// model-version unit catalog id = `--release-id` 或 `db{dbnum}-s{sesno}`。
 fn resolve_export_batch_id(sub: &ArgMatches) -> anyhow::Result<String> {
     if let Some(id) = sub.get_one::<String>("release-id") {
         let trimmed = id.trim();
@@ -4106,6 +4197,47 @@ fn parse_metadata_json(sub: &ArgMatches) -> anyhow::Result<Value> {
         }
         None => Ok(serde_json::json!({})),
     }
+}
+
+async fn handle_resolve_anchor_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    // Surreal 连接由 main 在进入 model-version resolve-anchor 前 ensure_surreal_connected。
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+    let sesno = *sub.get_one::<u32>("sesno").expect("required");
+    let exact_only = sub.get_flag("exact-only");
+    let json = sub.get_flag("json");
+
+    // 确保锚点表 + fn::sesno_version* 已定义（幂等）。
+    crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
+
+    let hit = aios_core::resolve_anchor(dbnum, sesno)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve_anchor 失败: {e}"))?;
+
+    let Some(hit) = hit else {
+        anyhow::bail!("未找到 dbnum={dbnum} sesno<={sesno} 的 sesno_version_anchor");
+    };
+    if exact_only && !hit.exact {
+        anyhow::bail!(
+            "exact-only: 无精确锚点 dbnum={dbnum} sesno={sesno}；最近不大于为 sesno={} anchored_at={}",
+            hit.sesno,
+            hit.anchored_at
+        );
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&hit)?);
+    } else {
+        println!(
+            "dbnum={} requested_sesno={} resolved_sesno={} exact={} source={} anchored_at={}",
+            hit.dbnum,
+            sesno,
+            hit.sesno,
+            hit.exact,
+            hit.source.as_deref().unwrap_or("-"),
+            hit.anchored_at
+        );
+    }
+    Ok(())
 }
 
 async fn handle_history_command(

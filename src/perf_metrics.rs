@@ -568,14 +568,16 @@ pub fn record_generate_stage_ms(stages: &[(String, u64)]) {
 }
 
 /// 生成阶段收尾：按当前模型库查询验收口径表计数。
-pub async fn finish_generate_stage_from_model_store(duration_ms: u64) {
+pub async fn finish_generate_stage_from_db(duration_ms: u64) {
     if COLLECTOR.get().and_then(|c| c.as_ref()).is_none() {
         return;
     }
 
     async fn surreal_count(table: &str) -> usize {
+        use aios_core::{SurrealQueryExt, project_primary_db};
         let sql = format!("SELECT count() FROM {table} GROUP ALL;");
-        match crate::fast_model::model_store::model_query_take::<Vec<serde_json::Value>, _>(sql, 0)
+        match project_primary_db()
+            .query_take::<Vec<serde_json::Value>>(sql, 0)
             .await
         {
             Ok(rows) => rows
@@ -586,15 +588,22 @@ pub async fn finish_generate_stage_from_model_store(duration_ms: u64) {
             Err(_) => 0,
         }
     }
-    let cache_miss = crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
-        .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
-        .unwrap_or(0);
+    // cache miss / failed-sql 计数来自 gen_model 网格管线；瘦构建（无 gen_model）记 0。
+    #[cfg(feature = "gen_model")]
+    let (cache_miss, failed_sql) = (
+        crate::fast_model::gen_model::cache_miss_report::snapshot_global_report()
+            .map(|r| r.buckets.values().map(|b| b.count as usize).sum())
+            .unwrap_or(0),
+        crate::fast_model::gen_model::pdms_inst::failed_sql_dump_count(),
+    );
+    #[cfg(not(feature = "gen_model"))]
+    let (cache_miss, failed_sql) = (0usize, 0usize);
     finish_generate_stage(
         surreal_count("inst_relate").await,
         surreal_count("inst_info").await,
         surreal_count("inst_relate_aabb").await,
         surreal_count("tubi_relate").await,
-        crate::fast_model::gen_model::pdms_inst::failed_sql_dump_count(),
+        failed_sql,
         cache_miss,
         duration_ms,
     );

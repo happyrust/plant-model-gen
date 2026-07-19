@@ -160,13 +160,6 @@ sysinfo = { version = "0.37.0", optional = true }
 # SQLite driver for spatial tests and cache
 rusqlite = { version = "0.33", features = ["bundled"], optional = true }
 
-# DuckDB (bundled) — gated behind `model-writer-ducklake` feature for the DuckLakeModelWriterBackend.
-# 旧的 `# DuckDB removed - backend no longer uses this feature` 注释指的是更早的占位依赖；
-# 本次为 goals/ducklake-model-writer goal 引入，用于 src/fast_model/gen_model/model_writer_ducklake.rs。
-duckdb = { version = "1.10502.0", optional = true, default-features = false, features = [
-    "bundled",
-] }
-
 indicatif = "0.18.1"
 rust_xlsxwriter = { version = "0.91.0", optional = true }
 
@@ -186,10 +179,23 @@ tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"]
 #   kv-rocksdb      RocksDB 嵌入后端（C++ 编译重）
 #   full            完整产物，默认仍使用 SurrealDB ws 模式；RocksDB/file 需显式启用 review-rocksdb 或 kv-rocksdb。
 # 默认使用 SurrealDB ws 模式，不编译 kv-rocksdb，避免 release/站点部署默认拉起 file/RocksDB 后端。
-# 轻量校审构建请用 `--no-default-features --features review`。
+# 日常默认不含 parquet-export（polars/arrow 链极重）；需要导出时显式加 feature。
+# 同步/锚点瘦构建：`--no-default-features --features sync-cli`
+# 校审 Web：`--features review`；完整产物：`--features full` 或 deploy 脚本里的 FEATURES。
 # ═══════════════════════════════════════════════════════════════
 [features]
-default = ["review", "parquet-export"]
+# 默认：校审最小集，不含 polars/arrow/parquet（显著加快日常/release 编译）
+default = ["review"]
+
+# PE/ATT 全量/增量同步 + 锚点/history CLI（不含 web/manifold/parquet）
+# 用法：cargo build --release --bin aios-database --no-default-features --features sync-cli
+sync-cli = [
+    "ws",
+    "gen_model",
+    "surreal-save",
+    "write-to-surrealdb",
+    "sqlite-index",
+]
 
 # 三维校审最小必要集
 # 不含：polars / arrow / parquet / ethnum / RocksDB（C++ 编译重）
@@ -224,7 +230,6 @@ parquet-export = [
 
 # pe_transform 持久化后端（用于刷新/对比，不改变默认 SurrealDB 路径）
 transform-store-parquet = ["parquet-export"]
-transform-store-ducklake = ["transform-store-parquet"]
 transform-store-compare = []
 
 # Excel 数据导出（data_to_excel/，目前模块已注释，保留 hook）
@@ -252,7 +257,8 @@ local = []
 ws = []
 debug_obj_export = []
 debug_expr = ["aios_core/debug_expr"]
-mqtt = ["dep:rumqttc"]
+# mqtt 路径依赖 pdms_io::sync（CBA 压缩/克隆），必须连带打开 pdms_io/sync-archive
+mqtt = ["dep:rumqttc", "pdms_io/sync-archive"]
 viewer = []                           #是否开启视图
 gen_model = ["aios_core/gen_model"]
 manifold = ["aios_core/manifold"]
@@ -260,11 +266,6 @@ manifold = ["aios_core/manifold"]
 surreal-save = []
 write-to-surrealdb = []
 model-writer-drain = []
-# DuckLake backend for ModelWriter (goals/ducklake-model-writer). Default off; loads Rust duckdb crate.
-model-writer-ducklake = ["dep:duckdb"]
-# DuckLake catalog for immutable model release snapshots. Default off; this is
-# separate from the experimental generation writer above.
-model-version-ducklake = ["dep:duckdb", "parquet-export"]
 test = ["aios_core/test"]
 mem-kv-save = ["aios_core/mem-kv-save"] #额外保存PE数据到内存KV数据库
 kv-rocksdb = [

@@ -18,7 +18,115 @@ use std::{fs, path::Path as FsPath, time::SystemTime};
 
 use crate::web_server::AppState;
 use aios_core::project_primary_db;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use surrealdb::types::SurrealValue;
+
+use crate::versioned_db::version_commit::committed_watermark;
+
+/// specs/022 候选4·方案B：HTTP 触发的增量运行注册表（内存态）。
+/// sync = 真实落库（persist），detect = 只读试跑（no-persist）；两者都走
+/// `version_management::increment_run::run_increment`（同一 IncrementRun /
+/// Version Commit seam）。写侧安全由 commit_version 的 lease + Commit Pending
+/// + 锚点固化兜底。进程重启后注册表清空（运行记录不持久，锚点才是权威）。
+static INCREMENT_RUNS: Lazy<DashMap<String, IncrementRunStatus>> = Lazy::new(DashMap::new);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IncrementRunStatus {
+    pub run_id: String,
+    pub dbnum: u32,
+    /// "sync"（落库）| "detect"（只读试跑）
+    pub kind: String,
+    /// "running" | "succeeded" | "failed"
+    pub state: String,
+    pub from_sesno: u32,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub summary: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+fn new_run_id(kind: &str, dbnum: u32) -> String {
+    format!(
+        "{kind}-db{dbnum}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+    )
+}
+
+/// 后台跑一次 IncrementRun 并把结果写回注册表。persist=false 即 detect 试跑。
+async fn spawn_increment_run(dbnum: u32, persist: bool) -> Result<IncrementRunStatus, String> {
+    let watermark = committed_watermark(dbnum)
+        .await
+        .map_err(|e| format!("查询 Committed Watermark 失败 dbnum={dbnum}: {e}"))?;
+    if watermark == 0 {
+        return Err(format!(
+            "dbnum={dbnum} 无 Committed Watermark（从未全量解析），不能做增量；请先全量建库"
+        ));
+    }
+
+    let kind = if persist { "sync" } else { "detect" };
+    let run_id = new_run_id(kind, dbnum);
+    let status = IncrementRunStatus {
+        run_id: run_id.clone(),
+        dbnum,
+        kind: kind.to_string(),
+        state: "running".to_string(),
+        from_sesno: watermark,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: None,
+        summary: None,
+        error: None,
+    };
+    INCREMENT_RUNS.insert(run_id.clone(), status.clone());
+
+    let run_id_task = run_id.clone();
+    tokio::spawn(async move {
+        let db_option_ext =
+            crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
+        let options = crate::version_management::increment_run::IncrementRunOptions {
+            file: None,
+            dbnums: vec![dbnum],
+            from_sesno: watermark,
+            to_sesno: None,
+            rescan_index: false,
+            persist_data: persist,
+            recover_pending: false,
+            generate_model: false,
+            source_observation_manifest: None,
+            source_observation_manifest_hash: None,
+            publication_handoff_dir: None,
+            release_id_prefix: None,
+            require_tree_index: false,
+            verbose: false,
+        };
+        // web server 启动时已连 surreal；这里做一次轻量探针即可。
+        let ensure = || async {
+            project_primary_db()
+                .query("RETURN 1;")
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        };
+        let result =
+            crate::version_management::increment_run::run_increment(&db_option_ext, options, ensure)
+                .await;
+        if let Some(mut entry) = INCREMENT_RUNS.get_mut(&run_id_task) {
+            entry.finished_at = Some(chrono::Utc::now().to_rfc3339());
+            match result {
+                Ok(run) => {
+                    entry.state = "succeeded".to_string();
+                    entry.summary = Some(run.summary);
+                }
+                Err(err) => {
+                    entry.state = "failed".to_string();
+                    entry.error = Some(err.to_string());
+                }
+            }
+        }
+    });
+
+    Ok(status)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveFile {
@@ -407,44 +515,111 @@ fn not_implemented(action: &str) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// 未实现：触发增量检测（走 CLI）。
+fn parse_dbnum_path(raw: &str) -> Result<u32, (StatusCode, Json<serde_json::Value>)> {
+    raw.trim().parse::<u32>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("site_id 需为 dbnum（数字），收到: {raw}"),
+            })),
+        )
+    })
+}
+
+/// 触发增量检测（只读试跑，no-persist）：后台跑 IncrementRun 收集变更但不落库。
+/// 路径参数为 dbnum。返回 run_id，用 get_detection_task_status 轮询。
 pub async fn start_incremental_detection(
     _state: State<AppState>,
-    Path(_site_id): Path<String>,
+    Path(site_id): Path<String>,
 ) -> impl IntoResponse {
-    not_implemented("HTTP 触发增量检测")
+    let dbnum = match parse_dbnum_path(&site_id) {
+        Ok(dbnum) => dbnum,
+        Err(resp) => return resp,
+    };
+    match spawn_increment_run(dbnum, false).await {
+        Ok(status) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "success": true,
+                "run_id": status.run_id,
+                "dbnum": dbnum,
+                "kind": "detect",
+                "from_sesno": status.from_sesno,
+                "message": "增量检测（只读试跑）已启动，用 /api/incremental/task/{run_id} 查询",
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": err })),
+        ),
+    }
 }
 
-/// 未实现：触发增量同步（走 CLI）。
+/// 触发增量同步（真实落库，persist）：后台跑 IncrementRun，经 commit_version
+/// 固化 Version Anchor。persist-only，不触发模型生成（与 watch 语义一致）。
 pub async fn start_incremental_sync(
     _state: State<AppState>,
-    Path(_site_id): Path<String>,
+    Path(site_id): Path<String>,
 ) -> impl IntoResponse {
-    not_implemented("HTTP 触发增量同步")
+    let dbnum = match parse_dbnum_path(&site_id) {
+        Ok(dbnum) => dbnum,
+        Err(resp) => return resp,
+    };
+    match spawn_increment_run(dbnum, true).await {
+        Ok(status) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "success": true,
+                "run_id": status.run_id,
+                "dbnum": dbnum,
+                "kind": "sync",
+                "from_sesno": status.from_sesno,
+                "message": "增量同步已启动（persist-only，走 Version Commit seam），用 /api/incremental/task/{run_id} 查询",
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": err })),
+        ),
+    }
 }
 
-/// 未实现：增量任务状态查询。
+/// 查询某次增量运行（sync/detect）的状态。
 pub async fn get_detection_task_status(
     _state: State<AppState>,
-    Path(_task_id): Path<String>,
+    Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    not_implemented("增量任务状态查询")
+    match INCREMENT_RUNS.get(&task_id) {
+        Some(status) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "run": status.value() })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "error": format!("未找到增量运行 run_id={task_id}（进程重启后运行记录会清空）"),
+            })),
+        ),
+    }
 }
 
-/// 未实现：取消增量任务。
+/// 取消增量任务：IncrementRun 一旦进入落库阶段不可安全中断，故不支持中途取消。
+/// Commit 的原子性/幂等由 commit_version 保证，失败自然回退等待重试。
 pub async fn cancel_task(
     _state: State<AppState>,
     Path(_task_id): Path<String>,
 ) -> impl IntoResponse {
-    not_implemented("取消增量任务")
+    not_implemented("取消进行中的增量运行（IncrementRun 落库不可中途安全中断，请等待完成或依赖 Commit Pending 恢复）")
 }
 
-/// 未实现：增量配置读取。
+/// 未实现：增量配置读取（无配置存储，检测/同步为按需触发）。
 pub async fn get_incremental_config(_state: State<AppState>) -> impl IntoResponse {
     not_implemented("增量配置读取")
 }
 
-/// 未实现：增量配置更新。
+/// 未实现：增量配置更新（无配置存储）。
 pub async fn update_incremental_config(
     _state: State<AppState>,
     Json(_config): Json<serde_json::Value>,

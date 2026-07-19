@@ -111,6 +111,14 @@ class IncrementalUpdateManager {
                     ${pendingCount > 0 ? this.renderPendingList(db) : ''}
                 </div>
                 <div class="flex flex-col space-y-2 ml-4">
+                    <button onclick="incrementalManager.triggerRun(${db.dbnum}, 'detect')"
+                            class="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700">
+                        <i class="fas fa-search mr-1"></i>检测(试跑)
+                    </button>
+                    <button onclick="incrementalManager.triggerRun(${db.dbnum}, 'sync')"
+                            class="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700">
+                        <i class="fas fa-sync mr-1"></i>增量同步
+                    </button>
                     <button onclick="incrementalManager.showDetails(${db.dbnum})"
                             class="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700">
                         <i class="fas fa-timeline mr-1"></i>锚点时间线
@@ -141,6 +149,58 @@ class IncrementalUpdateManager {
                 </div>
             </div>
         `;
+    }
+
+    // 触发一次增量运行（detect=只读试跑 / sync=真实落库），启动后轮询状态
+    async triggerRun(dbnum, kind) {
+        const endpoint = kind === 'sync'
+            ? `/api/incremental/sync/${dbnum}`
+            : `/api/incremental/detect/${dbnum}`;
+        if (kind === 'sync' && !confirm(`确定对 dbnum ${dbnum} 触发增量同步（真实落库，固化 Version Anchor）？`)) {
+            return;
+        }
+        try {
+            const response = await fetch(endpoint, { method: 'POST' });
+            const data = await response.json();
+            if (!data.success) {
+                this.showNotification(data.error || '触发失败', 'error');
+                return;
+            }
+            this.showNotification(`已启动 ${kind === 'sync' ? '增量同步' : '检测试跑'}：${data.run_id}`, 'success');
+            this.pollRun(data.run_id);
+        } catch (error) {
+            console.error('触发增量运行失败:', error);
+            this.showNotification('触发失败', 'error');
+        }
+    }
+
+    // 轮询一次增量运行直到终态
+    async pollRun(runId) {
+        const started = Date.now();
+        const tick = async () => {
+            try {
+                const response = await fetch(`/api/incremental/task/${runId}`);
+                const data = await response.json();
+                if (data.success && data.run) {
+                    const state = data.run.state;
+                    if (state === 'running') {
+                        if (Date.now() - started < 30 * 60 * 1000) {
+                            setTimeout(tick, 3000);
+                        }
+                        return;
+                    }
+                    if (state === 'succeeded') {
+                        this.showNotification(`运行 ${runId} 完成`, 'success');
+                    } else {
+                        this.showNotification(`运行 ${runId} 失败：${data.run.error || ''}`, 'error');
+                    }
+                    this.loadStatus();
+                }
+            } catch (error) {
+                console.error('轮询运行状态失败:', error);
+            }
+        };
+        setTimeout(tick, 2000);
     }
 
     // 锚点时间线详情

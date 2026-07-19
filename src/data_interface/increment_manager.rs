@@ -150,6 +150,14 @@ const JSON_CHUNK_COUNT: usize = 200;
 
 pub const CHECK_DB_TYPES: [&'static str; 6] = ["CATA", "DESI", "DICT", "SYST", "GLB", "GLOB"];
 
+/// 启动补增量 config 门控：环境变量 `AIOS_WATCH_STARTUP_CATCHUP` 取
+/// `1`/`true`/`yes`/`on`（大小写不敏感）时开启，默认关闭。
+fn startup_catchup_enabled() -> bool {
+    std::env::var("AIOS_WATCH_STARTUP_CATCHUP")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 impl AiosDBManager {
     /// 执行增量更新（specs/022：watch 与 CLI 共用同一 Version Commit seam）。
     ///
@@ -316,6 +324,103 @@ impl AiosDBManager {
         println!("初始化增量更新耗时: {} s", time.elapsed().as_secs_f32());
 
         anyhow::Ok(())
+    }
+
+    /// 启动补增量：追赶服务停机期间落后的区间。
+    ///
+    /// config 门控（默认关闭）：仅当环境变量 `AIOS_WATCH_STARTUP_CATCHUP` 为
+    /// `1`/`true`/`yes`/`on` 时执行。对每个受监听 db 文件，取 Committed Watermark
+    /// 作为已提交起点，若文件最新 sesno 领先则收集 `watermark+1..=file_latest`
+    /// 并经 `execute_incr_update`（与 `async_watch` 同一 Version Commit seam）落库。
+    /// 安全性由该 seam 的 per-dbnum lease + Commit Pending + 锚点固化兜底：
+    /// 提交失败的 dbnum 不产生锚点，下次启动/文件事件重试。
+    ///
+    /// 应在 `init_watcher`（已初始化 headers）之后、`async_watch` 之前调用。
+    pub async fn startup_catchup(&self) -> anyhow::Result<PdmsIncrementPersistStats> {
+        if !startup_catchup_enabled() {
+            return Ok(PdmsIncrementPersistStats::default());
+        }
+        let db_option = get_db_option();
+        let manual_dbnums = db_option.manual_db_nums.clone().unwrap_or_default();
+        let exclude_dbnums = db_option.exclude_db_nums.clone().unwrap_or_default();
+        let project = db_option.project_name.clone();
+
+        let mut params: IndexMap<PathBuf, (DbPageBasicInfo, RangeInclusive<i32>)> = IndexMap::new();
+        let mut path_by_dbnum: HashMap<u32, PathBuf> = HashMap::new();
+        for watch_dir in &self.watcher.watch_dirs {
+            for entry in WalkDir::new(watch_dir) {
+                let dir_entry =
+                    entry.map_err(|e| anyhow::anyhow!("Failed to get directory entry: {}", e))?;
+                let path = dir_entry.path();
+                if path.is_dir() {
+                    continue;
+                }
+                let DbBasicInfo {
+                    db_type, dbnum, ..
+                } = parse_db_basic_info(path.to_path_buf());
+                if !manual_dbnums.is_empty() && !manual_dbnums.contains(&dbnum) {
+                    continue;
+                }
+                if !exclude_dbnums.is_empty() && exclude_dbnums.contains(&dbnum) {
+                    continue;
+                }
+                if !CHECK_DB_TYPES.contains(&db_type.as_str()) {
+                    continue;
+                }
+                let watermark = match committed_watermark(dbnum).await {
+                    Ok(sesno) => sesno,
+                    Err(e) => {
+                        eprintln!("[startup-catchup] 查询 Committed Watermark 失败 dbnum={dbnum}: {e}");
+                        continue;
+                    }
+                };
+                // watermark==0：从未全量解析过，不属于增量追赶范围
+                if watermark == 0 {
+                    continue;
+                }
+                let mut io = PdmsIO::new(&project, path, true);
+                if io.open().is_err() {
+                    continue;
+                }
+                let file_latest_sesno = io.get_latest_sesno().unwrap_or_default();
+                if file_latest_sesno <= watermark {
+                    continue;
+                }
+                let Ok(basic_info) = io.get_page_basic_info() else {
+                    continue;
+                };
+                println!(
+                    "[startup-catchup] dbnum={dbnum} 落后: watermark={watermark} file_latest={file_latest_sesno}，追赶区间 {}..={}",
+                    watermark + 1,
+                    file_latest_sesno
+                );
+                params.insert(
+                    path.to_path_buf(),
+                    (basic_info, (watermark as i32 + 1)..=file_latest_sesno as i32),
+                );
+                path_by_dbnum.insert(dbnum, path.to_path_buf());
+            }
+        }
+
+        if params.is_empty() {
+            println!("[startup-catchup] 无落后 db 文件，跳过");
+            return Ok(PdmsIncrementPersistStats::default());
+        }
+        let stats = self.execute_incr_update(params).await?;
+        // 追赶成功的文件推进内存 header，使 async_watch 后续事件从正确基线计算
+        for anchor in &stats.anchors {
+            let Some(path) = path_by_dbnum.get(&anchor.dbnum) else {
+                continue;
+            };
+            let mut io = PdmsIO::new(&project, path, true);
+            if io.open().is_err() {
+                continue;
+            }
+            if let Ok(basic_info) = io.get_page_basic_info() {
+                self.watcher.headers.insert(path.clone(), basic_info);
+            }
+        }
+        Ok(stats)
     }
 
     //开始监测数据文件夹

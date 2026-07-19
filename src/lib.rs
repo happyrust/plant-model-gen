@@ -392,6 +392,19 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     /// 创建db manager
     if sync_live {
         mgr.init_watcher().await?;
+        // 启动补增量（config 门控 AIOS_WATCH_STARTUP_CATCHUP，默认关闭）：
+        // 追赶停机期间落后区间，走与 async_watch 同一 Version Commit seam。
+        match mgr.startup_catchup().await {
+            Ok(stats) if !stats.anchors.is_empty() => {
+                log::info!(
+                    "启动补增量完成：固化锚点 {} 个，失败 {} 个",
+                    stats.anchors.len(),
+                    stats.commit_failures.len()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("启动补增量失败（不阻断服务启动）：{}", e),
+        }
     }
 
     // SQLite R*-tree initialization is handled automatically

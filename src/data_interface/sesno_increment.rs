@@ -1,23 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::SystemTime;
 
-use aios_core::Datetime;
 use aios_core::pdms_types::{
     BRAN_COMPONENT_NOUN_NAMES, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES,
     TOTAL_CATA_GEO_NOUN_NAMES, TOTAL_LOOP_NOUN_NAMES, TOTAL_VERT_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
-use aios_core::{RefU64, RefnoEnum, get_pe, project_primary_db};
+use aios_core::{RefU64, RefnoEnum, project_primary_db};
 use anyhow::Context;
 use once_cell::sync::Lazy;
 use parse_pdms_db::parse::EleData;
 use pdms_io::PdmsIO;
 use pdms_io::io::{EleOperationData, EleOperationDetail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
+use crate::versioned_db::version_commit::{
+    VersionCommitCounts, VersionCommitRequest, VersionCommitSource, commit_version,
+    compute_commit_fingerprint, recover_version_commit,
+};
 
 static PRIM_NOUN_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| GNERAL_PRIM_NOUN_NAMES.iter().copied().collect());
@@ -41,18 +42,6 @@ static LOOP_CONTAINER_NOUN_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         .copied()
         .collect()
 });
-
-async fn normalize_element_type(refno: RefnoEnum, element_type: &str) -> anyhow::Result<String> {
-    if element_type.eq_ignore_ascii_case("LOOP") {
-        if let Some(pe) = get_pe(refno).await? {
-            let noun_upper = pe.noun.to_uppercase();
-            if CATA_NOUN_SET.contains(noun_upper.as_str()) {
-                return Ok("CATA".to_string());
-            }
-        }
-    }
-    Ok(element_type.to_uppercase())
-}
 
 fn remove_refno_from_log(update_log: &mut IncrGeoUpdateLog, refno: RefnoEnum) {
     update_log.prim_refnos.remove(&refno);
@@ -219,6 +208,20 @@ pub struct VersionAnchorRecord {
     pub sesno: u32,
     pub source: String,
     pub anchored_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub idempotent: bool,
+    #[serde(default)]
+    pub recovered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionCommitFailureRecord {
+    pub dbnum: u32,
+    pub from_sesno: u32,
+    pub to_sesno: u32,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -234,6 +237,9 @@ pub struct PdmsIncrementPersistStats {
     /// specs/022：本批增量落库固化的 sesno 锚点（成功路径末尾写入）。
     #[serde(default)]
     pub anchors: Vec<VersionAnchorRecord>,
+    /// 每个 dbnum 独立提交；多库命令保留已成功锚点并显式报告失败项。
+    #[serde(default)]
+    pub commit_failures: Vec<VersionCommitFailureRecord>,
 }
 
 impl PdmsIncrementPersistStats {
@@ -247,6 +253,7 @@ impl PdmsIncrementPersistStats {
         self.uda_rows += other.uda_rows;
         self.dbnum_info_updates += other.dbnum_info_updates;
         self.anchors.extend(other.anchors);
+        self.commit_failures.extend(other.commit_failures);
     }
 }
 
@@ -574,34 +581,9 @@ fn record_target(table: &str, refno: RefU64) -> String {
 async fn exec_statements(sqls: &[String], chunk_size: usize) -> anyhow::Result<()> {
     for chunk in sqls.chunks(chunk_size.max(1)) {
         let sql = chunk.join("\n");
-        project_primary_db().query(sql).await?;
+        project_primary_db().query(sql).await?.check()?;
     }
     Ok(())
-}
-
-/// specs/022 T009：把本批 (dbnum, sesno) 固化为 `sesno_version_anchor` 锚点。
-///
-/// 幂等：UPSERT 到定长 record id `sesno_version_anchor:[dbnum, sesno]`，同一
-/// (dbnum, sesno) 重跑增量时覆盖 anchored_at；`source` 取 "incremental" / "full"。
-/// 调用点必须在本批全部 UPSERT/DELETE flush 完成之后，任何前序错误经 `?` 提前返回
-/// 都不会触达锚点写入（满足 FR-004：落库失败不写锚点）。
-pub(crate) async fn write_sesno_version_anchor(
-    dbnum: u32,
-    sesno: u32,
-    source: &str,
-) -> anyhow::Result<VersionAnchorRecord> {
-    crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
-    let sql = format!(
-        "UPSERT sesno_version_anchor:[{dbnum}, {sesno}] SET dbnum = {dbnum}, sesno = {sesno}, source = '{source}', anchored_at = time::now() RETURN anchored_at;"
-    );
-    let mut response = project_primary_db().query(sql).await?;
-    let anchored_at: Option<Datetime> = response.take((0, "anchored_at")).unwrap_or_default();
-    Ok(VersionAnchorRecord {
-        dbnum,
-        sesno,
-        source: source.to_string(),
-        anchored_at: anchored_at.map(|dt| dt.to_string()),
-    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -611,11 +593,12 @@ struct Ref0PersistInfo {
     max_ref1: u64,
 }
 
-async fn delete_increment_element(refno: RefU64) -> anyhow::Result<usize> {
+async fn build_increment_delete_statements(refno: RefU64) -> anyhow::Result<Vec<String>> {
     let pe_key = refno.to_pe_key();
     let mut response = project_primary_db()
-        .query(format!("SELECT VALUE noun FROM ONLY {pe_key};"))
-        .await?;
+        .query(format!("SELECT VALUE noun FROM {pe_key} LIMIT 1;"))
+        .await?
+        .check()?;
     let noun: Option<String> = response.take(0).unwrap_or_default();
 
     let mut sqls = Vec::new();
@@ -624,8 +607,7 @@ async fn delete_increment_element(refno: RefU64) -> anyhow::Result<usize> {
     }
     sqls.push(format!("DELETE {};", record_target("ATT_UDA", refno)));
     sqls.push(format!("DELETE {pe_key};"));
-    exec_statements(&sqls, 100).await?;
-    Ok(sqls.len())
+    Ok(sqls)
 }
 
 async fn persist_pdms_increment_file(
@@ -656,12 +638,14 @@ async fn persist_pdms_increment_file(
             )
         })?;
 
-    persist_pdms_increment_grouped(report, &grouped).await
+    persist_pdms_increment_grouped(report, &grouped, None, false).await
 }
 
 async fn persist_pdms_increment_grouped(
     report: &PdmsSesnoIncrementFileReport,
     grouped: &BTreeMap<u32, Vec<EleOperationData>>,
+    source_observation_hash: Option<&str>,
+    recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats {
         file_count: 1,
@@ -673,17 +657,19 @@ async fn persist_pdms_increment_grouped(
 
     stats.session_count = grouped.len();
 
-    let mut pe_upserts = Vec::new();
-    let mut att_upserts = Vec::new();
-    let mut uda_upserts = Vec::new();
+    // Keep mutations in sesno order. The previous implementation buffered PE/ATT
+    // separately while executing deletes immediately, so add→delete in one range
+    // could be replayed as delete→add and expose the wrong final state.
+    let mut mutation_sqls = Vec::new();
     let mut dbnum_info: BTreeMap<u64, Ref0PersistInfo> = BTreeMap::new();
 
     for operations in grouped.values() {
         for operation in operations {
             if matches!(&operation.detail, EleOperationDetail::Deleted) {
                 stats.delete_count += 1;
-                let deleted_sqls = delete_increment_element(operation.refno).await?;
-                stats.att_rows += deleted_sqls.saturating_sub(1);
+                let deleted_sqls = build_increment_delete_statements(operation.refno).await?;
+                stats.att_rows += deleted_sqls.len().saturating_sub(1);
+                mutation_sqls.extend(deleted_sqls);
                 continue;
             }
 
@@ -705,27 +691,31 @@ async fn persist_pdms_increment_grouped(
                 pe_data.gen_sur_json(Some(refno.to_pe_key())),
                 ele.children.as_slice(),
             );
-            pe_upserts.push(format!("UPSERT {} MERGE {};", refno.to_pe_key(), pe_json));
+            mutation_sqls.push(format!("UPSERT {} CONTENT {};", refno.to_pe_key(), pe_json));
             stats.pe_rows += 1;
             stats.upsert_count += 1;
 
             let type_name = att.get_type_str().to_string();
             if !type_name.is_empty() {
-                if let Some(json) = att.gen_sur_json() {
-                    att_upserts.push(format!(
-                        "UPSERT {} MERGE {};",
+                if let Some(json) = att.gen_sur_json_exclude(&["id"], None) {
+                    mutation_sqls.push(format!(
+                        "UPSERT {} CONTENT {};",
                         record_target(&type_name, refno),
                         json
                     ));
                     stats.att_rows += 1;
                 }
-                if let Some(json) = att.gen_sur_json_uda(&[]) {
-                    uda_upserts.push(format!(
-                        "UPSERT {} MERGE {};",
+                if let Some(json) = att.gen_sur_json_uda(&["id"]) {
+                    mutation_sqls.push(format!(
+                        "UPSERT {} CONTENT {};",
                         record_target("ATT_UDA", refno),
                         aios_core::helper::normalize_sql_string(&json)
                     ));
                     stats.uda_rows += 1;
+                } else {
+                    // Removing the last UDA is a state change too; leaving the old
+                    // row would make current and historical snapshots disagree.
+                    mutation_sqls.push(format!("DELETE {};", record_target("ATT_UDA", refno)));
                 }
             }
 
@@ -746,10 +736,6 @@ async fn persist_pdms_increment_grouped(
         }
     }
 
-    exec_statements(&pe_upserts, 200).await?;
-    exec_statements(&att_upserts, 200).await?;
-    exec_statements(&uda_upserts, 200).await?;
-
     let file_name = report
         .file_path
         .file_name()
@@ -763,13 +749,58 @@ async fn persist_pdms_increment_grouped(
         ));
     }
     stats.dbnum_info_updates = dbnum_sqls.len();
-    exec_statements(&dbnum_sqls, 200).await?;
 
-    // specs/022 T009：成功路径末尾（全部 UPSERT/DELETE + dbnum_info flush 完成后）固化锚点。
-    // 空批已在函数开头提前返回，不会到这里，故空批不写锚点。
-    let anchor =
-        write_sesno_version_anchor(report.dbnum, report.actual_end_sesno, "incremental").await?;
-    stats.anchors.push(anchor);
+    let fingerprint = compute_commit_fingerprint(
+        report.dbnum,
+        report.actual_start_sesno,
+        report.actual_end_sesno,
+        VersionCommitSource::Incremental,
+        source_observation_hash,
+        mutation_sqls
+            .iter()
+            .chain(dbnum_sqls.iter())
+            .map(String::as_str),
+    );
+    let commit_counts = VersionCommitCounts {
+        pe_rows: stats.pe_rows,
+        att_rows: stats.att_rows,
+        uda_rows: stats.uda_rows,
+        delete_count: stats.delete_count,
+        dbnum_info_updates: stats.dbnum_info_updates,
+    };
+    let request = VersionCommitRequest {
+        dbnum: report.dbnum,
+        from_sesno: report.actual_start_sesno,
+        to_sesno: report.actual_end_sesno,
+        source: VersionCommitSource::Incremental,
+        fingerprint,
+        source_observation_hash: source_observation_hash.map(str::to_string),
+        expected_counts: Some(commit_counts.clone()),
+    };
+    let outcome = if recover_pending {
+        recover_version_commit(request, || async move {
+            exec_statements(&mutation_sqls, 200).await?;
+            exec_statements(&dbnum_sqls, 200).await?;
+            Ok(commit_counts)
+        })
+        .await?
+    } else {
+        commit_version(request, || async move {
+            exec_statements(&mutation_sqls, 200).await?;
+            exec_statements(&dbnum_sqls, 200).await?;
+            Ok(commit_counts)
+        })
+        .await?
+    };
+    stats.anchors.push(VersionAnchorRecord {
+        dbnum: outcome.dbnum,
+        sesno: outcome.to_sesno,
+        source: "incremental".to_string(),
+        anchored_at: Some(outcome.anchored_at),
+        fingerprint: Some(outcome.fingerprint),
+        idempotent: outcome.idempotent,
+        recovered: outcome.recovered,
+    });
 
     Ok(stats)
 }
@@ -787,10 +818,30 @@ pub async fn persist_pdms_increment_files(
 
 pub async fn persist_collected_pdms_increment_files(
     files: &[PdmsSesnoCollectedFile],
+    source_observation_hash: Option<&str>,
+    recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats::default();
     for file in files {
-        stats.merge(persist_pdms_increment_grouped(&file.report, &file.grouped_operations).await?);
+        match persist_pdms_increment_grouped(
+            &file.report,
+            &file.grouped_operations,
+            source_observation_hash,
+            recover_pending,
+        )
+        .await
+        {
+            Ok(file_stats) => stats.merge(file_stats),
+            Err(error) => {
+                stats.file_count += 1;
+                stats.commit_failures.push(VersionCommitFailureRecord {
+                    dbnum: file.report.dbnum,
+                    from_sesno: file.report.actual_start_sesno,
+                    to_sesno: file.report.actual_end_sesno,
+                    error: error.to_string(),
+                });
+            }
+        }
     }
     Ok(stats)
 }
@@ -1097,212 +1148,4 @@ pub fn collect_pdms_increment_for_dbnums_from_index(
         )?
         .into_outcome(),
     )
-}
-
-/// 元素变更操作类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ChangeOperation {
-    Add,
-    Modify,
-    Delete,
-}
-
-impl FromStr for ChangeOperation {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
-            "ADD" | "INSERT" => Ok(ChangeOperation::Add),
-            "MODIFY" | "UPDATE" => Ok(ChangeOperation::Modify),
-            "DELETE" | "REMOVE" => Ok(ChangeOperation::Delete),
-            _ => Err(anyhow::anyhow!("未知的变更操作类型: {}", s)),
-        }
-    }
-}
-
-/// 元素变更记录
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ElementChange {
-    /// 元素引用号
-    pub refno: String,
-    /// 元素类型
-    pub element_type: String,
-    /// 操作类型
-    pub operation: ChangeOperation,
-    /// 会话号
-    pub sesno: u32,
-    /// 时间戳
-    pub timestamp: Datetime,
-    /// 数据库编号
-    pub dbnum: i32,
-}
-
-/// 获取特定 sesno 的所有变更
-///
-/// # 参数
-/// * `sesno` - 目标会话号
-///
-/// # 返回值
-/// * `anyhow::Result<IncrGeoUpdateLog>` - 增量几何更新日志
-pub async fn get_changes_at_sesno(sesno: u32) -> anyhow::Result<IncrGeoUpdateLog> {
-    // 查询该 sesno 的所有变更记录
-    let sql = format!(
-        "SELECT refno, element_type, operation, sesno, timestamp, dbnum FROM element_changes WHERE sesno = {} ORDER BY timestamp",
-        sesno
-    );
-
-    let mut response = project_primary_db().query(sql).await?;
-    let raw_values: Vec<JsonValue> = response.take(0)?;
-    let changes: Vec<ElementChange> = raw_values
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<_, _>>()
-        .map_err(|err| anyhow::anyhow!(err))?;
-
-    // 转换为 IncrGeoUpdateLog
-    let mut update_log = IncrGeoUpdateLog::default();
-
-    for change in changes {
-        let refno = RefnoEnum::Refno(aios_core::RefU64(change.refno.parse::<u64>()?));
-
-        let normalized_type = normalize_element_type(refno, &change.element_type).await?;
-
-        let is_delete = matches!(change.operation, ChangeOperation::Delete);
-        if insert_change_by_noun(&mut update_log, refno, &normalized_type, is_delete).is_none() {
-            println!(
-                "警告：未知元素类型 {} 对于 refno {}",
-                change.element_type, refno
-            );
-        }
-    }
-
-    Ok(update_log)
-}
-
-/// 获取 sesno 范围内的所有变更
-///
-/// # 参数
-/// * `start_sesno` - 起始会话号
-/// * `end_sesno` - 结束会话号
-///
-/// # 返回值
-/// * `anyhow::Result<IncrGeoUpdateLog>` - 增量几何更新日志
-pub async fn get_changes_between_sesnos(
-    start_sesno: u32,
-    end_sesno: u32,
-) -> anyhow::Result<IncrGeoUpdateLog> {
-    let sql = format!(
-        "SELECT refno, element_type, operation, sesno, timestamp, dbnum FROM element_changes WHERE sesno >= {} AND sesno <= {} ORDER BY sesno, timestamp",
-        start_sesno, end_sesno
-    );
-
-    let mut response = project_primary_db().query(sql).await?;
-    let raw_values: Vec<JsonValue> = response.take(0)?;
-    let changes: Vec<ElementChange> = raw_values
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<_, _>>()
-        .map_err(|err| anyhow::anyhow!(err))?;
-
-    let mut update_log = IncrGeoUpdateLog::default();
-
-    // 按时间顺序处理变更，后面的变更会覆盖前面的
-    for change in changes {
-        let refno = RefnoEnum::Refno(aios_core::RefU64(change.refno.parse::<u64>()?));
-
-        let normalized_type = normalize_element_type(refno, &change.element_type).await?;
-
-        let is_delete = matches!(change.operation, ChangeOperation::Delete);
-        if insert_change_by_noun(&mut update_log, refno, &normalized_type, is_delete).is_none() {
-            println!(
-                "警告：未知元素类型 {} 对于 refno {}",
-                change.element_type, refno
-            );
-        }
-    }
-
-    Ok(update_log)
-}
-
-/// 检查指定 sesno 是否存在变更记录
-///
-/// # 参数
-/// * `sesno` - 目标会话号
-///
-/// # 返回值
-/// * `anyhow::Result<bool>` - 是否存在变更记录
-pub async fn has_changes_at_sesno(sesno: u32) -> anyhow::Result<bool> {
-    let sql = format!(
-        "SELECT COUNT(*) as count FROM element_changes WHERE sesno = {}",
-        sesno
-    );
-
-    let mut response = project_primary_db().query(sql).await?;
-    let count: Option<i64> = response.take("count")?;
-
-    Ok(count.unwrap_or(0) > 0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_get_changes_at_sesno() -> anyhow::Result<()> {
-        // 这里需要有测试数据库连接
-        // 实际测试需要根据具体的数据库环境进行调整
-        let sesno = 100u32;
-
-        match get_changes_at_sesno(sesno).await {
-            Ok(update_log) => {
-                println!(
-                    "获取到 sesno {} 的变更: {} 个元素",
-                    sesno,
-                    update_log.count()
-                );
-                assert!(update_log.count() >= 0);
-            }
-            Err(e) => {
-                // 在没有数据库连接的测试环境中，这是预期的
-                println!("测试跳过（数据库连接问题）: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_change_operation_from_str() -> anyhow::Result<()> {
-        assert_eq!(ChangeOperation::from_str("ADD")?, ChangeOperation::Add);
-        assert_eq!(
-            ChangeOperation::from_str("MODIFY")?,
-            ChangeOperation::Modify
-        );
-        assert_eq!(
-            ChangeOperation::from_str("DELETE")?,
-            ChangeOperation::Delete
-        );
-        assert_eq!(ChangeOperation::from_str("insert")?, ChangeOperation::Add);
-
-        assert!(ChangeOperation::from_str("UNKNOWN").is_err());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_has_changes_at_sesno() -> anyhow::Result<()> {
-        let sesno = 100u32;
-
-        match has_changes_at_sesno(sesno).await {
-            Ok(has_changes) => {
-                println!("sesno {} 是否有变更: {}", sesno, has_changes);
-                // 这个测试主要验证函数不会崩溃
-            }
-            Err(e) => {
-                println!("测试跳过（数据库连接问题）: {}", e);
-            }
-        }
-
-        Ok(())
-    }
 }

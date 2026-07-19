@@ -9,7 +9,7 @@ use aios_core::room::algorithm::*;
 use aios_core::shape::pdms_shape::PlantMesh;
 
 use aios_core::{
-    GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, model_primary_db,
+    GeomInstQuery, ModelHashInst, RefU64, RefnoEnum, SurrealQueryExt, project_primary_db,
 };
 
 use dashmap::DashMap;
@@ -533,7 +533,7 @@ async fn refresh_sqlite_spatial_index_from_refnos(
             "#
         );
 
-        let mut response = model_primary_db().query_response(&sql).await?;
+        let mut response = project_primary_db().query_response(&sql).await?;
         let inst_sql = format!(
             r#"
             SELECT
@@ -547,7 +547,7 @@ async fn refresh_sqlite_spatial_index_from_refnos(
             WHERE in IN [{pe_list}] AND in != NONE
             "#
         );
-        let inst_rows: Vec<InstRelateRow> = model_primary_db().query_take(&inst_sql, 0).await?;
+        let inst_rows: Vec<InstRelateRow> = project_primary_db().query_take(&inst_sql, 0).await?;
         let inst_map: HashMap<RefnoEnum, InstRelateRow> = inst_rows
             .into_iter()
             .filter(|row| row.refno.is_valid())
@@ -668,7 +668,7 @@ async fn query_inst_relate_rows_by_dbnums(db_nums: &[u32]) -> anyhow::Result<Vec
         WHERE dbnum IN [{dbnum_list}]
         "#
     );
-    let rows: Vec<InstRelateRow> = model_primary_db().query_take(&sql, 0).await?;
+    let rows: Vec<InstRelateRow> = project_primary_db().query_take(&sql, 0).await?;
     Ok(rows)
 }
 
@@ -695,7 +695,7 @@ async fn query_aabb_rows_by_dbnums(
              ORDER BY refno \
              LIMIT {page_size} START {offset}"
         );
-        let mut batch: Vec<QueryAabbRowRaw> = model_primary_db().query_take(&sql, 0).await?;
+        let mut batch: Vec<QueryAabbRowRaw> = project_primary_db().query_take(&sql, 0).await?;
         if batch.is_empty() {
             break;
         }
@@ -872,7 +872,7 @@ async fn query_branch_tubi_aggregate_aabbs(
             owner_refno = branch_refno.to_pe_key()
         );
 
-        let rows: Vec<TubiAabbRow> = match model_primary_db().query_take(&sql, 0).await {
+        let rows: Vec<TubiAabbRow> = match project_primary_db().query_take(&sql, 0).await {
             Ok(rows) => rows,
             Err(err) => {
                 warn!(
@@ -997,7 +997,7 @@ async fn save_spatial_aggregate_aabbs_by_dbnums(
     }
 
     let dbnum_list = db_nums.iter().map(u32::to_string).join(", ");
-    model_primary_db()
+    project_primary_db()
         .query(&format!(
             "DELETE FROM inst_relate_agg_aabb WHERE refno.dbnum IN [{dbnum_list}];"
         ))
@@ -1039,7 +1039,7 @@ async fn save_spatial_aggregate_aabbs_by_dbnums(
         }
 
         if !statements.is_empty() {
-            model_primary_db()
+            project_primary_db()
                 .query(&(statements.join(";\n") + ";"))
                 .await?;
         }
@@ -1054,7 +1054,7 @@ async fn query_spatial_index_refresh_dbnums() -> anyhow::Result<Vec<u32>> {
         SELECT VALUE array::distinct(dbnum) FROM inst_relate GROUP ALL;
         SELECT VALUE array::distinct(refno.dbnum) FROM inst_relate_aabb WHERE aabb_id.d != NONE GROUP ALL;
     "#;
-    let mut response = model_primary_db().query_response(sql).await?;
+    let mut response = project_primary_db().query_response(sql).await?;
     let inst_dbnums: Vec<Vec<i64>> = response.take(0).unwrap_or_default();
     let aabb_dbnums: Vec<Vec<i64>> = response.take(1).unwrap_or_default();
 
@@ -1113,7 +1113,7 @@ async fn refresh_sqlite_spatial_index_from_dbnums(
             WHERE refno IN [{pe_list}] AND aabb_id.d != NONE;
             "#
         );
-        let mut response = model_primary_db().query_response(&sql).await?;
+        let mut response = project_primary_db().query_response(&sql).await?;
         let booled_rows: Vec<QueryAabbRowRaw> = response.take(0)?;
         let raw_rows: Vec<QueryAabbRowRaw> = response.take(1)?;
 
@@ -1288,7 +1288,7 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
     let booled_sql = format!(
         "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE"
     );
-    let booled_rows: Vec<QueryAabbRowRaw> = match model_primary_db().query(&booled_sql).await {
+    let booled_rows: Vec<QueryAabbRowRaw> = match project_primary_db().query(&booled_sql).await {
         Ok(mut resp) => resp.take(0).unwrap_or_default(),
         Err(_) => Vec::new(),
     };
@@ -1325,7 +1325,7 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
         let fallback_sql = format!(
             "SELECT refno, aabb_id.d as aabb FROM inst_relate_aabb WHERE refno IN [{missing_ids}] AND aabb_id.d != NONE"
         );
-        let mut response = model_primary_db().query(&fallback_sql).await?;
+        let mut response = project_primary_db().query(&fallback_sql).await?;
         let rows: Vec<QueryAabbRowRaw> = response.take(0)?;
 
         for row in rows {
@@ -1354,7 +1354,7 @@ pub(crate) async fn query_aabb_from_inst_relate_aabb(
         let aggregate_sql = format!(
             "SELECT refno, aabb_id.d as aabb FROM inst_relate_agg_aabb WHERE refno IN [{missing_ids}] AND aabb_id.d != NONE"
         );
-        let rows: Vec<QueryAabbRowRaw> = match model_primary_db().query(&aggregate_sql).await {
+        let rows: Vec<QueryAabbRowRaw> = match project_primary_db().query(&aggregate_sql).await {
             Ok(mut response) => response.take(0).unwrap_or_default(),
             Err(_) => Vec::new(),
         };
@@ -1498,7 +1498,7 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
     {
         let booled_sql =
             "SELECT refno, aabb_id.d as aabb FROM inst_relate_booled_aabb WHERE aabb_id.d != NONE";
-        match model_primary_db().query(booled_sql).await {
+        match project_primary_db().query(booled_sql).await {
             Ok(mut resp) => {
                 let booled_rows: Vec<QueryAabbRowRaw> = resp.take(0).unwrap_or_default();
                 for row in booled_rows {
@@ -1540,7 +1540,7 @@ pub async fn refresh_sqlite_spatial_index_from_inst_relate_aabb(
              ORDER BY refno \
              LIMIT {CHUNK_SIZE} START {offset}"
         );
-        let mut response = model_primary_db().query(&sql).await?;
+        let mut response = project_primary_db().query(&sql).await?;
         let rows: Vec<InstRelateAabbRow> = response.take(0)?;
 
         if rows.is_empty() {
@@ -1658,7 +1658,7 @@ async fn count_inst_relate_aabb_rows_for_refnos(refnos: &[RefnoEnum]) -> anyhow:
         let sql = format!(
             "SELECT VALUE count() FROM inst_relate_aabb WHERE refno IN [{ids}] AND aabb_id.d != NONE GROUP ALL"
         );
-        let counts: Vec<usize> = model_primary_db().query_take(&sql, 0).await?;
+        let counts: Vec<usize> = project_primary_db().query_take(&sql, 0).await?;
         total += counts.into_iter().next().unwrap_or(0);
     }
 
@@ -1696,7 +1696,7 @@ async fn preflight_room_compute_aabb_count(
         let sql = format!(
             "SELECT VALUE count() FROM inst_relate_aabb WHERE refno.dbnum IN [{dbnum_list}] AND aabb_id.d != NONE GROUP ALL"
         );
-        let counts: Vec<usize> = model_primary_db().query_take(&sql, 0).await?;
+        let counts: Vec<usize> = project_primary_db().query_take(&sql, 0).await?;
         let count = counts.into_iter().next().unwrap_or(0);
         if count == 0 {
             anyhow::bail!(
@@ -1707,7 +1707,7 @@ async fn preflight_room_compute_aabb_count(
         return Ok(count);
     }
 
-    let counts: Vec<usize> = model_primary_db()
+    let counts: Vec<usize> = project_primary_db()
         .query_take(
             "SELECT VALUE count() FROM inst_relate_aabb WHERE aabb_id.d != NONE GROUP ALL",
             0,
@@ -1863,7 +1863,7 @@ async fn pregen_room_panels_into_model_cache(
         gen_option.manual_db_nums = Some(nums.to_vec());
     }
 
-    crate::fast_model::gen_model::gen_all_geos_data(panel_refnos, &gen_option, None, None).await?;
+    crate::fast_model::gen_model::gen_all_geos_data(panel_refnos, &gen_option, None).await?;
     Ok(())
 }
 
@@ -3105,7 +3105,7 @@ async fn query_candidate_rooms(
         table, filter
     );
 
-    let mut response = model_primary_db().query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?;
     let raw_result: Vec<(RecordId, String)> = response.take(0)?;
 
     Ok(raw_result
@@ -3159,7 +3159,7 @@ async fn create_room_panel_relations_batch(
         return Ok(());
     }
 
-    model_primary_db().query(batch_sql).await?;
+    project_primary_db().query(batch_sql).await?;
     Ok(())
 }
 
@@ -3172,7 +3172,7 @@ async fn create_room_panel_relations_batch_chunked(
     for chunk in room_groups.chunks(CHUNK_SIZE) {
         let batch_sql = build_room_panel_relations_sql(chunk);
         if !batch_sql.is_empty() {
-            model_primary_db().query(batch_sql).await?;
+            project_primary_db().query(batch_sql).await?;
         }
     }
     Ok(())
@@ -3205,7 +3205,7 @@ async fn sync_room_panel_relations(
         return Ok(());
     }
 
-    model_primary_db().query(sql_statements.join("\n")).await?;
+    project_primary_db().query(sql_statements.join("\n")).await?;
     Ok(())
 }
 
@@ -4828,7 +4828,7 @@ pub async fn save_room_relate(
 
     let batch_sql = sql_statements.join("\n");
 
-    model_primary_db().query(&batch_sql).await?;
+    project_primary_db().query(&batch_sql).await?;
 
     debug!(
         "保存房间关系: panel={}, components={}",
@@ -4869,7 +4869,7 @@ async fn save_room_relate_batch(panel_relations: &[PanelComputedRelations]) -> a
         return Ok(());
     }
 
-    model_primary_db().query(batch_sql).await?;
+    project_primary_db().query(batch_sql).await?;
     Ok(())
 }
 
@@ -4882,7 +4882,7 @@ async fn save_room_relate_batch_chunked(
     for chunk in panel_relations.chunks(CHUNK_SIZE) {
         let batch_sql = build_room_relate_batch_sql(chunk);
         if !batch_sql.is_empty() {
-            model_primary_db().query(batch_sql).await?;
+            project_primary_db().query(batch_sql).await?;
         }
     }
     Ok(())
@@ -6420,7 +6420,7 @@ async fn query_panels_containing_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<
         refno_list
     );
 
-    let mut response = model_primary_db().query(&sql).await?;
+    let mut response = project_primary_db().query(&sql).await?;
 
     let panels: Vec<PanelRoom> = response.take(0)?;
 
@@ -6432,7 +6432,7 @@ async fn query_panels_containing_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 
 async fn delete_all_room_relations() -> anyhow::Result<()> {
-    model_primary_db()
+    project_primary_db()
         .query("DELETE room_relate;\nDELETE room_panel_relate;")
         .await?;
     Ok(())
@@ -6448,7 +6448,7 @@ async fn delete_room_relations_for_panels(panels: &[PanelRoom]) -> anyhow::Resul
     let panel_refnos: Vec<RefnoEnum> = panels.iter().map(|p| p.panel).collect();
 
     if let Some(sql) = build_delete_room_relations_sql_for_panels(&panel_refnos) {
-        model_primary_db().query(sql).await?;
+        project_primary_db().query(sql).await?;
     }
 
     debug!("已删除 {} 个面板的房间关系", panels.len());

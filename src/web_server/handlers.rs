@@ -5354,7 +5354,20 @@ async fn execute_real_task(state: AppState, task_id: String) {
             config.excluded_nouns.clone().unwrap_or_default();
         db_option_ext.index_tree_debug_limit_per_target_type = config.debug_limit_per_noun_type;
 
-        if let Err(e) = gen_all_geos_data(vec![], &db_option_ext, None, config.target_sesno).await {
+        // specs/022 候选3：target_sesno 依赖的 element_changes 表从未有写入方，路径已移除；
+        // 显式携带 target_sesno 的请求快速失败并指引改用 incremental-sesno。
+        let gen_result: anyhow::Result<()> = if let Some(sesno) = config.target_sesno {
+            Err(anyhow::anyhow!(
+                "target_sesno={} 已废弃：element_changes 表从未有写入方，按 sesno 的增量生成请改用 CLI incremental-sesno --dbnum ... --from-sesno/--to-sesno --generate-model（specs/022）",
+                sesno
+            ))
+        } else {
+            gen_all_geos_data(vec![], &db_option_ext, None)
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        };
+        if let Err(e) = gen_result {
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
                 task.status = TaskStatus::Failed;
@@ -8983,13 +8996,18 @@ async fn execute_refno_model_generation(
     }
 
     // 重新获取 options (避免借用问题，虽然这里 clone 了)
-    let result = gen_all_geos_data(
-        parsed_refnos.clone(),
-        &db_option_ext,
-        None,
-        config.target_sesno,
-    )
-    .await;
+    // specs/022 候选3：target_sesno 的 element_changes 反查路径已移除，显式传入时快速失败。
+    let result: anyhow::Result<()> = if let Some(sesno) = config.target_sesno {
+        Err(anyhow::anyhow!(
+            "target_sesno={} 已废弃：element_changes 表从未有写入方，按 sesno 的增量生成请改用 CLI incremental-sesno（specs/022）",
+            sesno
+        ))
+    } else {
+        gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    };
 
     let duration = start_time.elapsed();
 
@@ -9466,7 +9484,7 @@ pub async fn api_show_by_refno(
 
     // 5. 调用生成函数
     let result =
-        crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None, None)
+        crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None)
             .await;
 
     match result {

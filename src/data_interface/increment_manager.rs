@@ -31,8 +31,12 @@ use walkdir::WalkDir;
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::data_interface::interface::PdmsDataInterface;
+use crate::data_interface::sesno_increment::{
+    PdmsIncrementPersistStats, PdmsSesnoCollectedOutcome,
+    collect_pdms_increment_for_file_with_operations, persist_collected_pdms_increment_files,
+};
 use crate::data_interface::tidb_manager::AiosDBManager;
-use crate::fast_model::*;
+use crate::versioned_db::version_commit::committed_watermark;
 #[cfg(feature = "mqtt")]
 use crate::mqtt_service::SyncE3dFileMsg;
 #[cfg(feature = "web_server")]
@@ -42,55 +46,6 @@ use crate::web_server::{
     sync_control_center::{NewSyncTaskParams, SYNC_CONTROL_CENTER},
 };
 use parse_pdms_db::parse::DbBasicInfo;
-
-/// 增量更新信息结构体
-///
-/// 用于存储和跟踪数据库中元素的增量变化信息
-#[derive(Debug, Default, Clone)]
-pub struct IncrementInfo {
-    /// 元素的引用编号
-    pub refno: RefU64,
-    /// 数据库编号
-    pub dbnum: i32,
-    /// 元素的属性映射
-    pub attr: NamedAttrMap,
-    /// 子元素的引用编号列表
-    pub children: RefU64Vec,
-    /// 元素的操作类型(增加/修改/删除)
-    pub operation: EleOperation,
-}
-
-impl IncrementInfo {
-    /// 检查元素是否被修改
-    ///
-    /// # 返回值
-    ///
-    /// * `bool` - 如果元素被修改返回true，否则返回false
-    #[inline]
-    pub fn is_modified(&self) -> bool {
-        matches!(self.operation, EleOperation::Modified)
-    }
-
-    /// 检查元素是否被删除
-    ///
-    /// # 返回值
-    ///
-    /// * `bool` - 如果元素被删除返回true，否则返回false
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        matches!(self.operation, EleOperation::Deleted)
-    }
-
-    /// 检查元素是否为新增
-    ///
-    /// # 返回值
-    ///
-    /// * `bool` - 如果元素是新增的返回true，否则返回false
-    #[inline]
-    pub fn is_added(&self) -> bool {
-        matches!(self.operation, EleOperation::Add)
-    }
-}
 
 #[cfg(feature = "web_server")]
 #[derive(Debug)]
@@ -196,113 +151,86 @@ const JSON_CHUNK_COUNT: usize = 200;
 pub const CHECK_DB_TYPES: [&'static str; 6] = ["CATA", "DESI", "DICT", "SYST", "GLB", "GLOB"];
 
 impl AiosDBManager {
-    /// 执行增量更新
-    /// 执行增量更新操作
+    /// 执行增量更新（specs/022：watch 与 CLI 共用同一 Version Commit seam）。
     ///
-    /// 该函数处理多个数据库文件的增量更新。
+    /// 对每个 `(path, sesno_range)`：复用 CLI 的采集深模块收集增量操作，
+    /// 然后经 `persist_collected_pdms_increment_files` → `commit_version()` 落库——
+    /// fingerprint、per-dbnum lease、`sesno_version_anchor` 固化与 Commit Pending
+    /// 语义全部由该 seam 提供。本函数不做源观测门（watch 无 manifest），
+    /// 也永不自动恢复 pending（恢复保持人工 `incremental-sesno --recover-pending`）。
     ///
     /// # 参数
     ///
-    /// * `increment_ranges_map` - 包含路径和对应的数据库页面基本信息及会话号范围的映射
-    ///   键为数据库文件路径，值为元组，包含数据库页面基本信息和需要更新的会话号范围
+    /// * `increment_ranges_map` - 数据库文件路径 → (页面基本信息, 待提交 sesno 区间)；
+    ///   区间起点必须是 Committed Watermark + 1（由调用方基于 `committed_watermark` 计算）
     ///
     /// # 返回值
     ///
-    /// * `anyhow::Result<bool>` - 成功返回Ok(true)，失败返回错误
-    ///
-    /// # 错误
-    ///
-    /// 当数据库操作失败时会返回错误
+    /// * `PdmsIncrementPersistStats` - 含已固化锚点 `anchors` 与按 dbnum 的
+    ///   `commit_failures`；调用方据此决定哪些 dbnum 可推进 header/通知
     pub async fn execute_incr_update(
         &self,
         increment_ranges_map: IndexMap<PathBuf, (DbPageBasicInfo, RangeInclusive<i32>)>,
-    ) -> anyhow::Result<bool> {
-        for (path, (basic_info, sesno_range)) in increment_ranges_map {
-            println!("Path: {:?}, Sesno Range: {:?}", path, &sesno_range);
-            let mut io = PdmsIO::new("", path.clone(), true);
-            io.open()
-                .map_err(|e| anyhow::anyhow!("Failed to open PdmsIO: {}", e))?;
-            let end_sesno = sesno_range.end().clone();
-            let range_update_eles = io.collect_increment_eles(Some(sesno_range))?;
-            io.update_elements_to_database(&range_update_eles, true)
-                .await?;
-
-            //执行逻辑
-
-            //更新 sesno 到 db_file_info 中
-            let file_name = path.file_stem().unwrap().to_str().unwrap();
-            // dbg!(&file_name);
-            //更新 sesno 到 db_file_info 中的sql
-            let sql = format!("UPDATE db_file_info:{} SET sesno={};", file_name, end_sesno);
-            //执行更新
-            project_primary_db().query(sql).await.unwrap();
+    ) -> anyhow::Result<PdmsIncrementPersistStats> {
+        let project = get_db_option().project_name.clone();
+        let mut collected = PdmsSesnoCollectedOutcome::default();
+        for (path, (_basic_info, sesno_range)) in increment_ranges_map {
+            println!(
+                "[watch-incremental] 采集增量: path={:?}, sesno_range={:?}",
+                path, &sesno_range
+            );
+            // collect_* 的入参是"已缓存 sesno"（= 区间起点 - 1）与目标 sesno
+            let cached_sesno = (*sesno_range.start()).max(1) as u32 - 1;
+            let target_sesno = (*sesno_range.end()).max(0) as u32;
+            let outcome = collect_pdms_increment_for_file_with_operations(
+                &project,
+                &path,
+                cached_sesno,
+                Some(target_sesno),
+                false,
+            )?;
+            collected.merge(outcome);
         }
 
-        Ok(true)
-    }
-
-    /// 通过文件名查询数据库中最新的会话号
-    ///
-    /// # 参数
-    ///
-    /// * `file_name` - 要查询的数据库文件名
-    ///
-    /// # 返回值
-    ///
-    /// * `anyhow::Result<u32>` - 成功则返回最新会话号,失败返回错误
-    ///
-    /// # 错误
-    ///
-    /// 当数据库查询失败时会返回错误
-    async fn query_latest_sesno_by_file_name(file_name: &str) -> anyhow::Result<u32> {
-        let mut response = project_primary_db()
-            .query(format!(
-                r#"
-                select value sesno from only db_file_info:{} limit 1;
-                "#,
-                file_name
-            ))
-            .await?;
-        let sesno: Option<u32> = response.take(0)?;
-        Ok(sesno.unwrap_or_default())
-    }
-
-    /// 通过数据库编号查询数据库中最新的会话号
-    ///
-    /// # 参数
-    ///
-    /// * `dbnum` - 要查询的数据库编号
-    ///
-    /// # 返回值
-    ///
-    /// * `anyhow::Result<u32>` - 成功则返回最新会话号,失败返回错误
-    ///
-    /// # 错误
-    ///
-    /// 当数据库查询失败时会返回错误
-    async fn query_latest_sesno_by_dbnum(dbnum: u32) -> anyhow::Result<u32> {
-        // 从dbnum_info_table中查询对应dbnum的最大sesno
-        // 使用更高效的查询，直接获取该dbnum的最大sesno值
-        let mut response = project_primary_db()
-            .query(format!(
-                r#"
-                math::max(array::flatten([
-                    SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {}
-                ]));
-                "#,
-                dbnum
-            ))
-            .await?;
-        let sesno: Option<u32> = response.take(0)?;
-        Ok(sesno.unwrap_or_default())
+        let stats =
+            persist_collected_pdms_increment_files(&collected.files, None, false).await?;
+        // persist-only：分类结果仅记录备用，模型生成留给 CLI/IncrementRun
+        let update_log = &collected.outcome.update_log;
+        if update_log.count() > 0 {
+            println!(
+                "[watch-incremental] 模型增量分类: prim={} loop_owner={} bran_hanger={} basic_cata={} delete={} (persist-only，不触发模型生成)",
+                update_log.prim_refnos.len(),
+                update_log.loop_owner_refnos.len(),
+                update_log.bran_hanger_refnos.len(),
+                update_log.basic_cata_refnos.len(),
+                update_log.delete_refnos.len()
+            );
+        }
+        for anchor in &stats.anchors {
+            println!(
+                "[watch-incremental] Version Anchor 已固化: dbnum={} sesno={} idempotent={} recovered={}",
+                anchor.dbnum, anchor.sesno, anchor.idempotent, anchor.recovered
+            );
+        }
+        for failure in &stats.commit_failures {
+            eprintln!(
+                "[watch-incremental] Version Commit 失败: dbnum={} sesno={}..={} error={} \
+                 （保留旧水位等待下次文件事件重试；Commit Pending 需人工 incremental-sesno --recover-pending）",
+                failure.dbnum, failure.from_sesno, failure.to_sesno, failure.error
+            );
+        }
+        Ok(stats)
     }
 
     ///初始化监测
-    /// 启动时监测数据文件夹里的文件变化
+    /// 启动时监测数据文件夹里的文件变化，初始化 headers 与 CBA 归档。
+    ///
+    /// 注：启动时不做补增量（停机期间落后的区间不在这里追）。若需要
+    /// "启动补增量"，应作为独立开关走与 `async_watch` 相同的
+    /// `execute_incr_update`（同一 Version Commit seam），而不是旁路实现。
     pub async fn init_watcher(&self) -> anyhow::Result<()> {
-        let mut params = IndexMap::new();
         fs::create_dir_all("assets/archives")?;
-        let mut time = Instant::now();
+        let time = Instant::now();
         dbg!(&self.watcher.watch_dirs);
         let db_option = get_db_option();
         let manual_dbnums = db_option.manual_db_nums.clone().unwrap_or_default();
@@ -332,8 +260,8 @@ impl AiosDBManager {
 
                 let DbBasicInfo {
                     db_type,
-                    ses_pgno,
-                    dbnum: dbnum,
+                    ses_pgno: _,
+                    dbnum,
                 } = parse_db_basic_info(path.to_path_buf());
                 //是否调试里有筛选
                 if !manual_dbnums.is_empty() && !manual_dbnums.contains(&dbnum) {
@@ -343,28 +271,22 @@ impl AiosDBManager {
                 if !exclude_dbnums.is_empty() && exclude_dbnums.contains(&dbnum) {
                     continue;
                 }
-                let project = get_db_option().project_name.clone();
-                let file_latest_sesno = PdmsIO::new(&project, path.to_path_buf(), true)
-                    .get_latest_sesno()
-                    .unwrap_or_default();
-                // dbg!((dbnum, file_latest_sesno));
-
                 if !CHECK_DB_TYPES.contains(&db_type.as_str()) {
                     continue;
                 }
                 //TODO 这种情况，需要全新的解析
-                let Ok(db_latest_sesno) = Self::query_latest_sesno_by_dbnum(dbnum).await else {
+                let Ok(watermark) = committed_watermark(dbnum).await else {
                     //先暂时跳过数据库里没有的文件，todo 考虑自动追加文件全新解析
                     continue;
                 };
-                // dbg!((dbnum, db_latest_sesno));
-                if db_latest_sesno == 0 {
+                // watermark == 0：该 dbnum 从未全量解析过，不属于增量监听范围
+                if watermark == 0 {
                     continue;
                 }
+                let project = get_db_option().project_name.clone();
                 self.watcher
                     .file_name_full_path_map
                     .insert(file_name.to_owned(), path.to_path_buf());
-                // dbg!(db_latest_sesno);
                 //只有开启异地同步时，才需要初始化异地更新压缩数据包
                 #[cfg(feature = "mqtt")]
                 {
@@ -380,59 +302,16 @@ impl AiosDBManager {
                     // });
                 }
 
-                //每个path 都要检查一遍
-                // if db_latest_sesno != 0
+                // 初始化监听的headers
                 {
-                    // #[cfg(feature = "debug_parse")]
-                    // dbg!((dbnum, db_latest_sesno));
-                    //暂时先跳过更新比较大的
-                    //
-                    {
-                        let mut io = PdmsIO::new(&project, path, true);
-                        io.open()?;
-                        if let Ok(basic_info) = io.get_page_basic_info() {
-                            if file_latest_sesno > db_latest_sesno {
-                                println!(
-                                    "发现需要增量更新的文件: {:?}, 当前数据库属性最大sesno: {db_latest_sesno},\
-                                        文件属性对应sesno: {file_latest_sesno}",
-                                    &file_name
-                                );
-                                let nearest_sesno = io
-                                    .get_nearest_large_sesno(db_latest_sesno as i32 + 1)
-                                    .unwrap_or_default();
-                                params.insert(
-                                    path.to_path_buf(),
-                                    (
-                                        basic_info.clone(),
-                                        //warning : db_latest_sesno as i32 + 1 不一定存在，需要找离他最近的sesno
-                                        nearest_sesno..=file_latest_sesno as i32,
-                                    ),
-                                );
-                            }
-                            // 初始化监听的headers
-                            self.watcher.headers.insert(path.to_path_buf(), basic_info);
-                        }
+                    let mut io = PdmsIO::new(&project, path, true);
+                    io.open()?;
+                    if let Ok(basic_info) = io.get_page_basic_info() {
+                        self.watcher.headers.insert(path.to_path_buf(), basic_info);
                     }
                 }
             }
         }
-
-        //等所有的文件都检查同步完毕，才执行更新
-        //按每个单独的 sesno
-        if !params.is_empty() {
-            dbg!(params.len());
-        }
-        // match self.execute_incr_update(params).await {
-        //     Ok(true) => {
-        //         println!("执行启动后的自动增量完成。")
-        //     }
-        //     Ok(false) => {
-        //         println!("没有发生增量更新。")
-        //     }
-        //     Err(e) => {
-        //         println!("Execute increment update error: {:?}", e);
-        //     }
-        // }
 
         println!("初始化增量更新耗时: {} s", time.elapsed().as_secs_f32());
 
@@ -496,26 +375,31 @@ impl AiosDBManager {
                                 let prev_sesno = old.latest_ses_data.sesno;
                                 let new_sesno = new_header.latest_ses_data.sesno;
 
-                                // 从数据库获取最新的sesno，而不是使用缓存的值
+                                // specs/022：以 Committed Watermark（锚点优先）为增量起点，
+                                // 而不是缓存 header 或 dbnum_info_table——Commit Pending 时
+                                // 后者可能领先锚点，会静默跳过半写区间
                                 let db_num = new_header.pdms_header.db_num;
-                                let db_latest_sesno =
-                                    match Self::query_latest_sesno_by_dbnum(db_num as _).await {
-                                        Ok(sesno) => sesno,
-                                        Err(e) => {
-                                            println!("查询数据库最新sesno失败: {:?}", e);
-                                            continue;
-                                        }
-                                    };
+                                let watermark = match committed_watermark(db_num as _).await {
+                                    Ok(sesno) => sesno,
+                                    Err(e) => {
+                                        println!("查询 Committed Watermark 失败: {:?}", e);
+                                        continue;
+                                    }
+                                };
+                                // 从未全量解析过的 dbnum 不做增量
+                                if watermark == 0 {
+                                    continue;
+                                }
 
                                 // dbg!(&old.pdms_header);
                                 //未发生修改，直接跳过
-                                if db_latest_sesno as i32 == new_sesno {
+                                if watermark as i32 >= new_sesno {
                                     continue;
                                 }
                                 //比如给出准确的范围next_sesno..=end_sesno
                                 params.insert(
                                     path.clone(),
-                                    (new_header.clone(), (db_latest_sesno as i32 + 1)..=new_sesno),
+                                    (new_header.clone(), (watermark as i32 + 1)..=new_sesno),
                                 );
                             } else {
                                 println!("watcher.headers: {:?}", self.watcher.headers);
@@ -608,12 +492,27 @@ impl AiosDBManager {
 
                         //如果数据没有发生变化，则不需要推出变化，不需要执行增量
                         match self.execute_incr_update(params).await {
-                            Ok(true) => {
+                            Ok(stats) => {
+                                // specs/022：提交失败的 dbnum 不推进 header、不推送同步——
+                                // Committed Watermark 未前移，下次文件事件会重试同一区间；
+                                // Commit Pending 需人工 incremental-sesno --recover-pending
+                                let failed_dbnums: HashSet<u32> = stats
+                                    .commit_failures
+                                    .iter()
+                                    .map(|failure| failure.dbnum)
+                                    .collect();
                                 //执行没问题了，再更新当前的版本记录，headers直接存本地json
                                 for (path, new_header) in new_headers {
                                     let file_name = path.file_stem().unwrap().to_str().unwrap();
                                     let dbnum = new_header.pdms_header.db_num as u32;
                                     if path.is_dir() {
+                                        continue;
+                                    }
+                                    if failed_dbnums.contains(&dbnum) {
+                                        println!(
+                                            "[watch-incremental] dbnum={} 本次 Version Commit 失败，保留旧 header 等待重试",
+                                            dbnum
+                                        );
                                         continue;
                                     }
                                     // dbg!(&file_name);
@@ -708,12 +607,8 @@ impl AiosDBManager {
                                 //now save the watch.json
                                 // self.watcher.save(None).expect("save watch.json failed");
                             }
-                            Ok(false) => {
-                                println!("{:?} 文件发生修改，但是没有发生增量更新。", &event.paths);
-                                continue;
-                            }
                             Err(e) => {
-                                println!("Execute increment update error: {:?}", e);
+                                eprintln!("[watch-incremental] 增量执行失败: {:?}", e);
                             }
                         }
                         //publish notify db file updates

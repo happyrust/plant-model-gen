@@ -1,70 +1,24 @@
+//! specs/022 候选4（方案 A）：增量状态 HTTP 面。
+//!
+//! 状态类端点是 Version Commit 存储（`sesno_version_anchor` / `version_commit_state`
+//! / `dbnum_info_table`）之上的只读 adapter——与 CLI 共享同一事实源，不再返回 mock。
+//! 动作类端点（触发检测/同步、任务、配置）从未有过实现，统一返回 501 并指引走
+//! CLI `incremental-sesno` / `watch-incremental`；未来要回填时应接
+//! `version_management::increment_run`（同一 IncrementRun seam），而非旁路实现。
+
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
 use std::{fs, path::Path as FsPath, time::SystemTime};
 
 use crate::web_server::AppState;
-
-/// 增量更新检测状态
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UpdateDetectionStatus {
-    /// 空闲，未运行检测
-    Idle,
-    /// 正在扫描变更
-    Scanning,
-    /// 检测到变更，等待处理
-    ChangesDetected,
-    /// 正在同步
-    Syncing,
-    /// 同步完成
-    Completed,
-    /// 错误
-    Error(String),
-}
-
-/// 增量更新信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncrementalUpdateInfo {
-    /// 站点ID
-    pub site_id: String,
-    /// 站点名称
-    pub site_name: String,
-    /// 上次同步时间
-    pub last_sync_time: Option<DateTime<Utc>>,
-    /// 检测状态
-    pub detection_status: UpdateDetectionStatus,
-    /// 待同步项目数
-    pub pending_items: usize,
-    /// 已同步项目数
-    pub synced_items: usize,
-    /// 变更文件列表
-    pub changed_files: Vec<ChangedFile>,
-    /// 增量大小（字节）
-    pub increment_size: u64,
-    /// 预计同步时间（秒）
-    pub estimated_sync_time: u32,
-}
-
-/// 变更文件信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangedFile {
-    /// 文件路径
-    pub path: String,
-    /// 变更类型
-    pub change_type: ChangeType,
-    /// 文件大小
-    pub size: u64,
-    /// 修改时间
-    pub modified_time: DateTime<Utc>,
-    /// 数据库编号
-    pub db_num: Option<u32>,
-}
+use aios_core::project_primary_db;
+use surrealdb::types::SurrealValue;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveFile {
@@ -74,15 +28,6 @@ pub struct ArchiveFile {
     pub modified: Option<String>,
     pub dbnum: Option<u32>,
     pub sesno: Option<u32>,
-}
-
-/// 变更类型
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChangeType {
-    Added,
-    Modified,
-    Deleted,
 }
 
 fn system_time_to_rfc3339(time: SystemTime) -> String {
@@ -177,233 +122,332 @@ pub async fn list_incremental_archives() -> Result<Json<serde_json::Value>, Stat
     })))
 }
 
-/// 获取所有部署站点的增量更新状态
-pub async fn get_all_incremental_status(
-    _state: State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 从数据库获取实际的部署站点信息
-    let mock_sites = vec![
-        IncrementalUpdateInfo {
-            site_id: "site_001".to_string(),
-            site_name: "生产环境-主站".to_string(),
-            last_sync_time: Some(Utc::now() - chrono::Duration::hours(2)),
-            detection_status: UpdateDetectionStatus::ChangesDetected,
-            pending_items: 15,
-            synced_items: 0,
-            changed_files: vec![
-                ChangedFile {
-                    path: "/desi/7999/model.xkt".to_string(),
-                    change_type: ChangeType::Modified,
-                    size: 1024 * 1024 * 5, // 5MB
-                    modified_time: Utc::now() - chrono::Duration::minutes(30),
-                    db_num: Some(7999),
-                },
-                ChangedFile {
-                    path: "/desi/8001/model.xkt".to_string(),
-                    change_type: ChangeType::Added,
-                    size: 1024 * 1024 * 3, // 3MB
-                    modified_time: Utc::now() - chrono::Duration::minutes(15),
-                    db_num: Some(8001),
-                },
-            ],
-            increment_size: 1024 * 1024 * 8, // 8MB total
-            estimated_sync_time: 120,        // 2 minutes
-        },
-        IncrementalUpdateInfo {
-            site_id: "site_002".to_string(),
-            site_name: "测试环境".to_string(),
-            last_sync_time: Some(Utc::now() - chrono::Duration::hours(6)),
-            detection_status: UpdateDetectionStatus::Idle,
-            pending_items: 0,
-            synced_items: 235,
-            changed_files: vec![],
-            increment_size: 0,
-            estimated_sync_time: 0,
-        },
-        IncrementalUpdateInfo {
-            site_id: "site_003".to_string(),
-            site_name: "开发环境".to_string(),
-            last_sync_time: Some(Utc::now() - chrono::Duration::minutes(10)),
-            detection_status: UpdateDetectionStatus::Syncing,
-            pending_items: 8,
-            synced_items: 12,
-            changed_files: vec![],
-            increment_size: 1024 * 1024 * 15, // 15MB
-            estimated_sync_time: 180,         // 3 minutes
-        },
-    ];
-
-    Ok(Json(json!({
-        "success": true,
-        "sites": mock_sites,
-        "total_pending": 23,
-        "total_synced": 247,
-        "last_check": Utc::now(),
-    })))
+/// 每库增量/版本状态（真实数据）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DbIncrementStatus {
+    pub dbnum: u32,
+    /// Committed Watermark：已发布 Version Anchor 的最高 sesno（0 = 无锚点）
+    pub committed_watermark: u32,
+    /// dbnum_info_table 记录级最大 sesno（存量/记账口径，Commit Pending 时可能领先锚点）
+    pub legacy_max_sesno: u32,
+    /// 最近一条锚点
+    pub last_anchor_sesno: Option<u32>,
+    pub last_anchored_at: Option<String>,
+    pub last_anchor_source: Option<String>,
+    /// 未恢复的 Commit Pending（阻塞该 dbnum 更高 sesno 提交）
+    pub pending_commits: Vec<PendingCommitInfo>,
 }
 
-/// 获取特定站点的增量更新详情
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCommitInfo {
+    pub to_sesno: u32,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorAggRow {
+    dbnum: u32,
+    max_sesno: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorLatestRow {
+    dbnum: u32,
+    sesno: u32,
+    anchored_at: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PendingRow {
+    dbnum: u32,
+    to_sesno: u32,
+    status: String,
+    last_error: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn statement_missing_table(error: &surrealdb::Error) -> bool {
+    error.to_string().contains("does not exist")
+}
+
+async fn collect_db_increment_status() -> anyhow::Result<Vec<DbIncrementStatus>> {
+    use std::collections::BTreeMap;
+
+    let sql = r#"
+SELECT dbnum, math::max(sesno) AS max_sesno FROM dbnum_info_table GROUP BY dbnum;
+SELECT dbnum, math::max(sesno) AS max_sesno FROM sesno_version_anchor GROUP BY dbnum;
+SELECT dbnum, sesno, type::string(anchored_at) AS anchored_at, source FROM sesno_version_anchor ORDER BY anchored_at DESC LIMIT 200;
+SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_at FROM version_commit_state WHERE status IN ['preparing', 'pending'];
+"#;
+    let mut response = project_primary_db().query(sql).await?;
+
+    // 表不存在（未启用锚点/从未解析）按空处理，其余错误上抛
+    let legacy_rows: Vec<AnchorAggRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let anchor_rows: Vec<AnchorAggRow> = match response.take(1) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let latest_rows: Vec<AnchorLatestRow> = match response.take(2) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let pending_rows: Vec<PendingRow> = match response.take(3) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut by_dbnum: BTreeMap<u32, DbIncrementStatus> = BTreeMap::new();
+    for row in legacy_rows {
+        let entry = by_dbnum.entry(row.dbnum).or_insert_with(|| DbIncrementStatus {
+            dbnum: row.dbnum,
+            ..Default::default()
+        });
+        entry.legacy_max_sesno = row.max_sesno.unwrap_or_default();
+    }
+    for row in anchor_rows {
+        let entry = by_dbnum.entry(row.dbnum).or_insert_with(|| DbIncrementStatus {
+            dbnum: row.dbnum,
+            ..Default::default()
+        });
+        entry.committed_watermark = row.max_sesno.unwrap_or_default();
+    }
+    // Committed Watermark 语义：无锚点回退 legacy（与 committed_watermark() 一致）
+    for status in by_dbnum.values_mut() {
+        if status.committed_watermark == 0 {
+            status.committed_watermark = status.legacy_max_sesno;
+        }
+    }
+    for row in latest_rows {
+        if let Some(entry) = by_dbnum.get_mut(&row.dbnum) {
+            if entry.last_anchor_sesno.is_none() {
+                entry.last_anchor_sesno = Some(row.sesno);
+                entry.last_anchored_at = row.anchored_at;
+                entry.last_anchor_source = row.source;
+            }
+        }
+    }
+    for row in pending_rows {
+        if let Some(entry) = by_dbnum.get_mut(&row.dbnum) {
+            entry.pending_commits.push(PendingCommitInfo {
+                to_sesno: row.to_sesno,
+                status: row.status,
+                last_error: row.last_error,
+                updated_at: row.updated_at,
+            });
+        }
+    }
+
+    Ok(by_dbnum.into_values().collect())
+}
+
+/// 全部 dbnum 的增量/版本状态（真实数据：锚点 + 水位 + Commit Pending）。
+pub async fn get_all_incremental_status(_state: State<AppState>) -> impl IntoResponse {
+    match collect_db_increment_status().await {
+        Ok(databases) => {
+            let pending_total: usize = databases
+                .iter()
+                .map(|status| status.pending_commits.len())
+                .sum();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "databases": databases,
+                    "pending_commit_total": pending_total,
+                    "last_check": Utc::now(),
+                    "source": "sesno_version_anchor + dbnum_info_table + version_commit_state",
+                })),
+            )
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("查询增量状态失败: {error}"),
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorDetailRow {
+    sesno: u32,
+    from_sesno: Option<u32>,
+    source: Option<String>,
+    anchored_at: Option<String>,
+    fingerprint: Option<String>,
+    pe_rows: Option<i64>,
+    att_rows: Option<i64>,
+    uda_rows: Option<i64>,
+    delete_count: Option<i64>,
+}
+
+/// 单库增量详情：锚点时间线（最近 50 条）+ Commit Pending。
+/// 路径参数为 dbnum（历史路由名为 site_id，语义即数据库编号）。
 pub async fn get_site_incremental_details(
     _state: State<AppState>,
     Path(site_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 从数据库获取实际数据
-    let site_info = IncrementalUpdateInfo {
-        site_id: site_id.clone(),
-        site_name: "生产环境-主站".to_string(),
-        last_sync_time: Some(Utc::now() - chrono::Duration::hours(2)),
-        detection_status: UpdateDetectionStatus::ChangesDetected,
-        pending_items: 15,
-        synced_items: 0,
-        changed_files: vec![
-            ChangedFile {
-                path: "/desi/7999/model.xkt".to_string(),
-                change_type: ChangeType::Modified,
-                size: 1024 * 1024 * 5,
-                modified_time: Utc::now() - chrono::Duration::minutes(30),
-                db_num: Some(7999),
-            },
-            ChangedFile {
-                path: "/desi/8001/model.xkt".to_string(),
-                change_type: ChangeType::Added,
-                size: 1024 * 1024 * 3,
-                modified_time: Utc::now() - chrono::Duration::minutes(15),
-                db_num: Some(8001),
-            },
-            ChangedFile {
-                path: "/desi/8002/metadata.json".to_string(),
-                change_type: ChangeType::Modified,
-                size: 1024 * 50,
-                modified_time: Utc::now() - chrono::Duration::minutes(5),
-                db_num: Some(8002),
-            },
-        ],
-        increment_size: 1024 * 1024 * 8,
-        estimated_sync_time: 120,
+) -> impl IntoResponse {
+    let Ok(dbnum) = site_id.trim().parse::<u32>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("site_id 需为 dbnum（数字），收到: {site_id}"),
+            })),
+        );
     };
 
-    Ok(Json(json!({
-        "success": true,
-        "site": site_info,
-        "sync_history": [
-            {
-                "time": Utc::now() - chrono::Duration::hours(2),
-                "items_synced": 45,
-                "size": 1024 * 1024 * 120,
-                "duration": 300,
-                "status": "completed"
-            },
-            {
-                "time": Utc::now() - chrono::Duration::hours(8),
-                "items_synced": 23,
-                "size": 1024 * 1024 * 56,
-                "duration": 180,
-                "status": "completed"
-            }
-        ]
-    })))
+    let sql = format!(
+        "SELECT sesno, from_sesno, source, type::string(anchored_at) AS anchored_at, fingerprint, \
+         pe_rows, att_rows, uda_rows, delete_count \
+         FROM sesno_version_anchor WHERE dbnum = {dbnum} ORDER BY sesno DESC LIMIT 50;\n\
+         SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_at \
+         FROM version_commit_state WHERE dbnum = {dbnum} AND status IN ['preparing', 'pending'];"
+    );
+    let mut response = match project_primary_db().query(sql).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("查询 dbnum={dbnum} 增量详情失败: {error}"),
+                })),
+            );
+        }
+    };
+    let anchors: Vec<AnchorDetailRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("读取锚点失败: {error}"),
+                })),
+            );
+        }
+    };
+    let pending: Vec<PendingRow> = match response.take(1) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("读取 Commit Pending 失败: {error}"),
+                })),
+            );
+        }
+    };
+
+    let anchors: Vec<serde_json::Value> = anchors
+        .into_iter()
+        .map(|row| {
+            json!({
+                "sesno": row.sesno,
+                "from_sesno": row.from_sesno,
+                "source": row.source,
+                "anchored_at": row.anchored_at,
+                "fingerprint": row.fingerprint,
+                "counts": {
+                    "pe_rows": row.pe_rows,
+                    "att_rows": row.att_rows,
+                    "uda_rows": row.uda_rows,
+                    "delete_count": row.delete_count,
+                },
+            })
+        })
+        .collect();
+    let pending: Vec<serde_json::Value> = pending
+        .into_iter()
+        .map(|row| {
+            json!({
+                "to_sesno": row.to_sesno,
+                "status": row.status,
+                "last_error": row.last_error,
+                "updated_at": row.updated_at,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "dbnum": dbnum,
+            "anchors": anchors,
+            "pending_commits": pending,
+        })),
+    )
 }
 
-/// 启动增量检测
+fn not_implemented(action: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "success": false,
+            "error": format!(
+                "{action} 未实现：请使用 CLI incremental-sesno / watch-incremental（specs/022，写路径统一走 Version Commit seam）"
+            ),
+        })),
+    )
+}
+
+/// 未实现：触发增量检测（走 CLI）。
 pub async fn start_incremental_detection(
     _state: State<AppState>,
-    Path(site_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 实际触发增量检测逻辑
-    println!("启动站点 {} 的增量检测", site_id);
-
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("已启动站点 {} 的增量检测", site_id),
-        "task_id": format!("detect_{}_{}",site_id, Utc::now().timestamp()),
-    })))
+    Path(_site_id): Path<String>,
+) -> impl IntoResponse {
+    not_implemented("HTTP 触发增量检测")
 }
 
-/// 启动增量同步
+/// 未实现：触发增量同步（走 CLI）。
 pub async fn start_incremental_sync(
     _state: State<AppState>,
-    Path(site_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 实际触发增量同步逻辑
-    println!("启动站点 {} 的增量同步", site_id);
-
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("已启动站点 {} 的增量同步", site_id),
-        "task_id": format!("sync_{}_{}",site_id, Utc::now().timestamp()),
-    })))
+    Path(_site_id): Path<String>,
+) -> impl IntoResponse {
+    not_implemented("HTTP 触发增量同步")
 }
 
-/// 获取检测任务状态
+/// 未实现：增量任务状态查询。
 pub async fn get_detection_task_status(
     _state: State<AppState>,
-    Path(task_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 从任务管理器获取实际状态
-    Ok(Json(json!({
-        "success": true,
-        "task_id": task_id,
-        "status": "running",
-        "progress": 65,
-        "scanned_files": 1250,
-        "detected_changes": 15,
-        "estimated_remaining": 30, // seconds
-    })))
+    Path(_task_id): Path<String>,
+) -> impl IntoResponse {
+    not_implemented("增量任务状态查询")
 }
 
-/// 取消检测或同步任务
+/// 未实现：取消增量任务。
 pub async fn cancel_task(
     _state: State<AppState>,
-    Path(task_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 实际取消任务逻辑
-    println!("取消任务: {}", task_id);
-
-    Ok(Json(json!({
-        "success": true,
-        "message": format!("任务 {} 已取消", task_id),
-    })))
+    Path(_task_id): Path<String>,
+) -> impl IntoResponse {
+    not_implemented("取消增量任务")
 }
 
-/// 获取增量更新配置
-pub async fn get_incremental_config(
-    _state: State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(json!({
-        "success": true,
-        "config": {
-            "auto_detect": true,
-            "detect_interval": 300, // 5 minutes
-            "auto_sync": false,
-            "sync_batch_size": 10,
-            "max_concurrent_syncs": 3,
-            "retry_on_failure": true,
-            "max_retries": 3,
-            "notification_enabled": true,
-            "notification_threshold": 50, // MB
-        }
-    })))
+/// 未实现：增量配置读取。
+pub async fn get_incremental_config(_state: State<AppState>) -> impl IntoResponse {
+    not_implemented("增量配置读取")
 }
 
-/// 更新增量更新配置
-#[derive(Debug, Deserialize)]
-pub struct UpdateConfigRequest {
-    pub auto_detect: Option<bool>,
-    pub detect_interval: Option<u32>,
-    pub auto_sync: Option<bool>,
-    pub sync_batch_size: Option<usize>,
-    pub notification_enabled: Option<bool>,
-}
-
+/// 未实现：增量配置更新。
 pub async fn update_incremental_config(
     _state: State<AppState>,
-    Json(config): Json<UpdateConfigRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: 保存配置到数据库
-    println!("更新增量配置: {:?}", config);
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "配置已更新",
-    })))
+    Json(_config): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    not_implemented("增量配置更新")
 }

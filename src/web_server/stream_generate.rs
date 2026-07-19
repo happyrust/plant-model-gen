@@ -440,7 +440,6 @@ pub async fn api_stream_generate(
                                     neg_missing,
                                     &db_option_ext,
                                     None,
-                                    None,
                                 )
                                 .await
                                 {
@@ -591,7 +590,6 @@ pub async fn api_stream_generate(
                             match crate::fast_model::gen_all_geos_data(
                                 to_generate_in_batch.clone(),
                                 &db_option_ext,
-                                None,
                                 None,
                             )
                             .await

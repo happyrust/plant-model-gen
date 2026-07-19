@@ -1492,7 +1492,7 @@ async fn execute_room_regenerate(
     db_option_clone.apply_boolean_operation = request.apply_boolean_operation;
     db_option_clone.manual_db_nums = Some(vec![request.db_num]);
 
-    match gen_all_geos_data(all_refnos, &db_option_clone, None, None).await {
+    match gen_all_geos_data(all_refnos, &db_option_clone, None).await {
         Ok(_) => {
             info!("✅ 模型生成完成");
             update_status(70.0, "模型生成完成".to_string());

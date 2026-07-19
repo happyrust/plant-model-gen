@@ -13,6 +13,7 @@ pub mod hashing;
 pub mod history_baseline;
 pub mod history_replay_plan;
 pub mod history_replay_validation;
+pub mod increment_run;
 pub mod missing_mesh_repair;
 pub mod model_release;
 pub mod physical_baseline_snapshot;

@@ -6,7 +6,6 @@
 //! - 增量更新、手动 refno、调试模式的处理
 //! - 空间索引和截图捕获的触发
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
-use crate::data_interface::sesno_increment::get_changes_at_sesno;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
@@ -825,7 +824,6 @@ pub struct GenModelResult {
 /// * `manual_refnos` - 手动指定的 refno 列表
 /// * `db_option` - 数据库配置
 /// * `incr_updates` - 增量更新日志
-/// * `target_sesno` - 目标 sesno
 #[cfg_attr(
     feature = "profile",
     tracing::instrument(skip_all, name = "gen_all_geos_data")
@@ -834,7 +832,6 @@ pub async fn gen_all_geos_data(
     manual_refnos: Vec<RefnoEnum>,
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
-    target_sesno: Option<u32>,
 ) -> Result<GenModelResult> {
     let time = Instant::now();
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
@@ -853,45 +850,19 @@ pub async fn gen_all_geos_data(
     // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
     // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
-    let mut final_incr_updates = incr_updates;
-
-    // 如果指定了 target_sesno，获取该 sesno 的增量数据
-    if let Some(sesno) = target_sesno {
-        if !db_option.use_surrealdb {
-            return Err(IndexTreeError::Other(anyhow::anyhow!(
-                "cache-only 模式下不支持 --target-sesno（需要从 SurrealDB 获取 element_changes）：sesno={}",
-                sesno
-            )));
-        }
-
-        if final_incr_updates.is_none() {
-            match get_changes_at_sesno(sesno).await {
-                Ok(sesno_changes) => {
-                    if sesno_changes.count() > 0 {
-                        final_incr_updates = Some(sesno_changes);
-                    } else {
-                        println!("[gen_model] sesno {} 没有发现变更，跳过增量生成", sesno);
-                        return Ok(GenModelResult { success: false });
-                    }
-                }
-
-                Err(e) => {
-                    eprintln!("获取 sesno {} 的变更失败: {}", sesno, e);
-                    return Err(IndexTreeError::Other(e));
-                }
-            }
-        }
-    }
+    // specs/022 候选 3：原 target_sesno 入参依赖 element_changes 表按 sesno 反查增量，
+    // 但该表从未有写入方（幽灵 seam），路径永远命中空集——已整体移除。
+    // 按 sesno 的增量生成走 incremental-sesno（IncrementRun 采集 → update_log 直传）。
+    let final_incr_updates = incr_updates;
 
     let incr_count = final_incr_updates
         .as_ref()
         .map(|log| log.count())
         .unwrap_or(0);
     println!(
-        "[gen_model] 启动 gen_all_geos_data: manual_refnos={}, incr_updates={}, target_sesno={:?}",
+        "[gen_model] 启动 gen_all_geos_data: manual_refnos={}, incr_updates={}",
         manual_refnos.len(),
         incr_count,
-        target_sesno,
     );
 
     // 性能剖析：尽量在最上层启用 tracing，覆盖 precheck -> gen_model -> mesh -> room 计算全链路。
@@ -1005,7 +976,7 @@ pub async fn gen_all_geos_data(
     }
 
     perf.mark("index_tree_generation");
-    let result = process_index_tree_generation(scope, db_option, target_sesno, time).await;
+    let result = process_index_tree_generation(scope, db_option, time).await;
     perf.print_summary();
 
     // 输出 cache miss 报告（覆盖写）。
@@ -1061,7 +1032,6 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
 async fn process_index_tree_generation(
     scope: GenerationScope,
     db_option: &DbOptionExt,
-    _target_sesno: Option<u32>,
     time: Instant,
 ) -> Result<GenModelResult> {
     let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");

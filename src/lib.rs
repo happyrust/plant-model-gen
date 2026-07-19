@@ -411,17 +411,17 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         let path: PathBuf = "assets/meshes".into();
 
         let generate_started = Instant::now();
-        let gen_result = gen_all_geos_data(vec![], &db_option_ext, None, None).await;
+        let gen_result = gen_all_geos_data(vec![], &db_option_ext, None).await;
         let generate_ms = generate_started.elapsed().as_millis() as u64;
         // spec 004：生成收尾统计——落库数量走 Surreal 计数（与验收口径一致），
         // 错误数取 failed_sql 转储计数，cache miss 取全局报告快照。
         {
             async fn surreal_count(table: &str) -> usize {
+                use aios_core::{SurrealQueryExt, project_primary_db};
                 let sql = format!("SELECT count() FROM {table} GROUP ALL;");
-                match crate::fast_model::model_store::model_query_take::<Vec<serde_json::Value>, _>(
-                    sql, 0,
-                )
-                .await
+                match project_primary_db()
+                    .query_take::<Vec<serde_json::Value>>(sql, 0)
+                    .await
                 {
                     Ok(rows) => rows
                         .first()

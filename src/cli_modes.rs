@@ -1568,7 +1568,7 @@ async fn rebuild_room_compute_panel_spatial_index(
     root_refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<()> {
-    use aios_core::{SurrealQueryExt, model_primary_db, project_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
     use aios_database::fast_model::query_provider::query_multi_descendants_with_self;
     use aios_database::fast_model::room_model::refresh_sqlite_spatial_index_from_inst_relate_aabb;
     use aios_database::spatial_index::SqliteSpatialIndex;
@@ -1669,7 +1669,7 @@ async fn rebuild_room_compute_panel_spatial_index(
             "#,
             pe_keys.join(",")
         );
-        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+        let rows: Vec<InstRelateAabbQuery> = project_primary_db()
             .query_take(&noun_sql, 0)
             .await
             .unwrap_or_default();
@@ -1693,7 +1693,7 @@ async fn rebuild_room_compute_panel_spatial_index(
             "SELECT in as refno, in.noun as noun, aabb_id.d as aabb FROM [{}]",
             refno_strs.join(",")
         );
-        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+        let rows: Vec<InstRelateAabbQuery> = project_primary_db()
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
@@ -1732,7 +1732,7 @@ async fn rebuild_room_compute_panel_spatial_index(
             "SELECT refno, refno.noun as noun, aabb_id.d as aabb FROM {}",
             model_refno_id("inst_relate_aabb", root_refnos[0])
         );
-        let rows: Vec<InstRelateAabbQuery> = model_primary_db()
+        let rows: Vec<InstRelateAabbQuery> = project_primary_db()
             .query_take(&panel_sql, 0)
             .await
             .unwrap_or_default();
@@ -1949,7 +1949,7 @@ pub async fn run_generate_model(
         "incremental",
         generate_started,
     );
-    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await;
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None).await;
     gen_heartbeat.stop();
     let generate_ms = generate_started.elapsed().as_millis() as u64;
     match &gen_result {
@@ -1964,7 +1964,7 @@ pub async fn run_generate_model(
             generate_ms,
         ),
     }
-    aios_database::perf_metrics::finish_generate_stage_from_model_store(generate_ms).await;
+    aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
     println!("✅ 模型增量生成完成");
     Ok(gen_result)
@@ -2063,7 +2063,7 @@ pub async fn run_regen_model(
     );
     let gen_heartbeat =
         start_generate_progress_heartbeat("gen_all_geos_data_running", "regen", generate_started);
-    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None, None).await;
+    let gen_result = gen_all_geos_data(target_refnos, &db_option_override, None).await;
     gen_heartbeat.stop();
     let generate_ms = generate_started.elapsed().as_millis() as u64;
     match &gen_result {
@@ -2078,7 +2078,7 @@ pub async fn run_regen_model(
             generate_ms,
         ),
     }
-    aios_database::perf_metrics::finish_generate_stage_from_model_store(generate_ms).await;
+    aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
     println!("✅ 模型重新生成完成");
     Ok(gen_result)
@@ -3559,7 +3559,7 @@ pub async fn export_dbnum_instances_json_mode(
 
                         // Step 3: 生成模型（仅写入 model cache）
                         // 捕获错误但继续尝试导出（缓存可能已有部分数据）
-                        match gen_all_geos_data(vec![], &db_option_ext_override, None, None).await {
+                        match gen_all_geos_data(vec![], &db_option_ext_override, None).await {
                             Ok(_) => {
                                 println!("✅ 模型生成完成");
                             }
@@ -4319,7 +4319,7 @@ pub struct RoomComputeCliConfig {
 /// 从数据库构建 AABB 空间索引
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn build_spatial_index_from_db(db_nums: Option<&[u32]>, verbose: bool) -> Result<()> {
-    use aios_core::model_primary_db;
+    use aios_core::project_primary_db;
     use aios_database::spatial_index::SqliteSpatialIndex;
     use aios_database::sqlite_index::SqliteAabbIndex;
     use std::time::Instant;
@@ -4359,7 +4359,7 @@ async fn build_spatial_index_from_db(db_nums: Option<&[u32]>, verbose: bool) -> 
         world_aabb: aios_core::types::PlantAabb,
     }
 
-    let mut q = model_primary_db().query(&sql);
+    let mut q = project_primary_db().query(&sql);
     if let Some(nums) = db_nums {
         q = q.bind(("dbnums", nums.to_vec()));
     }
@@ -4828,7 +4828,7 @@ pub async fn room_compute_panel_mode(
                 },
             );
             perf_timer.mark("generate_panel_models");
-            gen_all_geos_data(gen_refnos.clone(), &gen_opt, None, None).await?;
+            gen_all_geos_data(gen_refnos.clone(), &gen_opt, None).await?;
 
             println!("✅ 模型生成完成");
             if derived_dbnums.is_empty() {

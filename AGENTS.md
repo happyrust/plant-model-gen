@@ -19,12 +19,17 @@ alwaysApply: true
 
 - **建库属性**：非 versioned 数据目录不能原地开 `versioned=true`；切换=新建目录 + `sync_pdms` 重灌。已初始化站点管理端改开关会被拒绝。
 - **同 dbnum 增量串行**：watch-incremental 单队列；锚点一致性依赖此约束。
+- **watch 增量同一 seam**：`async_watch`/`execute_incr_update` 复用 CLI 的 collect + `persist_collected_pdms_increment_files` → `commit_version()`（fingerprint/lease/锚点走同一入口，禁止旁路直写）；增量起点取 Committed Watermark（`sesno_version_anchor` 优先、回退 `dbnum_info_table`，见 CONTEXT.md）；提交失败的 dbnum 不推进 header/同步通知，Commit Pending 仍需人工 `incremental-sesno --recover-pending`。
 - **锚点是唯一业务入口**：对外只暴露 `sesno_version_anchor` 已固化的 sesno；历史查询走 `model-version history *`（rs-core `version_query`），勿绕过锚点裸查 VERSION。
-- **retention**：默认 `0`（无限保留，全量历史；磁盘只增不减）；可按站点改为 `90d`/`30d` 等。改 `version_retention` 后重启即可，无需重建库。若配置了有限窗口，窗外返回明确过期错误，兜底 DuckLake（023）或源 db 重扫。
+- **retention**：默认 `0`（无限保留，全量历史；磁盘只增不减）；可按站点改为 `90d`/`30d` 等。改 `version_retention` 后重启即可，无需重建库。若配置了有限窗口，窗外返回明确过期错误，兜底源 db 重扫。
 - **模型数据同库**：SurrealKV/MODEL_KV 分离机制已移除，模型表与 PE/ATT 固定同库（`model_primary_db()` 恒等于 SUL_DB）；versioned 站点模型表一并版本化，磁盘靠 retention 兜底。
-- **与 023 共存**：022=PE/ATT 源行细粒度历史；023=导出交付单元版本，主键 `(dbnum, refno, sesno)`。
 
 ## Tools
+
+编译加速（日常 / 同步专用）：
+- 默认 feature **已不含** `parquet-export`（polars/arrow）；需要导出时显式 `--features parquet-export` 或 `--features full`。
+- PE/ATT 全量/增量瘦构建：`powershell -File scripts/build-sync-cli.ps1`（`--features sync-cli`，无 web/manifold/parquet）。
+- 部署完整包仍用 `scripts/package/build-windows-bundle.ps1` / deploy 脚本里的 FEATURES 列表。
 
 <!-- sigmap-tools -->
 

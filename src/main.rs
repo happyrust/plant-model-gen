@@ -158,48 +158,10 @@ async fn promote_generation_refnos_to_bran_hang_roots(
     Ok(promoted_refnos)
 }
 
+// specs/022 候选 2：增量管线深模块化——编排移入库内
+// `aios_database::version_management::increment_run`，此处只剩薄参数 adapter。
 #[cfg(not(feature = "gui"))]
-#[derive(Debug, Clone)]
-struct IncrementalSesnoRunOptions {
-    file: Option<PathBuf>,
-    dbnums: Vec<u32>,
-    from_sesno: u32,
-    to_sesno: Option<u32>,
-    rescan_index: bool,
-    persist_data: bool,
-    generate_model: bool,
-    source_observation_manifest: Option<PathBuf>,
-    source_observation_manifest_hash: Option<String>,
-    publication_handoff_dir: Option<PathBuf>,
-    release_id_prefix: Option<String>,
-    require_tree_index: bool,
-    verbose: bool,
-}
-
-#[cfg(not(feature = "gui"))]
-struct IncrementalSesnoRunResult {
-    summary: serde_json::Value,
-    outcome: aios_database::data_interface::sesno_increment::PdmsSesnoIncrementOutcome,
-    persist_stats: aios_database::data_interface::sesno_increment::PdmsIncrementPersistStats,
-    generation_success: Option<bool>,
-    parquet_export: Option<
-        aios_database::fast_model::export_model::post_gen_export::PostGenerationParquetExportReport,
-    >,
-}
-
-#[cfg(not(feature = "gui"))]
-struct IncrementalSourceObservationGate {
-    evidence: aios_database::version_management::source_observation::SourceObservationEvidence,
-    source_sha256_before: String,
-}
-
-#[cfg(not(feature = "gui"))]
-#[derive(Debug, Clone)]
-struct IncrementalTreeIndexEvidence {
-    ready: bool,
-    missing_dbnums: Vec<u32>,
-    summary: serde_json::Value,
-}
+use aios_database::version_management::increment_run::{IncrementRunOptions, IncrementRunResult};
 
 #[cfg(all(not(feature = "gui"), feature = "sqlite-index"))]
 struct WatchSourceObservationGate {
@@ -210,583 +172,14 @@ struct WatchSourceObservationGate {
 #[cfg(not(feature = "gui"))]
 async fn run_incremental_sesno_once(
     db_option_ext: &aios_database::options::DbOptionExt,
-    options: IncrementalSesnoRunOptions,
-) -> anyhow::Result<IncrementalSesnoRunResult> {
-    let run_started = std::time::Instant::now();
-    let metrics_elapsed = || run_started.elapsed().as_millis() as u64;
-    if !options.persist_data && options.generate_model {
-        anyhow::bail!(
-            "--no-persist cannot be combined with --generate-model; incremental model generation requires persisted PE/ATT data"
-        );
-    }
-    aios_database::perf_metrics::record_generate_progress(
-        "incremental_sesno_started",
-        Some("preparing source observation and collection"),
-        metrics_elapsed(),
-    );
-    let source_observation_gate =
-        prepare_incremental_source_observation_gate(db_option_ext, &options)?;
-    let mut collected_outcome =
-        aios_database::data_interface::sesno_increment::PdmsSesnoCollectedOutcome::default();
-    let mut source_count = 0usize;
-
-    if let Some(file) = options.file.as_ref() {
-        source_count += 1;
-        let detail = format!("file={}", file.display());
-        let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-            "incremental_sesno_collecting_file",
-            Some(detail.clone()),
-            std::time::Duration::from_secs(15),
-        );
-        let file_outcome = aios_database::data_interface::sesno_increment::collect_pdms_increment_for_file_with_operations(
-                &db_option_ext.inner.project_name,
-                file.clone(),
-                options.from_sesno,
-                options.to_sesno,
-                options.verbose,
-            )?;
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_collected_file",
-            Some(&detail),
-            metrics_elapsed(),
-        );
-        collected_outcome.merge(file_outcome);
-    }
-
-    if !options.dbnums.is_empty() {
-        source_count += options.dbnums.len();
-        #[cfg(feature = "sqlite-index")]
-        {
-            let index_path = aios_database::data_interface::db_index::default_index_path(
-                &db_option_ext.inner.project_name,
-            );
-            if options.rescan_index || !index_path.exists() {
-                let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                    "incremental_sesno_rebuilding_db_index",
-                    Some(format!("index_path={}", index_path.display())),
-                    std::time::Duration::from_secs(15),
-                );
-                let report =
-                    aios_database::data_interface::db_index::rebuild_from_config(false).await?;
-                println!(
-                    "✅ db_index 已刷新: {} 个库, {} 条 ref0 映射",
-                    report.db_files, report.ref0_total
-                );
-            }
-            let detail = format!("dbnums={:?}", options.dbnums);
-            let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                "incremental_sesno_collecting_dbnums",
-                Some(detail.clone()),
-                std::time::Duration::from_secs(15),
-            );
-            let indexed_outcome = match aios_database::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations(
-                &db_option_ext.inner.project_name,
-                &index_path,
-                &options.dbnums,
-                options.from_sesno,
-                options.to_sesno,
-                options.verbose,
-            ) {
-                Ok(outcome) => outcome,
-                Err(err) if !options.rescan_index => {
-                    eprintln!("⚠️  db_index 命中失败，按指纹刷新索引后重试: {}", err);
-                    let report =
-                        aios_database::data_interface::db_index::rebuild_from_config(false)
-                            .await?;
-                    println!(
-                        "✅ db_index 已刷新: {} 个库, {} 条 ref0 映射",
-                        report.db_files, report.ref0_total
-                    );
-                    aios_database::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations(
-                        &db_option_ext.inner.project_name,
-                        &index_path,
-                        &options.dbnums,
-                        options.from_sesno,
-                        options.to_sesno,
-                        options.verbose,
-                    )?
-                }
-                Err(err) => return Err(err),
-            };
-            aios_database::perf_metrics::record_generate_progress(
-                "incremental_sesno_collected_dbnums",
-                Some(&detail),
-                metrics_elapsed(),
-            );
-            collected_outcome.merge(indexed_outcome);
-        }
-        #[cfg(not(feature = "sqlite-index"))]
-        {
-            anyhow::bail!(
-                "incremental-sesno --dbnum 需要 sqlite-index feature；可改用 --file 直接指定 db 文件"
-            );
-        }
-    }
-
-    if source_count == 0 {
-        anyhow::bail!("incremental-sesno 需要指定 --file 或 --dbnum");
-    }
-
-    let aios_database::data_interface::sesno_increment::PdmsSesnoCollectedOutcome {
-        outcome,
-        files: collected_increment_files,
-    } = collected_outcome;
-
-    let db_meta_refreshed_files = if options.persist_data {
-        let refreshed = {
-            let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                "incremental_sesno_refreshing_db_meta",
-                Some(format!("files={}", outcome.files.len())),
-                std::time::Duration::from_secs(15),
-            );
-            aios_database::data_interface::sesno_increment::refresh_db_meta_for_increment_files(
-                &db_option_ext.inner.project_name,
-                &outcome.files,
-            )?
-        };
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_db_meta_refreshed",
-            Some(&format!("files={refreshed}")),
-            metrics_elapsed(),
-        );
-        if refreshed > 0 {
-            println!("✅ 增量 db_meta 已刷新: {} 个 db 文件", refreshed);
-        }
-        refreshed
-    } else {
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_db_meta_refresh_skipped",
-            Some("--no-persist requested"),
-            metrics_elapsed(),
-        );
-        0
-    };
-
-    let persist_stats = if options.persist_data {
-        {
-            let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                "incremental_sesno_connecting_model_store",
-                Some("ensure_surreal_connected".to_string()),
-                std::time::Duration::from_secs(15),
-            );
-            crate::cli_modes::ensure_surreal_connected(db_option_ext).await?;
-        }
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_model_store_connected",
-            Some("ensure_surreal_connected"),
-            metrics_elapsed(),
-        );
-        let stats = {
-            let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                "incremental_sesno_persisting",
-                Some(format!(
-                    "files={} reused_collected_operations=true",
-                    collected_increment_files.len()
-                )),
-                std::time::Duration::from_secs(15),
-            );
-            aios_database::data_interface::sesno_increment::persist_collected_pdms_increment_files(
-                &collected_increment_files,
-            )
-            .await?
-        };
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_persisted",
-            Some(&format!(
-                "sessions={} pe={} att={} deletes={}",
-                stats.session_count, stats.pe_rows, stats.att_rows, stats.delete_count
-            )),
-            metrics_elapsed(),
-        );
-        if stats.session_count > 0 || stats.upsert_count > 0 {
-            println!(
-                "✅ 增量数据已保存: sessions={} pe={} att={} uda={} deletes={} dbnum_info={}",
-                stats.session_count,
-                stats.pe_rows,
-                stats.att_rows,
-                stats.uda_rows,
-                stats.delete_count,
-                stats.dbnum_info_updates
-            );
-        }
-        stats
-    } else {
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_persist_skipped",
-            Some("--no-persist requested"),
-            metrics_elapsed(),
-        );
-        println!("ℹ️ --no-persist 已启用：跳过 db_meta 刷新、SurrealDB 连接和 PE/ATT 写入");
-        Default::default()
-    };
-
-    let generation_dbnums: Vec<u32> = {
-        let mut dbnums = std::collections::BTreeSet::new();
-        for file in &outcome.files {
-            if file.dbnum > 0 {
-                dbnums.insert(file.dbnum);
-            }
-        }
-        dbnums.into_iter().collect()
-    };
-
-    let update_log = outcome.update_log.clone();
-    let tree_index_evidence = if options.generate_model {
-        let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-            "incremental_sesno_checking_tree_index",
-            Some(format!("dbnums={generation_dbnums:?}")),
-            std::time::Duration::from_secs(15),
-        );
-        let evidence = build_incremental_tree_index_evidence(
-            db_option_ext,
-            &generation_dbnums,
-            options.require_tree_index,
-        )?;
-        aios_database::perf_metrics::record_generate_progress(
-            "incremental_sesno_tree_index_checked",
-            Some(if evidence.ready {
-                "tree_index_ready"
-            } else {
-                "tree_index_degraded_or_missing"
-            }),
-            metrics_elapsed(),
-        );
-        Some(evidence)
-    } else {
-        None
-    };
-    let mut generation_success = None;
-    let mut parquet_export = None;
-    if options.generate_model {
-        if update_log.count() == 0 {
-            println!("ℹ️ 未收集到增量元素，跳过模型生成");
-            generation_success = Some(false);
-        } else {
-            if let Some(evidence) = &tree_index_evidence
-                && options.require_tree_index
-                && !evidence.ready
-            {
-                anyhow::bail!(
-                    "tree_index_missing: --require-tree-index enabled but scene_tree files are missing for dbnums {:?}; checked evidence: {}",
-                    evidence.missing_dbnums,
-                    serde_json::to_string(&evidence.summary)?
-                );
-            }
-            let mut gen_db_option_ext = db_option_ext.clone();
-            if !generation_dbnums.is_empty() {
-                gen_db_option_ext.inner.manual_db_nums = Some(generation_dbnums.clone());
-                println!(
-                    "🔧 增量模型生成限定 manual_db_nums -> {:?}",
-                    generation_dbnums
-                );
-            }
-            let generate_started = std::time::Instant::now();
-            aios_database::perf_metrics::record_generate_progress(
-                "incremental_sesno_generate_started",
-                Some("incremental-sesno"),
-                0,
-            );
-            let gen_result = {
-                let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                    "incremental_sesno_generate_running",
-                    Some(format!("dbnums={generation_dbnums:?}")),
-                    std::time::Duration::from_secs(15),
-                );
-                aios_database::fast_model::gen_all_geos_data(
-                    Vec::new(),
-                    &gen_db_option_ext,
-                    Some(update_log),
-                    None,
-                )
-                .await
-            };
-            let generate_ms = generate_started.elapsed().as_millis() as u64;
-            match &gen_result {
-                Ok(_) => aios_database::perf_metrics::record_generate_progress(
-                    "incremental_sesno_generate_finished",
-                    Some("incremental-sesno"),
-                    generate_ms,
-                ),
-                Err(err) => aios_database::perf_metrics::record_generate_progress(
-                    "incremental_sesno_generate_failed",
-                    Some(&err.to_string()),
-                    generate_ms,
-                ),
-            }
-            aios_database::perf_metrics::finish_generate_stage_from_model_store(generate_ms).await;
-            let gen_result = gen_result?;
-            generation_success = Some(gen_result.success);
-            let export_report = {
-                let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-                    "incremental_sesno_exporting_parquet",
-                    Some(format!("dbnums={generation_dbnums:?}")),
-                    std::time::Duration::from_secs(15),
-                );
-                aios_database::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
-                    &gen_db_option_ext,
-                    Some(generation_dbnums.clone()),
-                )
-                .await?
-            };
-            aios_database::perf_metrics::record_generate_progress(
-                "incremental_sesno_parquet_export_checked",
-                Some(if export_report.enabled {
-                    "post_generation_export_enabled"
-                } else {
-                    "post_generation_export_disabled"
-                }),
-                metrics_elapsed(),
-            );
-            if export_report.enabled {
-                println!(
-                    "✅ 生成后 Parquet 导出: dbnums={:?} skipped={:?}",
-                    export_report.exported_dbnums, export_report.skipped_reason
-                );
-            }
-            parquet_export = Some(export_report);
-        }
-    }
-
-    let source_observation_summary = if let Some(gate) = &source_observation_gate {
-        let source_sha256_after =
-            aios_database::version_management::source_observation::verify_source_observation_primary_hash(
-                &gate.evidence,
-                "after incremental-sesno",
-            )?;
-        Some(serde_json::json!({
-            "manifest_path": gate.evidence.manifest_path,
-            "manifest_hash": gate.evidence.manifest_hash,
-            "observation_id": gate.evidence.manifest.observation_id,
-            "dbnum": gate.evidence.manifest.dbnum,
-            "source_db_file": gate.evidence.manifest.primary.path,
-            "resolved_sesno": gate.evidence.manifest.resolved_sesno,
-            "quiescence_stable": gate.evidence.manifest.quiescence.stable,
-            "primary_sha256": gate.evidence.manifest.primary.sha256,
-            "source_sha256_before": gate.source_sha256_before,
-            "source_sha256_after": source_sha256_after,
-            "source_hash_unchanged": gate.source_sha256_before.eq_ignore_ascii_case(&source_sha256_after),
-        }))
-    } else {
-        None
-    };
-
-    let publication_handoff = {
-        let _heartbeat = aios_database::perf_metrics::start_generate_heartbeat(
-            "incremental_sesno_building_handoff",
-            Some(format!("dbnums={generation_dbnums:?}")),
-            std::time::Duration::from_secs(15),
-        );
-        build_incremental_publication_handoff(
-            db_option_ext,
-            &options,
-            &outcome,
-            &persist_stats,
-            &generation_dbnums,
-            generation_success,
-            parquet_export.as_ref(),
-            source_observation_summary.as_ref(),
-            tree_index_evidence
-                .as_ref()
-                .map(|evidence| &evidence.summary),
-        )?
-    };
-    aios_database::perf_metrics::record_generate_progress(
-        "incremental_sesno_handoff_built",
-        publication_handoff
-            .as_ref()
-            .and_then(|value| value.get("manifest_path"))
-            .and_then(|value| value.as_str()),
-        metrics_elapsed(),
-    );
-
-    let summary = serde_json::json!({
-        "from_sesno": options.from_sesno,
-        "to_sesno": options.to_sesno,
-        "source_observation": source_observation_summary,
-        "tree_index": tree_index_evidence.as_ref().map(|evidence| evidence.summary.clone()),
-        "publication_handoff": publication_handoff,
-        "source_count": source_count,
-        "file_count": outcome.files.len(),
-        "session_count": outcome.total_session_count(),
-        "element_count": outcome.total_element_count(),
-        "db_meta_refreshed_files": db_meta_refreshed_files,
-        "data_persist_enabled": options.persist_data,
-        "data_persist_skipped_reason": if options.persist_data { serde_json::Value::Null } else { serde_json::json!("--no-persist requested") },
-        "data_persist": persist_stats,
-        "version_anchor": persist_stats.anchors,
-        "generation_dbnums": generation_dbnums,
-        "generation_success": generation_success,
-        "parquet_export": parquet_export,
-        "category_counts": {
-            "prim": outcome.update_log.prim_refnos.len(),
-            "loop_owner": outcome.update_log.loop_owner_refnos.len(),
-            "bran_hanger": outcome.update_log.bran_hanger_refnos.len(),
-            "basic_cata": outcome.update_log.basic_cata_refnos.len(),
-            "delete": outcome.update_log.delete_refnos.len(),
-            "total": outcome.update_log.count(),
-        },
-        "files": outcome.files,
-        "element_changes": outcome.element_changes,
-        "update_log": outcome.update_log,
-    });
-
-    Ok(IncrementalSesnoRunResult {
-        summary,
-        outcome,
-        persist_stats,
-        generation_success,
-        parquet_export,
-    })
-}
-
-#[cfg(not(feature = "gui"))]
-fn build_incremental_tree_index_evidence(
-    db_option_ext: &aios_database::options::DbOptionExt,
-    generation_dbnums: &[u32],
-    require_tree_index: bool,
-) -> anyhow::Result<IncrementalTreeIndexEvidence> {
-    let scene_tree_dir = db_option_ext.get_scene_tree_dir();
-    let db_meta_info_file = scene_tree_dir.join("db_meta_info.json");
-    let db_meta_info_exists = db_meta_info_file.is_file();
-    let mut checked_dbnums: Vec<u32> = generation_dbnums.to_vec();
-    checked_dbnums.sort_unstable();
-    checked_dbnums.dedup();
-
-    let mut files = Vec::new();
-    let mut missing_dbnums = Vec::new();
-    for dbnum in &checked_dbnums {
-        let tree_file = scene_tree_dir.join(format!("{dbnum}.tree"));
-        let metadata = std::fs::metadata(&tree_file).ok();
-        let exists = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
-        if !exists {
-            missing_dbnums.push(*dbnum);
-        }
-        let modified_unix_ms = metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-        files.push(serde_json::json!({
-            "dbnum": dbnum,
-            "path": tree_file,
-            "exists": exists,
-            "bytes": metadata.as_ref().map(|m| m.len()),
-            "modified_unix_ms": modified_unix_ms,
-        }));
-    }
-
-    let ready = missing_dbnums.is_empty();
-    let mode = if require_tree_index {
-        "strict_required"
-    } else if ready {
-        "ready"
-    } else {
-        "degraded_allowed"
-    };
-    let recommendation = if ready {
-        "Tree index files are present for the incremental generation dbnums.".to_string()
-    } else if require_tree_index {
-        format!(
-            "Build or restore scene_tree files for dbnums {:?} before model generation, or rerun without --require-tree-index only for patch_only/quarantined handoff validation.",
-            missing_dbnums
-        )
-    } else {
-        format!(
-            "Generation may continue in degraded mode, but publication must remain patch_only/quarantined until scene_tree files are built or restored for dbnums {:?}. Do not auto-run long --gen-indextree work from watcher/default incremental paths.",
-            missing_dbnums
-        )
-    };
-
-    Ok(IncrementalTreeIndexEvidence {
-        ready,
-        missing_dbnums: missing_dbnums.clone(),
-        summary: serde_json::json!({
-            "manifest_version": "incremental_tree_index_evidence:v1",
-            "ready": ready,
-            "mode": mode,
-            "required": require_tree_index,
-            "scene_tree_dir": scene_tree_dir,
-            "db_meta_info_file": db_meta_info_file,
-            "db_meta_info_exists": db_meta_info_exists,
-            "checked_dbnums": checked_dbnums,
-            "missing_dbnums": missing_dbnums,
-            "files": files,
-            "recommendation": recommendation,
-        }),
-    })
-}
-
-#[cfg(not(feature = "gui"))]
-fn prepare_incremental_source_observation_gate(
-    db_option_ext: &aios_database::options::DbOptionExt,
-    options: &IncrementalSesnoRunOptions,
-) -> anyhow::Result<Option<IncrementalSourceObservationGate>> {
-    let Some(manifest_path) = &options.source_observation_manifest else {
-        return Ok(None);
-    };
-    let requested_source_count = usize::from(options.file.is_some()) + options.dbnums.len();
-    if requested_source_count != 1 {
-        anyhow::bail!(
-            "--source-observation-manifest currently gates exactly one incremental source; pass one --file or one --dbnum, got {} sources",
-            requested_source_count
-        );
-    }
-
-    let evidence =
-        aios_database::version_management::source_observation::load_source_observation_manifest(
-            manifest_path,
-            options.source_observation_manifest_hash.as_deref(),
-        )?;
-    let observed_dbnum = evidence.manifest.dbnum;
-    aios_database::version_management::source_observation::validate_source_observation_for_increment(
-        &evidence,
-        &db_option_ext.inner.project_name,
-        observed_dbnum,
-        options.from_sesno,
-        options.to_sesno,
-    )?;
-
-    if let Some(file) = &options.file {
-        ensure_incremental_observation_file_matches(file, &evidence)?;
-    }
-    if !options.dbnums.is_empty() {
-        let requested_dbnum = options.dbnums[0];
-        if requested_dbnum != observed_dbnum {
-            anyhow::bail!(
-                "source observation dbnum {} does not match incremental-sesno --dbnum {}",
-                observed_dbnum,
-                requested_dbnum
-            );
-        }
-    }
-
-    let source_sha256_before =
-        aios_database::version_management::source_observation::verify_source_observation_primary_hash(
-            &evidence,
-            "before incremental-sesno",
-        )?;
-    Ok(Some(IncrementalSourceObservationGate {
-        evidence,
-        source_sha256_before,
-    }))
-}
-
-#[cfg(not(feature = "gui"))]
-fn ensure_incremental_observation_file_matches(
-    file: &Path,
-    evidence: &aios_database::version_management::source_observation::SourceObservationEvidence,
-) -> anyhow::Result<()> {
-    let requested = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    let observed = std::fs::canonicalize(&evidence.manifest.primary.path)
-        .unwrap_or_else(|_| evidence.manifest.primary.path.clone());
-    if requested != observed {
-        anyhow::bail!(
-            "source observation primary file does not match incremental-sesno --file: observed={}, requested={}",
-            observed.display(),
-            requested.display()
-        );
-    }
-    Ok(())
+    options: IncrementRunOptions,
+) -> anyhow::Result<IncrementRunResult> {
+    aios_database::version_management::increment_run::run_increment(
+        db_option_ext,
+        options,
+        || async { crate::cli_modes::ensure_surreal_connected(db_option_ext).await },
+    )
+    .await
 }
 
 #[cfg(all(not(feature = "gui"), feature = "sqlite-index"))]
@@ -831,308 +224,7 @@ fn build_watch_source_observation_gate(
 }
 
 #[cfg(not(feature = "gui"))]
-fn build_incremental_publication_handoff(
-    db_option_ext: &aios_database::options::DbOptionExt,
-    options: &IncrementalSesnoRunOptions,
-    outcome: &aios_database::data_interface::sesno_increment::PdmsSesnoIncrementOutcome,
-    persist_stats: &aios_database::data_interface::sesno_increment::PdmsIncrementPersistStats,
-    generation_dbnums: &[u32],
-    generation_success: Option<bool>,
-    parquet_export: Option<
-        &aios_database::fast_model::export_model::post_gen_export::PostGenerationParquetExportReport,
-    >,
-    source_observation_summary: Option<&serde_json::Value>,
-    tree_index_summary: Option<&serde_json::Value>,
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let disabled = |reason: &str| {
-        Ok(Some(serde_json::json!({
-            "enabled": false,
-            "policy": "explicit_register_required",
-            "reason": reason,
-            "side_effect": "no release was registered by incremental-sesno",
-        })))
-    };
-
-    if !options.generate_model {
-        return disabled("--generate-model not requested");
-    }
-    if generation_success != Some(true) {
-        return disabled("model generation did not complete successfully");
-    }
-    let Some(export) = parquet_export else {
-        return disabled("post-generation Parquet export did not run");
-    };
-    if !export.enabled {
-        return disabled(
-            export
-                .skipped_reason
-                .as_deref()
-                .unwrap_or("post-generation Parquet export is disabled"),
-        );
-    }
-    if let Some(reason) = export.skipped_reason.as_deref() {
-        return disabled(reason);
-    }
-    let Some(output_dir) = export.output_dir.as_ref() else {
-        return disabled("post-generation Parquet export did not report output_dir");
-    };
-    if export.exported_dbnums.is_empty() {
-        return disabled("post-generation Parquet export reported no exported dbnums");
-    }
-
-    let actual_to_sesno = outcome
-        .files
-        .iter()
-        .map(|file| file.actual_end_sesno)
-        .max()
-        .or(options.to_sesno)
-        .unwrap_or(options.from_sesno);
-    let handoff_dir = options.publication_handoff_dir.clone().unwrap_or_else(|| {
-        db_option_ext
-            .get_project_output_dir()
-            .join("model_versions")
-            .join("runs")
-            .join("incremental_publication_handoffs")
-    });
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
-    let dbnum_tag = if export.exported_dbnums.len() == 1 {
-        export.exported_dbnums[0].to_string()
-    } else {
-        export
-            .exported_dbnums
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join("-")
-    };
-    let run_id = format!(
-        "incremental-db{}-{}-to-{}-{}",
-        dbnum_tag, options.from_sesno, actual_to_sesno, timestamp
-    );
-    let manifest_path = handoff_dir.join(format!("{run_id}.json"));
-
-    let config_arg =
-        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-    let executable = std::env::current_exe()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "aios-database".to_string());
-    let release_id_prefix = sanitize_release_id_fragment(
-        options
-            .release_id_prefix
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("incremental-sesno"),
-    );
-    if release_id_prefix.is_empty() {
-        anyhow::bail!("release-id-prefix produces an empty path-safe fragment");
-    }
-
-    let mut candidates = Vec::new();
-    for dbnum in &export.exported_dbnums {
-        let parquet_dir = output_dir.join(dbnum.to_string());
-        let package = aios_database::version_management::release_package::load_model_package(
-            &parquet_dir,
-            *dbnum,
-        )
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "post-generation handoff cannot load candidate package for dbnum {} at {}: {}",
-                dbnum,
-                parquet_dir.display(),
-                err
-            )
-        })?;
-        let package_hash_short = package.package_hash.chars().take(12).collect::<String>();
-        let suggested_release_id = format!(
-            "{}-db{}-sesno{}-pkg{}",
-            release_id_prefix, dbnum, actual_to_sesno, package_hash_short
-        );
-        aios_database::version_management::release_package::validate_release_id_for_path(
-            &suggested_release_id,
-        )?;
-
-        let metadata = serde_json::json!({
-            "source": "incremental-sesno publication handoff",
-            "project_name": db_option_ext.inner.project_name,
-            "dbnum": dbnum,
-            "from_sesno": options.from_sesno,
-            "to_sesno": actual_to_sesno,
-            "source_observation": source_observation_summary,
-            "incremental": {
-                "file_count": outcome.files.len(),
-                "session_count": outcome.total_session_count(),
-                "element_count": outcome.total_element_count(),
-                "data_persist": persist_stats,
-                "category_counts": {
-                    "prim": outcome.update_log.prim_refnos.len(),
-                    "loop_owner": outcome.update_log.loop_owner_refnos.len(),
-                    "bran_hanger": outcome.update_log.bran_hanger_refnos.len(),
-                    "basic_cata": outcome.update_log.basic_cata_refnos.len(),
-                    "delete": outcome.update_log.delete_refnos.len(),
-                    "total": outcome.update_log.count(),
-                },
-            },
-            "generation": {
-                "success": generation_success,
-                "generation_dbnums": generation_dbnums,
-                "parquet_export": export,
-                "tree_index": tree_index_summary,
-            },
-            "candidate_package": {
-                "source_parquet_dir": parquet_dir,
-                "package_hash": package.package_hash,
-                "rows_by_table": package.rows_by_table,
-            },
-            "publication_policy": {
-                "release_registration_is_explicit": true,
-                "register_copies_mutable_parquet_to_immutable_release_package": true,
-                "incremental_sesno_does_not_write_ducklake_release_catalog": true,
-                "suggested_release_quality": "patch_only",
-                "reason": "incremental-sesno generates the affected scope, not a proven full visual baseline",
-            }
-        });
-        let metadata_json = serde_json::to_string(&metadata)?;
-        let register_argv = vec![
-            executable.clone(),
-            "-c".to_string(),
-            config_arg.clone(),
-            "model-version".to_string(),
-            "register".to_string(),
-            "--release-id".to_string(),
-            suggested_release_id.clone(),
-            "--dbnum".to_string(),
-            dbnum.to_string(),
-            "--parquet-dir".to_string(),
-            parquet_dir.display().to_string(),
-            "--derivation-type".to_string(),
-            "incremental-sesno".to_string(),
-            "--release-quality".to_string(),
-            "patch_only".to_string(),
-            "--release-quality-reason".to_string(),
-            "incremental-sesno handoff contains the generated affected scope; verify or hydrate a full baseline package before publishing as a complete visual release".to_string(),
-            "--validation-flag".to_string(),
-            "incremental_handoff_affected_scope".to_string(),
-            "--validation-flag".to_string(),
-            "explicit_release_registration_required".to_string(),
-            "--metadata-json".to_string(),
-            metadata_json,
-            "--json".to_string(),
-        ];
-
-        candidates.push(serde_json::json!({
-            "dbnum": dbnum,
-            "source_parquet_dir": parquet_dir,
-            "package_hash": package.package_hash,
-            "rows_by_table": package.rows_by_table,
-            "suggested_release_id": suggested_release_id,
-            "register_argv": register_argv,
-            "register_command": command_to_shell_string_for_handoff(&register_argv),
-            "suggested_release_quality": "patch_only",
-            "next_step": "review the affected-scope package, then run register_argv to copy it into an immutable patch-only release; hydrate or validate a full baseline before complete_visual publication",
-        }));
-    }
-
-    let handoff = serde_json::json!({
-        "manifest_version": "incremental_publication_handoff:v1",
-        "run_id": run_id,
-        "project_name": db_option_ext.inner.project_name,
-        "from_sesno": options.from_sesno,
-        "to_sesno": actual_to_sesno,
-        "policy": "explicit_register_required",
-        "source_observation": source_observation_summary,
-        "tree_index": tree_index_summary,
-        "generation_success": generation_success,
-        "parquet_export": export,
-        "candidates": candidates,
-    });
-    let manifest_hash = write_json_manifest_atomic(&manifest_path, &handoff)?;
-
-    Ok(Some(serde_json::json!({
-        "enabled": true,
-        "policy": "explicit_register_required",
-        "manifest_path": manifest_path,
-        "manifest_hash": manifest_hash,
-        "candidate_count": candidates.len(),
-        "candidates": candidates,
-        "side_effect": "handoff manifest written; no release was registered by incremental-sesno",
-    })))
-}
-
-#[cfg(not(feature = "gui"))]
-fn write_json_manifest_atomic(path: &Path, value: &serde_json::Value) -> anyhow::Result<String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            anyhow::anyhow!(
-                "create handoff manifest dir failed: {}: {}",
-                parent.display(),
-                err
-            )
-        })?;
-    }
-    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec_pretty(value)?).map_err(|err| {
-        anyhow::anyhow!(
-            "write temporary handoff manifest failed: {}: {}",
-            tmp.display(),
-            err
-        )
-    })?;
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|err| {
-            anyhow::anyhow!(
-                "remove previous handoff manifest failed: {}: {}",
-                path.display(),
-                err
-            )
-        })?;
-    }
-    std::fs::rename(&tmp, path).map_err(|err| {
-        anyhow::anyhow!(
-            "replace handoff manifest failed: {}: {}",
-            path.display(),
-            err
-        )
-    })?;
-    aios_database::version_management::hashing::sha256_file(path)
-        .map_err(|err| anyhow::anyhow!("hash handoff manifest failed: {}: {}", path.display(), err))
-}
-
-#[cfg(not(feature = "gui"))]
-fn sanitize_release_id_fragment(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
-#[cfg(not(feature = "gui"))]
-fn command_to_shell_string_for_handoff(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            if arg.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/' | '\\' | ':')
-            }) {
-                arg.clone()
-            } else {
-                format!("\"{}\"", arg.replace('"', "\\\""))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(not(feature = "gui"))]
-fn print_incremental_sesno_summary(result: &IncrementalSesnoRunResult) {
+fn print_incremental_sesno_summary(result: &IncrementRunResult) {
     println!(
         "✅ incremental-sesno 完成: files={} sessions={} elements={} total_changes={}",
         result.summary["file_count"],
@@ -1172,10 +264,18 @@ fn print_incremental_sesno_summary(result: &IncrementalSesnoRunResult) {
         );
     }
     if let Some(export) = &result.parquet_export {
-        if export.enabled {
+        if export
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
             println!(
-                "   parquet_export: dbnums={:?} skipped={:?}",
-                export.exported_dbnums, export.skipped_reason
+                "   parquet_export: dbnums={} skipped={:?}",
+                export
+                    .get("exported_dbnums")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "[]".to_string()),
+                export.get("skipped_reason").and_then(|value| value.as_str())
             );
         }
     }
@@ -1730,9 +830,9 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("model-writer")
                 .long("model-writer")
-                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence; ducklake writes 9 trait-covered Phase 1 raw tables to ducklake-canonical schema via Rust duckdb crate (requires feature `model-writer-ducklake`; see goals/ducklake-model-writer/)")
+                .help("Model writer backend: surreal writes to SurrealDB; drain-only consumes generated batches for throughput testing without persistence")
                 .value_name("WRITER")
-                .value_parser(["surreal", "drain-only", "ducklake", "duck-lake"]),
+                .value_parser(["surreal", "drain-only"]),
         )
         .arg(
             Arg::new("export-parquet-after-gen")
@@ -2053,6 +1153,12 @@ async fn main() -> anyhow::Result<()> {
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("recover-pending")
+                        .long("recover-pending")
+                        .help("重放同 fingerprint 的 commit_pending；普通增量不会越过未恢复提交")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("generate-model")
                         .long("generate-model")
                         .help("收集增量后调用 gen_all_geos_data(..., Some(update_log), None)")
@@ -2342,13 +1448,13 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("transform-write-backend")
                 .long("transform-write-backend")
-                .help("pe_transform 写入后端: surreal|parquet|ducklake|dual")
+                .help("pe_transform 写入后端: surreal|parquet|dual")
                 .value_name("BACKEND"),
         )
         .arg(
             Arg::new("transform-read-backend")
                 .long("transform-read-backend")
-                .help("pe_transform 读取后端: auto|surreal|parquet|ducklake|rkyv|memory")
+                .help("pe_transform 读取后端: auto|surreal|parquet|rkyv|memory")
                 .value_name("BACKEND"),
         )
         .arg(
@@ -2361,18 +1467,6 @@ async fn main() -> anyhow::Result<()> {
             Arg::new("transform-parquet-dir")
                 .long("transform-parquet-dir")
                 .help("pe_transform Parquet 输出/读取目录")
-                .value_name("DIR"),
-        )
-        .arg(
-            Arg::new("transform-ducklake-metadata")
-                .long("transform-ducklake-metadata")
-                .help("DuckLake metadata.ducklake 路径")
-                .value_name("FILE"),
-        )
-        .arg(
-            Arg::new("transform-ducklake-data-path")
-                .long("transform-ducklake-data-path")
-                .help("DuckLake data path 目录")
                 .value_name("DIR"),
         )
         .arg(
@@ -2514,7 +1608,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(mv) = matches.subcommand_matches("model-version") {
-        if mv.subcommand_matches("history").is_some() {
+        if mv.subcommand_matches("history").is_some()
+            || mv.subcommand_matches("resolve-anchor").is_some()
+        {
             crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         }
     }
@@ -2600,7 +1696,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(writer) = matches.get_one::<String>("model-writer") {
         db_option_ext.model_writer_mode = match writer.as_str() {
             "drain-only" => ModelWriterMode::DrainOnly,
-            "ducklake" | "duck-lake" => ModelWriterMode::DuckLake,
             _ => ModelWriterMode::Surreal,
         };
         println!(
@@ -2609,12 +1704,6 @@ async fn main() -> anyhow::Result<()> {
         );
         if db_option_ext.model_writer_mode == ModelWriterMode::DrainOnly {
             println!("🔧 drain-only 压测模式: 生成几何 batch，仅消费统计，不写 SurrealDB");
-        }
-        if db_option_ext.model_writer_mode == ModelWriterMode::DuckLake {
-            println!(
-                "🔧 ducklake 模式: 写 9 张 trait 覆盖的 Phase 1 raw 表到 ducklake-canonical schema; \
-                 tubi/transforms/refno_assoc 6 项保持 Known Gap (goals/ducklake-model-writer/)"
-            );
         }
     }
     db_option_ext.validate_model_writer_features()?;
@@ -2645,14 +1734,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = matches.get_one::<String>("transform-parquet-dir") {
         db_option_ext.transform_parquet_dir = Some(dir.clone());
         println!("🔧 pe_transform Parquet 目录: {}", dir);
-    }
-    if let Some(path) = matches.get_one::<String>("transform-ducklake-metadata") {
-        db_option_ext.transform_ducklake_metadata = Some(path.clone());
-        println!("🔧 pe_transform DuckLake metadata: {}", path);
-    }
-    if let Some(path) = matches.get_one::<String>("transform-ducklake-data-path") {
-        db_option_ext.transform_ducklake_data_path = Some(path.clone());
-        println!("🔧 pe_transform DuckLake data path: {}", path);
     }
     if matches.get_flag("clear-transform-before-refresh") {
         db_option_ext.clear_transform_before_refresh = true;
@@ -2702,7 +1783,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ========== 启动 Web 服务器 ==========
-
     // 调试：显示配置加载结果
     println!("🔧 配置加载完成:");
     println!("   - 配置文件路径: {}", config_path);
@@ -4063,7 +3143,7 @@ async fn main() -> anyhow::Result<()> {
             .copied()
             .expect("required by clap");
         let json_output = incr_matches.get_flag("json");
-        let options = IncrementalSesnoRunOptions {
+        let options = IncrementRunOptions {
             file: incr_matches.get_one::<String>("file").map(PathBuf::from),
             dbnums: incr_matches
                 .get_many::<u32>("dbnum")
@@ -4073,6 +3153,7 @@ async fn main() -> anyhow::Result<()> {
             to_sesno: incr_matches.get_one::<u32>("to-sesno").copied(),
             rescan_index: incr_matches.get_flag("rescan-index"),
             persist_data: !incr_matches.get_flag("no-persist"),
+            recover_pending: incr_matches.get_flag("recover-pending"),
             generate_model: incr_matches.get_flag("generate-model"),
             source_observation_manifest: incr_matches
                 .get_one::<String>("source-observation-manifest")
@@ -4219,13 +3300,14 @@ async fn main() -> anyhow::Result<()> {
                     );
                     let result = run_incremental_sesno_once(
                         &db_option_ext,
-                        IncrementalSesnoRunOptions {
+                        IncrementRunOptions {
                             file: None,
                             dbnums: vec![rec.dbnum],
                             from_sesno: previous,
                             to_sesno: Some(rec.latest_sesno),
                             rescan_index: false,
                             persist_data: true,
+                            recover_pending: false,
                             generate_model,
                             source_observation_manifest: Some(
                                 source_observation.manifest_path.clone(),

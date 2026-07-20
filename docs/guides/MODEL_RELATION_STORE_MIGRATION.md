@@ -1,5 +1,10 @@
 # 模型关系数据迁移到 SQLite 方案
 
+> **清理记录**：`model_relation_store.rs`（本文档的存储层）已在生产中使用。但下文示例代码里的
+> `pdms_inst_v2::pre_cleanup_for_regen_v2` / `save_instance_data_to_sqlite` 集成层从未被 `mod`
+> 声明接入编译，是被放弃的分支，对应源文件（`pdms_inst_v2.rs`/`v3.rs`/`model_relation_store_v3.rs`）
+> 已删除。阅读下文代码示例时请注意：存储层（本节其余部分）仍有效，`pdms_inst_v2` 相关调用示例仅作历史参考。
+
 ## 概述
 
 将分散在 SurrealDB 多表中的模型关系数据集中到 SQLite 存储，简化 `--regen-model` 清理逻辑。

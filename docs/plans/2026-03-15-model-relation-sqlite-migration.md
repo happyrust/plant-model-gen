@@ -1,8 +1,14 @@
 # 模型关系数据迁移到 SQLite 实施计划
 
 **创建时间**: 2026-03-15
-**状态**: 待实施
+**状态**: 部分实施，其余已废弃并清理
 **优先级**: 高
+
+> **状态说明（清理记录）**：Phase 1（`model_relation_store.rs`）已落地并在生产中使用，
+> 替代了分散在 SurrealDB 多表中的关系数据（见 `docs/guides/MODEL_RELATION_STORE_MIGRATION.md`）。
+> 但本文档描述的 Phase 2-5（`pdms_inst_v2.rs`/`pdms_inst_v3.rs`/`model_relation_store_v3.rs`、
+> `ENABLE_SQLITE_STORE` 开关、双写迁移方案）从未真正接入编译（`mod` 声明缺失），是被放弃的分支，
+> 对应源文件已删除。以下内容按原计划保留作历史记录，不代表当前代码状态。
 
 ## 目标
 

@@ -37,11 +37,7 @@ pub fn rocksdb_conn_str(data_path: &str, versioned: bool, retention: &str) -> St
     );
     if versioned {
         let retention = retention.trim();
-        let retention = if retention.is_empty() {
-            "90d"
-        } else {
-            retention
-        };
+        let retention = if retention.is_empty() { "0" } else { retention };
         format!("rocksdb://{data_path}?versioned=true&retention={retention}")
     } else {
         format!("rocksdb://{data_path}")
@@ -76,54 +72,67 @@ fn default_inst_aabb_write_concurrency() -> usize {
     2
 }
 
-fn parse_model_writer_mode(raw: Option<&str>) -> ModelWriterMode {
+fn parse_model_writer_mode(raw: Option<&str>) -> anyhow::Result<ModelWriterMode> {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
         Some(mode) if mode == "drain-only" || mode == "drain_only" || mode == "drain" => {
-            ModelWriterMode::DrainOnly
+            Ok(ModelWriterMode::DrainOnly)
         }
         Some(mode) if mode == "ducklake" || mode == "duck-lake" || mode == "duck_lake" => {
-            // DuckLake backend removed; fall back to Surreal so old configs still load.
-            eprintln!("警告: model_writer=ducklake 已移除，回退为 surreal");
-            ModelWriterMode::Surreal
+            anyhow::bail!(
+                "model_writer={mode} 已退役；请显式改为 surreal 或 drain-only，系统不会静默回退"
+            )
         }
-        Some(_) | None => ModelWriterMode::Surreal,
+        Some(mode) if mode == "surreal" => Ok(ModelWriterMode::Surreal),
+        Some(mode) => anyhow::bail!("未知 model_writer={mode}；仅支持 surreal 或 drain-only"),
+        None => Ok(ModelWriterMode::Surreal),
     }
 }
 
-pub fn parse_transform_write_backend(raw: Option<&str>) -> TransformWriteBackend {
+pub fn parse_transform_write_backend(raw: Option<&str>) -> anyhow::Result<TransformWriteBackend> {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(mode) if mode == "parquet" => TransformWriteBackend::Parquet,
-        Some(mode) if mode == "ducklake" => {
-            eprintln!("警告: transform_write_backend=ducklake 已移除，回退为 parquet");
-            TransformWriteBackend::Parquet
+        Some(mode) if mode == "parquet" => Ok(TransformWriteBackend::Parquet),
+        Some(mode) if mode == "ducklake" => anyhow::bail!(
+            "transform_write_backend=ducklake 已退役；请显式改为 surreal、parquet 或 dual"
+        ),
+        Some(mode) if mode == "dual" => Ok(TransformWriteBackend::Dual),
+        Some(mode) if mode == "surreal" => Ok(TransformWriteBackend::Surreal),
+        Some(mode) => {
+            anyhow::bail!("未知 transform_write_backend={mode}；仅支持 surreal、parquet 或 dual")
         }
-        Some(mode) if mode == "dual" => TransformWriteBackend::Dual,
-        Some(_) | None => TransformWriteBackend::Surreal,
+        None => Ok(TransformWriteBackend::Surreal),
     }
 }
 
-pub fn parse_transform_read_backend(raw: Option<&str>) -> TransformReadBackend {
+pub fn parse_transform_read_backend(raw: Option<&str>) -> anyhow::Result<TransformReadBackend> {
     match raw.map(|s| s.trim().to_ascii_lowercase()) {
-        Some(mode) if mode == "surreal" => TransformReadBackend::Surreal,
-        Some(mode) if mode == "parquet" => TransformReadBackend::Parquet,
-        Some(mode) if mode == "ducklake" => {
-            eprintln!("警告: transform_read_backend=ducklake 已移除，回退为 parquet");
-            TransformReadBackend::Parquet
-        }
-        Some(mode) if mode == "rkyv" => TransformReadBackend::Rkyv,
-        Some(mode) if mode == "memory" => TransformReadBackend::Memory,
-        Some(_) | None => TransformReadBackend::Auto,
+        Some(mode) if mode == "surreal" => Ok(TransformReadBackend::Surreal),
+        Some(mode) if mode == "parquet" => Ok(TransformReadBackend::Parquet),
+        Some(mode) if mode == "ducklake" => anyhow::bail!(
+            "transform_read_backend=ducklake 已退役；请显式改为 auto、surreal、parquet、rkyv 或 memory"
+        ),
+        Some(mode) if mode == "rkyv" => Ok(TransformReadBackend::Rkyv),
+        Some(mode) if mode == "memory" => Ok(TransformReadBackend::Memory),
+        Some(mode) if mode == "auto" => Ok(TransformReadBackend::Auto),
+        Some(mode) => anyhow::bail!(
+            "未知 transform_read_backend={mode}；仅支持 auto、surreal、parquet、rkyv 或 memory"
+        ),
+        None => Ok(TransformReadBackend::Auto),
     }
 }
 
-pub fn parse_transform_compare_backends(raw: Option<&str>) -> Vec<TransformReadBackend> {
-    raw.map(|s| {
-        s.split(',')
-            .map(|part| parse_transform_read_backend(Some(part)))
-            .filter(|backend| *backend != TransformReadBackend::Auto)
-            .collect()
-    })
-    .unwrap_or_default()
+pub fn parse_transform_compare_backends(
+    raw: Option<&str>,
+) -> anyhow::Result<Vec<TransformReadBackend>> {
+    let mut backends = Vec::new();
+    if let Some(raw) = raw {
+        for part in raw.split(',') {
+            let backend = parse_transform_read_backend(Some(part))?;
+            if backend != TransformReadBackend::Auto {
+                backends.push(backend);
+            }
+        }
+    }
+    Ok(backends)
 }
 
 /// 校验数据源模式是否符合当前固定策略。
@@ -309,10 +318,6 @@ pub struct DbOptionExt {
     /// HTTP数据服务器端口，用于异地部署
     #[serde(default)]
     pub http_port: Option<u16>,
-
-    /// 目标会话号，用于历史模型生成
-    #[serde(default)]
-    pub target_sesno: Option<u32>,
 
     /// IndexTree 模式下同时进行的 Noun 级任务数量
     /// 默认为 None 时使用合理的并发数（如 CPU 核数）
@@ -632,7 +637,6 @@ impl From<DbOption> for DbOptionExt {
             mqtt_port: None,
             http_server: None,
             http_port: None,
-            target_sesno: None,
             index_tree_max_concurrent_targets: None,
             index_tree_batch_size: None,
             index_tree_enabled_target_types: Vec::new(),
@@ -842,37 +846,37 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
             .get("model_writer")
             .or_else(|| toml_value.get("model_writer_mode"))
             .and_then(|v| v.as_str()),
-    );
+    )?;
 
     let transform_write_backend = parse_transform_write_backend(
         toml_value
             .get("transform_write_backend")
             .and_then(|v| v.as_str()),
-    );
+    )?;
 
     let transform_read_backend = parse_transform_read_backend(
         toml_value
             .get("transform_read_backend")
             .and_then(|v| v.as_str()),
-    );
+    )?;
 
-    let transform_compare_backends = toml_value
-        .get("transform_compare_backends")
-        .and_then(|v| {
-            if let Some(arr) = v.as_array() {
-                Some(
-                    arr.iter()
-                        .filter_map(|item| item.as_str())
-                        .map(|item| parse_transform_read_backend(Some(item)))
-                        .filter(|backend| *backend != TransformReadBackend::Auto)
-                        .collect::<Vec<_>>(),
-                )
+    let transform_compare_backends =
+        if let Some(value) = toml_value.get("transform_compare_backends") {
+            if let Some(items) = value.as_array() {
+                let mut parsed = Vec::new();
+                for item in items.iter().filter_map(|item| item.as_str()) {
+                    let backend = parse_transform_read_backend(Some(item))?;
+                    if backend != TransformReadBackend::Auto {
+                        parsed.push(backend);
+                    }
+                }
+                parsed
             } else {
-                v.as_str()
-                    .map(|s| parse_transform_compare_backends(Some(s)))
+                parse_transform_compare_backends(value.as_str())?
             }
-        })
-        .unwrap_or_default();
+        } else {
+            Vec::new()
+        };
 
     let transform_parquet_dir = toml_value
         .get("transform_parquet_dir")
@@ -952,7 +956,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         mqtt_port: None,
         http_server: None,
         http_port: None,
-        target_sesno: None,
         index_tree_max_concurrent_targets,
         index_tree_batch_size,
         index_tree_enabled_target_types,

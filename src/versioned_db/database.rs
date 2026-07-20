@@ -1,5 +1,6 @@
 #[cfg(feature = "surreal-save")]
 use aios_core::project_primary_db;
+use anyhow::Context;
 use log::{debug, error, info, warn};
 
 // 内存KV数据库全局连接（从 aios_core 导入）
@@ -40,9 +41,9 @@ use std::mem::take;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::fs;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncReadExt;
@@ -57,6 +58,10 @@ use crate::tables::*;
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
 use crate::versioned_db::tree_export::{TreeNodeMeta, export_tree_file};
+use crate::versioned_db::version_commit::{
+    VersionCommitCounts, VersionCommitError, VersionCommitRequest, VersionCommitSource,
+    commit_version, compute_commit_fingerprint, recover_version_commit,
+};
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -95,6 +100,45 @@ fn resolve_sync_chunk_size(configured: Option<u32>, default_chunk_size: usize) -
         .or_else(|| configured.map(|value| value as usize))
         .unwrap_or(default_chunk_size)
         .max(1)
+}
+
+/// Surreal write-path timing (consumer workers). Cumulative across all insert tasks.
+static SYNC_WRITE_QUERIES: AtomicU64 = AtomicU64::new(0);
+static SYNC_WRITE_MS: AtomicU64 = AtomicU64::new(0);
+static SYNC_WRITE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+fn record_sync_write(kind: &str, rows: usize, ms: u64) {
+    let n = SYNC_WRITE_QUERIES.fetch_add(1, Ordering::Relaxed) + 1;
+    let total_ms = SYNC_WRITE_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+    let total_rows = SYNC_WRITE_ROWS.fetch_add(rows as u64, Ordering::Relaxed) + rows as u64;
+    // Always print slow queries; otherwise sample every 25 to avoid drowning logs.
+    if ms >= 200 || n % 25 == 0 || n == 1 {
+        let rate = if total_ms > 0 {
+            total_rows as f64 * 1000.0 / total_ms as f64
+        } else {
+            0.0
+        };
+        println!(
+            "[sync-write] kind={} rows={} query_ms={} | cumulative queries={} rows={} ms={} ({:.0} rows/s)",
+            kind, rows, ms, n, total_rows, total_ms, rate
+        );
+    }
+}
+
+#[cfg(feature = "surreal-save")]
+async fn timed_primary_query(kind: &'static str, sql: &str, rows: usize) {
+    let t0 = Instant::now();
+    let response = project_primary_db()
+        .query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("[sync-write] {kind} transport failed: {e}"));
+    if let Err(error) = response.check() {
+        if kind == "att" {
+            eprintln!("[sync-write][att-statement-failed] rows={rows} error={error} sql={sql}");
+        }
+        panic!("[sync-write] {kind} statement failed: {error}");
+    }
+    record_sync_write(kind, rows, t0.elapsed().as_millis() as u64);
 }
 
 #[inline]
@@ -526,9 +570,10 @@ static SESNO_VERSION_ANCHOR_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
 /// 确保 sesno_version_anchor 锚点表 schema 存在（specs/022 T008）。
 ///
-/// 表用途：把业务版本号 sesno 固化为存储时间戳锚点（dbnum + sesno → anchored_at），
-/// 供按 sesno 的历史查询（`SELECT ... VERSION`）换算时间戳；增量落库收尾写
-/// `source='incremental'`，全量重灌收尾写 `source='full'`。
+/// 表用途：把业务版本号 sesno 固化为存储时间戳锚点
+///（dbnum + sesno + source → anchored_at），供按 sesno 的历史查询
+///（`SELECT ... VERSION`）换算时间戳。数据提交写 `full`/`incremental`，
+/// 模型生成全部成功后写 `model_gen`。
 ///
 /// 幂等：DDL 全部使用 IF NOT EXISTS；进程内经 OnceCell 成功后只执行一次，
 /// 失败不缓存、下次调用重试并向调用方传播错误（锚点写入前必须 schema 就绪）。
@@ -540,9 +585,10 @@ DEFINE TABLE IF NOT EXISTS sesno_version_anchor SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS dbnum ON TABLE sesno_version_anchor TYPE int;
 DEFINE FIELD IF NOT EXISTS sesno ON TABLE sesno_version_anchor TYPE int;
 DEFINE FIELD IF NOT EXISTS anchored_at ON TABLE sesno_version_anchor TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS source ON TABLE sesno_version_anchor TYPE string ASSERT $value IN ['full', 'incremental'];
+DEFINE FIELD OVERWRITE source ON TABLE sesno_version_anchor TYPE string ASSERT $value IN ['full', 'incremental', 'model_gen'];
 DEFINE FIELD IF NOT EXISTS note ON TABLE sesno_version_anchor TYPE option<string>;
-DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno ON TABLE sesno_version_anchor FIELDS dbnum, sesno UNIQUE;
+REMOVE INDEX IF EXISTS idx_sesno_version_anchor_dbnum_sesno ON sesno_version_anchor;
+DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno_source ON TABLE sesno_version_anchor FIELDS dbnum, sesno, source UNIQUE;
 "#;
             aios_core::project_primary_db()
                 .query(sql)
@@ -554,6 +600,113 @@ DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno ON TABLE sesno_v
             Ok::<(), anyhow::Error>(())
         })
         .await?;
+    // OVERWRITE 幂等：表 OnceCell 命中后仍刷新函数，便于升级已跑进程外的新部署。
+    ensure_sesno_version_lookup_functions().await?;
+    Ok(())
+}
+
+/// specs/024：库内按数据/模型语义分别查找 `sesno → anchored_at`。
+///
+/// - `fn::data_sesno_version*` 只解析 `full`/`incremental`
+/// - `fn::model_sesno_version*` 只解析 `model_gen`
+/// 精确命中优先；否则同 dbnum 下 `sesno <= 请求` 的最大一条（`exact=false`）。
+async fn ensure_sesno_version_lookup_functions() -> anyhow::Result<()> {
+    let sql = r#"
+DEFINE FUNCTION OVERWRITE fn::data_sesno_version($dbnum: number, $sesno: number) {
+    LET $exact = (
+        SELECT VALUE anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno = $sesno
+            AND source IN ['full', 'incremental']
+        ORDER BY anchored_at DESC
+        LIMIT 1
+    );
+    IF array::len($exact) > 0 {
+        RETURN $exact[0];
+    };
+    LET $fb = (
+        SELECT VALUE anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno <= $sesno
+            AND source IN ['full', 'incremental']
+        ORDER BY sesno DESC, anchored_at DESC
+        LIMIT 1
+    );
+    RETURN IF array::len($fb) > 0 { $fb[0] } ELSE { NONE };
+};
+
+DEFINE FUNCTION OVERWRITE fn::data_sesno_version_hit($dbnum: number, $sesno: number) {
+    LET $exact = (
+        SELECT dbnum, sesno, source, anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno = $sesno
+            AND source IN ['full', 'incremental']
+        ORDER BY anchored_at DESC
+        LIMIT 1
+    );
+    IF array::len($exact) > 0 {
+        LET $r = $exact[0];
+        RETURN {
+            dbnum: $r.dbnum,
+            sesno: $r.sesno,
+            source: $r.source,
+            anchored_at: $r.anchored_at,
+            exact: true
+        };
+    };
+    LET $fb = (
+        SELECT dbnum, sesno, source, anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno <= $sesno
+            AND source IN ['full', 'incremental']
+        ORDER BY sesno DESC, anchored_at DESC
+        LIMIT 1
+    );
+    IF array::len($fb) > 0 {
+        LET $r = $fb[0];
+        RETURN {
+            dbnum: $r.dbnum,
+            sesno: $r.sesno,
+            source: $r.source,
+            anchored_at: $r.anchored_at,
+            exact: false
+        };
+    };
+    RETURN NONE;
+};
+
+DEFINE FUNCTION OVERWRITE fn::model_sesno_version($dbnum: number, $sesno: number) {
+    LET $hit = (
+        SELECT VALUE anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno <= $sesno AND source = 'model_gen'
+        ORDER BY sesno DESC, anchored_at DESC
+        LIMIT 1
+    );
+    RETURN IF array::len($hit) > 0 { $hit[0] } ELSE { NONE };
+};
+
+DEFINE FUNCTION OVERWRITE fn::model_sesno_version_hit($dbnum: number, $sesno: number) {
+    LET $hit = (
+        SELECT dbnum, sesno, source, anchored_at FROM sesno_version_anchor
+        WHERE dbnum = $dbnum AND sesno <= $sesno AND source = 'model_gen'
+        ORDER BY sesno DESC, anchored_at DESC
+        LIMIT 1
+    );
+    IF array::len($hit) > 0 {
+        LET $r = $hit[0];
+        RETURN {
+            dbnum: $r.dbnum,
+            sesno: $r.sesno,
+            source: $r.source,
+            anchored_at: $r.anchored_at,
+            exact: $r.sesno = $sesno
+        };
+    };
+    RETURN NONE;
+};
+"#;
+    aios_core::project_primary_db()
+        .query(sql)
+        .await
+        .map_err(|e| anyhow::anyhow!("定义 fn::*_sesno_version* 失败: {e}"))?
+        .check()
+        .map_err(|e| anyhow::anyhow!("fn::*_sesno_version* 语句执行失败: {e}"))?;
     Ok(())
 }
 
@@ -564,24 +717,103 @@ DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno ON TABLE sesno_v
 /// dbnum 本轮全部 PE/ATT 写入；不能在解析循环里逐文件写（写库经 flume channel
 /// 异步 flush，逐文件时刻数据未必已落库）。
 ///
-/// 失败仅告警不中断：全量解析本体已成功，缺锚点可由 quickstart 的「首条锚点确认」
-/// 步骤发现并重跑补写，不值得让多小时的全量重灌因锚点写入失败而整体报错重来。
-async fn write_full_version_anchors(pending: &[(u32, u32)]) {
-    for &(dbnum, sesno) in pending {
-        match crate::data_interface::sesno_increment::write_sesno_version_anchor(
-            dbnum, sesno, "full",
+/// specs/023 T008：pe_owner 边（PERelateJson）走同一 sender/sink 通道，上述 join
+/// 约束同样保证"边全部落库先于 full 锚点固化"——锚点时刻的 VERSION 查询必然
+/// 覆盖本轮全部边。锚点成功后按 dbnum 写 `pe_owner_version_meta`（full_reload
+/// 重置可信起点；仅 surreal-save 构建下有边可信可言）。
+///
+/// 锚点失败必须向上传播。数据写入已经完成，调用方可只重试收尾；但在锚点成功前
+/// 不能把本次 full sync 宣告为可供历史查询的完整提交。
+async fn write_full_version_anchors(
+    pending: &[(u32, u32, String)],
+) -> anyhow::Result<Vec<crate::data_interface::sesno_increment::VersionAnchorRecord>> {
+    let mut written = Vec::with_capacity(pending.len());
+    for (dbnum, sesno, source_evidence) in pending {
+        let fingerprint_input = format!("full-sync-v1:{dbnum}:{sesno}");
+        let fingerprint = compute_commit_fingerprint(
+            *dbnum,
+            *sesno,
+            *sesno,
+            VersionCommitSource::Full,
+            None,
+            [fingerprint_input.as_str(), source_evidence.as_str()],
+        );
+        let counts = VersionCommitCounts::default();
+        let request = VersionCommitRequest {
+            dbnum: *dbnum,
+            from_sesno: *sesno,
+            to_sesno: *sesno,
+            source: VersionCommitSource::Full,
+            fingerprint,
+            source_hash: None,
+            expected_counts: Some(counts.clone()),
+        };
+        let outcome = match commit_version(request.clone(), || async { Ok(counts.clone()) }).await {
+            Ok(outcome) => outcome,
+            Err(VersionCommitError::PendingCommit { pending_sesno, .. })
+                if pending_sesno == *sesno =>
+            {
+                recover_version_commit(request, || async { Ok(counts) })
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "full sync 数据已写入，但 pending 锚点恢复失败(dbnum={dbnum} sesno={sesno})"
+                        )
+                    })?
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "full sync 数据已写入，但锚点发布失败(dbnum={dbnum} sesno={sesno})"
+                )));
+            }
+        };
+        let record = crate::data_interface::sesno_increment::VersionAnchorRecord {
+            dbnum: outcome.dbnum,
+            sesno: outcome.to_sesno,
+            source: "full".to_string(),
+            anchored_at: Some(outcome.anchored_at),
+            fingerprint: Some(outcome.fingerprint),
+            idempotent: outcome.idempotent,
+            recovered: outcome.recovered,
+        };
+        info!(
+            "sesno_version_anchor(full) 已写入: dbnum={} sesno={} anchored_at={:?}",
+            record.dbnum, record.sesno, record.anchored_at
+        );
+        // specs/023 T008：full 重灌以先删后插覆盖了全部 owner 的边，
+        // 自本 sesno 起 pe_owner 历史可信；meta 失败不阻断（读侧回退 pe.children 天然安全）。
+        #[cfg(feature = "surreal-save")]
+        if let Err(e) = crate::versioned_db::pe_owner_meta::upsert_maintained_since(
+            *dbnum,
+            *sesno,
+            crate::versioned_db::pe_owner_meta::META_SOURCE_FULL_RELOAD,
         )
         .await
         {
-            Ok(record) => info!(
-                "sesno_version_anchor(full) 已写入: dbnum={} sesno={} anchored_at={:?}",
-                record.dbnum, record.sesno, record.anchored_at
-            ),
-            Err(e) => {
-                warn!("sesno_version_anchor(full) 写入失败(dbnum={dbnum} sesno={sesno}): {e:?}")
-            }
+            log::warn!(
+                "pe_owner_version_meta(full_reload) 写入失败(dbnum={dbnum} sesno={sesno}): {e}"
+            );
         }
+        written.push(record);
     }
+    Ok(written)
+}
+
+fn full_sync_source_evidence(path: &Path) -> String {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return format!("{}|metadata=unavailable", path.display());
+    };
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{}|len={}|modified_ns={modified_nanos}",
+        path.display(),
+        metadata.len()
+    )
 }
 
 /// 初始化project database
@@ -1180,10 +1412,12 @@ where
                                 let sql = format!("INSERT IGNORE INTO pe [{}]", pes.join(","));
 
                                 // 保存到主数据库
-                                let mut response = project_primary_db()
+                                project_primary_db()
                                     .query(&sql)
                                     .await
-                                    .expect("insert pes failed");
+                                    .expect("insert pes transport failed")
+                                    .check()
+                                    .expect("insert pes statement failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1204,16 +1438,17 @@ where
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::PERelateJson(relates) => {
                             if !relates.is_empty() {
-                                let sql = format!(
-                                    "INSERT RELATION INTO pe_owner [{}]",
-                                    relates.join(",")
-                                );
+                                // specs/023 T007：批内元素已是完整语句
+                                // （每 owner 先 DELETE 后 INSERT RELATION，幂等），直接拼接执行。
+                                let sql = relates.join("\n");
 
                                 // 保存到主数据库
                                 project_primary_db()
                                     .query(&sql)
                                     .await
-                                    .expect("insert pe_owner failed");
+                                    .expect("insert pe_owner transport failed")
+                                    .check()
+                                    .expect("insert pe_owner statement failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1244,7 +1479,9 @@ where
                                 project_primary_db()
                                     .query(&sql)
                                     .await
-                                    .expect("insert ele_reuse_relate failed");
+                                    .expect("insert ele_reuse_relate transport failed")
+                                    .check()
+                                    .expect("insert ele_reuse_relate statement failed");
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -1276,7 +1513,9 @@ where
                                 project_primary_db()
                                     .query(sql)
                                     .await
-                                    .expect("insert att failed");
+                                    .expect("insert att transport failed")
+                                    .check()
+                                    .expect("insert att statement failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -1289,7 +1528,9 @@ where
                                 project_primary_db()
                                     .query(sql)
                                     .await
-                                    .expect("update dbnum_info failed");
+                                    .expect("update dbnum_info transport failed")
+                                    .check()
+                                    .expect("update dbnum_info statement failed");
                             }
                         }
                         #[cfg(not(feature = "surreal-save"))]
@@ -1303,7 +1544,9 @@ where
                             project_primary_db()
                                 .query(&sql)
                                 .await
-                                .expect("insert partitioned pe failed");
+                                .expect("insert partitioned pe transport failed")
+                                .check()
+                                .expect("insert partitioned pe statement failed");
 
                             // 如果启用了 mem-kv-save，同时保存到备份数据库
                             #[cfg(feature = "mem-kv-save")]
@@ -1387,7 +1630,7 @@ where
         crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
     // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
-    let mut pending_full_version_anchors: Vec<(u32, u32)> = Vec::new();
+    let mut pending_full_version_anchors: Vec<(u32, u32, String)> = Vec::new();
     // spec 004：解析阶段总耗时计时起点。
     let sync_stage_started = Instant::now();
 
@@ -1801,7 +2044,11 @@ where
 
         // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
         if is_save_db && sesno > 0 {
-            pending_full_version_anchors.push((dbnum, sesno as u32));
+            pending_full_version_anchors.push((
+                dbnum,
+                sesno as u32,
+                full_sync_source_evidence(&path),
+            ));
         }
 
         if tree_nodes.is_empty() {
@@ -1857,11 +2104,11 @@ where
 
     // 等待所有写入任务完成
     drop(sender);
-    while let Some(_result) = insert_handles.next().await {
-        // 可在此加入错误处理或日志
+    while let Some(result) = insert_handles.next().await {
+        result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
     // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
-    write_full_version_anchors(&pending_full_version_anchors).await;
+    write_full_version_anchors(&pending_full_version_anchors).await?;
     validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
     crate::perf_metrics::finish_parse_stage(
         parse_failed_sql_count(),
@@ -1974,14 +2221,9 @@ pub async fn sync_total_async_threaded(
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::PEJson(pes) => {
                             if !pes.is_empty() {
+                                let rows = pes.len();
                                 let sql = format!("INSERT IGNORE INTO pe [{}]", pes.join(","));
-
-                                // 保存到主数据库
-                                let mut response = project_primary_db()
-                                    .query(&sql)
-                                    .await
-                                    .expect("insert pes failed");
-
+                                timed_primary_query("pe", &sql, rows).await;
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
                                 {
@@ -2001,16 +2243,11 @@ pub async fn sync_total_async_threaded(
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::PERelateJson(relates) => {
                             if !relates.is_empty() {
-                                let sql = format!(
-                                    "INSERT RELATION INTO pe_owner [{}]",
-                                    relates.join(",")
-                                );
-
-                                // 保存到主数据库
-                                project_primary_db()
-                                    .query(&sql)
-                                    .await
-                                    .expect("insert pe_owner failed");
+                                let rows = relates.len();
+                                // specs/023 T007：批内元素已是完整语句
+                                // （每 owner 先 DELETE 后 INSERT RELATION，幂等），直接拼接执行。
+                                let sql = relates.join("\n");
+                                timed_primary_query("pe_owner", &sql, rows).await;
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -2032,16 +2269,12 @@ pub async fn sync_total_async_threaded(
                         SenderJsonsData::EleReuseRelateJson(relates) => {
                             if !relates.is_empty() {
                                 ensure_ele_reuse_relate_relation_schema().await;
+                                let rows = relates.len();
                                 let sql = format!(
                                     "INSERT RELATION INTO ele_reuse_relate [{}]",
                                     relates.join(",")
                                 );
-
-                                // 保存到主数据库
-                                project_primary_db()
-                                    .query(&sql)
-                                    .await
-                                    .expect("insert ele_reuse_relate failed");
+                                timed_primary_query("ele_reuse_relate", &sql, rows).await;
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -2065,14 +2298,10 @@ pub async fn sync_total_async_threaded(
                         #[cfg(feature = "surreal-save")]
                         SenderJsonsData::AttJson((table, atts)) => {
                             if !atts.is_empty() {
+                                let rows = atts.len();
                                 let sql =
                                     format!("INSERT IGNORE INTO {} [{}]", table, atts.join(","));
-
-                                // 保存到主数据库
-                                project_primary_db()
-                                    .query(&sql)
-                                    .await
-                                    .expect("insert atts failed");
+                                timed_primary_query("att", &sql, rows).await;
 
                                 // 如果启用了 mem-kv-save，同时保存到备份数据库
                                 #[cfg(feature = "mem-kv-save")]
@@ -2095,10 +2324,7 @@ pub async fn sync_total_async_threaded(
                             if !updates.is_empty() {
                                 // 使用UPSERT语法来更新或插入dbnum_info_table记录
                                 for update in updates {
-                                    project_primary_db()
-                                        .query(update.as_str())
-                                        .await
-                                        .expect("upsert dbnum_info failed");
+                                    timed_primary_query("dbnum_info", update.as_str(), 1).await;
 
                                     // 同步到内存KV备份库
                                     #[cfg(feature = "mem-kv-save")]
@@ -2122,10 +2348,7 @@ pub async fn sync_total_async_threaded(
                         SenderJsonsData::PartitionedPEJson { table_name, sql } => {
                             // 保存简化PE数据到分表
                             log::debug!("插入到分表 {}", table_name);
-                            project_primary_db()
-                                .query(&sql)
-                                .await
-                                .expect("insert partitioned pe failed");
+                            timed_primary_query("pe_partition", &sql, 1).await;
 
                             // 如果启用了 mem-kv-save，同时保存到备份数据库
                             #[cfg(feature = "mem-kv-save")]
@@ -2201,7 +2424,7 @@ pub async fn sync_total_async_threaded(
     let pending_full_version_anchors = tokio::spawn(async move {
         let mut parsed_artifacts = Vec::new();
         // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
-        let mut pending_full_version_anchors: Vec<(u32, u32)> = Vec::new();
+        let mut pending_full_version_anchors: Vec<(u32, u32, String)> = Vec::new();
         // spec 004：解析阶段总耗时计时起点。
         let sync_stage_started = Instant::now();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
@@ -2450,6 +2673,7 @@ pub async fn sync_total_async_threaded(
                         let db_basic_clone = db_basic.clone();
                         let ses_range_map_clone = ses_range_map.clone();
                         async move {
+                            let parse_t0 = Instant::now();
                             let result = parse_file_with_chunk(
                                 db_basic_clone,
                                 &file_name_clone,
@@ -2459,7 +2683,8 @@ pub async fn sync_total_async_threaded(
                                 true,
                             )
                             .await;
-                            (chunk_index, result)
+                            let parse_ms = parse_t0.elapsed().as_millis() as u64;
+                            (chunk_index, parse_ms, result)
                         }
                     }),
                 )
@@ -2483,10 +2708,14 @@ pub async fn sync_total_async_threaded(
                         chunk_stage_start,
                     );
                     let next_chunk = chunk_stream.next().await;
-                    let Some((chunk_index, parse_result)) = next_chunk else {
+                    let Some((chunk_index, parse_ms, parse_result)) = next_chunk else {
                         parse_heartbeat.stop();
                         break;
                     };
+
+                    let mut save_pes_ms = 0u64;
+                    let mut att_send_ms = 0u64;
+                    let mut chunk_attrs = 0usize;
 
                     match parse_result {
                         Ok(PdmsDbData {
@@ -2500,6 +2729,7 @@ pub async fn sync_total_async_threaded(
 
 
                             total_cnt += total_attr_map_arc.len();
+                            chunk_attrs = total_attr_map_arc.len();
                             for entry in total_attr_map_arc.iter() {
                                 let refno = *entry.key();
                                 let att = entry.value();
@@ -2517,6 +2747,7 @@ pub async fn sync_total_async_threaded(
                             if should_save {
                                 //开始执行保存数据
                                 info!("开始保存pe数量: {}", total_attr_map_arc.len());
+                                let save_t0 = Instant::now();
                                 save_pes(
                                     &db_basic,
                                     &total_attr_map_arc,
@@ -2528,6 +2759,7 @@ pub async fn sync_total_async_threaded(
                                 )
                                 .await
                                 .expect("save pes failed");
+                                save_pes_ms = save_t0.elapsed().as_millis() as u64;
                             }
                             if b_save_mysql && !gen_tree_only {
                                 #[cfg(feature = "sql")]
@@ -2543,6 +2775,7 @@ pub async fn sync_total_async_threaded(
                                 .await;
                             }
                             if is_save_db {
+                                let att_t0 = Instant::now();
                                 for kv in type_ele_map.iter() {
                                     let noun: i32 = *kv.key() as _;
                                     let type_name = db1_dehash(noun as _);
@@ -2596,6 +2829,7 @@ pub async fn sync_total_async_threaded(
                                         }
                                     }
                                 }
+                                att_send_ms = att_t0.elapsed().as_millis() as u64;
                             }
                         }
                         Err(e) => {
@@ -2607,6 +2841,19 @@ pub async fn sync_total_async_threaded(
                     }
                     completed_chunks += 1;
                     last_completed_chunk = Some(chunk_index + 1);
+                    println!(
+                        "[parse-progress] chunk_timing project={} file={} dbnum={} chunk={}/{} attrs={} parse_ms={} save_pes_ms={} att_send_ms={} producer_ms={}",
+                        project,
+                        file_name,
+                        dbnum,
+                        completed_chunks,
+                        total_chunks,
+                        chunk_attrs,
+                        parse_ms,
+                        save_pes_ms,
+                        att_send_ms,
+                        parse_ms + save_pes_ms + att_send_ms
+                    );
                     if completed_chunks == 1
                         || completed_chunks == total_chunks
                         || completed_chunks % 5 == 0
@@ -2701,7 +2948,11 @@ pub async fn sync_total_async_threaded(
 
                 // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
                 if is_save_db && sesno > 0 {
-                    pending_full_version_anchors.push((dbnum, sesno as u32));
+                    pending_full_version_anchors.push((
+                        dbnum,
+                        sesno as u32,
+                        full_sync_source_evidence(&path),
+                    ));
                 }
                 let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
@@ -2780,11 +3031,10 @@ pub async fn sync_total_async_threaded(
     drop(sender);
     // insert_handles.push(parse_handle);
     while let Some(result) = insert_handles.next().await {
-        // 处理每个完成的 future 的结果
-        // dbg!(&result);
+        result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
     // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
-    write_full_version_anchors(&pending_full_version_anchors).await;
+    write_full_version_anchors(&pending_full_version_anchors).await?;
     // all_handles.push(parse_handle);
     // futures::future::join_all(take(&mut all_handles)).await;
     // futures::future::join_all(&mut [parse_handle]).await;

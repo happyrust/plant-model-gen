@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
-use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+use crate::fast_model::gen_model::model_record_id::model_refno_range;
 use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
 
 const DEFAULT_DISTANCE: f32 = 0.0;
@@ -445,7 +445,7 @@ async fn fetch_bran_centerline_segments(
 
     ensure_sqlite_spatial_surreal_context().await?;
 
-    let tubi_range = model_refno_sesno_range("tubi_relate", branch_refno);
+    let tubi_range = model_refno_range("tubi_relate", branch_refno);
     let sql = format!(
         r#"
         SELECT
@@ -453,7 +453,7 @@ async fn fetch_bran_centerline_segments(
             world_trans.d as world_trans,
             start_pt.d as start_pt,
             end_pt.d as end_pt,
-            id[3] as index
+            id[2] as index
         FROM {tubi_range};
         "#
     );
@@ -462,27 +462,7 @@ async fn fetch_bran_centerline_segments(
         "USE NS `{}` DB `{}`;\n{}",
         db_option.surreal_ns, db_option.project_name, sql
     );
-    let mut rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 1).await?;
-    if rows.is_empty() {
-        let pe_key = branch_refno.to_pe_key();
-        let legacy_tubi_range = format!("tubi_relate:[{pe_key}, 0]..=[{pe_key}, ..]");
-        let sql = format!(
-            r#"
-            SELECT
-                in as leave_refno,
-                world_trans.d as world_trans,
-                start_pt.d as start_pt,
-                end_pt.d as end_pt,
-                id[1] as index
-            FROM {legacy_tubi_range};
-            "#
-        );
-        let sql = format!(
-            "USE NS `{}` DB `{}`;\n{}",
-            db_option.surreal_ns, db_option.project_name, sql
-        );
-        rows = SUL_DB.query_take(&sql, 1).await?;
-    }
+    let rows: Vec<TubiRelateRow> = SUL_DB.query_take(&sql, 1).await?;
     if rows.is_empty() {
         anyhow::bail!(
             "tubi_relate returned no segments for branch_refno={} pe_key={}",
@@ -2437,7 +2417,9 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
         per_page: Some(per_page),
         has_more: Some(false),
         query_bbox: None,
-        filter_options: Some(empty_filter_options(params.include_negative.unwrap_or(false))),
+        filter_options: Some(empty_filter_options(
+            params.include_negative.unwrap_or(false),
+        )),
         error: None,
     }
 }
@@ -3369,7 +3351,9 @@ mod tests {
         ])
         .unwrap();
 
-        let resp = with_test_index(&db, || do_spatial_query(base_spatial_bbox_params(), None, None));
+        let resp = with_test_index(&db, || {
+            do_spatial_query(base_spatial_bbox_params(), None, None)
+        });
 
         assert!(resp.success);
         let items = resp.results.unwrap_or_default();
@@ -3434,10 +3418,12 @@ mod tests {
 
         let filter_options = resp.filter_options.unwrap();
         assert!(filter_options.include_negative);
-        assert!(filter_options
-            .nouns
-            .iter()
-            .any(|item| item.value == "NBOX" && item.is_negative));
+        assert!(
+            filter_options
+                .nouns
+                .iter()
+                .any(|item| item.value == "NBOX" && item.is_negative)
+        );
     }
 
     #[test]

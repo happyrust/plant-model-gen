@@ -57,7 +57,6 @@ export function createDefaultRegistryConfig(
     apply_boolean_operation: true,
     mesh_tol_ratio: 3.0,
     room_keyword: '-RM',
-    target_sesno: null,
     meshes_path: null,
     export_json: false,
     export_parquet: true,

@@ -4,7 +4,7 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ use crate::data_interface::db_meta_manager::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
+// specs/023 M1：latest（不带 sesno）层级查询主路径切 pe_owner 图查询；
+// `AIOS_TREE_QUERY_SOURCE=tree` 可一键回退旧 TreeIndex 路径（M4 删除开关）。
+use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
 
 #[derive(Clone)]
 pub struct E3dTreeApiState {
@@ -52,6 +55,9 @@ pub struct NodeResponse {
     pub success: bool,
     pub node: Option<TreeNodeDto>,
     pub error_message: Option<String>,
+    /// specs/023：带 sesno 请求时的版本元信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<TreeVersionInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,6 +67,9 @@ pub struct ChildrenResponse {
     pub children: Vec<TreeNodeDto>,
     pub truncated: bool,
     pub error_message: Option<String>,
+    /// specs/023：带 sesno 请求时的版本元信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<TreeVersionInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +77,9 @@ pub struct AncestorsResponse {
     pub success: bool,
     pub refnos: Vec<RefnoEnum>,
     pub error_message: Option<String>,
+    /// specs/023：带 sesno 请求时的版本元信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<TreeVersionInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +88,9 @@ pub struct SubtreeRefnosResponse {
     pub refnos: Vec<RefnoEnum>,
     pub truncated: bool,
     pub error_message: Option<String>,
+    /// specs/023：带 sesno 请求时的版本元信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<TreeVersionInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +116,9 @@ pub struct SearchRequest {
     pub keyword: String,
     pub nouns: Option<Vec<String>>,
     pub limit: Option<i32>,
+    /// specs/023：search 暂不支持版本模式（二期）；传入即返回 VersionUnsupported
+    #[serde(default)]
+    pub sesno: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -144,6 +162,480 @@ pub struct SiteNodesResponse {
 #[derive(Debug, Deserialize)]
 pub struct ChildrenQuery {
     pub limit: Option<i32>,
+    /// specs/023：可选版本参数（per-dbnum sesno）；不传 = 现状 TreeIndex 路径
+    pub sesno: Option<u32>,
+}
+
+// ========================
+// specs/023: 版本化树查询辅助
+// ========================
+
+/// 带 `sesno` 的树接口响应附带的版本元信息（contracts/tree-version-api.md）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeVersionInfo {
+    pub requested_sesno: u32,
+    pub resolved_sesno: u32,
+    /// true = 精确命中锚点；false = 回退到「最近不大于」锚点
+    pub exact: bool,
+    /// 实际层级数据源："pe_owner" | "pe_children_fallback"
+    pub source: String,
+}
+
+/// 版本解析结果：锚点命中 + VERSION 时刻 + 数据源分界。
+#[derive(Debug, Clone)]
+pub struct ResolvedTreeVersion {
+    pub dbnum: u32,
+    pub requested_sesno: u32,
+    pub resolved_sesno: u32,
+    pub exact: bool,
+    /// RFC3339 时刻字符串，可直接拼进 `VERSION d'<...>'`
+    pub anchored_at: String,
+    /// pe_owner 历史可信起点（`pe_owner_version_meta`）；缺失 = 一律回退 pe.children
+    pub maintained_since_sesno: Option<u32>,
+}
+
+impl ResolvedTreeVersion {
+    /// 数据源选择（FR-008）：可信分界之后走 pe_owner 边，否则回退 pe.children。
+    pub fn use_pe_owner(&self) -> bool {
+        self.maintained_since_sesno
+            .map(|since| self.resolved_sesno >= since)
+            .unwrap_or(false)
+    }
+
+    pub fn source_str(&self) -> &'static str {
+        if self.use_pe_owner() {
+            "pe_owner"
+        } else {
+            "pe_children_fallback"
+        }
+    }
+
+    /// 拼接 `VERSION d'<anchored_at>'` 子句。
+    pub fn version_clause(&self) -> String {
+        format!("VERSION d'{}'", self.anchored_at)
+    }
+
+    pub fn to_info(&self) -> TreeVersionInfo {
+        TreeVersionInfo {
+            requested_sesno: self.requested_sesno,
+            resolved_sesno: self.resolved_sesno,
+            exact: self.exact,
+            source: self.source_str().to_string(),
+        }
+    }
+}
+
+/// 版本解析/查询错误 → HTTP 语义（对齐 `/api/model-history/*`，contracts 通用错误表）。
+#[derive(Debug)]
+pub enum TreeVersionError {
+    /// 404：该 dbnum 无任何 ≤sesno 的锚点（含非 versioned 站点）
+    AnchorMissing(String),
+    /// 410：锚点时刻低于 retention GC 水位线
+    Expired(String),
+    /// 400：接口不支持版本模式（FR-010）
+    VersionUnsupported(String),
+    /// 502：底层查询失败
+    QueryFailed(String),
+}
+
+impl TreeVersionError {
+    pub fn into_response(self) -> Response {
+        let (status, code, message) = match self {
+            Self::AnchorMissing(m) => (StatusCode::NOT_FOUND, "AnchorMissing", m),
+            Self::Expired(m) => (StatusCode::GONE, "Expired", m),
+            Self::VersionUnsupported(m) => (StatusCode::BAD_REQUEST, "VersionUnsupported", m),
+            Self::QueryFailed(m) => (StatusCode::BAD_GATEWAY, "QueryFailed", m),
+        };
+        (
+            status,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": { "code": code, "message": message },
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// 把 VERSION 查询的底层错误分类为 Expired / QueryFailed。
+///
+/// 启发式与 rs-core `version_query::is_history_expired_message` 同源（该函数未导出）：
+/// GC 水位线越界在 kvs 层表现为 InvalidArgument / full_history_ts_low 类消息。
+pub fn classify_version_query_error(message: &str) -> TreeVersionError {
+    let lower = message.to_ascii_lowercase();
+    let expired = lower.contains("invalidargument")
+        || lower.contains("invalid argument")
+        || lower.contains("below the garbage collection")
+        || lower.contains("full_history_ts_low")
+        || lower.contains("retention")
+            && (lower.contains("version") || lower.contains("history") || lower.contains("gc"));
+    if expired {
+        TreeVersionError::Expired(format!(
+            "该 sesno 历史已超出 retention 窗口，请改用源 db 文件重扫或放宽 version_retention：{message}"
+        ))
+    } else {
+        TreeVersionError::QueryFailed(message.to_string())
+    }
+}
+
+/// 版本入口：锚点解析（specs/022 体系，禁止绕过锚点裸查 VERSION）+ pe_owner 可信分界读取。
+pub async fn resolve_tree_version(
+    dbnum: u32,
+    sesno: u32,
+) -> Result<ResolvedTreeVersion, TreeVersionError> {
+    match aios_core::resolve_data_anchor(dbnum, sesno).await {
+        Ok(Some(hit)) => {
+            let maintained_since_sesno =
+                crate::versioned_db::pe_owner_meta::get_maintained_since(dbnum)
+                    .await
+                    .unwrap_or_default();
+            Ok(ResolvedTreeVersion {
+                dbnum,
+                requested_sesno: sesno,
+                resolved_sesno: hit.sesno,
+                exact: hit.exact,
+                anchored_at: hit.anchored_at,
+                maintained_since_sesno,
+            })
+        }
+        Ok(None) => Err(TreeVersionError::AnchorMissing(format!(
+            "未找到 dbnum={dbnum} sesno<={sesno} 的 sesno_version_anchor（非 versioned 站点或 sesno 过早）"
+        ))),
+        Err(e) => Err(TreeVersionError::QueryFailed(format!(
+            "resolve_anchor failed: {e}"
+        ))),
+    }
+}
+
+/// 由 refno 解析版本入口（树接口通用前置）。
+pub async fn resolve_tree_version_for_refno(
+    refno: RefnoEnum,
+    sesno: u32,
+) -> Result<ResolvedTreeVersion, TreeVersionError> {
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).map_err(|e| {
+        TreeVersionError::QueryFailed(format!("resolve_dbnum_for_refno failed: {e}"))
+    })?;
+    resolve_tree_version(dbnum, sesno).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorldRootQuery {
+    pub sesno: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeQuery {
+    pub sesno: Option<u32>,
+}
+
+/// 版本模式不支持的接口用于拦截 sesno 参数（FR-010）。
+#[derive(Debug, Deserialize)]
+pub struct VersionGuardQuery {
+    pub sesno: Option<u32>,
+}
+
+/// 版本化 PE 展示属性行（批量点查投影）。
+#[derive(Debug, Deserialize, SurrealValue)]
+struct VersionedPeRow {
+    id: RefnoEnum,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    noun: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    owner: Option<RefnoEnum>,
+}
+
+/// 版本模式：查询 t 时刻的直接子节点 refnos（顺序 = 该版本同胞顺序）。
+///
+/// 数据源选择（FR-008）：可信分界内走 pe_owner 图遍历；否则回退 pe.children 字段。
+/// 注意：**禁止 `pe_owner:[..]..` id 区间扫 + VERSION**（research C3：语法接受但
+/// 静默返回当前态）；`ORDER BY id` 必须在 VERSION 之前（反之为解析错误）。
+async fn query_children_refnos_versioned(
+    parent: RefnoEnum,
+    ver: &ResolvedTreeVersion,
+) -> Result<Vec<RefnoEnum>, TreeVersionError> {
+    let parent_key = parent.to_pe_key();
+    if ver.use_pe_owner() {
+        let sql = format!(
+            "SELECT VALUE in FROM {parent_key}<-pe_owner ORDER BY id {};",
+            ver.version_clause()
+        );
+        project_primary_db()
+            .query_take::<Vec<RefnoEnum>>(&sql, 0)
+            .await
+            .map_err(|e| classify_version_query_error(&e.to_string()))
+    } else {
+        let sql = format!(
+            "SELECT VALUE children FROM {parent_key} {};",
+            ver.version_clause()
+        );
+        let rows = project_primary_db()
+            .query_take::<Vec<Option<Vec<RefnoEnum>>>>(&sql, 0)
+            .await
+            .map_err(|e| classify_version_query_error(&e.to_string()))?;
+        Ok(rows.into_iter().flatten().next().unwrap_or_default())
+    }
+}
+
+/// 版本模式：批量点查 t 时刻的 PE 展示属性；t 时刻不存在的记录不返回行。
+async fn fetch_pe_snapshots_versioned(
+    refnos: &[RefnoEnum],
+    ver: &ResolvedTreeVersion,
+) -> Result<HashMap<RefnoEnum, VersionedPeRow>, TreeVersionError> {
+    let mut out = HashMap::new();
+    for chunk in refnos.chunks(500) {
+        let keys = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, name, noun, owner FROM [{keys}] {};",
+            ver.version_clause()
+        );
+        let rows = project_primary_db()
+            .query_take::<Vec<VersionedPeRow>>(&sql, 0)
+            .await
+            .map_err(|e| classify_version_query_error(&e.to_string()))?;
+        for row in rows {
+            out.insert(row.id, row);
+        }
+    }
+    Ok(out)
+}
+
+/// 版本模式 children（contracts/tree-version-api.md §children）。
+async fn get_children_versioned(parent_refno: RefnoEnum, sesno: u32, limit: i32) -> Response {
+    let ver = match resolve_tree_version_for_refno(parent_refno, sesno).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let mut child_refnos = match query_children_refnos_versioned(parent_refno, &ver).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let truncated = child_refnos.len() > limit as usize;
+    if truncated {
+        child_refnos.truncate(limit as usize);
+    }
+    let snapshots = match fetch_pe_snapshots_versioned(&child_refnos, &ver).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let children = child_refnos
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            let snap = snapshots.get(r);
+            let noun = snap
+                .and_then(|s| s.noun.clone())
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            let mut name = snap.and_then(|s| s.name.clone()).unwrap_or_default();
+            // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
+            if name.trim().is_empty() {
+                name = format!("{} {}", noun, idx + 1);
+            }
+            TreeNodeDto {
+                refno: *r,
+                name,
+                noun,
+                owner: Some(parent_refno),
+                // 版本模式下逐子统计孙辈代价高，恒为 None（契约边界）
+                children_count: None,
+            }
+        })
+        .collect();
+    Json(ChildrenResponse {
+        success: true,
+        parent_refno,
+        children,
+        truncated,
+        error_message: None,
+        version: Some(ver.to_info()),
+    })
+    .into_response()
+}
+
+/// 版本模式单节点快照（contracts/tree-version-api.md §node）。
+async fn get_node_versioned(refno: RefnoEnum, sesno: u32) -> Response {
+    let ver = match resolve_tree_version_for_refno(refno, sesno).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let snapshots = match fetch_pe_snapshots_versioned(&[refno], &ver).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    match snapshots.get(&refno) {
+        Some(snap) => {
+            let noun = snap.noun.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+            let mut name = snap.name.clone().unwrap_or_default();
+            if name.trim().is_empty() {
+                // 版本模式无同胞序上下文，空名回退 refno 字符串
+                name = refno.to_string();
+            }
+            Json(NodeResponse {
+                success: true,
+                node: Some(TreeNodeDto {
+                    refno,
+                    name,
+                    noun,
+                    owner: snap.owner,
+                    children_count: None,
+                }),
+                error_message: None,
+                version: Some(ver.to_info()),
+            })
+            .into_response()
+        }
+        None => Json(NodeResponse {
+            success: false,
+            node: None,
+            error_message: Some(format!("Node not found at sesno {}", ver.resolved_sesno)),
+            version: Some(ver.to_info()),
+        })
+        .into_response(),
+    }
+}
+
+/// 版本模式 ancestors（contracts/tree-version-api.md §ancestors）。
+///
+/// 走 `pe.owner` 字段 VERSION 点查逐级上溯（点查最廉价，不走边）；
+/// 返回顺序与现状一致：根→父，不含自身。深度上限 20。
+async fn get_ancestors_versioned(refno: RefnoEnum, sesno: u32) -> Response {
+    const MAX_ANCESTOR_DEPTH: usize = 20;
+    let ver = match resolve_tree_version_for_refno(refno, sesno).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    let mut chain: Vec<RefnoEnum> = Vec::new();
+    let mut seen: HashSet<RefnoEnum> = HashSet::new();
+    seen.insert(refno);
+    let mut cur = refno;
+    for _ in 0..MAX_ANCESTOR_DEPTH {
+        let sql = format!(
+            "SELECT VALUE owner FROM {} {};",
+            cur.to_pe_key(),
+            ver.version_clause()
+        );
+        let owners = match project_primary_db()
+            .query_take::<Vec<Option<RefnoEnum>>>(&sql, 0)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return classify_version_query_error(&e.to_string()).into_response(),
+        };
+        let Some(owner) = owners.into_iter().flatten().next() else {
+            break;
+        };
+        // owner 自指或成环 → 停（防脏数据死循环）
+        if !seen.insert(owner) {
+            break;
+        }
+        chain.push(owner);
+        cur = owner;
+    }
+    chain.reverse();
+    Json(AncestorsResponse {
+        success: true,
+        refnos: chain,
+        error_message: None,
+        version: Some(ver.to_info()),
+    })
+    .into_response()
+}
+
+/// 版本模式 subtree-refnos（contracts/tree-version-api.md §subtree-refnos）。
+///
+/// children BFS 逐层（复用版本 children 数据源选择），沿用 max_depth/limit/truncated 语义。
+async fn get_subtree_refnos_versioned(
+    root_refno: RefnoEnum,
+    sesno: u32,
+    include_self: bool,
+    max_depth: i32,
+    limit: usize,
+) -> Response {
+    let ver = match resolve_tree_version_for_refno(root_refno, sesno).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+
+    let mut out: Vec<RefnoEnum> = Vec::new();
+    if max_depth > 0 {
+        let mut visited: HashSet<RefnoEnum> = HashSet::new();
+        visited.insert(root_refno);
+        let mut frontier = vec![root_refno];
+        'bfs: for _ in 0..max_depth {
+            if frontier.is_empty() || out.len() > limit {
+                break;
+            }
+            let mut next = Vec::new();
+            for parent in frontier {
+                let children = match query_children_refnos_versioned(parent, &ver).await {
+                    Ok(v) => v,
+                    Err(e) => return e.into_response(),
+                };
+                for child in children {
+                    if visited.insert(child) {
+                        out.push(child);
+                        next.push(child);
+                        if out.len() > limit {
+                            break 'bfs;
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+    }
+
+    if include_self {
+        out.insert(0, root_refno);
+    }
+    let truncated = out.len() > limit;
+    if truncated {
+        out.truncate(limit);
+    }
+
+    Json(SubtreeRefnosResponse {
+        success: true,
+        refnos: out,
+        truncated,
+        error_message: None,
+        version: Some(ver.to_info()),
+    })
+    .into_response()
+}
+
+/// 版本模式 world-root：仅单 dbnum 上下文生效（契约 §world-root）。
+async fn get_world_root_versioned(sesno: u32) -> Response {
+    let Some(world) = resolve_offline_world_refno() else {
+        return TreeVersionError::QueryFailed(
+            "版本模式 world-root 要求单 dbnum 上下文（manual_db_nums 或 db_meta 可推导），当前无法解析".to_string(),
+        )
+        .into_response();
+    };
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(world)
+        .unwrap_or_else(|_| (world.refno().0 >> 32) as u32);
+    let ver = match resolve_tree_version(dbnum, sesno).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    Json(NodeResponse {
+        success: true,
+        node: Some(TreeNodeDto {
+            refno: world,
+            name: "*".to_string(),
+            noun: "WORL".to_string(),
+            owner: None,
+            children_count: None,
+        }),
+        error_message: None,
+        version: Some(ver.to_info()),
+    })
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +643,14 @@ pub struct SubtreeQuery {
     pub include_self: Option<bool>,
     pub max_depth: Option<i32>,
     pub limit: Option<i32>,
+    /// specs/023：可选版本参数；不传 = 现状 TreeIndex 路径
+    pub sesno: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AncestorsQuery {
+    /// specs/023：可选版本参数；不传 = 现状 TreeIndex 路径
+    pub sesno: Option<u32>,
 }
 
 fn parse_refno_path(raw: &str) -> Result<RefnoEnum, StatusCode> {
@@ -160,8 +660,14 @@ fn parse_refno_path(raw: &str) -> Result<RefnoEnum, StatusCode> {
 }
 
 async fn get_world_root(
+    Query(query): Query<WorldRootQuery>,
     State(_state): State<E3dTreeApiState>,
-) -> Result<Json<NodeResponse>, StatusCode> {
+) -> Response {
+    // specs/023：带 sesno 走版本分支；不传 sesno 行为与现状完全一致
+    if let Some(sesno) = query.sesno {
+        return get_world_root_versioned(sesno).await;
+    }
+
     let db_option = aios_core::get_db_option();
     let mdb_name = db_option.mdb_name.clone();
 
@@ -178,11 +684,13 @@ async fn get_world_root(
             Ok(Err(e)) => match resolve_offline_world_refno() {
                 Some(refno) => (refno.refno(), Some(format!("get_world_refno failed: {e}"))),
                 None => {
-                    return Ok(Json(NodeResponse {
+                    return Json(NodeResponse {
                         success: false,
                         node: None,
                         error_message: Some(format!("get_world_refno failed: {e}")),
-                    }));
+                        version: None,
+                    })
+                    .into_response();
                 }
             },
             Err(_) => match resolve_offline_world_refno() {
@@ -191,11 +699,13 @@ async fn get_world_root(
                     Some("get_world_refno timed out; using offline world refno".to_string()),
                 ),
                 None => {
-                    return Ok(Json(NodeResponse {
+                    return Json(NodeResponse {
                         success: false,
                         node: None,
                         error_message: Some("get_world_refno timed out".to_string()),
-                    }));
+                        version: None,
+                    })
+                    .into_response();
                 }
             },
         }
@@ -204,7 +714,9 @@ async fn get_world_root(
     // pe 表可能不包含 WORL/SITE 数据；因此这里优先返回可用的根 refno + noun。
     let node = match query_node(world.into()).await {
         Ok(Some(mut n)) => {
-            if let Some(children_count) = try_offline_world_children_count(RefnoEnum::from(world)) {
+            if let Some(children_count) =
+                try_offline_world_children_count(RefnoEnum::from(world)).await
+            {
                 n.children_count = Some(children_count);
             }
             Some(n)
@@ -214,48 +726,70 @@ async fn get_world_root(
             name: "*".to_string(),
             noun: "WORL".to_string(),
             owner: None,
-            children_count: try_offline_world_children_count(RefnoEnum::from(world)),
+            children_count: try_offline_world_children_count(RefnoEnum::from(world)).await,
         }),
     };
 
-    Ok(Json(NodeResponse {
+    Json(NodeResponse {
         success: true,
         node,
         error_message: world_error,
-    }))
+        version: None,
+    })
+    .into_response()
 }
 
 async fn get_node(
     Path(refno): Path<String>,
+    Query(query): Query<NodeQuery>,
     State(_state): State<E3dTreeApiState>,
-) -> Result<Json<NodeResponse>, StatusCode> {
-    let refno = parse_refno_path(&refno)?;
+) -> Response {
+    let refno = match parse_refno_path(&refno) {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
+    // specs/023：带 sesno 走版本分支
+    if let Some(sesno) = query.sesno {
+        return get_node_versioned(refno, sesno).await;
+    }
     let node = match query_node(refno).await {
         Ok(v) => v,
         Err(_) => None,
     };
     if node.is_none() {
-        return Ok(Json(NodeResponse {
+        return Json(NodeResponse {
             success: false,
             node: None,
             error_message: Some("Node not found".to_string()),
-        }));
+            version: None,
+        })
+        .into_response();
     }
 
-    Ok(Json(NodeResponse {
+    Json(NodeResponse {
         success: true,
         node,
         error_message: None,
-    }))
+        version: None,
+    })
+    .into_response()
 }
 
 async fn get_children(
     Path(parent_refno): Path<String>,
     Query(query): Query<ChildrenQuery>,
     State(_state): State<E3dTreeApiState>,
-) -> Result<Json<ChildrenResponse>, StatusCode> {
-    let parent_refno = parse_refno_path(&parent_refno)?;
+) -> Response {
+    let parent_refno = match parse_refno_path(&parent_refno) {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
     let limit = query.limit.unwrap_or(200).clamp(1, 2000);
+
+    // specs/023：带 sesno 走版本分支（实时 VERSION 查询）；不传 sesno 走现状 TreeIndex 路径
+    if let Some(sesno) = query.sesno {
+        return get_children_versioned(parent_refno, sesno, limit).await;
+    }
 
     let parent_type = get_type_name(parent_refno).await;
 
@@ -281,10 +815,15 @@ async fn get_children(
                             }
                         })
                         .collect(),
-                    _ => offline_world_children(parent_refno),
+                    _ => offline_world_children(parent_refno).await,
                 };
             hydrate_tree_node_names(&mut children).await;
             children
+        } else if latest_tree_source_is_pe_owner() {
+            // specs/023 M1：pe_owner 边有序 children + 批量 meta/计数（增量后实时可见）
+            query_children_dtos_pe_owner(parent_refno)
+                .await
+                .unwrap_or_default()
         } else {
             match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
                 Ok(dbnum) => {
@@ -324,13 +863,51 @@ async fn get_children(
         children.truncate(limit as usize);
     }
 
-    Ok(Json(ChildrenResponse {
+    Json(ChildrenResponse {
         success: true,
         parent_refno,
         children,
         truncated,
         error_message: None,
-    }))
+        version: None,
+    })
+    .into_response()
+}
+
+/// specs/023 M1：latest children 的 pe_owner 主路径——
+/// 同胞顺序 = 边序（`ORDER BY id`），noun/children_count 批量查询（不逐子回环）。
+async fn query_children_dtos_pe_owner(
+    parent_refno: RefnoEnum,
+) -> anyhow::Result<Vec<TreeNodeDto>> {
+    let child_refnos = PeOwnerTreeStore::query_children(parent_refno).await?;
+    if child_refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+    let metas = PeOwnerTreeStore::fetch_node_metas(&child_refnos).await?;
+    let counts = PeOwnerTreeStore::query_children_counts(&child_refnos).await?;
+
+    let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
+    for (idx, r) in child_refnos.iter().enumerate() {
+        let noun = metas.get(r).map(|m| m.noun.clone()).unwrap_or_default();
+        let mut name = crate::fast_model::query_provider::get_pe(*r)
+            .await
+            .ok()
+            .flatten()
+            .map(|pe| pe.name)
+            .unwrap_or_default();
+        // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"（order 来自边序）
+        if name.trim().is_empty() {
+            name = format!("{} {}", noun, idx + 1);
+        }
+        out.push(TreeNodeDto {
+            refno: *r,
+            name,
+            noun,
+            owner: Some(parent_refno),
+            children_count: Some(counts.get(r).copied().unwrap_or(0) as i32),
+        });
+    }
+    Ok(out)
 }
 
 async fn hydrate_tree_node_names(nodes: &mut [TreeNodeDto]) {
@@ -382,12 +959,20 @@ fn is_offline_world_refno(refno: RefnoEnum) -> bool {
         .unwrap_or(false)
 }
 
-fn try_offline_world_children_count(world_refno: RefnoEnum) -> Option<i32> {
-    let children = offline_world_children(world_refno);
+async fn try_offline_world_children_count(world_refno: RefnoEnum) -> Option<i32> {
+    let children = offline_world_children(world_refno).await;
     Some(children.len() as i32)
 }
 
-fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
+async fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
+    // specs/023 M1（D4）：pe_owner 主路径改查 DB（pe WHERE noun='WORL' + db_meta dbnum 清单），
+    // 不再依赖 .tree 文件；`AIOS_TREE_QUERY_SOURCE=tree` 回退旧文件路径。
+    if latest_tree_source_is_pe_owner() {
+        return offline_world_children_pe_owner(parent_refno)
+            .await
+            .unwrap_or_default();
+    }
+
     let tree_dir = TreeIndexManager::with_default_dir(vec![])
         .tree_dir()
         .to_path_buf();
@@ -407,6 +992,68 @@ fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
     out = offline_world_children_by_scan(parent_refno, &tree_dir);
     out.sort_by_key(|node| node.refno.refno().0);
     out
+}
+
+/// D4：offline world 子节点的 DB 主路径。
+///
+/// 1) 先按 pe_owner/children 取 parent 的直接子（parent 可能就是真实 WORL 行）；
+/// 2) 合成 world（`dbnum<<32`）无 pe 行时，按 db_meta/manual dbnum 清单逐库找
+///    `pe WHERE noun='WORL'` 行并取其 children；仍空则回退该库 SITE 行清单。
+async fn offline_world_children_pe_owner(
+    parent_refno: RefnoEnum,
+) -> anyhow::Result<Vec<TreeNodeDto>> {
+    let direct = query_children_dtos_pe_owner(parent_refno).await?;
+    if !direct.is_empty() {
+        return Ok(direct);
+    }
+
+    if !is_offline_world_refno(parent_refno) {
+        return Ok(Vec::new());
+    }
+
+    let mut dbnums = aios_core::get_db_option()
+        .manual_db_nums
+        .clone()
+        .unwrap_or_default();
+    if dbnums.is_empty() {
+        let _ = db_meta().ensure_loaded();
+        dbnums = db_meta().get_all_dbnums();
+    }
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    let mut roots: Vec<RefnoEnum> = Vec::new();
+    for dbnum in dbnums {
+        let store = PeOwnerTreeStore::new(vec![dbnum]);
+        let worlds = store.query_noun_refnos("WORL", None).await?;
+        let mut db_roots: Vec<RefnoEnum> = Vec::new();
+        for world in worlds {
+            db_roots.extend(PeOwnerTreeStore::query_children(world).await?);
+        }
+        if db_roots.is_empty() {
+            // 库内无 WORL 行（或 WORL 无子）：回退该库 SITE 清单（与旧 by_scan 路径对齐）
+            db_roots = store.query_noun_refnos("SITE", None).await?;
+        }
+        roots.extend(db_roots);
+    }
+    roots.sort_by_key(|r| r.refno().0);
+    roots.dedup();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let metas = PeOwnerTreeStore::fetch_node_metas(&roots).await?;
+    let counts = PeOwnerTreeStore::query_children_counts(&roots).await?;
+    Ok(roots
+        .into_iter()
+        .map(|r| TreeNodeDto {
+            refno: r,
+            name: r.to_string(),
+            noun: metas.get(&r).map(|m| m.noun.clone()).unwrap_or_default(),
+            owner: Some(parent_refno),
+            children_count: Some(counts.get(&r).copied().unwrap_or(0) as i32),
+        })
+        .collect())
 }
 
 fn offline_world_children_from_index(
@@ -632,6 +1279,7 @@ fn legacy_project_output_root() -> std::path::PathBuf {
     }
 }
 
+#[cfg_attr(not(feature = "parquet-export"), allow(dead_code))]
 fn resolve_local_dbnum_dir(dbnum: u32, required_file: &str) -> Option<std::path::PathBuf> {
     let project_output_root = configured_project_output_root();
     let legacy_project_output_root = legacy_project_output_root();
@@ -661,6 +1309,17 @@ fn resolve_local_dbnum_dir(dbnum: u32, required_file: &str) -> Option<std::path:
         .find(|candidate| candidate.join(required_file).exists())
 }
 
+#[cfg(not(feature = "parquet-export"))]
+fn filter_visible_candidates_from_parquet(
+    _candidates: &[RefnoEnum],
+    _dbnum: u32,
+    _bran_hang_load_roots: &HashSet<RefnoEnum>,
+) -> Option<(Vec<RefnoEnum>, String)> {
+    // 未编译 parquet-export 时跳过 parquet 过滤，调用方回退 inst_relate 查询。
+    None
+}
+
+#[cfg(feature = "parquet-export")]
 fn filter_visible_candidates_from_parquet(
     candidates: &[RefnoEnum],
     dbnum: u32,
@@ -708,50 +1367,91 @@ fn filter_visible_candidates_from_parquet(
 
 async fn get_ancestors(
     Path(refno): Path<String>,
+    Query(query): Query<AncestorsQuery>,
     State(_state): State<E3dTreeApiState>,
-) -> Result<Json<AncestorsResponse>, StatusCode> {
-    let refno = parse_refno_path(&refno)?;
-    // 层级查询统一走 indextree（TreeIndex）
-    let ancestors = match crate::fast_model::query_provider::get_ancestors(refno).await {
+) -> Response {
+    let refno = match parse_refno_path(&refno) {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
+    // specs/023：带 sesno 走版本分支
+    if let Some(sesno) = query.sesno {
+        return get_ancestors_versioned(refno, sesno).await;
+    }
+    // specs/023 M1：pe_owner 主路径（owner 链接递归 idiom）；`tree` 开关回退 TreeIndex
+    let ancestors_result = if latest_tree_source_is_pe_owner() {
+        PeOwnerTreeStore::query_ancestors(refno).await
+    } else {
+        crate::fast_model::query_provider::get_ancestors(refno).await
+    };
+    let ancestors = match ancestors_result {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Json(AncestorsResponse {
+            return Json(AncestorsResponse {
                 success: false,
                 refnos: vec![],
                 error_message: Some(format!("query_ancestor_refnos failed: {e}")),
-            }));
+                version: None,
+            })
+            .into_response();
         }
     };
 
-    Ok(Json(AncestorsResponse {
+    Json(AncestorsResponse {
         success: true,
         refnos: ancestors,
         error_message: None,
-    }))
+        version: None,
+    })
+    .into_response()
 }
 
 async fn get_subtree_refnos(
     Path(root_refno): Path<String>,
     Query(query): Query<SubtreeQuery>,
     State(_state): State<E3dTreeApiState>,
-) -> Result<Json<SubtreeRefnosResponse>, StatusCode> {
-    let root_refno = parse_refno_path(&root_refno)?;
+) -> Response {
+    let root_refno = match parse_refno_path(&root_refno) {
+        Ok(v) => v,
+        Err(status) => return status.into_response(),
+    };
     let include_self = query.include_self.unwrap_or(true);
     let max_depth = query.max_depth.unwrap_or(64).clamp(0, 256);
     let limit = query.limit.unwrap_or(50_000).clamp(1, 200_000) as usize;
 
-    // 层级查询统一走 indextree（TreeIndex）
-    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    // specs/023：带 sesno 走版本分支（children BFS 实时 VERSION 查询）
+    if let Some(sesno) = query.sesno {
+        return get_subtree_refnos_versioned(root_refno, sesno, include_self, max_depth, limit)
+            .await;
+    }
+
+    // specs/023 M1：pe_owner 主路径（递归图 idiom）；`tree` 开关回退 TreeIndex
     let mut out: Vec<RefnoEnum> = if max_depth <= 0 {
         Vec::new()
+    } else if latest_tree_source_is_pe_owner() {
+        match PeOwnerTreeStore::query_descendants(root_refno, Some(max_depth as usize)).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Json(SubtreeRefnosResponse {
+                    success: false,
+                    refnos: vec![],
+                    truncated: false,
+                    error_message: Some(format!("pe_owner query_descendants failed: {e}")),
+                    version: None,
+                })
+                .into_response();
+            }
+        }
     } else {
         let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root_refno) else {
-            return Ok(Json(SubtreeRefnosResponse {
+            return Json(SubtreeRefnosResponse {
                 success: false,
                 refnos: vec![],
                 truncated: false,
                 error_message: Some("resolve_dbnum_for_refno failed".to_string()),
-            }));
+                version: None,
+            })
+            .into_response();
         };
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         manager.query_descendants(root_refno, Some(max_depth as usize))
@@ -766,15 +1466,36 @@ async fn get_subtree_refnos(
         out.truncate(limit);
     }
 
-    Ok(Json(SubtreeRefnosResponse {
+    Json(SubtreeRefnosResponse {
         success: true,
         refnos: out,
         truncated,
         error_message: None,
-    }))
+        version: None,
+    })
+    .into_response()
 }
 
+/// specs/023 FR-010：几何/实例数据 latest-only，带 sesno 显式拒绝而非静默返回当前态。
 async fn get_visible_insts(
+    Path(refno): Path<String>,
+    Query(guard): Query<VersionGuardQuery>,
+    State(state): State<E3dTreeApiState>,
+) -> Response {
+    if guard.sesno.is_some() {
+        return TreeVersionError::VersionUnsupported(
+            "visible-insts 数据源（几何实例/instances json/parquet）为 latest-only，不支持版本模式"
+                .to_string(),
+        )
+        .into_response();
+    }
+    match get_visible_insts_inner(Path(refno), State(state)).await {
+        Ok(json) => json.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn get_visible_insts_inner(
     Path(refno): Path<String>,
     State(state): State<E3dTreeApiState>,
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
@@ -783,7 +1504,7 @@ async fn get_visible_insts(
     // 层级查询统一走 indextree（TreeIndex）
     let mut candidates = if is_offline_world_refno(refno) {
         let mut out = Vec::new();
-        for child in offline_world_children(refno) {
+        for child in offline_world_children(refno).await {
             match crate::fast_model::query_compat::query_deep_visible_inst_refnos(child.refno).await
             {
                 Ok(mut values) => out.append(&mut values),
@@ -825,7 +1546,25 @@ async fn get_visible_insts(
     }
     let candidates_count = candidates.len();
 
-    let bran_hang_load_roots: HashSet<RefnoEnum> = if let Ok(dbnum) =
+    let bran_hang_load_roots: HashSet<RefnoEnum> = if latest_tree_source_is_pe_owner() {
+        // specs/023 M1：批量 meta 点查判 BRAN/HANG（不再依赖 .tree）
+        match PeOwnerTreeStore::fetch_node_metas(&candidates).await {
+            Ok(metas) => candidates
+                .iter()
+                .copied()
+                .filter(|candidate| {
+                    metas
+                        .get(candidate)
+                        .map(|m| {
+                            let noun = m.noun.trim().to_ascii_uppercase();
+                            noun == "BRAN" || noun == "HANG"
+                        })
+                        .unwrap_or(false)
+                })
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    } else if let Ok(dbnum) =
         crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
             refno,
         ) {
@@ -1023,7 +1762,24 @@ async fn get_visible_insts(
     }))
 }
 
+/// specs/023 FR-010：search 版本模式二期，带 sesno 显式拒绝。
 async fn search_nodes(
+    State(state): State<E3dTreeApiState>,
+    Json(request): Json<SearchRequest>,
+) -> Response {
+    if request.sesno.is_some() {
+        return TreeVersionError::VersionUnsupported(
+            "search 暂不支持版本模式（noun 表为当前态；版本化搜索属二期范围）".to_string(),
+        )
+        .into_response();
+    }
+    match search_nodes_inner(State(state), Json(request)).await {
+        Ok(json) => json.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn search_nodes_inner(
     State(_state): State<E3dTreeApiState>,
     Json(request): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, StatusCode> {
@@ -1093,14 +1849,23 @@ async fn query_node(refno: RefnoEnum) -> anyhow::Result<Option<TreeNodeDto>> {
     let mut name = pe.name;
     // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
     if name.trim().is_empty() {
-        use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-        let order = match TreeIndexManager::resolve_dbnum_for_refno(refno) {
-            Ok(dbnum) => {
-                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                let siblings = manager.query_children(pe.owner);
-                siblings.iter().position(|r| *r == refno).unwrap_or(0)
+        let order = if latest_tree_source_is_pe_owner() {
+            // specs/023 M1：order 来自 pe_owner 边序（ORDER BY id），与 fn::default_name 同源
+            PeOwnerTreeStore::query_children(pe.owner)
+                .await
+                .ok()
+                .and_then(|siblings| siblings.iter().position(|r| *r == refno))
+                .unwrap_or(0)
+        } else {
+            use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+            match TreeIndexManager::resolve_dbnum_for_refno(refno) {
+                Ok(dbnum) => {
+                    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+                    let siblings = manager.query_children(pe.owner);
+                    siblings.iter().position(|r| *r == refno).unwrap_or(0)
+                }
+                Err(_) => 0,
             }
-            Err(_) => 0,
         };
         name = format!("{} {}", pe.noun, order + 1);
     }
@@ -1136,7 +1901,25 @@ struct SceneNodeRow {
 }
 
 /// 获取 SITE 的所有 Node 层级数据（用于前端构建 xeokit Node 层级）
+/// specs/023 FR-010：scene_node 数据源非版本化，带 sesno 显式拒绝。
 async fn get_site_nodes(
+    Path(site_refno): Path<String>,
+    Query(guard): Query<VersionGuardQuery>,
+    State(state): State<E3dTreeApiState>,
+) -> Response {
+    if guard.sesno.is_some() {
+        return TreeVersionError::VersionUnsupported(
+            "site-nodes 数据源（scene_node）为非版本化表，不支持版本模式".to_string(),
+        )
+        .into_response();
+    }
+    match get_site_nodes_inner(Path(site_refno), State(state)).await {
+        Ok(json) => json.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+async fn get_site_nodes_inner(
     Path(site_refno): Path<String>,
     State(_state): State<E3dTreeApiState>,
 ) -> Result<Json<SiteNodesResponse>, StatusCode> {

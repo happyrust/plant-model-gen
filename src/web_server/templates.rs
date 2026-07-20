@@ -1858,7 +1858,6 @@ pub fn render_tasks_page() -> String {
                             <div><span class="text-gray-600">布尔运算：</span><span class="font-medium" x-text="taskDetails?.config?.apply_boolean_operation ? '是' : '否'"></span></div>
                             <div><span class="text-gray-600">网格容差：</span><span class="font-medium" x-text="taskDetails?.config?.mesh_tol_ratio"></span></div>
                             <div><span class="text-gray-600">房间关键字：</span><span class="font-medium" x-text="taskDetails?.config?.room_keyword"></span></div>
-                            <div x-show="taskDetails?.config?.target_sesno"><span class="text-gray-600">目标会话号：</span><span class="font-medium" x-text="taskDetails?.config?.target_sesno"></span></div>
                         </div>
 
                         <!-- 原始配置JSON -->
@@ -3578,11 +3577,11 @@ pub fn render_db_status_page() -> String {
 
                         if (response.ok) {{
                             const data = await response.json();
-                            alert(`更新任务已启动！任务ID: ${{data.task_id}}`);
-                            // 跳转到任务管理页面
-                            window.location.href = "/tasks";
+                            alert(`增量更新已启动！运行ID: ${{(data.run_ids || [data.task_id]).join(", ")}}`);
+                            await this.loadDbStatus();
                         }} else {{
-                            alert("更新任务启动失败");
+                            const err = await response.json().catch(() => null);
+                            alert(`增量更新启动失败: ${{err && err.error ? err.error : response.status}}`);
                         }}
                     }} catch (error) {{
                         console.error("Failed to execute update:", error);

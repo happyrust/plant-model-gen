@@ -60,7 +60,7 @@ use aios_core::tool::math_tool::to_pdms_vec_str;
 
 use aios_core::{
     HASH_PSEUDO_ATT_MAPS, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, SurrealQueryExt,
-    gen_aabb_hash, gen_plant_transform_hash, model_primary_db,
+    gen_aabb_hash, gen_plant_transform_hash, project_primary_db,
 };
 
 use aios_core::Transform;
@@ -439,7 +439,7 @@ async fn query_nozz_branch_endpoint(nozz_refno: RefnoEnum) -> Option<NozzBranchE
         "SELECT * FROM BRAN WHERE TREF = pe:`{0}` OR HREF = pe:`{0}` LIMIT 1;",
         ref_id
     );
-    let mut response = model_primary_db().query_response(&sql).await.ok()?;
+    let mut response = project_primary_db().query_response(&sql).await.ok()?;
     let rows: Vec<NamedAttrMap> = response.take(0).ok()?;
     let branch_att = rows.into_iter().next()?;
     let branch_refno = branch_att.get_refno_or_default();
@@ -6474,7 +6474,7 @@ async fn gen_cata_geos_inner(
 
             // 注意：连接级错误才会落到 Err；语句级错误（如 RELATE 内函数抛错）
             // 藏在 Response 里，必须 check()，否则写入失败被静默吞掉。
-            match model_primary_db().query(sql).await {
+            match project_primary_db().query(sql).await {
                 Err(e) => {
                     debug_model!("[BRAN_TUBI] 写入 tubi_relate 失败: {}", e);
 

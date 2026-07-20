@@ -853,12 +853,13 @@ pub async fn gen_prim_geos(
 
             let neg_map = {
                 let tree_dir = db_option.get_scene_tree_dir();
-                neg_query::query_descendants_map_by_dbnum(
+                neg_query::query_descendants_map_by_dbnum_dual(
                     &tree_dir,
                     &batch_refnos,
                     &GENRAL_NEG_NOUN_NAMES,
                     false,
                 )
+                .await
                 .unwrap_or_default()
             };
 

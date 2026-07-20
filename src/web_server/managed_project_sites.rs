@@ -4055,7 +4055,7 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("90d");
+        .unwrap_or("0");
     if create_versioned || req.version_retention.is_some() {
         if let Err(err) =
             apply_versioned_params_to_site_config(&site, create_versioned, create_retention)
@@ -8923,7 +8923,7 @@ fn site_versioned_params(site: &ManagedProjectSite) -> (bool, String) {
 }
 
 fn read_versioned_params_from_path(path: &Path) -> (bool, String) {
-    let default_retention = "90d".to_string();
+    let default_retention = "0".to_string();
     let Ok(raw) = fs::read_to_string(path) else {
         return (false, default_retention);
     };

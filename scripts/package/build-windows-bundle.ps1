@@ -463,7 +463,8 @@ if (-not $SkipBackendBuild) {
     if ($env:AIOS_PACKAGE_CARGO_INCREMENTAL) {
         $env:CARGO_INCREMENTAL = $env:AIOS_PACKAGE_CARGO_INCREMENTAL
     } else {
-        $env:CARGO_INCREMENTAL = "1"
+        # sccache 与增量互斥：默认关闭增量，缓存复用交给 sccache（见 .cargo/config.toml）
+        $env:CARGO_INCREMENTAL = "0"
     }
     if ($env:AIOS_PACKAGE_CARGO_BUILD_JOBS) {
         $env:CARGO_BUILD_JOBS = $env:AIOS_PACKAGE_CARGO_BUILD_JOBS

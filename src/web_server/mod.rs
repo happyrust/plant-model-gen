@@ -993,9 +993,11 @@ pub async fn start_web_server_with_config(
             "/api/db-status/{dbnum}",
             get(db_status_handlers::get_db_status_detail),
         )
+        // 增量更新：与 /api/incremental/* 同一 IncrementRun / Version Commit seam
+        // （旧实现为 sync_pdms(total_sync=true) 全量重解析旁路，已撤除）
         .route(
             "/api/db-status/update",
-            post(db_status_handlers::execute_incremental_update),
+            post(incremental_update_handlers::execute_incremental_update),
         )
         .route(
             "/api/db-status/check-versions",
@@ -1437,11 +1439,9 @@ pub async fn start_web_server_with_config(
     println!("   - 实时进度监控");
     println!("   - 配置管理");
     println!("   - 任务历史记录");
-    // 后台自动更新扫描任务（基于 auto_update + sesno 比较）
-    // 注释掉自动调度器，因为数据库服务由配置管理
-    // 先确保 SurrealDB 的表结构字段齐备（在生产环境中便于统一管理）
-    // crate::web_server::db_status_handlers::ensure_dbnum_info_schema().await;
-    // tokio::spawn(auto_update_scheduler(app_state.clone()));
+    // 自动增量更新调度器已删除：其 needs_update 判定恒为 false（两个硬编码 0 比较），
+    // 从未产生过实际更新。若要恢复自动增量，应基于 committed_watermark 与文件最新
+    // sesno 比较，并走 incremental_update_handlers 的 IncrementRun 入口，而非旁路。
 
     // 周期性项目健康检查（可通过 WEBUI_HEALTH_SCHED=0 关闭）
     // 也注释掉，避免启动时查询数据库
@@ -1483,63 +1483,6 @@ pub async fn start_web_server_with_config(
     }
     serve_result?;
     Ok(())
-}
-
-async fn auto_update_scheduler(state: AppState) {
-    use crate::web_server::models::{IncrementalUpdateRequest, UpdateType};
-    use aios_core::project_primary_db;
-    use axum::{Json, extract::State as AxumState};
-    use std::time::Duration;
-
-    loop {
-        // 每60秒扫描一次
-        tokio::time::sleep(Duration::from_secs(60)).await;
-
-        // 读取 auto_update 的记录
-        let sql = "SELECT dbnum, file_name, sesno, project, auto_update, updating FROM dbnum_info_table WHERE auto_update = true";
-        let rows = match project_primary_db().query(sql).await {
-            Ok(mut resp) => resp.take::<Vec<serde_json::Value>>(0).unwrap_or_default(),
-            Err(_) => continue,
-        };
-
-        for row in rows {
-            let dbnum = row["dbnum"].as_u64().unwrap_or(0) as u32;
-            let project = row["project"].as_str().unwrap_or("");
-            let updating = row["updating"].as_bool().unwrap_or(false);
-
-            // 计算是否需要更新
-            // SESSION_STORE removed
-            let cached_sesno = 0u32;
-            let latest_file_sesno = {
-                // TODO: Implement proper PDMS sesno extraction
-                // This requires creating PdmsIO from project directory
-                0
-            };
-            let needs_update = cached_sesno < latest_file_sesno;
-
-            if needs_update && !updating {
-                // 读取更新类型
-                let typ = row["auto_update_type"].as_str().unwrap_or("ParseAndModel");
-                let update_type = match typ {
-                    "ParseOnly" => UpdateType::ParseOnly,
-                    "Full" => UpdateType::Full,
-                    _ => UpdateType::ParseAndModel,
-                };
-                // 构造并发起增量更新（解析+建模）
-                let req = IncrementalUpdateRequest {
-                    dbnums: vec![dbnum],
-                    force_update: false,
-                    update_type,
-                    target_sesno: None,
-                };
-                let _ = crate::web_server::handlers::execute_incremental_update(
-                    AxumState(state.clone()),
-                    Json(req),
-                )
-                .await;
-            }
-        }
-    }
 }
 
 /// 查询参数

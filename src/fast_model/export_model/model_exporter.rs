@@ -314,24 +314,26 @@ pub async fn collect_export_refnos(
         println!("🌳 收集子孙节点...");
     }
 
-    // cache-only：层级查询严格走 TreeIndex（indextree），不允许导出阶段回退/自动生成/交互询问。
+    // 层级查询双源（specs/023 M2）：pe_owner（默认）走 pe 快照；
+    // `AIOS_TREE_QUERY_SOURCE=tree` 回退 `.tree`（cache-only，不允许自动生成/交互询问）。
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::gen_model::tree_index_manager::{
         TreeIndexManager, load_index_with_large_stack,
     };
+    use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
+    use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
     use aios_core::tool::db_tool::db1_hash;
     use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
     use std::collections::{BTreeMap, HashSet};
 
     db_meta().ensure_loaded()?;
 
-    // 强制关闭 “缺失则自动从 SurrealDB 生成 tree 文件” 的全局开关，保证导出语义确定。
-    // disable_auto_generate_tree 已移除
+    let use_pe_owner = latest_tree_source_is_pe_owner();
 
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
         .tree_dir()
         .to_path_buf();
-    if !tree_dir.exists() {
+    if !use_pe_owner && !tree_dir.exists() {
         anyhow::bail!(
             "TreeIndex 目录不存在: {}\n\
              需要 cache-only 层级查询，请先生成 output/scene_tree/{{dbnum}}.tree 与 output/scene_tree/db_meta_info.json",
@@ -343,7 +345,7 @@ pub async fn collect_export_refnos(
         .filter(|n| !n.is_empty())
         .map(|nouns| nouns.iter().map(|s| db1_hash(s.as_str())).collect());
 
-    // roots 先按 dbnum 分组，避免跨库读取 tree。
+    // roots 先按 dbnum 分组，避免跨库读取。
     let mut by_dbnum: BTreeMap<u32, Vec<RefnoEnum>> = BTreeMap::new();
     let mut unresolved: Vec<RefnoEnum> = Vec::new();
     for &root in input_refnos {
@@ -368,7 +370,32 @@ pub async fn collect_export_refnos(
         }
     }
 
+    let options = TreeQueryOptions {
+        include_self: false,
+        max_depth: None,
+        filter: TreeQueryFilter {
+            noun_hashes,
+            ..Default::default()
+        },
+        prune_on_match: false,
+    };
+
     for (dbnum, roots) in by_dbnum {
+        if use_pe_owner {
+            let snap = get_or_load_pe_snapshot(dbnum)
+                .await
+                .with_context(|| format!("加载 pe 快照失败 dbnum={dbnum}"))?;
+            for root in roots {
+                for r in snap.collect_descendants_bfs(root.refno(), &options) {
+                    let r = RefnoEnum::from(r);
+                    if r.is_valid() && seen.insert(r) {
+                        out.push(r);
+                    }
+                }
+            }
+            continue;
+        }
+
         let tree_path = tree_dir.join(format!("{dbnum}.tree"));
         if !tree_path.exists() {
             anyhow::bail!(
@@ -381,16 +408,6 @@ pub async fn collect_export_refnos(
         // 大栈线程加载，避免 Windows 反序列化大 `.tree` 文件触发栈溢出。
         let index = load_index_with_large_stack(&tree_dir, dbnum)
             .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()))?;
-
-        let options = TreeQueryOptions {
-            include_self: false,
-            max_depth: None,
-            filter: TreeQueryFilter {
-                noun_hashes: noun_hashes.clone(),
-                ..Default::default()
-            },
-            prune_on_match: false,
-        };
 
         for root in roots {
             for r in index.collect_descendants_bfs(root.refno(), &options) {

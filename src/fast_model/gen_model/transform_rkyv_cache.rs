@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use aios_core::rs_surreal::geometry_query::PlantTransform;
 use aios_core::transform::get_local_mat4;
-use aios_core::{RefnoEnum, SurrealQueryExt, Transform, model_primary_db};
+use aios_core::{RefnoEnum, SurrealQueryExt, Transform, project_primary_db};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -230,7 +230,7 @@ pub(crate) async fn query_world_transforms_from_pe_transform(
             "#
         );
 
-        let rows: Vec<PeWorldTransRow> = model_primary_db().query_take(&sql, 0).await?;
+        let rows: Vec<PeWorldTransRow> = project_primary_db().query_take(&sql, 0).await?;
         for row in rows {
             let Some(refno) = row.refno else { continue };
             let Some(world) = row.world_trans else {

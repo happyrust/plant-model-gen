@@ -198,6 +198,9 @@ async fn ensure_review_query_indexes_inner() -> Result<()> {
             DEFINE INDEX IF NOT EXISTS idx_review_tasks_status ON TABLE review_tasks FIELDS status;
             DEFINE INDEX IF NOT EXISTS idx_review_records_form_id ON TABLE review_records FIELDS form_id;
             DEFINE INDEX IF NOT EXISTS idx_review_records_task_id ON TABLE review_records FIELDS task_id;
+            UPDATE review_records
+                SET dimension_document_version = 0
+                WHERE dimension_document_version = NONE;
             DEFINE INDEX IF NOT EXISTS idx_review_comments_annotation_id ON TABLE review_comments FIELDS annotation_id;
             DEFINE INDEX IF NOT EXISTS idx_review_attachment_form_id ON TABLE review_attachment FIELDS form_id;
             DEFINE INDEX IF NOT EXISTS idx_review_form_model_form_id ON TABLE review_form_model FIELDS form_id;

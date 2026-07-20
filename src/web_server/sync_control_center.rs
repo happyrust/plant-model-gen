@@ -1242,7 +1242,7 @@ pub async fn start_monitoring() {
 
 /// 更新连接状态
 async fn update_connection_status() {
-    use crate::data_interface::db_model::MQTT_CONNECT_STATUS;
+    use crate::data_interface::mqtt_file_sync::MQTT_CONNECT_STATUS;
     use crate::web_server::remote_runtime::REMOTE_RUNTIME;
 
     let mqtt_connected = {

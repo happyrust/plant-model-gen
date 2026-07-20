@@ -1,5 +1,5 @@
 use aios_core::error::init_save_database_error;
-use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use dashmap::DashMap;
 use parry3d::bounding_volume::Aabb;
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
             // 这里若再次 connect+signin 会与流水线在飞请求竞争 WS router 死锁
             // （实测 gen_cata_geos worker 预取触发 rkyv 构建时 2/3 概率挂死）。
             // 先用轻量探针判断连接是否已就绪，就绪则跳过重复 init。
-            let already_live = model_primary_db().query("RETURN 1;").await.is_ok();
+            let already_live = project_primary_db().query("RETURN 1;").await.is_ok();
             if already_live {
                 println!("[ensure_surreal_init] 连接已就绪，跳过重复 init_surreal");
             } else {
@@ -31,7 +31,7 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
             // tubi_relate 写入 SQL 里的 `dt=fn::ses_date(...)` 会因
             // "The table 'ses' does not exist" 整条 RELATE 失败（且历史上被静默吞掉）。
             // 这里无条件确保空表存在：空表上 fn::ses_date 安全返回 none。
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE TABLE IF NOT EXISTS ses SCHEMALESS;")
                 .await;
             anyhow::Ok(())
@@ -44,29 +44,31 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
 pub async fn ensure_inst_relate_relation_schema() {
     INST_RELATE_SCHEMA_INIT
         .get_or_init(|| async {
-            let _ = model_primary_db().query("REMOVE TABLE inst_relate;").await;
+            let _ = project_primary_db()
+                .query("REMOVE TABLE inst_relate;")
+                .await;
 
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE TABLE inst_relate TYPE RELATION;")
                 .await;
 
             // TYPE RELATION 会隐式创建 in/out 字段，但默认 TYPE record；这里显式改为更严格的类型。
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("REMOVE FIELD in ON TABLE inst_relate;")
                 .await;
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("REMOVE FIELD out ON TABLE inst_relate;")
                 .await;
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE FIELD in ON TABLE inst_relate TYPE record<pe>;")
                 .await;
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE FIELD out ON TABLE inst_relate TYPE record<inst_info>;")
                 .await;
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE INDEX idx_inst_relate_in ON TABLE inst_relate FIELDS in UNIQUE;")
                 .await;
-            let _ = model_primary_db()
+            let _ = project_primary_db()
                 .query("DEFINE INDEX idx_inst_relate_out ON TABLE inst_relate FIELDS out;")
                 .await;
         })
@@ -92,7 +94,7 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
                 rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
             }
             let sql = format!("INSERT IGNORE INTO aabb [{}];", rows.join(","));
-            match model_primary_db().query(&sql).await {
+            match project_primary_db().query(&sql).await {
                 Ok(_) => {}
                 Err(_) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
@@ -123,7 +125,7 @@ pub async fn save_inst_relate_bool(
         "UPSERT {id_key} CONTENT {{ refno: {refno_key}, mesh_id: {mesh_str}, status: '{status}', source: '{source}', updated_at: time::now() }};",
     );
 
-    if let Err(e) = aios_core::model_query_response(&sql).await {
+    if let Err(e) = aios_core::project_primary_db().query_response(&sql).await {
         let msg = format!("{sql}\n-- err: {e}");
         init_save_database_error(&msg, &std::panic::Location::caller().to_string());
         anyhow::bail!("save_inst_relate_bool 失败: refno={refno} err={e}");
@@ -157,7 +159,7 @@ pub async fn save_inst_relate_cata_bool(
     }
     sql.push_str("};");
 
-    if let Err(e) = aios_core::model_query_response(&sql).await {
+    if let Err(e) = aios_core::project_primary_db().query_response(&sql).await {
         init_save_database_error(
             &format!("{sql}\n-- err: {e}"),
             &std::panic::Location::caller().to_string(),
@@ -205,7 +207,7 @@ async fn batch_insert_aabb_table(
         }
 
         let sql = rows.join(";\n") + ";";
-        if let Err(e) = model_primary_db().query(&sql).await {
+        if let Err(e) = project_primary_db().query(&sql).await {
             let msg = format!("[batch_insert_aabb_table] {table} 写入失败: {e}");
             log::error!("{msg}");
             init_save_database_error(
@@ -243,7 +245,7 @@ pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
                 rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
             }
             let sql = format!("INSERT IGNORE INTO vec3 [{}];", rows.join(","));
-            match model_primary_db().query(&sql).await {
+            match project_primary_db().query(&sql).await {
                 Ok(_) => {}
                 Err(_e) => {
                     init_save_database_error(&sql, &std::panic::Location::caller().to_string());
@@ -266,7 +268,7 @@ pub async fn save_transforms_to_surreal(trans_map: &HashMap<u64, String>) -> any
                 }
             }
             let sql = build_save_transforms_sql(&part);
-            model_primary_db()
+            project_primary_db()
                 .query(&sql)
                 .await
                 .with_context(|| format!("写入 trans 失败: {sql}"))?;

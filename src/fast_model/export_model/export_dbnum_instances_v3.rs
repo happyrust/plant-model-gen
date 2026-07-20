@@ -28,8 +28,9 @@ use serde_json::json;
 use surrealdb::types::SurrealValue;
 
 use super::InstRelateRow;
+use super::anchor_export::AnchorExportContext;
 use super::export_transform_config::ExportTransformConfig;
-use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_sesno_range};
+use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_range};
 use crate::fast_model::unit_converter::UnitConverter;
 
 // =============================================================================
@@ -75,6 +76,20 @@ struct AabbQueryRow {
     d: Option<aios_core::types::PlantAabb>,
 }
 
+#[derive(Debug, Deserialize, SurrealValue)]
+struct HistoricalInstanceMetaRow {
+    owner: Option<RefnoEnum>,
+    world_aabb_hash: Option<String>,
+    world_trans_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct HistoricalUnitFlagRow {
+    hash: String,
+    #[serde(default)]
+    unit_flag: bool,
+}
+
 // =============================================================================
 // 内部数据结构
 // =============================================================================
@@ -117,6 +132,54 @@ pub async fn export_dbnum_instances_v3(
     transform_config: ExportTransformConfig,
     root_refno: Option<RefnoEnum>,
 ) -> Result<V3ExportStats> {
+    export_dbnum_instances_v3_with_context(
+        dbnum,
+        output_dir,
+        db_option,
+        verbose,
+        transform_config,
+        root_refno,
+        None,
+    )
+    .await
+}
+
+pub async fn export_dbnum_instances_v3_at_anchor(
+    dbnum: u32,
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+    transform_config: ExportTransformConfig,
+    anchor_context: &AnchorExportContext,
+) -> Result<V3ExportStats> {
+    if anchor_context.dbnum != dbnum {
+        anyhow::bail!(
+            "anchor export dbnum mismatch: context={} request={}",
+            anchor_context.dbnum,
+            dbnum
+        );
+    }
+    export_dbnum_instances_v3_with_context(
+        dbnum,
+        output_dir,
+        db_option,
+        verbose,
+        transform_config,
+        None,
+        Some(anchor_context),
+    )
+    .await
+}
+
+async fn export_dbnum_instances_v3_with_context(
+    dbnum: u32,
+    output_dir: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+    transform_config: ExportTransformConfig,
+    root_refno: Option<RefnoEnum>,
+    anchor_context: Option<&AnchorExportContext>,
+) -> Result<V3ExportStats> {
     let start_time = std::time::Instant::now();
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
@@ -132,6 +195,19 @@ pub async fn export_dbnum_instances_v3(
         if transform_config.apply_rotation {
             println!("   坐标旋转: Z-up → Y-up");
         }
+        if let Some(anchor) = anchor_context {
+            println!(
+                "   历史锚点: requested={} resolved={} exact={} source={} anchored_at={}",
+                anchor.requested_sesno,
+                anchor.resolved_sesno,
+                anchor.exact,
+                anchor.source,
+                anchor.anchored_at
+            );
+        }
+    }
+    if anchor_context.is_some() && root_refno.is_some() {
+        anyhow::bail!("历史锚点导出暂不接受 root_refno；请按 dbnum 导出完整锚点代");
     }
 
     std::fs::create_dir_all(output_dir)
@@ -160,7 +236,7 @@ pub async fn export_dbnum_instances_v3(
         }
         super::query_inst_relate_batch(&sub_refnos, false, verbose).await?
     } else {
-        query_inst_relate_by_dbnum(dbnum, verbose).await?
+        query_inst_relate_by_dbnum(dbnum, verbose, anchor_context).await?
     };
 
     if verbose {
@@ -248,7 +324,7 @@ pub async fn export_dbnum_instances_v3(
     }
     let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
     if !in_refnos.is_empty() {
-        match query_export_insts(&in_refnos, true).await {
+        match query_export_insts(&in_refnos, true, anchor_context).await {
             Ok(export_insts) => {
                 for inst in export_insts {
                     export_inst_map.insert(inst.refno, inst);
@@ -260,6 +336,11 @@ pub async fn export_dbnum_instances_v3(
                         in_refnos.len()
                     );
                 }
+            }
+            Err(e) if anchor_context.is_some() => {
+                return Err(
+                    e.context("历史锚点导出的几何实例查询失败；拒绝输出部分数据或当前态替代品")
+                );
             }
             Err(e) => {
                 if verbose {
@@ -279,7 +360,7 @@ pub async fn export_dbnum_instances_v3(
             bran_owner_refnos.len()
         );
     }
-    let tubings_map = query_tubi_relate(&bran_owner_refnos, verbose).await?;
+    let tubings_map = query_tubi_relate(&bran_owner_refnos, verbose, anchor_context).await?;
 
     // =========================================================================
     // 5. 收集所有唯一 trans_hash 和 aabb_hash
@@ -340,12 +421,27 @@ pub async fn export_dbnum_instances_v3(
             &trans_hashes,
             &unit_converter,
             transform_config.apply_rotation,
-            verbose
+            verbose,
+            anchor_context,
         ),
-        resolve_aabb(&aabb_hashes, &unit_converter, verbose),
+        resolve_aabb(&aabb_hashes, &unit_converter, verbose, anchor_context),
     );
     let trans_map = trans_map?;
     let aabb_map = aabb_map?;
+    if anchor_context.is_some() && trans_map.len() != trans_hashes.len() {
+        anyhow::bail!(
+            "历史导出缺少 transform 记录：expected={} resolved={}；拒绝生成不完整锚点导出",
+            trans_hashes.len(),
+            trans_map.len()
+        );
+    }
+    if anchor_context.is_some() && aabb_map.len() != aabb_hashes.len() {
+        anyhow::bail!(
+            "历史导出缺少 aabb 记录：expected={} resolved={}；拒绝生成不完整锚点导出",
+            aabb_hashes.len(),
+            aabb_map.len()
+        );
+    }
 
     if verbose {
         println!(
@@ -520,7 +616,9 @@ pub async fn export_dbnum_instances_v3(
             let slug = root.to_string().replace(['/', '\\'], "_").replace(' ', "_");
             format!("instances_v3_root_{slug}.json")
         }
-        None => format!("instances_v3_{dbnum}.json"),
+        None => anchor_context
+            .map(|anchor| format!("instances_v3_{dbnum}_sesno_{}.json", anchor.resolved_sesno))
+            .unwrap_or_else(|| format!("instances_v3_{dbnum}.json")),
     };
 
     let root_json = json!({
@@ -528,6 +626,7 @@ pub async fn export_dbnum_instances_v3(
         "format": "json",
         "generated_at": generated_at,
         "dbnum": dbnum,
+        "anchor": anchor_context,
         "export_transform": transform_config.to_manifest_json(),
         "transforms": transforms_json,
         "aabb": aabb_json,
@@ -576,7 +675,35 @@ pub async fn export_dbnum_instances_v3(
 // SurrealDB 查询函数
 // =============================================================================
 
-async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<InstRelateRow>> {
+fn version_clause(anchor_context: Option<&AnchorExportContext>) -> String {
+    anchor_context
+        .map(AnchorExportContext::version_clause)
+        .unwrap_or_default()
+}
+
+fn map_anchor_query_error(
+    error: anyhow::Error,
+    anchor_context: Option<&AnchorExportContext>,
+    operation: &str,
+) -> anyhow::Error {
+    if let Some(anchor) = anchor_context {
+        let history = aios_core::map_history_query_error(error, &anchor.anchored_at);
+        anyhow::anyhow!(
+            "{operation} at model_gen sesno={} anchored_at={}: {}",
+            anchor.resolved_sesno,
+            anchor.anchored_at,
+            aios_core::format_history_error(&history)
+        )
+    } else {
+        error.context(operation.to_string())
+    }
+}
+
+async fn query_inst_relate_by_dbnum(
+    dbnum: u32,
+    verbose: bool,
+    anchor_context: Option<&AnchorExportContext>,
+) -> Result<Vec<InstRelateRow>> {
     if verbose {
         println!(
             "🔍 扫描 inst_relate（索引路径: WHERE dbnum = {}）...",
@@ -584,22 +711,37 @@ async fn query_inst_relate_by_dbnum(dbnum: u32, verbose: bool) -> Result<Vec<Ins
         );
     }
 
-    let sql = r#"
+    let noun_expr = if anchor_context.is_some() {
+        "NONE"
+    } else {
+        "in.noun"
+    };
+    let version = version_clause(anchor_context);
+    let sql = format!(
+        r#"
         SELECT
             owner_refno,
             owner_type,
             in as refno,
-            in.noun as noun,
+            {noun_expr} as noun,
             spec_value as spec_value
         FROM inst_relate
         WHERE dbnum = $dbnum
-    "#;
+        {version}
+    "#
+    );
 
     let mut resp = aios_core::project_primary_db()
-        .query(sql)
+        .query(&sql)
         .bind(("dbnum", dbnum))
-        .await?;
-    let rows: Vec<InstRelateRow> = resp.take(0)?;
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(|error| {
+            map_anchor_query_error(error, anchor_context, "query inst_relate by dbnum")
+        })?;
+    let rows: Vec<InstRelateRow> = resp.take(0).map_err(anyhow::Error::from).map_err(|error| {
+        map_anchor_query_error(error, anchor_context, "decode inst_relate by dbnum")
+    })?;
 
     if verbose {
         println!("   ✅ inst_relate 命中: {} 条", rows.len());
@@ -660,6 +802,7 @@ async fn query_inst_relate_all(verbose: bool) -> Result<Vec<InstRelateRow>> {
 async fn query_export_insts(
     refnos: &[RefnoEnum],
     enable_holes: bool,
+    anchor_context: Option<&AnchorExportContext>,
 ) -> Result<Vec<aios_core::ExportInstQuery>> {
     if refnos.is_empty() {
         return Ok(Vec::new());
@@ -667,6 +810,29 @@ async fn query_export_insts(
 
     let batch_size = 50;
     let mut results = Vec::new();
+    let version = version_clause(anchor_context);
+    let historical = anchor_context.is_some();
+    let bool_owner_expr = if historical { "refno" } else { "refno.owner" };
+    let owner_expr = if historical { "in" } else { "in.owner ?? in" };
+    let world_aabb_expr = if historical {
+        "NONE"
+    } else {
+        r#"(if id != NONE && type::record("inst_relate_aabb", id).aabb_id != NONE {
+            record::id(type::record("inst_relate_aabb", id).aabb_id)
+        } else { NONE })"#
+    };
+    let world_trans_expr = if historical {
+        "NONE"
+    } else {
+        r#"(if in != NONE && type::record("pe_transform", record::id(in)).world_trans != NONE {
+            record::id(type::record("pe_transform", record::id(in)).world_trans)
+        } else { NONE })"#
+    };
+    let unit_flag_expr = if historical {
+        "false"
+    } else {
+        "out.unit_flag ?? false"
+    };
 
     for chunk in refnos.chunks(batch_size) {
         if enable_holes {
@@ -680,11 +846,15 @@ async fn query_export_insts(
                 r#"
                 SELECT
                     refno,
-                    refno.owner as owner,
-                    (if type::record("inst_relate_aabb", id).aabb_id != NONE {{
+                    {bool_owner_expr} as owner,
+                    (if {historical} {{
+                        NONE
+                    }} else if type::record("inst_relate_aabb", id).aabb_id != NONE {{
                         record::id(type::record("inst_relate_aabb", id).aabb_id)
                     }} else {{ None }}) as world_aabb_hash,
-                    (if refno != NONE && type::record("pe_transform", record::id(refno)).world_trans != NONE {{
+                    (if {historical} {{
+                        NONE
+                    }} else if refno != NONE && type::record("pe_transform", record::id(refno)).world_trans != NONE {{
                         record::id(type::record("pe_transform", record::id(refno)).world_trans)
                     }} else {{ None }}) as world_trans_hash,
                     [{{ "geo_hash": mesh_id, "trans_hash": "0", "unit_flag": false }}] as insts,
@@ -692,14 +862,18 @@ async fn query_export_insts(
                 FROM [{bool_keys}]
                 WHERE status = 'Success'
                   AND refno != NONE
+                {version}
                 "#,
-                bool_keys = bool_keys_str
+                bool_keys = bool_keys_str,
+                historical = if historical { "true" } else { "false" },
             );
 
             let mut bool_results: Vec<aios_core::ExportInstQuery> = aios_core::project_primary_db()
                 .query_take(&bool_sql, 0)
                 .await
-                .with_context(|| "query_export_insts bool SQL failed")?;
+                .map_err(|error| {
+                    map_anchor_query_error(error, anchor_context, "query_export_insts bool SQL")
+                })?;
 
             let bool_refnos: HashSet<RefnoEnum> = bool_results.iter().map(|r| r.refno).collect();
             results.append(&mut bool_results);
@@ -714,32 +888,30 @@ async fn query_export_insts(
                 let mut geo_sql_batch = String::new();
                 for r in &non_bool_refnos {
                     let inst_relate_key = model_refno_id("inst_relate", *r);
-                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    let geo_range = model_refno_range("geo_relate", *r);
                     geo_sql_batch.push_str(&format!(
                         r#"
                         SELECT
                             in as refno,
-                            in.owner ?? in as owner,
-                            (if id != NONE && type::record("inst_relate_aabb", id).aabb_id != NONE {{
-                                record::id(type::record("inst_relate_aabb", id).aabb_id)
-                            }} else {{ None }}) as world_aabb_hash,
-                            (if in != NONE && type::record("pe_transform", record::id(in)).world_trans != NONE {{
-                                record::id(type::record("pe_transform", record::id(in)).world_trans)
-                            }} else {{ None }}) as world_trans_hash,
+                            {owner_expr} as owner,
+                            {world_aabb_expr} as world_aabb_hash,
+                            {world_trans_expr} as world_trans_hash,
                             (
                                 SELECT
                                     (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
                                     (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
-                                    out.unit_flag ?? false as unit_flag
+                                    {unit_flag_expr} as unit_flag
                                 FROM {geo_range}
                                 WHERE visible
-                                  && (trans.d ?? NONE) != NONE
+                                  && trans != NONE
                                   && out != NONE
                                   && geo_type IN ['Pos', 'CatePos', 'Compound', 'Neg']
+                                {version}
                             ) as insts,
                             false as has_neg
                         FROM [{inst_relate_key}]
-                        WHERE in != NONE;
+                        WHERE in != NONE
+                        {version};
                         "#
                     ));
                 }
@@ -747,9 +919,20 @@ async fn query_export_insts(
                 let mut resp = aios_core::project_primary_db()
                     .query_response(&geo_sql_batch)
                     .await
-                    .with_context(|| "query_export_insts geo SQL failed")?;
+                    .map_err(|error| {
+                        map_anchor_query_error(error, anchor_context, "query_export_insts geo SQL")
+                    })?;
                 for (stmt_idx, _) in non_bool_refnos.iter().enumerate() {
-                    let mut geo_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                    let mut geo_results: Vec<aios_core::ExportInstQuery> = resp
+                        .take(stmt_idx)
+                        .map_err(anyhow::Error::from)
+                        .map_err(|error| {
+                            map_anchor_query_error(
+                                error,
+                                anchor_context,
+                                "decode query_export_insts geo SQL",
+                            )
+                        })?;
                     results.append(&mut geo_results);
                 }
             }
@@ -757,32 +940,30 @@ async fn query_export_insts(
             let mut sql_batch = String::new();
             for r in chunk {
                 let inst_relate_key = model_refno_id("inst_relate", *r);
-                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                let geo_range = model_refno_range("geo_relate", *r);
                 sql_batch.push_str(&format!(
                     r#"
                     SELECT
                         in as refno,
-                        in.owner ?? in as owner,
-                        (if id != NONE && type::record("inst_relate_aabb", id).aabb_id != NONE {{
-                            record::id(type::record("inst_relate_aabb", id).aabb_id)
-                        }} else {{ None }}) as world_aabb_hash,
-                        (if in != NONE && type::record("pe_transform", record::id(in)).world_trans != NONE {{
-                            record::id(type::record("pe_transform", record::id(in)).world_trans)
-                        }} else {{ None }}) as world_trans_hash,
+                        {owner_expr} as owner,
+                        {world_aabb_expr} as world_aabb_hash,
+                        {world_trans_expr} as world_trans_hash,
                         (
                             SELECT
                                 (if trans != NONE {{ record::id(trans) }} else {{ None }}) as trans_hash,
                                 (if out != NONE {{ record::id(out) }} else {{ None }}) as geo_hash,
-                                out.unit_flag ?? false as unit_flag
+                                {unit_flag_expr} as unit_flag
                             FROM {geo_range}
                             WHERE visible
-                              && (trans.d ?? NONE) != NONE
+                              && trans != NONE
                               && out != NONE
                               && geo_type IN ['Pos', 'DesiPos', 'CatePos', 'Compound', 'Neg']
+                            {version}
                         ) as insts,
                         false as has_neg
                     FROM [{inst_relate_key}]
-                    WHERE in != NONE;
+                    WHERE in != NONE
+                    {version};
                     "#
                 ));
             }
@@ -790,36 +971,169 @@ async fn query_export_insts(
             let mut resp = aios_core::project_primary_db()
                 .query_response(&sql_batch)
                 .await
-                .with_context(|| "query_export_insts SQL failed")?;
+                .map_err(|error| {
+                    map_anchor_query_error(error, anchor_context, "query_export_insts SQL")
+                })?;
             for (stmt_idx, _) in chunk.iter().enumerate() {
-                let mut chunk_results: Vec<aios_core::ExportInstQuery> = resp.take(stmt_idx)?;
+                let mut chunk_results: Vec<aios_core::ExportInstQuery> = resp
+                    .take(stmt_idx)
+                    .map_err(anyhow::Error::from)
+                    .map_err(|error| {
+                        map_anchor_query_error(
+                            error,
+                            anchor_context,
+                            "decode query_export_insts SQL",
+                        )
+                    })?;
                 results.append(&mut chunk_results);
             }
         }
     }
 
+    if let Some(anchor) = anchor_context {
+        enrich_historical_export_insts(&mut results, anchor).await?;
+        for row in &results {
+            if row.world_trans_hash.is_none()
+                || row.world_aabb_hash.is_none()
+                || row.insts.is_empty()
+                || row
+                    .insts
+                    .iter()
+                    .any(|inst| inst.geo_hash.is_empty() || inst.trans_hash.is_none())
+            {
+                anyhow::bail!(
+                    "历史锚点导出记录不完整: refno={} world_trans={} world_aabb={} geos={}；拒绝输出部分数据",
+                    row.refno,
+                    row.world_trans_hash.is_some(),
+                    row.world_aabb_hash.is_some(),
+                    row.insts.len()
+                );
+            }
+        }
+    }
     results.retain(|row| row.has_neg || row.world_trans_hash.is_some());
     Ok(results)
+}
+
+async fn enrich_historical_export_insts(
+    rows: &mut [aios_core::ExportInstQuery],
+    anchor: &AnchorExportContext,
+) -> Result<()> {
+    let version = anchor.version_clause();
+    let mut sql_batch = String::new();
+    for row in rows.iter() {
+        let pe_key = row.refno.to_pe_key();
+        let pe_transform = model_refno_id("pe_transform", row.refno);
+        let inst_relate_aabb = model_refno_id("inst_relate_aabb", row.refno);
+        sql_batch.push_str(&format!(
+            r#"
+            RETURN {{
+                owner: (SELECT VALUE owner FROM {pe_key}{version})[0] ?? NONE,
+                world_trans_hash: (SELECT VALUE record::id(world_trans) FROM {pe_transform}{version})[0] ?? NONE,
+                world_aabb_hash: (SELECT VALUE record::id(aabb_id) FROM {inst_relate_aabb}{version})[0] ?? NONE
+            }};
+            "#
+        ));
+    }
+
+    if !sql_batch.is_empty() {
+        let mut response = aios_core::project_primary_db()
+            .query_response(&sql_batch)
+            .await
+            .map_err(|error| {
+                map_anchor_query_error(error, Some(anchor), "query historical instance metadata")
+            })?;
+        for (index, row) in rows.iter_mut().enumerate() {
+            let metadata: Option<HistoricalInstanceMetaRow> = response
+                .take(index)
+                .map_err(anyhow::Error::from)
+                .map_err(|error| {
+                    map_anchor_query_error(
+                        error,
+                        Some(anchor),
+                        "decode historical instance metadata",
+                    )
+                })?;
+            let metadata = metadata.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "历史锚点导出未返回实例元数据: refno={} anchored_at={}",
+                    row.refno,
+                    anchor.anchored_at
+                )
+            })?;
+            if let Some(owner) = metadata.owner {
+                row.owner = owner;
+            }
+            row.world_trans_hash = metadata.world_trans_hash;
+            row.world_aabb_hash = metadata.world_aabb_hash;
+        }
+    }
+
+    let geo_hashes = rows
+        .iter()
+        .flat_map(|row| row.insts.iter())
+        .map(|inst| inst.geo_hash.clone())
+        .filter(|hash| !hash.is_empty())
+        .collect::<HashSet<_>>();
+    let mut unit_flags = HashMap::new();
+    let hashes = geo_hashes.iter().collect::<Vec<_>>();
+    for chunk in hashes.chunks(500) {
+        let keys = chunk
+            .iter()
+            .map(|hash| format!("inst_geo:⟨{}⟩", hash))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "SELECT record::id(id) AS hash, unit_flag ?? false AS unit_flag FROM [{}]{};",
+            keys.join(", "),
+            version
+        );
+        let unit_rows: Vec<HistoricalUnitFlagRow> = aios_core::project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .map_err(|error| {
+                map_anchor_query_error(error, Some(anchor), "query historical inst_geo unit flags")
+            })?;
+        for row in unit_rows {
+            unit_flags.insert(row.hash, row.unit_flag);
+        }
+    }
+    if unit_flags.len() != geo_hashes.len() {
+        anyhow::bail!(
+            "历史锚点导出缺少 inst_geo 记录: expected={} resolved={}；拒绝输出部分数据",
+            geo_hashes.len(),
+            unit_flags.len()
+        );
+    }
+    for row in rows {
+        for inst in &mut row.insts {
+            if let Some(unit_flag) = unit_flags.get(&inst.geo_hash) {
+                inst.unit_flag = *unit_flag;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn query_tubi_relate(
     owner_refnos: &[RefnoEnum],
     verbose: bool,
+    anchor_context: Option<&AnchorExportContext>,
 ) -> Result<HashMap<RefnoEnum, Vec<TubiQueryRow>>> {
     let mut tubings_map: HashMap<RefnoEnum, Vec<TubiQueryRow>> = HashMap::new();
     if owner_refnos.is_empty() {
         return Ok(tubings_map);
     }
 
+    let version = version_clause(anchor_context);
     for owners_chunk in owner_refnos.chunks(200) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
+            let tubi_range = model_refno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
                     {owner_refno} as refno,
-                    id[3] as index,
+                    id[2] as index,
                     in as leave,
                     record::id(aabb) as world_aabb_hash,
                     record::id(world_trans) as world_trans_hash,
@@ -828,7 +1142,8 @@ async fn query_tubi_relate(
                 FROM {tubi_range}
                 WHERE aabb != NONE
                   AND world_trans != NONE
-                  AND geo != NONE;
+                  AND geo != NONE
+                {version};
                 "#,
                 owner_refno = owner_refno.to_pe_key()
             ));
@@ -836,9 +1151,17 @@ async fn query_tubi_relate(
 
         let mut resp = aios_core::project_primary_db()
             .query_response(&sql_batch)
-            .await?;
+            .await
+            .map_err(|error| {
+                map_anchor_query_error(error, anchor_context, "query historical tubi_relate")
+            })?;
         for (stmt_idx, owner_refno) in owners_chunk.iter().enumerate() {
-            let raw_rows: Vec<TubiQueryRow> = resp.take(stmt_idx)?;
+            let raw_rows: Vec<TubiQueryRow> = resp
+                .take(stmt_idx)
+                .map_err(anyhow::Error::from)
+                .map_err(|error| {
+                    map_anchor_query_error(error, anchor_context, "decode historical tubi_relate")
+                })?;
             for row in raw_rows {
                 if row.geo_hash.is_some() {
                     tubings_map.entry(*owner_refno).or_default().push(row);
@@ -868,8 +1191,9 @@ async fn resolve_trans_to_matrices(
     unit_converter: &UnitConverter,
     apply_rotation: bool,
     verbose: bool,
+    anchor_context: Option<&AnchorExportContext>,
 ) -> Result<HashMap<String, Vec<f32>>> {
-    use aios_core::model_primary_db;
+    use aios_core::project_primary_db;
 
     let mut result = HashMap::new();
     if hashes.is_empty() {
@@ -884,19 +1208,28 @@ async fn resolve_trans_to_matrices(
 
     let factor = unit_converter.conversion_factor() as f64;
     let needs_conversion = unit_converter.needs_conversion();
+    let version = version_clause(anchor_context);
 
     let hashes_vec: Vec<&String> = hashes.iter().collect();
     for chunk in hashes_vec.chunks(500) {
         let keys: Vec<String> = chunk.iter().map(|h| format!("trans:⟨{}⟩", h)).collect();
         let sql = format!(
-            "SELECT record::id(id) as hash, d FROM [{}]",
-            keys.join(", ")
+            "SELECT record::id(id) as hash, d FROM [{}]{}",
+            keys.join(", "),
+            version
         );
 
-        let rows: Vec<TransQueryRow> = model_primary_db()
-            .query_take(&sql, 0)
-            .await
-            .unwrap_or_default();
+        let rows: Vec<TransQueryRow> =
+            project_primary_db()
+                .query_take(&sql, 0)
+                .await
+                .map_err(|error| {
+                    map_anchor_query_error(
+                        error,
+                        anchor_context,
+                        "resolve historical transform records",
+                    )
+                })?;
 
         for row in rows {
             if let Some(mut mat) = parse_transform_to_dmat4(&row.d) {
@@ -980,6 +1313,7 @@ async fn resolve_aabb(
     hashes: &HashSet<String>,
     unit_converter: &UnitConverter,
     verbose: bool,
+    anchor_context: Option<&AnchorExportContext>,
 ) -> Result<HashMap<String, Vec<f64>>> {
     use aios_core::project_primary_db;
 
@@ -989,19 +1323,24 @@ async fn resolve_aabb(
     }
 
     let factor = unit_converter.conversion_factor() as f64;
+    let version = version_clause(anchor_context);
 
     let hashes_vec: Vec<&String> = hashes.iter().collect();
     for chunk in hashes_vec.chunks(500) {
         let keys: Vec<String> = chunk.iter().map(|h| format!("aabb:⟨{}⟩", h)).collect();
         let sql = format!(
-            "SELECT record::id(id) as hash, d FROM [{}]",
-            keys.join(", ")
+            "SELECT record::id(id) as hash, d FROM [{}]{}",
+            keys.join(", "),
+            version
         );
 
-        let rows: Vec<AabbQueryRow> = project_primary_db()
-            .query_take(&sql, 0)
-            .await
-            .unwrap_or_default();
+        let rows: Vec<AabbQueryRow> =
+            project_primary_db()
+                .query_take(&sql, 0)
+                .await
+                .map_err(|error| {
+                    map_anchor_query_error(error, anchor_context, "resolve historical aabb records")
+                })?;
 
         for row in rows {
             if let Some(aabb) = row.d {
@@ -1150,7 +1489,7 @@ pub async fn export_all_instances_v3(
     }
     let mut export_inst_map: HashMap<RefnoEnum, aios_core::ExportInstQuery> = HashMap::new();
     if !in_refnos.is_empty() {
-        match query_export_insts(&in_refnos, true).await {
+        match query_export_insts(&in_refnos, true, None).await {
             Ok(export_insts) => {
                 for inst in export_insts {
                     export_inst_map.insert(inst.refno, inst);
@@ -1179,7 +1518,7 @@ pub async fn export_all_instances_v3(
             bran_owner_refnos.len()
         );
     }
-    let tubings_map = query_tubi_relate(&bran_owner_refnos, verbose).await?;
+    let tubings_map = query_tubi_relate(&bran_owner_refnos, verbose, None).await?;
 
     // 5. 收集所有唯一 trans_hash 和 aabb_hash
     let mut trans_hashes: HashSet<String> = HashSet::new();
@@ -1236,9 +1575,10 @@ pub async fn export_all_instances_v3(
             &trans_hashes,
             &unit_converter,
             transform_config.apply_rotation,
-            verbose
+            verbose,
+            None,
         ),
-        resolve_aabb(&aabb_hashes, &unit_converter, verbose),
+        resolve_aabb(&aabb_hashes, &unit_converter, verbose, None),
     );
     let trans_map = trans_map?;
     let aabb_map = aabb_map?;

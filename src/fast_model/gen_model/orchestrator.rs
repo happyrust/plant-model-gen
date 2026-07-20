@@ -837,6 +837,15 @@ pub async fn gen_all_geos_data(
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
     perf.mark("init");
 
+    // specs/023 M2（D2）：每次生成 run 开始失效 pe 层级快照——增量提交后的新 run
+    // 必须重新从 SurrealDB 加载最新层级（修 §0-2/§0-3 “索引永不失效”缺陷）。
+    {
+        let cleared = crate::versioned_db::pe_owner_snapshot::invalidate_pe_snapshots();
+        if cleared > 0 {
+            println!("[gen_model] pe 层级快照已失效重置: {} 个 dbnum", cleared);
+        }
+    }
+
     // 生成入口显式确保 surreal 辅助 schema 就绪（含 ses 空表兜底）。
     // 此前 ensure_surreal_init 只在 rkyv 构建等旁路被动触发：全新空库站点若
     // 首批 BRAN_TUBI tubi_relate 写入先于任何旁路调用，`dt=fn::ses_date(...)`
@@ -850,9 +859,7 @@ pub async fn gen_all_geos_data(
     // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
     // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
-    // specs/022 候选 3：原 target_sesno 入参依赖 element_changes 表按 sesno 反查增量，
-    // 但该表从未有写入方（幽灵 seam），路径永远命中空集——已整体移除。
-    // 按 sesno 的增量生成走 incremental-sesno（IncrementRun 采集 → update_log 直传）。
+    // 按 sesno 的增量生成只走 IncrementRun 采集后直传的 update_log。
     let final_incr_updates = incr_updates;
 
     let incr_count = final_incr_updates
@@ -1004,6 +1011,9 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
     let bran_hash = db1_hash("BRAN");
     let hang_hash = db1_hash("HANG");
     let mut out = Vec::new();
+    // specs/023 M2：按 refno 出现的 dbnum 一次性加载层级视图（pe_owner 快照默认 /
+    // .tree 回退）；meta 查不到不再静默 continue，记入 cache_miss_report（修 §0-3 可观测性）。
+    let mut view_cache: HashMap<u32, super::hier_view::HierView> = HashMap::new();
     for &r in refnos {
         if !r.is_valid() {
             continue;
@@ -1013,11 +1023,32 @@ async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-        let Ok(index) = manager.load_index(dbnum) else {
+        if !view_cache.contains_key(&dbnum) {
+            match super::hier_view::HierView::load(vec![dbnum]).await {
+                Ok(view) => {
+                    view_cache.insert(dbnum, view);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gen_model] filter_bran_hang: 加载层级视图失败 dbnum={} err={}",
+                        dbnum, e
+                    );
+                    continue;
+                }
+            }
+        }
+        let Some(view) = view_cache.get(&dbnum) else {
             continue;
         };
-        let Some(meta) = index.node_meta(r.refno()) else {
+        let Some(meta) = view.get_node_meta(r) else {
+            super::cache_miss_report::with_global_report(|report| {
+                report.record_refno_miss(
+                    "filter_bran_hang",
+                    "hier_meta_missing",
+                    r,
+                    Some("层级视图中查不到节点 meta（增量新增未入库或 dbnum 映射错误）"),
+                );
+            });
             continue;
         };
         if meta.noun == bran_hash || meta.noun == hang_hash {

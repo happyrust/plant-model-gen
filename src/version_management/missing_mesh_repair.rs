@@ -1,15 +1,12 @@
 use crate::fast_model::gen_model::mesh_generate::gen_inst_meshes_by_geo_ids_with_state;
 use crate::fast_model::gen_model::mesh_state::mesh_file_exists_in_dir;
 use crate::options::DbOptionExt;
-use crate::version_management::types::{
-    ModelMissingMeshRepairRequest, ModelMissingMeshRepairResponse, ModelMissingMeshRepairRow,
-};
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::utils::RecordIdExt;
-use aios_core::{RecordId, SurrealQueryExt, model_primary_db};
+use aios_core::{RecordId, SurrealQueryExt, project_primary_db};
 use anyhow::Context;
 use itertools::Itertools;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -18,7 +15,59 @@ use surrealdb::types::SurrealValue;
 
 const DEGRADED_FRADIUS_FALLBACK_ENV: &str = "AIOS_CSG_ALLOW_DEGRADED_PROFILE_FALLBACK";
 const DEGRADED_FRADIUS_FALLBACK_LOG_ENV: &str = "AIOS_CSG_DEGRADED_PROFILE_FALLBACK_LOG";
-const ALLOW_RELEASE_PACKAGE_REPAIR_ENV: &str = "AIOS_ALLOW_RELEASE_PACKAGE_MESH_REPAIR";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelMissingMeshRepairRequest {
+    pub project_name: String,
+    pub dbnum: u32,
+    pub report_file: PathBuf,
+    pub mesh_root: PathBuf,
+    pub limit: Option<usize>,
+    pub dry_run: bool,
+    pub retry_bad: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelMissingMeshRepairRow {
+    pub geo_hash: String,
+    pub before_exists: bool,
+    pub after_exists: bool,
+    pub inst_geo_found: bool,
+    pub has_param: bool,
+    pub was_bad: bool,
+    pub attempted: bool,
+    pub generated_now: bool,
+    pub still_missing: bool,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelMissingMeshRepairResponse {
+    pub project_name: String,
+    pub dbnum: u32,
+    pub report_file: PathBuf,
+    pub mesh_root: PathBuf,
+    pub dry_run: bool,
+    pub retry_bad: bool,
+    pub degraded_fradius_fallback_enabled: bool,
+    pub degraded_fradius_fallback_log: Option<PathBuf>,
+    pub degraded_fradius_fallback_rows: usize,
+    pub requested_hashes: usize,
+    pub limited: bool,
+    pub invalid_hashes: usize,
+    pub skipped_existing: usize,
+    pub missing_inst_geo: usize,
+    pub param_missing: usize,
+    pub non_renderable_inputs: usize,
+    pub self_intersecting_inputs: usize,
+    pub bad_skipped: usize,
+    pub attempted_hashes: usize,
+    pub generated_hashes: usize,
+    pub still_missing_hashes: usize,
+    pub rows: Vec<ModelMissingMeshRepairRow>,
+    pub recommended_action: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct MissingMeshReportFile {
@@ -63,18 +112,6 @@ pub async fn repair_missing_meshes(
             request.report_file.display()
         );
     }
-    if !request.dry_run
-        && !env_bool(ALLOW_RELEASE_PACKAGE_REPAIR_ENV)
-        && looks_like_release_package_path(&request.mesh_root)
-    {
-        anyhow::bail!(
-            "refusing to write missing-mesh repair into immutable ReleasePackage path: {}. \
-             Write repaired meshes to a scratch mesh root and register a new release, or set {}=1 for an explicit manual override.",
-            request.mesh_root.display(),
-            ALLOW_RELEASE_PACKAGE_REPAIR_ENV
-        );
-    }
-
     crate::fast_model::utils::ensure_surreal_init().await?;
 
     let raw = fs::read_to_string(&request.report_file).with_context(|| {
@@ -363,18 +400,19 @@ pub async fn repair_missing_meshes(
     let recommended_action = if request.dry_run {
         "Dry run only. Re-run without --dry-run to generate eligible missing meshes.".to_string()
     } else if degraded_fradius_fallback_rows > 0 {
-        "Generated one or more meshes with degraded FRADIUS fallback. Register the release as degraded_visual and add validation flag degraded_geometry_fallback unless a stronger geometry review accepts the approximation."
+        "Generated one or more meshes with degraded FRADIUS fallback. Review the approximation and keep the repair report as operational evidence."
             .to_string()
     } else if self_intersecting_inputs > 0 {
-        "Review self_intersecting_input rows as source-data/profile defects; repair the source profile or publish only with explicit degraded/quarantine evidence."
+        "Review self_intersecting_input rows as source-data/profile defects and repair the source profile."
             .to_string()
     } else if still_missing_hashes == 0 {
-        "Rerun Parquet export, then validate-history-replay to refresh mesh_validation.".to_string()
+        "Rerun the required viewer export and verify that all referenced mesh files exist."
+            .to_string()
     } else if non_renderable_inputs > 0 {
-        "Review non_renderable_input rows as source-data defects; repair upstream geometry or quarantine them with signed visual-contract evidence before publishing."
+        "Review non_renderable_input rows as source-data defects and repair upstream geometry."
             .to_string()
     } else {
-        "Review rows with still_missing=true; classify bad/non-visual geometry or fix generation before publishing."
+        "Review rows with still_missing=true; classify non-visual geometry or fix generation."
             .to_string()
     };
 
@@ -418,7 +456,7 @@ async fn query_inst_geo_candidates(hashes: &[u64]) -> anyhow::Result<Vec<InstGeo
             ids
         );
         let mut chunk_rows: Vec<InstGeoRepairCandidate> =
-            model_primary_db().query_take(&sql, 0).await?;
+            project_primary_db().query_take(&sql, 0).await?;
         rows.append(&mut chunk_rows);
     }
     Ok(rows)
@@ -437,7 +475,7 @@ async fn query_inst_geo_statuses(ids: &[RecordId]) -> anyhow::Result<Vec<InstGeo
             ids
         );
         let mut chunk_rows: Vec<InstGeoRepairStatus> =
-            model_primary_db().query_take(&sql, 0).await?;
+            project_primary_db().query_take(&sql, 0).await?;
         rows.append(&mut chunk_rows);
     }
     Ok(rows)
@@ -715,16 +753,4 @@ fn count_log_lines(path: Option<&PathBuf>) -> anyhow::Result<usize> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read degraded FRADIUS fallback log: {}", path.display()))?;
     Ok(raw.lines().filter(|line| !line.trim().is_empty()).count())
-}
-
-fn looks_like_release_package_path(path: &std::path::Path) -> bool {
-    let mut saw_model_versions = false;
-    for component in path.components() {
-        let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-        if saw_model_versions && name == "releases" {
-            return true;
-        }
-        saw_model_versions = name == "model_versions";
-    }
-    false
 }

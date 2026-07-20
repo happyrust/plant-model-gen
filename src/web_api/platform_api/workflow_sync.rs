@@ -1344,6 +1344,8 @@ mod tests {
             rect_annotations: Vec::new(),
             obb_annotations: Vec::new(),
             measurements: Vec::new(),
+            dimension_document: None,
+            dimension_document_version: 0,
             note: String::new(),
             confirmed_at: String::new(),
         }
@@ -2347,6 +2349,8 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
         rect_annotations: Option<Vec<Value>>,
         obb_annotations: Option<Vec<Value>>,
         measurements: Option<Vec<Value>>,
+        dimension_document: Option<Value>,
+        dimension_document_version: Option<u64>,
         note: Option<String>,
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
@@ -2356,7 +2360,7 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
         "workflow_sync.records_by_form",
         db.query(
             r#"
-            SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
+            SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, dimension_document, dimension_document_version, note, confirmed_at
             FROM review_records
             WHERE form_id = $form_id
             ORDER BY confirmed_at DESC
@@ -2378,6 +2382,8 @@ async fn query_workflow_records_by_form_id(form_id: &str) -> anyhow::Result<Vec<
             rect_annotations: row.rect_annotations.unwrap_or_default(),
             obb_annotations: row.obb_annotations.unwrap_or_default(),
             measurements: row.measurements.unwrap_or_default(),
+            dimension_document: row.dimension_document,
+            dimension_document_version: row.dimension_document_version.unwrap_or(0),
             note: row.note.unwrap_or_default(),
             confirmed_at: row
                 .confirmed_at
@@ -2398,6 +2404,8 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
         rect_annotations: Option<Vec<Value>>,
         obb_annotations: Option<Vec<Value>>,
         measurements: Option<Vec<Value>>,
+        dimension_document: Option<Value>,
+        dimension_document_version: Option<u64>,
         note: Option<String>,
         confirmed_at: Option<surrealdb::types::Datetime>,
     }
@@ -2407,7 +2415,7 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
         "workflow_sync.records_by_task",
         db.query(
             r#"
-            SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, note, confirmed_at
+            SELECT id, task_id, type, annotations, cloud_annotations, rect_annotations, obb_annotations, measurements, dimension_document, dimension_document_version, note, confirmed_at
             FROM review_records
             WHERE task_id = $task_id
             ORDER BY confirmed_at DESC
@@ -2429,6 +2437,8 @@ async fn query_workflow_records_by_task_id(task_id: &str) -> anyhow::Result<Vec<
             rect_annotations: row.rect_annotations.unwrap_or_default(),
             obb_annotations: row.obb_annotations.unwrap_or_default(),
             measurements: row.measurements.unwrap_or_default(),
+            dimension_document: row.dimension_document,
+            dimension_document_version: row.dimension_document_version.unwrap_or(0),
             note: row.note.unwrap_or_default(),
             confirmed_at: row
                 .confirmed_at

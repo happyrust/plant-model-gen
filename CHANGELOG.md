@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-07-20
+
+### Changed — 树查询迁移 M2：模型生成管线与导出路径切 pe_owner 快照
+
+> 依据 `docs/plans/2026-07-20-pe-owner-tree-query-migration-dev-plan.md` M2（T6+T7，D2 决策）。生成/导出管线的层级查询从 `.tree` 文件切到 **per-run 内存快照**（`versioned_db/pe_owner_snapshot.rs`：per-dbnum 从 pe 表 cursor 分页批量加载 id/owner/noun/cata_hash/children，构建 arena 同语义的内存索引；查询语义逐行对齐 rs-core `TreeIndex` BFS/prune/ancestors）。**行为变化：增量提交后，下一次生成 run 立即看到新层级——`gen_all_geos_data` 入口强制失效快照缓存，修复 TreeIndex 永不失效导致的"BRAN 增量新增管件被静默漏生成"（计划 §0-2/§0-3）**。
+
+- 新增 `fast_model/gen_model/hier_view.rs`：`HierView`（Snapshot|Tree 双源桥接，方法面向 `TreeIndexManager` 签名对齐），加载后全同步查询；`AIOS_TREE_QUERY_SOURCE=tree` 一键回退旧 `.tree` 路径（M4 删除）。
+- 生成管线切换：`query_provider`（新 `PeOwnerSnapshotProvider`，层级走快照、PE/属性照旧委托 SurrealDB；`query_by_noun_all_db`/`count_noun_all_db`/`query_noun_page_all_db` 改 async 双源；`query_multi_descendants_with_self` 双源）、`query_compat`（visible/neg descendants、deep children、ancestors、children 过滤）、`neg_query::query_descendants_map_by_dbnum_dual`（prim 负实体批查）、`utilities::build_cata_hash_map_*`（cata_hash 取 pe 行字段；元件类 noun 缺字段回退 attmap 计算并记 `cache_miss_report`，提示跑 `backfill-pe-cata-hash`）、`tree_index_manager` 的 BRAN 子元件收集双源（`collect_children_elements_from_tree` / `collect_bran_cate_descendant_elements_from_tree`，覆盖 cata_model/cata_cache_gen/index_tree_mode 全部调用点）、`index_tree_mode`（noun 预查询/BFS 入口收集/树根枚举）、`orchestrator::filter_bran_hang_refnos`（meta miss 不再静默 continue，记 cache_miss_report）、`room_model`（可见几何收集/空间聚合节点表/房间面板 BFS）、`precheck_coordinator`（pe_owner 源跳过 .tree 存在性检查）。
+- 导出路径切换：`model_exporter::collect_export_refnos`、`spec_info`（SITE 枚举+分组子孙）、`export_dbnum_instances_{parquet,web}`（parquet 的 spec 祖先链/owner 链/visible geo 补齐全部经 `HierView`）、`export_instanced_bundle`（BRAN/HANG 过滤）、`export_prepack_lod`（全库 refno 枚举）；`cli_modes` tubi cache 的 BRAN/HANG 枚举与"缺 .tree 自动 gen_tree_only 解析"在 pe_owner 源下跳过。
+- 快照读分页默认 2000/页（`AIOS_PE_SNAPSHOT_PAGE_SIZE` 可调，cursor 分页 `id >` 已在 fork 实测）；大库加载耗时与 t012 全量生成 bench（≤10% 预算）待站点环境实测补录。
+
+### Changed — 树查询迁移 M1：Web API latest 层级查询切 pe_owner 图查询
+
+> 依据 `docs/plans/2026-07-20-pe-owner-tree-query-migration-dev-plan.md`（M0 已落 `PeOwnerTreeStore` 原语层）。latest（不带 sesno）层级查询从 `.tree` 文件（TreeIndex，仅全量解析时重建、增量后陈旧）切换到 SurrealDB pe_owner 边/递归图查询——**行为变化：增量提交后，latest 树接口立即反映新增/删除/移动，不再等下一次全量解析**。
+
+- 切换面：`/api/e3d/*`（children/node/ancestors/subtree-refnos/world-root、children_count 与空名 `{noun} {order+1}` 序号改边序）、`/api/spatial/*`（noun 路由 + 直接子节点）、room tree（构件计数/子节点展开）、`scene_tree` init 构建源；`offline_world_children` 改查 DB（`pe WHERE noun='WORL'` + db_meta dbnum 清单，D4）。带 sesno 的 versioned 分支与 `resolve_dbnum_for_refno`（db_meta 驱动）零改动；`stream_generate` 经审计本就 DB 驱动，未动。
+- 新增双源开关 `AIOS_TREE_QUERY_SOURCE`：`pe_owner`（默认）| `tree`（一键回退旧 TreeIndex 路径，双源并行期兜底，M4 移除）。
+- 前置条件：存量站点切换前先跑 `scripts/smoke/pe_owner_children_audit.ps1`，不绿先 `model-version rebuild-pe-owner`（混合态下递归主路径会在缺边节点截断子树）。
+
+### Changed — Spec 024：数据与模型历史统一到 RocksDB versioned
+
+- `sesno_version_anchor` 扩展为 `[dbnum,sesno,source]`，数据只使用
+  `full/incremental`，模型生成成功后写 `model_gen`；默认 retention 改为 `0`
+  （无限保留），有限窗口外只能重扫 PDMS 源文件。
+- 模型 record ID 删除恒为 0 的 sesno 槽位，点表统一 `[ref0,ref1]`、关系表使用
+  纯 refno 前缀；rs-core 增加 `model_snapshot_at` / `model_diff`，CLI 增加
+  `model-version history model-snapshot/model-diff`。
+- 新增真正使用 `VERSION anchored_at` 的
+  `model-version export --dbnum --sesno --format v3-json`；缺少 model_gen 锚点、
+  历史过期或引用记录不完整时明确失败，不以当前态冒充历史。
+- `watch-incremental` 成为唯一增量 runner，并以
+  `output/<project>/incremental.lock` 阻止 incremental/regen/full-generation
+  跨进程交错；MQTT 文件分发移入独立模块。
+- 退役 specs/023 DuckLake/release/history-replay 发布链、旧
+  `/api/model-version/*`、发布 CLI 与 ModelWriter DuckLake/Parquet 后端；保留
+  web Parquet 导出、pe_transform Parquet/Dual 后端和独立 missing-mesh repair。
+- 新增测试站硬切清理脚本、range VERSION/模型历史 fixture 与
+  `scripts/smoke/unified_versioning_e2e.ps1`（SC-001～SC-006，无 cargo test）。
+
+### Changed — 增量更新加固批次一：watch 起点=Committed Watermark、失败隔离与连续性门禁
+
+> specs/022 Version Commit seam 加固：修复 CLI `watch-incremental` 用文件 latest sesno 当增量起点（违反 Committed Watermark 硬约束，停机期间的区间被静默跳过）与单库失败杀死整个 watch 进程两处 P0；seam 增加连续性门禁，把"带洞锚定"从静默成功变成显式失败。
+
+- `watch-incremental` 起点改为每轮每 dbnum 查询 `committed_watermark`（db_index 的文件 latest sesno 仅作 cheap 探测）；**行为变化：watch 启动后第一轮自动补齐停机期间的 sesno 缺口**，大缺口意味着启动后立即出现一次较长增量运行（属预期，可用 `--dbnum` 收窄或先人工 `incremental-sesno`）；watermark==0（从未全量解析）跳过并提示；watermark 查询失败只跳过该 dbnum 本轮。
+- watch 单库失败不再终止进程：per-dbnum 隔离，失败库不推进起点（起点=watermark，下一轮天然重试同一区间）；LeaseBusy / Commit Pending 降级为 info 提示（正常竞争/待人工 `incremental-sesno --recover-pending`，不算异常）。`--once` 模式收集本轮 failures（JSON 输出 cycle 汇总带 `failures` 数组），存在失败时以非零码退出；持续 watch 模式不退出。
+- `commit_version` 新增连续性门禁：`source=incremental` 且非 recover 时，`from_sesno > committed_watermark + 1` 返回新错误 `ContinuityGap`（增量区间与 Committed Watermark 不衔接）；`from_sesno <= watermark + 1` 重叠重放、`to_sesno <= watermark` 落后区间重放、full 基线重置与 recover 路径均不受影响。
+- 新增锚点链审计（specs/022 T4）：`db-data/audit_anchor_continuity.surql` + `scripts/smoke/anchor_continuity_audit.ps1`（结果落 `db-data/audit_anchor_continuity.out.md`，可疑项退出码 1）；运维口径入 `specs/022 ops-notes.md`——历史断链只能对该 dbnum 全量重灌，锚点不可变、不做补洞回填。
+
 ## 2026-07-17
 
 ### Removed — 移除 SurrealKV/MODEL_KV 模型库分离机制

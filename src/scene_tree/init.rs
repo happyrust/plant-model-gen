@@ -10,9 +10,11 @@ use aios_core::tool::db_tool::db1_dehash;
 use aios_core::tree_query::{TreeQuery, TreeQueryFilter};
 use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Result;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+// specs/023 M1：scene_node 构建源主路径切 pe_owner（增量后实时）；`AIOS_TREE_QUERY_SOURCE=tree` 回退
+use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
 
 /// 从 DbOption.toml 读取 project_name
 fn get_project_name_from_config() -> String {
@@ -241,11 +243,15 @@ DELETE $scene_node_ids;
 async fn build_tree_from_world(
     world_refno: RefnoEnum,
 ) -> Result<(Vec<SceneNodeData>, Vec<(i64, i64)>)> {
+    // specs/023 M1：pe_owner 主路径（DB 实时层级，逐层批查）；`tree` 开关回退 TreeIndex 文件
+    if latest_tree_source_is_pe_owner() {
+        return build_tree_from_world_pe_owner(world_refno).await;
+    }
+
     let mut nodes = Vec::new();
     let mut relations = Vec::new();
     let mut queue = VecDeque::new();
 
-    // 层级查询统一走 TreeIndex（indextree），避免依赖 SurrealDB 的 pe_owner 递归查询。
     let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno)?;
     let manager = TreeIndexManager::with_default_dir(vec![dbnum_u32]);
     let index = manager.load_index(dbnum_u32)?;
@@ -295,6 +301,67 @@ async fn build_tree_from_world(
         for child in child_u64s {
             queue.push_back((RefnoEnum::from(child), Some(refno_i64)));
         }
+    }
+
+    Ok((nodes, relations))
+}
+
+/// pe_owner 主路径：逐层批查（children 边优先 / pe.children 字段回退，chunk 500），
+/// noun 走批量 meta 点查；visited 防脏数据成环。scene_node 无同胞顺序语义，
+/// 层内子顺序不影响结果。
+async fn build_tree_from_world_pe_owner(
+    world_refno: RefnoEnum,
+) -> Result<(Vec<SceneNodeData>, Vec<(i64, i64)>)> {
+    // dbnum 解析仍走 db_meta 驱动实现（不依赖 .tree 文件）
+    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno)?;
+    let dbnum = dbnum_u32 as i16;
+
+    let mut nodes = Vec::new();
+    let mut relations = Vec::new();
+    let mut visited: HashSet<RefnoEnum> = HashSet::new();
+    visited.insert(world_refno);
+    let mut frontier: Vec<(RefnoEnum, Option<i64>)> = vec![(world_refno, None)];
+
+    while !frontier.is_empty() {
+        let refnos: Vec<RefnoEnum> = frontier.iter().map(|(r, _)| *r).collect();
+        let metas = PeOwnerTreeStore::fetch_node_metas(&refnos).await?;
+        let kids_map = PeOwnerTreeStore::children_batch(&refnos).await?;
+
+        let mut next: Vec<(RefnoEnum, Option<i64>)> = Vec::new();
+        for (refno, parent_id) in frontier {
+            let refno_i64 = refno.refno().0 as i64;
+            let kids = kids_map.get(&refno).cloned().unwrap_or_default();
+            let noun = metas
+                .get(&refno)
+                .map(|m| m.noun.clone())
+                .unwrap_or_default();
+            let has_geo = is_geo_noun(&noun);
+            let is_leaf = kids.is_empty();
+
+            let geo_type = if has_geo {
+                get_geo_type_by_refno(refno).await.unwrap_or(None)
+            } else {
+                None
+            };
+
+            nodes.push(SceneNodeData {
+                id: refno_i64,
+                parent: parent_id,
+                has_geo,
+                is_leaf,
+                dbnum,
+                geo_type,
+            });
+            if let Some(pid) = parent_id {
+                relations.push((pid, refno_i64));
+            }
+            for kid in kids {
+                if visited.insert(kid) {
+                    next.push((kid, Some(refno_i64)));
+                }
+            }
+        }
+        frontier = next;
     }
 
     Ok((nodes, relations))

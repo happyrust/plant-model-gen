@@ -168,6 +168,16 @@ async fn check_tree_files(
     output_dir: &str,
     stats: &mut PrecheckStats,
 ) -> Result<()> {
+    // specs/023 M2：pe_owner 主路径不依赖 .tree 文件——层级数据来自 pe 快照（SurrealDB）。
+    // 仅在 AIOS_TREE_QUERY_SOURCE=tree 回退时保留 .tree 存在性检查。
+    if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+        println!("[precheck] 🌲 层级数据源=pe_owner（快照），跳过 .tree 文件检查");
+        stats.tree_checked = dbnums.len();
+        stats.tree_generated = 0;
+        stats.tree_failed = 0;
+        return Ok(());
+    }
+
     println!("[precheck] 🌲 检查 Tree 索引文件...");
 
     let tree_dir = Path::new(output_dir);

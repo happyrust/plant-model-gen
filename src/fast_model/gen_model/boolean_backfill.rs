@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 
 use super::boolean_task::{BooleanTask, BooleanTaskType, CataGeoData, CataNegBoolTask};
 
@@ -19,7 +19,7 @@ pub async fn query_cata_backfill_candidates(
 ) -> anyhow::Result<Vec<RefnoEnum>> {
     // 查询 DB 中所有标记了 has_cata_neg 的 refno
     let sql = "SELECT VALUE in.id FROM inst_relate WHERE has_cata_neg = true";
-    let all_cata_refnos: Vec<RefnoEnum> = model_primary_db()
+    let all_cata_refnos: Vec<RefnoEnum> = project_primary_db()
         .query_take(sql, 0)
         .await
         .unwrap_or_default();
@@ -60,7 +60,7 @@ pub async fn fetch_cata_bool_tasks_from_db(
             pe_keys_str
         );
 
-        let inst_rows: Vec<serde_json::Value> = model_primary_db()
+        let inst_rows: Vec<serde_json::Value> = project_primary_db()
             .query_take(&inst_sql, 0)
             .await
             .unwrap_or_default();
@@ -101,7 +101,7 @@ pub async fn fetch_cata_bool_tasks_from_db(
                 inst_info_id
             );
 
-            let geo_rows: Vec<serde_json::Value> = model_primary_db()
+            let geo_rows: Vec<serde_json::Value> = project_primary_db()
                 .query_take(&geo_sql, 0)
                 .await
                 .unwrap_or_default();

@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
 
-use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+use crate::fast_model::gen_model::model_record_id::model_refno_range;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 use crate::fast_model::export_model::{InstRelateRow, query_inst_relate_batch};
@@ -461,18 +461,19 @@ impl SpatialIndexSpecResolver {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
 async fn query_visible_geo_refnos_by_dbnums(db_nums: &[u32]) -> anyhow::Result<Vec<RefnoEnum>> {
-    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use crate::fast_model::gen_model::hier_view::HierView;
 
     if db_nums.is_empty() {
         return Ok(Vec::new());
     }
 
     info!(
-        "[room_model] 开始按 dbnums 从 TreeIndex 收集可见几何 refnos: {:?}",
+        "[room_model] 开始按 dbnums 从层级视图收集可见几何 refnos: {:?}",
         db_nums
     );
-    let manager = TreeIndexManager::with_default_dir(db_nums.to_vec());
-    let grouped = manager.query_nouns_grouped(&VISBILE_GEO_NOUNS);
+    // specs/023 M2：双源层级视图（pe_owner 快照默认 / .tree 回退）
+    let view = HierView::load(db_nums.to_vec()).await?;
+    let grouped = view.query_nouns_grouped(&VISBILE_GEO_NOUNS);
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -488,7 +489,7 @@ async fn query_visible_geo_refnos_by_dbnums(db_nums: &[u32]) -> anyhow::Result<V
 
     out.sort();
     info!(
-        "[room_model] TreeIndex 可见几何收集完成: {} 个 refnos",
+        "[room_model] 层级视图可见几何收集完成: {} 个 refnos",
         out.len()
     );
     Ok(out)
@@ -740,37 +741,37 @@ fn merge_aabb_into(map: &mut HashMap<RefnoEnum, Aabb>, refno: RefnoEnum, aabb: A
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-index"))]
-fn load_spatial_aggregate_node_infos_by_dbnums(
+async fn load_spatial_aggregate_node_infos_by_dbnums(
     db_nums: &[u32],
 ) -> anyhow::Result<(
     HashMap<RefnoEnum, SpatialAggregateNodeInfo>,
     SpatialAggregateStats,
 )> {
-    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use crate::fast_model::gen_model::hier_view::HierView;
     use aios_core::tool::db_tool::db1_dehash;
 
     let mut infos = HashMap::new();
     let mut stats = SpatialAggregateStats::default();
-    let manager = TreeIndexManager::with_default_dir(db_nums.to_vec());
 
     for &dbnum in db_nums {
-        let index = match manager.load_index(dbnum) {
-            Ok(index) => index,
+        // specs/023 M2：逐 dbnum 加载层级视图（pe_owner 快照默认 / .tree 回退），
+        // 单库失败跳过（与旧 TreeIndex 加载失败语义一致）。
+        let view = match HierView::load(vec![dbnum]).await {
+            Ok(view) => view,
             Err(err) => {
                 stats.skipped_tree_dbnums += 1;
                 warn!(
-                    "[room_model] 空间聚合跳过 dbnum={}：TreeIndex 加载失败: {}",
+                    "[room_model] 空间聚合跳过 dbnum={}：层级视图加载失败: {}",
                     dbnum, err
                 );
                 continue;
             }
         };
 
-        for ref_u64 in index.all_refnos() {
-            let Some(meta) = index.node_meta(ref_u64) else {
+        for refno in view.all_refnos() {
+            let Some(meta) = view.get_node_meta(refno) else {
                 continue;
             };
-            let refno = RefnoEnum::from(ref_u64);
             if !refno.is_valid() {
                 continue;
             }
@@ -856,7 +857,7 @@ async fn query_branch_tubi_aggregate_aabbs(
     let mut estimated_rows = 0usize;
 
     for branch_refno in branch_refnos {
-        let tubi_range = model_refno_sesno_range("tubi_relate", *branch_refno);
+        let tubi_range = model_refno_range("tubi_relate", *branch_refno);
         let sql = format!(
             r#"
             SELECT
@@ -926,7 +927,7 @@ async fn build_spatial_aggregate_aabbs_by_dbnums(
     HashMap<RefnoEnum, SpatialAggregateNodeInfo>,
     SpatialAggregateStats,
 )> {
-    let (node_infos, mut stats) = load_spatial_aggregate_node_infos_by_dbnums(db_nums)?;
+    let (node_infos, mut stats) = load_spatial_aggregate_node_infos_by_dbnums(db_nums).await?;
     if node_infos.is_empty() {
         return Ok((HashMap::new(), node_infos, stats));
     }
@@ -2849,7 +2850,70 @@ where
     let grouped_by_db =
         group_candidate_rooms_by_dbnum(rooms, |_| true, TreeIndexManager::resolve_dbnum_for_refno)?;
 
-    // 3. 对每个 dbnum 只加载一次 TreeIndex，再批量查询房间面板
+    let options = TreeQueryOptions {
+        include_self: false,
+        max_depth: None,
+        filter: TreeQueryFilter {
+            noun_hashes: Some(std::iter::once(db1_hash("PANE")).collect()),
+            ..Default::default()
+        },
+        prune_on_match: false,
+    };
+    let filter_visible = |room_refno: &RefnoEnum, descendants: Vec<RefnoEnum>| {
+        if let Some(visible) = visible_refnos {
+            if visible.contains(room_refno) {
+                descendants
+            } else {
+                descendants
+                    .into_iter()
+                    .filter(|refno| visible.contains(refno))
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            descendants
+        }
+    };
+
+    // specs/023 M2：pe_owner 主路径——先预加载各 dbnum 快照（loader 闭包是同步的），
+    // 闭包内走纯内存 BFS；`AIOS_TREE_QUERY_SOURCE=tree` 回退旧 TreeIndex 路径。
+    if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+        use crate::versioned_db::pe_owner_snapshot::{
+            preload_pe_snapshots, try_get_cached_pe_snapshot,
+        };
+        let dbnums: Vec<u32> = grouped_by_db.keys().copied().collect();
+        preload_pe_snapshots(&dbnums).await?;
+
+        return query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
+            let Some(snap) = try_get_cached_pe_snapshot(dbnum) else {
+                anyhow::bail!("pe 层级快照缺失: dbnum={dbnum}（preload 后被失效？）");
+            };
+            let mut out = Vec::new();
+            for (room_refno, room_num) in items {
+                let room_refno_u64 = room_refno.refno();
+                if !snap.contains_refno(room_refno_u64) {
+                    let message = format!(
+                        "pe 层级快照中缺少房间节点: dbnum={dbnum}, room_refno={room_refno}, room_num={room_num}\n\
+                         请确认该房间 pe 行已入库（增量提交完成）后重试。"
+                    );
+                    error!("{}", message);
+                    anyhow::bail!(message);
+                }
+                let descendants = snap
+                    .collect_descendants_bfs(room_refno_u64, &options)
+                    .into_iter()
+                    .map(RefnoEnum::from)
+                    .filter(|refno| refno.is_valid())
+                    .collect::<Vec<_>>();
+                let descendants = filter_visible(room_refno, descendants);
+                if !descendants.is_empty() {
+                    out.push((*room_refno, room_num.clone(), descendants));
+                }
+            }
+            Ok(out)
+        });
+    }
+
+    // 3. 对每个 dbnum 只加载一次 TreeIndex，再批量查询房间面板（tree 回退路径）
     query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         let tree_dir = manager.tree_dir().to_path_buf();
@@ -2870,15 +2934,6 @@ where
             error!("{}", message);
             anyhow::anyhow!(message)
         })?;
-        let options = TreeQueryOptions {
-            include_self: false,
-            max_depth: None,
-            filter: TreeQueryFilter {
-                noun_hashes: Some(std::iter::once(db1_hash("PANE")).collect()),
-                ..Default::default()
-            },
-            prune_on_match: false,
-        };
         let mut out = Vec::new();
 
         for (room_refno, room_num) in items {
@@ -2901,18 +2956,7 @@ where
                 .filter(|refno| refno.is_valid())
                 .collect::<Vec<_>>();
 
-            let descendants = if let Some(visible) = visible_refnos {
-                if visible.contains(room_refno) {
-                    descendants
-                } else {
-                    descendants
-                        .into_iter()
-                        .filter(|refno| visible.contains(refno))
-                        .collect::<Vec<_>>()
-                }
-            } else {
-                descendants
-            };
+            let descendants = filter_visible(room_refno, descendants);
 
             if !descendants.is_empty() {
                 out.push((*room_refno, room_num.clone(), descendants));
@@ -3205,7 +3249,9 @@ async fn sync_room_panel_relations(
         return Ok(());
     }
 
-    project_primary_db().query(sql_statements.join("\n")).await?;
+    project_primary_db()
+        .query(sql_statements.join("\n"))
+        .await?;
     Ok(())
 }
 

@@ -53,6 +53,7 @@ impl PerfTimer {
                 last.ended_at = Some(now);
             }
         }
+
         self.stages.push(StageRecord {
             name: stage_name.to_string(),
             started_at: now,
@@ -63,6 +64,7 @@ impl PerfTimer {
     /// 结束当前阶段（不开启新阶段）
     pub fn end_current(&mut self) {
         let now = Instant::now();
+
         if let Some(last) = self.stages.last_mut() {
             if last.ended_at.is_none() {
                 last.ended_at = Some(now);

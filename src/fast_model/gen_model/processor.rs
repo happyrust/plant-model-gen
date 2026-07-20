@@ -64,6 +64,7 @@ impl NounProcessor {
         for &noun in nouns.iter() {
             // 统计当前 noun 的总数
             let mut total = count_noun_all_db(noun)
+                .await
                 .map_err(|e| anyhow!("统计 {} noun {} 失败: {}", self.category_name, noun, e))?
                 as usize;
 
@@ -100,8 +101,9 @@ impl NounProcessor {
                 let current_page_size = page_size.min(remaining.max(1));
 
                 // 查询当前页
-                let refnos =
-                    query_noun_page_all_db(noun, processed, current_page_size).map_err(|e| {
+                let refnos = query_noun_page_all_db(noun, processed, current_page_size)
+                    .await
+                    .map_err(|e| {
                         anyhow!("分页查询 {} noun {} 失败: {}", self.category_name, noun, e)
                     })?;
 

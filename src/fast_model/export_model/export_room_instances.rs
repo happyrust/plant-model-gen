@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use aios_core::{RefnoEnum, SurrealQueryExt, model_primary_db};
+use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use parry3d::bounding_volume::Aabb;
@@ -225,7 +225,7 @@ fn build_query_room_panel_relations_sql() -> &'static str {
 
 /// 查询所有 room_relate 关系
 async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
-    let records: Vec<RoomRelateRecord> = model_primary_db()
+    let records: Vec<RoomRelateRecord> = project_primary_db()
         .query_take(build_query_room_relations_sql(), 0)
         .await
         .context("查询 room_relate 失败")?;
@@ -235,7 +235,7 @@ async fn query_room_relations() -> Result<Vec<RoomRelateRecord>> {
 
 /// 查询所有 room_panel_relate 关系
 async fn query_room_panel_relations() -> Result<Vec<RoomPanelRecord>> {
-    let records: Vec<RoomPanelRecord> = model_primary_db()
+    let records: Vec<RoomPanelRecord> = project_primary_db()
         .query_take(build_query_room_panel_relations_sql(), 0)
         .await
         .context("查询 room_panel_relate 失败")?;
@@ -277,7 +277,7 @@ async fn query_panel_geometries(panel_refnos: &[RefnoEnum]) -> Result<Vec<PanelG
         pe_list
     );
 
-    let records: Vec<PanelGeomQuery> = model_primary_db()
+    let records: Vec<PanelGeomQuery> = project_primary_db()
         .query_take(&sql, 0)
         .await
         .unwrap_or_default();
@@ -314,7 +314,7 @@ async fn query_core_snapshot_aabbs(refnos: &[RefnoEnum]) -> Result<Vec<CoreRoomA
             WHERE aabb_id != NONE;
             "#
         );
-        let mut resp = model_primary_db()
+        let mut resp = project_primary_db()
             .query_response(&sql)
             .await
             .with_context(|| "查询 core room snapshot AABB 失败")?;

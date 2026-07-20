@@ -41,6 +41,7 @@ pub mod index_tree_mode;
 pub mod orchestrator;
 
 // 实用工具
+pub mod hier_view; // specs/023 M2：双源层级视图（pe_owner 快照 / .tree 回退）
 pub mod precheck_coordinator;
 pub mod tree_index_manager;
 pub mod utilities; // 预检查协调器
@@ -49,8 +50,6 @@ pub mod utilities; // 预检查协调器
 pub mod mesh_processing;
 pub mod model_record_id;
 pub mod model_writer;
-#[cfg(feature = "model-writer-ducklake")]
-pub mod model_writer_ducklake;
 
 // 从 fast_model 根目录迁入的模型生成管线模块
 pub mod boolean_backfill; // 布尔任务 DB 补齐（enable_db_backfill）

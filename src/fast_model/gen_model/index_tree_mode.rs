@@ -127,10 +127,13 @@ pub async fn prequery_noun_counts(
     let mut results = Vec::new();
 
     let tree_dbnums = resolve_tree_dbnums(dbnums)?;
-    let manager = TreeIndexManager::with_default_dir(tree_dbnums);
+    // specs/023 M2：双源层级视图（pe_owner 快照默认 / .tree 回退）
+    let view = super::hier_view::HierView::load(tree_dbnums)
+        .await
+        .map_err(|e| IndexTreeError::DatabaseError(format!("加载层级视图失败: {}", e)))?;
 
     for &noun in nouns {
-        let mut refnos = manager.query_noun_refnos(noun, None);
+        let mut refnos = view.query_noun_refnos(noun, None);
         refnos.retain(|r| r.is_valid());
 
         if !refnos.is_empty() {
@@ -360,10 +363,13 @@ pub async fn gen_index_tree_geos_optimized(
     if need_bran_hang_stage {
         let bran_hanger_roots: HashSet<RefnoEnum>;
         if let Some(roots) = seed_roots.as_ref() {
-            // 从 seed_roots 出发，IndexTree BFS 收集 BRAN/HANG，遇到即 prune
+            // 从 seed_roots 出发，层级 BFS 收集 BRAN/HANG，遇到即 prune
+            // （specs/023 M2：pe_owner 快照默认 / .tree 回退）
             let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
-            let manager = TreeIndexManager::with_default_dir(tree_dbnums);
-            let collected = manager.collect_target_refnos_pruned(roots, &["BRAN", "HANG"]);
+            let view = super::hier_view::HierView::load(tree_dbnums)
+                .await
+                .map_err(|e| IndexTreeError::DatabaseError(format!("加载层级视图失败: {}", e)))?;
+            let collected = view.collect_target_refnos_pruned(roots, &["BRAN", "HANG"]);
             if !collected.is_empty() {
                 println!(
                     "[Pipeline] 从 seed_roots BFS 收集到 BRAN/HANG: {} 个",
@@ -444,23 +450,20 @@ pub async fn gen_index_tree_geos_optimized(
 
         let noun_strs: Vec<&str> = target_nouns.iter().map(|s| s.as_str()).collect();
         let tree_dbnums = resolve_tree_dbnums(&dbnums)?;
-        let manager = TreeIndexManager::with_default_dir(tree_dbnums.clone());
+        // specs/023 M2：双源层级视图（pe_owner 快照默认 / .tree 回退）
+        let view = super::hier_view::HierView::load(tree_dbnums.clone())
+            .await
+            .map_err(|e| IndexTreeError::DatabaseError(format!("加载层级视图失败: {}", e)))?;
 
-        // 确定 BFS 根节点：seed_roots 或 tree 根节点
+        // 确定 BFS 根节点：seed_roots 或树根节点
         let bfs_roots: Vec<RefnoEnum> = if let Some(roots) = seed_roots.as_ref() {
             roots.iter().copied().filter(|r| r.is_valid()).collect()
         } else {
-            let mut roots = Vec::new();
-            for &dbnum in &tree_dbnums {
-                if let Ok(index) = manager.load_index(dbnum) {
-                    roots.extend(index.roots().iter().map(|&r| RefnoEnum::from(r)));
-                }
-            }
-            roots
+            view.roots()
         };
 
         // 一次 BFS 收集所有目标 noun refnos，按 noun_hash 分组
-        let grouped = manager.collect_target_refnos_grouped(&bfs_roots, &noun_strs, false);
+        let grouped = view.collect_target_refnos_grouped(&bfs_roots, &noun_strs, false);
 
         // 构建分类用的 noun_hash 集合
         let loop_hashes: HashSet<u32> = GNERAL_LOOP_OWNER_NOUN_NAMES
@@ -1764,8 +1767,11 @@ async fn query_noun_refnos(
     limit: Option<usize>,
 ) -> Result<Vec<RefnoEnum>> {
     let tree_dbnums = resolve_tree_dbnums(dbnums)?;
-    let manager = TreeIndexManager::with_default_dir(tree_dbnums);
-    let mut refnos = manager.query_noun_refnos(noun, limit);
+    // specs/023 M2：双源层级视图（pe_owner 快照默认 / .tree 回退）
+    let view = super::hier_view::HierView::load(tree_dbnums)
+        .await
+        .map_err(|e| IndexTreeError::DatabaseError(format!("加载层级视图失败: {}", e)))?;
+    let mut refnos = view.query_noun_refnos(noun, limit);
     refnos.retain(|r| r.is_valid());
 
     if let Some(l) = limit {

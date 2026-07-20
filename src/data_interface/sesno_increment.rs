@@ -154,6 +154,8 @@ pub struct PdmsSesnoIncrementFileReport {
     pub dbnum: u32,
     pub project: String,
     pub file_path: PathBuf,
+    /// 在打开并采集源文件之前计算，用于 IncrementRun 写前/写后稳定性门禁。
+    pub source_sha256_before: String,
     pub requested_start_sesno: u32,
     pub requested_end_sesno: u32,
     pub actual_start_sesno: u32,
@@ -234,6 +236,9 @@ pub struct PdmsIncrementPersistStats {
     pub att_rows: usize,
     pub uda_rows: usize,
     pub dbnum_info_updates: usize,
+    /// specs/023：本批重写的 pe_owner 边行数（INSERT RELATION 行）
+    #[serde(default)]
+    pub pe_owner_rows: usize,
     /// specs/022：本批增量落库固化的 sesno 锚点（成功路径末尾写入）。
     #[serde(default)]
     pub anchors: Vec<VersionAnchorRecord>,
@@ -252,6 +257,7 @@ impl PdmsIncrementPersistStats {
         self.att_rows += other.att_rows;
         self.uda_rows += other.uda_rows;
         self.dbnum_info_updates += other.dbnum_info_updates;
+        self.pe_owner_rows += other.pe_owner_rows;
         self.anchors.extend(other.anchors);
         self.commit_failures.extend(other.commit_failures);
     }
@@ -574,6 +580,21 @@ fn inject_children_into_pe_json(mut json: String, children: &[RefU64]) -> String
     json
 }
 
+/// specs/023 M0/T2（D1 方案 A）：把 cata_hash 注入 pe 行 JSON（string 存储，
+/// u64 可能超出 Surreal int/i64 范围）。增量 UPSERT CONTENT 是整行替换——
+/// 若不在此注入，一次 modify 就会抹掉 full 解析/回填写入的 cata_hash。
+fn inject_cata_hash_into_pe_json(mut json: String, cata_hash: Option<u64>) -> String {
+    let Some(hash) = cata_hash else {
+        return json;
+    };
+    if json.ends_with('}') {
+        json.pop();
+        let sep = if json.contains(':') { ", " } else { "" };
+        json.push_str(&format!("{sep}cata_hash: '{hash}'}}"));
+    }
+    json
+}
+
 fn record_target(table: &str, refno: RefU64) -> String {
     format!("{}:{}", table, refno)
 }
@@ -599,7 +620,7 @@ async fn build_increment_delete_statements(refno: RefU64) -> anyhow::Result<Vec<
         .query(format!("SELECT VALUE noun FROM {pe_key} LIMIT 1;"))
         .await?
         .check()?;
-    let noun: Option<String> = response.take(0).unwrap_or_default();
+    let noun: Option<String> = response.take(0)?;
 
     let mut sqls = Vec::new();
     if let Some(noun) = noun.filter(|noun| !noun.trim().is_empty()) {
@@ -644,7 +665,7 @@ async fn persist_pdms_increment_file(
 async fn persist_pdms_increment_grouped(
     report: &PdmsSesnoIncrementFileReport,
     grouped: &BTreeMap<u32, Vec<EleOperationData>>,
-    source_observation_hash: Option<&str>,
+    source_hash: Option<&str>,
     recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats {
@@ -663,6 +684,16 @@ async fn persist_pdms_increment_grouped(
     let mut mutation_sqls = Vec::new();
     let mut dbnum_info: BTreeMap<u64, Ref0PersistInfo> = BTreeMap::new();
 
+    // specs/023 T004：层级边维护。按 op 顺序收集每个被触及 owner 的**最终**子列表
+    // （同批多次触及同一 owner 时 last-wins；每次重写都是全量替换，故语义精确），
+    // op 循环结束后统一生成"先全删、后全插"两段语句，且删/插分属**不同请求**提交
+    // （见 edge_delete_sqls/edge_insert_sqls 的 apply 顺序）。不与 PE/ATT 语句混排的原因：
+    // 同一请求内"删边→重插同 (in,out)"在 versioned 引擎上撞过 unique_pe_owner 唯一索引
+    // （rebuild CLI 实测，孤立复现不稳定）；跨请求提交后删除必然可见。
+    // 注意：删除元素（DELETE pe:x）时引擎会自动清除其两侧关联边（8030 实测），
+    // 这里对被删元素仍登记空重写（owner 侧显式清边），兜底"pe 行已缺失但残留边"的脏数据。
+    let mut edge_final: indexmap::IndexMap<RefU64, Vec<RefU64>> = indexmap::IndexMap::new();
+
     for operations in grouped.values() {
         for operation in operations {
             if matches!(&operation.detail, EleOperationDetail::Deleted) {
@@ -670,6 +701,7 @@ async fn persist_pdms_increment_grouped(
                 let deleted_sqls = build_increment_delete_statements(operation.refno).await?;
                 stats.att_rows += deleted_sqls.len().saturating_sub(1);
                 mutation_sqls.extend(deleted_sqls);
+                edge_final.insert(operation.refno, Vec::new());
                 continue;
             }
 
@@ -691,6 +723,7 @@ async fn persist_pdms_increment_grouped(
                 pe_data.gen_sur_json(Some(refno.to_pe_key())),
                 ele.children.as_slice(),
             );
+            let pe_json = inject_cata_hash_into_pe_json(pe_json, att.cal_cata_hash());
             mutation_sqls.push(format!("UPSERT {} CONTENT {};", refno.to_pe_key(), pe_json));
             stats.pe_rows += 1;
             stats.upsert_count += 1;
@@ -719,6 +752,10 @@ async fn persist_pdms_increment_grouped(
                 }
             }
 
+            // specs/023 T004：登记该元素的最终子列表（op 自带 children 全量；
+            // PDMS 语义：子列表变化时 owner 必以 Add/Modified 出现在 op 流）。
+            edge_final.insert(refno, ele.children.clone().0);
+
             let refno_u64 = refno.0;
             let ref_0 = (refno_u64 >> 32) as u64;
             let ref_1 = refno_u64 & 0xFFFF_FFFF;
@@ -733,6 +770,36 @@ async fn persist_pdms_increment_grouped(
                     max_sesno: operation.sesno as i32,
                     max_ref1: ref_1,
                 });
+        }
+    }
+
+    // specs/023 T004：由 edge_final 生成两段边语句——先删段与后插段。
+    // 幂等策略=先删后插（research.md Decision 2：撞 id 且值不同会报错，
+    // `INSERT IGNORE RELATION` 语法不存在）；禁止改用 id 区间扫（Decision 1/C3）。
+    const PE_OWNER_RELATION_CHUNK: usize = 500;
+    let mut edge_delete_sqls: Vec<String> = Vec::with_capacity(edge_final.len());
+    let mut edge_insert_sqls: Vec<String> = Vec::new();
+    for (owner, children) in &edge_final {
+        let owner_key = owner.to_pe_key();
+        edge_delete_sqls.push(format!("DELETE {owner_key}<-pe_owner;"));
+        if children.is_empty() {
+            continue;
+        }
+        stats.pe_owner_rows += children.len();
+        for (chunk_idx, chunk) in children.chunks(PE_OWNER_RELATION_CHUNK).enumerate() {
+            let rows = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    let order = chunk_idx * PE_OWNER_RELATION_CHUNK + i;
+                    format!(
+                        "{{ id: pe_owner:[{owner_key}, {order}], in: {}, out: {owner_key} }}",
+                        child.to_pe_key()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            edge_insert_sqls.push(format!("INSERT RELATION INTO pe_owner [{rows}];"));
         }
     }
 
@@ -755,9 +822,11 @@ async fn persist_pdms_increment_grouped(
         report.actual_start_sesno,
         report.actual_end_sesno,
         VersionCommitSource::Incremental,
-        source_observation_hash,
+        source_hash,
         mutation_sqls
             .iter()
+            .chain(edge_delete_sqls.iter())
+            .chain(edge_insert_sqls.iter())
             .chain(dbnum_sqls.iter())
             .map(String::as_str),
     );
@@ -767,6 +836,7 @@ async fn persist_pdms_increment_grouped(
         uda_rows: stats.uda_rows,
         delete_count: stats.delete_count,
         dbnum_info_updates: stats.dbnum_info_updates,
+        pe_owner_rows: stats.pe_owner_rows,
     };
     let request = VersionCommitRequest {
         dbnum: report.dbnum,
@@ -774,12 +844,15 @@ async fn persist_pdms_increment_grouped(
         to_sesno: report.actual_end_sesno,
         source: VersionCommitSource::Incremental,
         fingerprint,
-        source_observation_hash: source_observation_hash.map(str::to_string),
+        source_hash: source_hash.map(str::to_string),
         expected_counts: Some(commit_counts.clone()),
     };
     let outcome = if recover_pending {
         recover_version_commit(request, || async move {
             exec_statements(&mutation_sqls, 200).await?;
+            // 边先删段与后插段分属不同 exec 调用（不同请求），保证删除对插入可见
+            exec_statements(&edge_delete_sqls, 200).await?;
+            exec_statements(&edge_insert_sqls, 200).await?;
             exec_statements(&dbnum_sqls, 200).await?;
             Ok(commit_counts)
         })
@@ -787,6 +860,9 @@ async fn persist_pdms_increment_grouped(
     } else {
         commit_version(request, || async move {
             exec_statements(&mutation_sqls, 200).await?;
+            // 边先删段与后插段分属不同 exec 调用（不同请求），保证删除对插入可见
+            exec_statements(&edge_delete_sqls, 200).await?;
+            exec_statements(&edge_insert_sqls, 200).await?;
             exec_statements(&dbnum_sqls, 200).await?;
             Ok(commit_counts)
         })
@@ -818,7 +894,7 @@ pub async fn persist_pdms_increment_files(
 
 pub async fn persist_collected_pdms_increment_files(
     files: &[PdmsSesnoCollectedFile],
-    source_observation_hash: Option<&str>,
+    source_hash: Option<&str>,
     recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats::default();
@@ -826,7 +902,7 @@ pub async fn persist_collected_pdms_increment_files(
         match persist_pdms_increment_grouped(
             &file.report,
             &file.grouped_operations,
-            source_observation_hash,
+            source_hash,
             recover_pending,
         )
         .await
@@ -849,16 +925,18 @@ pub async fn persist_collected_pdms_increment_files(
 /// 使用 pdms-io 直接从一个 E3D/PDMS db 文件按 sesno 范围收集增量。
 ///
 /// `cached_sesno` 表示当前系统已解析/缓存到的版本；实际读取范围从
-/// `cached_sesno + 1` 到 `target_sesno`（省略则使用文件最新 sesno）。
+/// `cached_sesno + 1` 到 `to_sesno`（省略则使用文件最新 sesno）。
 /// 该函数只读源文件并构造模型增量日志，不写 SurrealDB/SQLite。
 pub fn collect_pdms_increment_for_file_with_operations(
     project: &str,
     file_path: impl AsRef<Path>,
     cached_sesno: u32,
-    target_sesno: Option<u32>,
+    to_sesno: Option<u32>,
     detail: bool,
 ) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
     let file_path = file_path.as_ref();
+    let source_sha256_before = crate::version_management::hashing::sha256_file(file_path)
+        .with_context(|| format!("计算增量源文件采集前 hash 失败: {}", file_path.display()))?;
     let mut io = PdmsIO::new(project, file_path, detail);
     io.open()
         .with_context(|| format!("PdmsIO::open 失败: {}", file_path.display()))?;
@@ -875,7 +953,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
         )
     })?;
     let requested_start = cached_sesno.saturating_add(1);
-    let requested_end = target_sesno.unwrap_or(latest_sesno);
+    let requested_end = to_sesno.unwrap_or(latest_sesno);
 
     if requested_end > latest_sesno {
         anyhow::bail!(
@@ -891,6 +969,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
             dbnum,
             project: project.to_string(),
             file_path: file_path.to_path_buf(),
+            source_sha256_before: source_sha256_before.clone(),
             requested_start_sesno: requested_start,
             requested_end_sesno: requested_end,
             actual_start_sesno: 0,
@@ -916,6 +995,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
             dbnum,
             project: project.to_string(),
             file_path: file_path.to_path_buf(),
+            source_sha256_before: source_sha256_before.clone(),
             requested_start_sesno: requested_start,
             requested_end_sesno: requested_end,
             actual_start_sesno: 0,
@@ -941,6 +1021,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
             dbnum,
             project: project.to_string(),
             file_path: file_path.to_path_buf(),
+            source_sha256_before: source_sha256_before.clone(),
             requested_start_sesno: requested_start,
             requested_end_sesno: requested_end,
             actual_start_sesno: 0,
@@ -966,6 +1047,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
             dbnum,
             project: project.to_string(),
             file_path: file_path.to_path_buf(),
+            source_sha256_before: source_sha256_before.clone(),
             requested_start_sesno: requested_start,
             requested_end_sesno: requested_end,
             actual_start_sesno: actual_start as u32,
@@ -1048,6 +1130,7 @@ pub fn collect_pdms_increment_for_file_with_operations(
         dbnum,
         project: project.to_string(),
         file_path: file_path.to_path_buf(),
+        source_sha256_before,
         requested_start_sesno: requested_start,
         requested_end_sesno: requested_end,
         actual_start_sesno: actual_start as u32,
@@ -1073,14 +1156,14 @@ pub fn collect_pdms_increment_for_file(
     project: &str,
     file_path: impl AsRef<Path>,
     cached_sesno: u32,
-    target_sesno: Option<u32>,
+    to_sesno: Option<u32>,
     detail: bool,
 ) -> anyhow::Result<PdmsSesnoIncrementOutcome> {
     Ok(collect_pdms_increment_for_file_with_operations(
         project,
         file_path,
         cached_sesno,
-        target_sesno,
+        to_sesno,
         detail,
     )?
     .into_outcome())
@@ -1093,7 +1176,7 @@ pub fn collect_pdms_increment_for_dbnums_from_index_with_operations(
     index_path: impl AsRef<Path>,
     dbnums: &[u32],
     cached_sesno: u32,
-    target_sesno: Option<u32>,
+    to_sesno: Option<u32>,
     detail: bool,
 ) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
     let store = crate::data_interface::db_index::DbIndexStore::open(index_path)?;
@@ -1118,7 +1201,7 @@ pub fn collect_pdms_increment_for_dbnums_from_index_with_operations(
             &record_project,
             &record_path,
             cached_sesno,
-            target_sesno,
+            to_sesno,
             detail,
         )
         .with_context(|| format!("dbnum={} 增量收集失败", dbnum))?;
@@ -1134,7 +1217,7 @@ pub fn collect_pdms_increment_for_dbnums_from_index(
     index_path: impl AsRef<Path>,
     dbnums: &[u32],
     cached_sesno: u32,
-    target_sesno: Option<u32>,
+    to_sesno: Option<u32>,
     detail: bool,
 ) -> anyhow::Result<PdmsSesnoIncrementOutcome> {
     Ok(
@@ -1143,7 +1226,7 @@ pub fn collect_pdms_increment_for_dbnums_from_index(
             index_path,
             dbnums,
             cached_sesno,
-            target_sesno,
+            to_sesno,
             detail,
         )?
         .into_outcome(),

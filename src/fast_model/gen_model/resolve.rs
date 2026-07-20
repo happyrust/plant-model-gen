@@ -7,7 +7,7 @@ use aios_core::expression::query_cata::{query_axis_params, resolve_cata_comp};
 use aios_core::expression::resolve::{SCOM_INFO_MAP, resolve_axis_param};
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo};
 use aios_core::pdms_data::{GmParam, PlinParam, ScomInfo};
-use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, model_primary_db};
+use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, project_primary_db};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -58,7 +58,7 @@ fn normalize_gm_param_expressions_in_place(gm: &mut GmParam) {
 /// 使用 SurrealDB 的 fn::get_ipara 函数
 async fn query_iparam_from_desi(desi_refno: RefnoEnum) -> anyhow::Result<Vec<f32>> {
     let sql = format!("return fn::get_ipara({})", desi_refno.to_pe_key());
-    let result: Vec<f32> = model_primary_db().query_take(&sql, 0).await?;
+    let result: Vec<f32> = project_primary_db().query_take(&sql, 0).await?;
 
     Ok(result)
 }

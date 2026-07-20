@@ -17,6 +17,7 @@ use serde_json::json;
 use std::{fs, path::Path as FsPath, time::SystemTime};
 
 use crate::web_server::AppState;
+use crate::web_server::models::{IncrementalUpdateRequest, UpdateType};
 use aios_core::project_primary_db;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
@@ -25,7 +26,8 @@ use surrealdb::types::SurrealValue;
 use crate::versioned_db::version_commit::committed_watermark;
 
 /// specs/022 候选4·方案B：HTTP 触发的增量运行注册表（内存态）。
-/// sync = 真实落库（persist），detect = 只读试跑（no-persist）；两者都走
+/// sync = 真实落库（persist），detect = 只读试跑（no-persist），
+/// sync+generate = 落库后按增量范围生成模型；全部走
 /// `version_management::increment_run::run_increment`（同一 IncrementRun /
 /// Version Commit seam）。写侧安全由 commit_version 的 lease + Commit Pending
 /// + 锚点固化兜底。进程重启后注册表清空（运行记录不持久，锚点才是权威）。
@@ -35,9 +37,9 @@ static INCREMENT_RUNS: Lazy<DashMap<String, IncrementRunStatus>> = Lazy::new(Das
 pub struct IncrementRunStatus {
     pub run_id: String,
     pub dbnum: u32,
-    /// "sync"（落库）| "detect"（只读试跑）
+    /// "sync"（落库）| "detect"（只读试跑）| "sync+generate"（落库+增量生成）
     pub kind: String,
-    /// "running" | "succeeded" | "failed"
+    /// "queued" | "running" | "succeeded" | "failed"
     pub state: String,
     pub from_sesno: u32,
     pub started_at: String,
@@ -51,6 +53,79 @@ fn new_run_id(kind: &str, dbnum: u32) -> String {
         "{kind}-db{dbnum}-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
     )
+}
+
+/// 执行一次 IncrementRun（增量采集 → Version Commit → 可选增量模型生成）。
+///
+/// 所有 HTTP 增量入口共用的唯一执行函数——连接探针、选项组装都在这里，
+/// 保证 HTTP 面不可能绕过 commit_version 的 lease/fingerprint/锚点语义。
+async fn run_increment_once(
+    dbnum: u32,
+    from_sesno: u32,
+    to_sesno: Option<u32>,
+    persist: bool,
+    generate_model: bool,
+) -> anyhow::Result<crate::version_management::increment_run::IncrementRunResult> {
+    let db_option_ext = crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
+    let options = crate::version_management::increment_run::IncrementRunOptions {
+        file: None,
+        dbnums: vec![dbnum],
+        from_sesno,
+        to_sesno,
+        rescan_index: false,
+        persist_data: persist,
+        recover_pending: false,
+        generate_model,
+        require_tree_index: false,
+        verbose: false,
+    };
+    // web server 启动时已连 surreal；这里做一次轻量探针即可。
+    let ensure = || async {
+        project_primary_db()
+            .query("RETURN 1;")
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    };
+    crate::version_management::increment_run::run_increment(&db_option_ext, options, ensure).await
+}
+
+/// 把一次运行的结果写回注册表。
+fn record_run_result(
+    run_id: &str,
+    result: anyhow::Result<crate::version_management::increment_run::IncrementRunResult>,
+) {
+    if let Some(mut entry) = INCREMENT_RUNS.get_mut(run_id) {
+        entry.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        match result {
+            Ok(run) => {
+                entry.state = "succeeded".to_string();
+                entry.summary = Some(run.summary);
+            }
+            Err(err) => {
+                entry.state = "failed".to_string();
+                entry.error = Some(err.to_string());
+            }
+        }
+    }
+}
+
+/// UI 状态位维护：dbnum_info_table.updating / last_update_result。
+/// 只是展示用记账，不属于 Version Commit 语义；失败静默忽略。
+async fn set_dbnum_updating(dbnum: u32, updating: bool, result: Option<&str>) {
+    let sql = match result {
+        Some(result) => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!(
+                "UPDATE dbnum_info_table SET updating = {updating}, last_update_result = '{result}', last_update_at = {ts} WHERE dbnum = {dbnum};"
+            )
+        }
+        None => format!("UPDATE dbnum_info_table SET updating = {updating} WHERE dbnum = {dbnum};"),
+    };
+    let _ = project_primary_db().query(sql).await;
 }
 
 /// 后台跑一次 IncrementRun 并把结果写回注册表。persist=false 即 detect 试跑。
@@ -81,51 +156,133 @@ async fn spawn_increment_run(dbnum: u32, persist: bool) -> Result<IncrementRunSt
 
     let run_id_task = run_id.clone();
     tokio::spawn(async move {
-        let db_option_ext =
-            crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
-        let options = crate::version_management::increment_run::IncrementRunOptions {
-            file: None,
-            dbnums: vec![dbnum],
-            from_sesno: watermark,
-            to_sesno: None,
-            rescan_index: false,
-            persist_data: persist,
-            recover_pending: false,
-            generate_model: false,
-            source_observation_manifest: None,
-            source_observation_manifest_hash: None,
-            publication_handoff_dir: None,
-            release_id_prefix: None,
-            require_tree_index: false,
-            verbose: false,
-        };
-        // web server 启动时已连 surreal；这里做一次轻量探针即可。
-        let ensure = || async {
-            project_primary_db()
-                .query("RETURN 1;")
-                .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from)
-        };
-        let result =
-            crate::version_management::increment_run::run_increment(&db_option_ext, options, ensure)
-                .await;
-        if let Some(mut entry) = INCREMENT_RUNS.get_mut(&run_id_task) {
-            entry.finished_at = Some(chrono::Utc::now().to_rfc3339());
-            match result {
-                Ok(run) => {
-                    entry.state = "succeeded".to_string();
-                    entry.summary = Some(run.summary);
-                }
-                Err(err) => {
-                    entry.state = "failed".to_string();
-                    entry.error = Some(err.to_string());
-                }
-            }
-        }
+        let result = run_increment_once(dbnum, watermark, None, persist, false).await;
+        record_run_result(&run_id_task, result);
     });
 
     Ok(status)
+}
+
+/// UI「增量更新」端点 `/api/db-status/update` 的真实实现。
+///
+/// 历史实现是旁路：把"增量更新"映射为 `sync_pdms(total_sync=true)` 全量重解析，
+/// 且硬编码 project_name（AvevaMarineSample/1516），绕开 Version Commit seam 的
+/// 语义约定。现在与其余增量入口同源：
+/// - `ParseOnly` → persist-only IncrementRun（同 `/api/incremental/sync/{dbnum}`）
+/// - `ParseAndModel` / `Full` → persist + 增量范围模型生成（mesh 由生成管线内部处理）
+/// - 多 dbnum 串行执行：每库独立 commit_version（lease/锚点各自独立），
+///   串行是为了避免生成管线并发互踩
+/// - 真正的全量重解析是另一个显式动作（任务创建 API / CLI sync_pdms），不在此端点
+pub async fn execute_incremental_update(
+    _state: State<AppState>,
+    Json(request): Json<IncrementalUpdateRequest>,
+) -> impl IntoResponse {
+    let generate_model = !matches!(request.update_type, UpdateType::ParseOnly);
+    if generate_model && !cfg!(feature = "gen_model") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "当前构建未启用 gen_model feature，只支持 ParseOnly 增量",
+            })),
+        );
+    }
+    let mut dbnums: Vec<u32> = request.dbnums.clone();
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    if dbnums.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "dbnums 不能为空",
+            })),
+        );
+    }
+
+    // 逐库校验 Committed Watermark（增量采集唯一合法起点，见 CONTEXT.md）
+    let mut accepted: Vec<(u32, u32, String)> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let kind = if generate_model {
+        "sync+generate"
+    } else {
+        "sync"
+    };
+    for dbnum in dbnums {
+        match committed_watermark(dbnum).await {
+            Ok(0) => skipped.push(json!({
+                "dbnum": dbnum,
+                "reason": "无 Committed Watermark（从未全量解析），不能做增量；请先全量建库",
+            })),
+            Ok(watermark) => {
+                let run_id = new_run_id(kind, dbnum);
+                INCREMENT_RUNS.insert(
+                    run_id.clone(),
+                    IncrementRunStatus {
+                        run_id: run_id.clone(),
+                        dbnum,
+                        kind: kind.to_string(),
+                        state: "queued".to_string(),
+                        from_sesno: watermark,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        finished_at: None,
+                        summary: None,
+                        error: None,
+                    },
+                );
+                accepted.push((dbnum, watermark, run_id));
+            }
+            Err(e) => skipped.push(json!({
+                "dbnum": dbnum,
+                "reason": format!("查询 Committed Watermark 失败: {e}"),
+            })),
+        }
+    }
+    if accepted.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "没有可执行增量的 dbnum",
+                "skipped": skipped,
+            })),
+        );
+    }
+
+    let run_ids: Vec<String> = accepted.iter().map(|(_, _, id)| id.clone()).collect();
+    let accepted_dbnums: Vec<u32> = accepted.iter().map(|(dbnum, _, _)| *dbnum).collect();
+    let to_sesno = request.to_sesno;
+    tokio::spawn(async move {
+        for (dbnum, watermark, run_id) in accepted {
+            if let Some(mut entry) = INCREMENT_RUNS.get_mut(&run_id) {
+                entry.state = "running".to_string();
+                entry.started_at = chrono::Utc::now().to_rfc3339();
+            }
+            set_dbnum_updating(dbnum, true, None).await;
+            let result = run_increment_once(dbnum, watermark, to_sesno, true, generate_model).await;
+            let result_tag = if result.is_ok() { "Success" } else { "Failed" };
+            record_run_result(&run_id, result);
+            set_dbnum_updating(dbnum, false, Some(result_tag)).await;
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "success": true,
+            "status": "success",
+            "message": "增量更新已启动（IncrementRun / Version Commit seam）",
+            "task_id": run_ids.first(),
+            "run_ids": run_ids,
+            "dbnums": accepted_dbnums,
+            "generate_model": generate_model,
+            "skipped": skipped,
+            "query": "/api/incremental/task/{run_id}",
+        })),
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,7 +443,8 @@ async fn collect_db_increment_status() -> anyhow::Result<Vec<DbIncrementStatus>>
 
     let sql = r#"
 SELECT dbnum, math::max(sesno) AS max_sesno FROM dbnum_info_table GROUP BY dbnum;
-SELECT dbnum, math::max(sesno) AS max_sesno FROM sesno_version_anchor GROUP BY dbnum;
+SELECT dbnum, math::max(sesno) AS max_sesno FROM sesno_version_anchor
+    WHERE source IN ['full', 'incremental'] GROUP BY dbnum;
 SELECT dbnum, sesno, type::string(anchored_at) AS anchored_at, source FROM sesno_version_anchor ORDER BY anchored_at DESC LIMIT 200;
 SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_at FROM version_commit_state WHERE status IN ['preparing', 'pending'];
 "#;
@@ -316,17 +474,21 @@ SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_
 
     let mut by_dbnum: BTreeMap<u32, DbIncrementStatus> = BTreeMap::new();
     for row in legacy_rows {
-        let entry = by_dbnum.entry(row.dbnum).or_insert_with(|| DbIncrementStatus {
-            dbnum: row.dbnum,
-            ..Default::default()
-        });
+        let entry = by_dbnum
+            .entry(row.dbnum)
+            .or_insert_with(|| DbIncrementStatus {
+                dbnum: row.dbnum,
+                ..Default::default()
+            });
         entry.legacy_max_sesno = row.max_sesno.unwrap_or_default();
     }
     for row in anchor_rows {
-        let entry = by_dbnum.entry(row.dbnum).or_insert_with(|| DbIncrementStatus {
-            dbnum: row.dbnum,
-            ..Default::default()
-        });
+        let entry = by_dbnum
+            .entry(row.dbnum)
+            .or_insert_with(|| DbIncrementStatus {
+                dbnum: row.dbnum,
+                ..Default::default()
+            });
         entry.committed_watermark = row.max_sesno.unwrap_or_default();
     }
     // Committed Watermark 语义：无锚点回退 legacy（与 committed_watermark() 一致）
@@ -611,7 +773,9 @@ pub async fn cancel_task(
     _state: State<AppState>,
     Path(_task_id): Path<String>,
 ) -> impl IntoResponse {
-    not_implemented("取消进行中的增量运行（IncrementRun 落库不可中途安全中断，请等待完成或依赖 Commit Pending 恢复）")
+    not_implemented(
+        "取消进行中的增量运行（IncrementRun 落库不可中途安全中断，请等待完成或依赖 Commit Pending 恢复）",
+    )
 }
 
 /// 未实现：增量配置读取（无配置存储，检测/同步为按需触发）。

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use surrealdb::types::{self as surrealdb_types, SurrealValue};
 
 use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+// specs/023 M1：latest 层级触点主路径切 pe_owner；`AIOS_TREE_QUERY_SOURCE=tree` 回退
+use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
 
 /// 空间查询API状态
 #[derive(Clone)]
@@ -150,15 +152,24 @@ async fn query_children_nodes(
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    // 层级查询统一走 TreeIndex（indextree）：这里仅需要父节点 noun 做路由判断。
+    // 这里仅需要父节点 noun 做路由判断。
+    // specs/023 M1：pe_owner 主路径直接点查 pe 行；`tree` 开关回退 TreeIndex。
     let parent_refno = RefnoEnum::from(RefU64(refno));
-    let parent_noun = TreeIndexManager::resolve_dbnum_for_refno(parent_refno)
-        .ok()
-        .and_then(|dbnum| {
-            let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
-            mgr.get_noun(parent_refno)
-        })
-        .unwrap_or_default();
+    let parent_noun = if latest_tree_source_is_pe_owner() {
+        PeOwnerTreeStore::get_noun(parent_refno)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        TreeIndexManager::resolve_dbnum_for_refno(parent_refno)
+            .ok()
+            .and_then(|dbnum| {
+                let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
+                mgr.get_noun(parent_refno)
+            })
+            .unwrap_or_default()
+    };
 
     if parent_noun.is_empty() {
         return Ok(Json(vec![]));
@@ -275,15 +286,20 @@ async fn query_children_by_type(
     let parent_pe_key = RefnoEnum::from(RefU64(parent_refno)).to_pe_key();
     let query = match build_relation_children_query(parent_noun.as_str(), &parent_pe_key) {
         Some(query) => query,
-        // 其他类型 -> 直接子节点：pe_owner 层级关系改走 TreeIndex。
+        // 其他类型 -> 直接子节点。
+        // specs/023 M1：pe_owner 边有序 children 主路径；`tree` 开关回退 TreeIndex。
         None => {
             let parent_refno_enum = RefnoEnum::from(RefU64(parent_refno));
-            let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum).ok();
-            let Some(dbnum) = dbnum else {
-                return Ok(Vec::new());
+            let mut children = if latest_tree_source_is_pe_owner() {
+                PeOwnerTreeStore::query_children(parent_refno_enum).await?
+            } else {
+                let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno_enum).ok();
+                let Some(dbnum) = dbnum else {
+                    return Ok(Vec::new());
+                };
+                let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
+                mgr.query_children(parent_refno_enum)
             };
-            let mgr = TreeIndexManager::with_default_dir(vec![dbnum]);
-            let mut children = mgr.query_children(parent_refno_enum);
             if children.len() > 100 {
                 children.truncate(100);
             }

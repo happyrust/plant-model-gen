@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +36,9 @@ pub struct VersionCommitCounts {
     pub uda_rows: usize,
     pub delete_count: usize,
     pub dbnum_info_updates: usize,
+    /// specs/023：本批写入的 pe_owner 边行数（INSERT RELATION 行；serde default 兼容旧记录）
+    #[serde(default)]
+    pub pe_owner_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +49,7 @@ pub struct VersionCommitRequest {
     pub source: VersionCommitSource,
     pub fingerprint: String,
     #[serde(default)]
-    pub source_observation_hash: Option<String>,
+    pub source_hash: Option<String>,
     #[serde(default)]
     pub expected_counts: Option<VersionCommitCounts>,
 }
@@ -63,6 +67,21 @@ pub struct VersionCommitOutcome {
     pub recovered: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelGenAnchor {
+    pub dbnum: u32,
+    pub sesno: u32,
+    pub source: String,
+    pub anchored_at: String,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct CurrentSesnoRow {
+    dbnum: i64,
+    #[serde(default)]
+    sesno: Option<i64>,
+}
+
 #[derive(Debug, Error)]
 pub enum VersionCommitError {
     #[error("version commit storage error: {0}")]
@@ -76,6 +95,15 @@ pub enum VersionCommitError {
         dbnum: u32,
         pending_sesno: u32,
         requested_sesno: u32,
+    },
+    #[error(
+        "dbnum={dbnum} incremental range {requested_from}..={requested_to} does not connect to committed watermark {watermark}（增量区间与 Committed Watermark 不衔接，禁止带洞锚定；请从 watermark 续传或对该 dbnum 全量重灌）"
+    )]
+    ContinuityGap {
+        dbnum: u32,
+        watermark: u32,
+        requested_from: u32,
+        requested_to: u32,
     },
     #[error(
         "immutable anchor conflict for dbnum={dbnum} sesno={sesno}: existing fingerprint={existing}, requested fingerprint={requested}"
@@ -130,6 +158,8 @@ struct ExistingAnchor {
     delete_count: Option<i64>,
     #[serde(default)]
     dbnum_info_updates: Option<i64>,
+    #[serde(default)]
+    pe_owner_rows: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, SurrealValue)]
@@ -148,7 +178,7 @@ pub fn compute_commit_fingerprint<'a>(
     from_sesno: u32,
     to_sesno: u32,
     source: VersionCommitSource,
-    source_observation_hash: Option<&str>,
+    source_hash: Option<&str>,
     normalized_operations: impl IntoIterator<Item = &'a str>,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -158,7 +188,7 @@ pub fn compute_commit_fingerprint<'a>(
     hasher.update(to_sesno.to_le_bytes());
     hasher.update(source.as_str().as_bytes());
     hasher.update([0]);
-    hasher.update(source_observation_hash.unwrap_or_default().as_bytes());
+    hasher.update(source_hash.unwrap_or_default().as_bytes());
     hasher.update([0]);
     for operation in normalized_operations {
         let normalized = operation.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -254,6 +284,8 @@ where
     }
     if recovered {
         require_matching_pending(request).await?;
+    } else {
+        reject_continuity_gap(request).await?;
     }
     reject_pending_commit(request, recovered).await?;
     mark_commit_preparing(request).await?;
@@ -317,13 +349,14 @@ DEFINE FIELD IF NOT EXISTS from_sesno ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS to_sesno ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS source ON TABLE version_commit_state TYPE string ASSERT $value IN ['full', 'incremental'];
 DEFINE FIELD IF NOT EXISTS fingerprint ON TABLE version_commit_state TYPE string;
-DEFINE FIELD IF NOT EXISTS source_observation_hash ON TABLE version_commit_state TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS source_hash ON TABLE version_commit_state TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS status ON TABLE version_commit_state TYPE string ASSERT $value IN ['preparing', 'pending', 'committed'];
 DEFINE FIELD IF NOT EXISTS pe_rows ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS att_rows ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS uda_rows ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS delete_count ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS dbnum_info_updates ON TABLE version_commit_state TYPE int;
+DEFINE FIELD IF NOT EXISTS pe_owner_rows ON TABLE version_commit_state TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS anchored_at ON TABLE version_commit_state TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS last_error ON TABLE version_commit_state TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON TABLE version_commit_state TYPE datetime DEFAULT time::now();
@@ -337,12 +370,13 @@ DEFINE FIELD IF NOT EXISTS expires_at ON TABLE version_commit_lease TYPE datetim
 
 DEFINE FIELD IF NOT EXISTS from_sesno ON TABLE sesno_version_anchor TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS fingerprint ON TABLE sesno_version_anchor TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS source_observation_hash ON TABLE sesno_version_anchor TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS source_hash ON TABLE sesno_version_anchor TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS pe_rows ON TABLE sesno_version_anchor TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS att_rows ON TABLE sesno_version_anchor TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS uda_rows ON TABLE sesno_version_anchor TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS delete_count ON TABLE sesno_version_anchor TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS dbnum_info_updates ON TABLE sesno_version_anchor TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS pe_owner_rows ON TABLE sesno_version_anchor TYPE option<int>;
 "#;
     project_primary_db()
         .query(sql)
@@ -359,9 +393,11 @@ async fn existing_idempotent_outcome(
 ) -> CommitResult<Option<VersionCommitOutcome>> {
     let sql = format!(
         "SELECT fingerprint, type::string(anchored_at) AS anchored_at, \
-         pe_rows, att_rows, uda_rows, delete_count, dbnum_info_updates \
-         FROM sesno_version_anchor:[{}, {}];",
-        request.dbnum, request.to_sesno
+         pe_rows, att_rows, uda_rows, delete_count, dbnum_info_updates, pe_owner_rows \
+         FROM sesno_version_anchor:[{}, {}, '{}'];",
+        request.dbnum,
+        request.to_sesno,
+        request.source.as_str()
     );
     let mut response = project_primary_db()
         .query(sql)
@@ -396,6 +432,7 @@ async fn existing_idempotent_outcome(
         uda_rows: existing.uda_rows.unwrap_or_default().max(0) as usize,
         delete_count: existing.delete_count.unwrap_or_default().max(0) as usize,
         dbnum_info_updates: existing.dbnum_info_updates.unwrap_or_default().max(0) as usize,
+        pe_owner_rows: existing.pe_owner_rows.unwrap_or_default().max(0) as usize,
     };
     mark_commit_committed(request, &counts, &existing.anchored_at).await?;
     Ok(Some(VersionCommitOutcome {
@@ -409,6 +446,42 @@ async fn existing_idempotent_outcome(
         idempotent: true,
         recovered,
     }))
+}
+
+/// specs/022 加固：增量提交必须与 Committed Watermark 衔接，把"带洞锚定"
+/// 从静默成功变成显式失败（`ContinuityGap`）。
+///
+/// 规则（仅 `source=incremental` 且非 recover 路径，调用方保证）：
+/// - `watermark == 0`（从未全量解析，无锚点也无 legacy 记录）放行——首个增量
+///   提交的合法性由调用方保证；
+/// - `request.to_sesno <= watermark` 放行——落后区间重放要么命中已有锚点走
+///   幂等/冲突分支，要么是 legacy 站点 dbnum_info_table 水位虚高场景，
+///   不在本门禁职责内（门禁只拦"跳空"）；
+/// - `request.from_sesno > watermark + 1` → `ContinuityGap`（间隙未采集）；
+///   `from_sesno <= watermark + 1` 的重叠重放合法。
+///
+/// full 是基线重置语义、豁免本门禁；recover 路径已由 `require_matching_pending`
+/// 的 fingerprint 匹配把关，且存在 legacy 站点 `dbnum_info_table` 在半次 apply
+/// 中被推进导致回退水位虚高的边界，故 recover 跳过门禁。
+async fn reject_continuity_gap(request: &VersionCommitRequest) -> CommitResult<()> {
+    if request.source != VersionCommitSource::Incremental {
+        return Ok(());
+    }
+    let watermark = committed_watermark(request.dbnum)
+        .await
+        .map_err(VersionCommitError::Storage)?;
+    if watermark == 0 || request.to_sesno <= watermark {
+        return Ok(());
+    }
+    if request.from_sesno > watermark + 1 {
+        return Err(VersionCommitError::ContinuityGap {
+            dbnum: request.dbnum,
+            watermark,
+            requested_from: request.from_sesno,
+            requested_to: request.to_sesno,
+        });
+    }
+    Ok(())
 }
 
 async fn require_matching_pending(request: &VersionCommitRequest) -> CommitResult<()> {
@@ -479,9 +552,9 @@ async fn mark_commit_preparing(request: &VersionCommitRequest) -> CommitResult<(
     let sql = format!(
         "UPSERT version_commit_state:[{}, {}] SET \
          dbnum = {}, from_sesno = {}, to_sesno = {}, source = $source, \
-         fingerprint = $fingerprint, source_observation_hash = $source_observation_hash, \
+         fingerprint = $fingerprint, source_hash = $source_hash, \
          status = 'preparing', pe_rows = 0, att_rows = 0, uda_rows = 0, \
-         delete_count = 0, dbnum_info_updates = 0, anchored_at = NONE, \
+         delete_count = 0, dbnum_info_updates = 0, pe_owner_rows = 0, anchored_at = NONE, \
          last_error = NONE, updated_at = time::now();",
         request.dbnum, request.to_sesno, request.dbnum, request.from_sesno, request.to_sesno
     );
@@ -505,9 +578,10 @@ async fn mark_commit_committed(
     let sql = format!(
         "UPSERT version_commit_state:[{}, {}] SET \
          dbnum = {}, from_sesno = {}, to_sesno = {}, source = $source, \
-         fingerprint = $fingerprint, source_observation_hash = $source_observation_hash, \
+         fingerprint = $fingerprint, source_hash = $source_hash, \
          status = 'committed', pe_rows = {}, att_rows = {}, uda_rows = {}, \
-         delete_count = {}, dbnum_info_updates = {}, anchored_at = <datetime>$anchored_at, \
+         delete_count = {}, dbnum_info_updates = {}, pe_owner_rows = {}, \
+         anchored_at = <datetime>$anchored_at, \
          last_error = NONE, updated_at = time::now();",
         request.dbnum,
         request.to_sesno,
@@ -518,7 +592,8 @@ async fn mark_commit_committed(
         counts.att_rows,
         counts.uda_rows,
         counts.delete_count,
-        counts.dbnum_info_updates
+        counts.dbnum_info_updates,
+        counts.pe_owner_rows
     );
     checked_bound_query(sql, request, None, Some(anchored_at)).await
 }
@@ -533,10 +608,7 @@ async fn checked_bound_query(
         .query(sql)
         .bind(("source", request.source.as_str().to_string()))
         .bind(("fingerprint", request.fingerprint.clone()))
-        .bind((
-            "source_observation_hash",
-            request.source_observation_hash.clone(),
-        ));
+        .bind(("source_hash", request.source_hash.clone()));
     if let Some(last_error) = last_error {
         query = query.bind(("last_error", last_error.to_string()));
     }
@@ -556,13 +628,15 @@ async fn create_immutable_anchor(
     counts: &VersionCommitCounts,
 ) -> CommitResult<String> {
     let sql = format!(
-        "CREATE ONLY sesno_version_anchor:[{}, {}] SET \
+        "CREATE ONLY sesno_version_anchor:[{}, {}, '{}'] SET \
          dbnum = {}, sesno = {}, from_sesno = {}, source = $source, \
-         fingerprint = $fingerprint, source_observation_hash = $source_observation_hash, \
+         fingerprint = $fingerprint, source_hash = $source_hash, \
          pe_rows = {}, att_rows = {}, uda_rows = {}, delete_count = {}, \
-         dbnum_info_updates = {}, anchored_at = time::now() RETURN anchored_at;",
+         dbnum_info_updates = {}, pe_owner_rows = {}, \
+         anchored_at = time::now() RETURN anchored_at;",
         request.dbnum,
         request.to_sesno,
+        request.source.as_str(),
         request.dbnum,
         request.to_sesno,
         request.from_sesno,
@@ -570,16 +644,14 @@ async fn create_immutable_anchor(
         counts.att_rows,
         counts.uda_rows,
         counts.delete_count,
-        counts.dbnum_info_updates
+        counts.dbnum_info_updates,
+        counts.pe_owner_rows
     );
     let mut response = project_primary_db()
         .query(sql)
         .bind(("source", request.source.as_str().to_string()))
         .bind(("fingerprint", request.fingerprint.clone()))
-        .bind((
-            "source_observation_hash",
-            request.source_observation_hash.clone(),
-        ))
+        .bind(("source_hash", request.source_hash.clone()))
         .await
         .map_err(|error| VersionCommitError::Storage(error.into()))?
         .check()
@@ -590,6 +662,128 @@ async fn create_immutable_anchor(
     anchored_at
         .map(|value| value.to_string())
         .ok_or_else(|| VersionCommitError::Storage(anyhow!("anchor returned no anchored_at")))
+}
+
+/// 发布模型生成完成锚点。
+///
+/// 仅在调用方确认全部模型写入和已启用的后处理成功后调用。同一
+/// `(dbnum, sesno)` 成功重跑会刷新 `anchored_at`，失败路径不得调用。
+pub async fn write_model_gen_anchor(dbnum: u32, sesno: u32) -> anyhow::Result<ModelGenAnchor> {
+    crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
+    let sql = format!(
+        "UPSERT sesno_version_anchor:[{dbnum}, {sesno}, 'model_gen'] SET \
+         dbnum = {dbnum}, sesno = {sesno}, source = 'model_gen', \
+         anchored_at = time::now(), note = 'model generation completed' \
+         RETURN anchored_at;"
+    );
+    let mut response = project_primary_db().query(sql).await?.check()?;
+    let anchored_at: Option<Datetime> = response.take((0, "anchored_at"))?;
+    let anchored_at = anchored_at
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow!("model_gen anchor returned no anchored_at"))?;
+    Ok(ModelGenAnchor {
+        dbnum,
+        sesno,
+        source: "model_gen".to_string(),
+        anchored_at,
+    })
+}
+
+/// 读取指定 dbnum 在 `dbnum_info_table` 中的当前 sesno。
+pub async fn current_dbnum_sesnos(dbnums: &[u32]) -> anyhow::Result<BTreeMap<u32, u32>> {
+    if dbnums.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let ids = dbnums
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table \
+         WHERE dbnum IN [{ids}] GROUP BY dbnum;"
+    );
+    let mut response = project_primary_db().query(sql).await?.check()?;
+    let rows: Vec<CurrentSesnoRow> = response.take(0)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let Ok(dbnum) = u32::try_from(row.dbnum) else {
+            continue;
+        };
+        let Some(sesno) = row.sesno.and_then(|value| u32::try_from(value).ok()) else {
+            continue;
+        };
+        out.insert(dbnum, sesno);
+    }
+    Ok(out)
+}
+
+async fn all_current_dbnum_sesnos() -> anyhow::Result<BTreeMap<u32, u32>> {
+    let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table GROUP BY dbnum;";
+    let mut response = project_primary_db().query(sql).await?.check()?;
+    let rows: Vec<CurrentSesnoRow> = response.take(0)?;
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let Ok(dbnum) = u32::try_from(row.dbnum) else {
+            continue;
+        };
+        let Some(sesno) = row.sesno.and_then(|value| u32::try_from(value).ok()) else {
+            continue;
+        };
+        out.insert(dbnum, sesno);
+    }
+    Ok(out)
+}
+
+/// 在一次完整/手动模型生成及其后处理全部成功后，为参与 dbnum 发布 `model_gen` 锚点。
+///
+/// 增量管线不能使用本函数：它必须按本次已提交 data anchor 的实际结束 sesno 发布。
+pub async fn publish_model_gen_anchors_after_generation(
+    db_option: &crate::options::DbOptionExt,
+    generation_success: bool,
+    stage: &str,
+    allow_all_when_unscoped: bool,
+) -> anyhow::Result<Vec<ModelGenAnchor>> {
+    if !generation_success
+        || !db_option.use_surrealdb
+        || !db_option.model_writer_mode.writes_to_surreal()
+        || db_option.gen_model_dry_run
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut requested_dbnums = db_option.inner.manual_db_nums.clone().unwrap_or_default();
+    requested_dbnums.sort_unstable();
+    requested_dbnums.dedup();
+    let sesnos = if requested_dbnums.is_empty() && allow_all_when_unscoped {
+        all_current_dbnum_sesnos().await?
+    } else if requested_dbnums.is_empty() {
+        anyhow::bail!("{stage} 成功但无法确定参与 dbnum，拒绝发布 model_gen 锚点");
+    } else {
+        let resolved = current_dbnum_sesnos(&requested_dbnums).await?;
+        for dbnum in &requested_dbnums {
+            if !resolved.contains_key(dbnum) {
+                anyhow::bail!(
+                    "{stage} 成功但 dbnum_info_table 缺少 dbnum={dbnum} 当前 sesno，拒绝发布部分 model_gen 锚点"
+                );
+            }
+        }
+        resolved
+    };
+    if sesnos.is_empty() {
+        anyhow::bail!("{stage} 成功但 dbnum_info_table 中没有可锚定的 dbnum/sesno");
+    }
+
+    let mut anchors = Vec::with_capacity(sesnos.len());
+    for (dbnum, sesno) in sesnos {
+        let anchor = write_model_gen_anchor(dbnum, sesno).await?;
+        println!(
+            "✅ model_gen 锚点已发布: stage={} dbnum={} sesno={} anchored_at={}",
+            stage, anchor.dbnum, anchor.sesno, anchor.anchored_at
+        );
+        anchors.push(anchor);
+    }
+    Ok(anchors)
 }
 
 #[derive(Debug)]
@@ -662,12 +856,16 @@ fn next_owner() -> String {
 /// 有意不读 `dbnum_info_table` 优先：Commit Pending 时该表可能领先锚点，
 /// 以它为准会静默跳过半写区间；以锚点为准则重试同一区间并被 PendingCommit 拒绝，
 /// 直到人工 `--recover-pending`。
+///
+/// 它同时是 `commit_while_leased` 连续性门禁（`ContinuityGap`）的基准水位，
+/// 增量提交的 `from_sesno` 必须与该值衔接（`<= watermark + 1`）。
 pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
     let sql = format!(
-        "math::max(array::flatten([SELECT VALUE sesno FROM sesno_version_anchor WHERE dbnum = {dbnum}]));\n\
+        "math::max(array::flatten([SELECT VALUE sesno FROM sesno_version_anchor \
+             WHERE dbnum = {dbnum} AND source IN ['full', 'incremental']]));\n\
          math::max(array::flatten([SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {dbnum}]));"
     );
-    let mut response = project_primary_db().query(sql).await?;
+    let mut response = project_primary_db().query(sql).await?.check()?;
     // 语句级取值：表不存在（例如从未跑过版本提交的存量站点没有
     // `sesno_version_anchor`）按"无记录"处理，其余语句错误照常上抛。
     let anchored = match response.take::<Option<u32>>(0) {

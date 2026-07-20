@@ -746,19 +746,33 @@ impl TreeIndexManager {
         refnos
     }
 
-    /// 仅基于 TreeIndex 查询“直接子节点元素列表”（不访问 SurrealDB）。
+    /// 仅基于层级索引查询“直接子节点元素列表”（不访问属性表）。
+    ///
+    /// specs/023 M2 双源：pe_owner（默认）走 pe 快照（增量后新鲜）；
+    /// `AIOS_TREE_QUERY_SOURCE=tree` 回退 `.tree` 文件。
     ///
     /// 用途：
     /// - BRAN/HANG 生成路径中收集子元件（管件）集合
     /// - cache-only 模式下的过滤/分组查询
     ///
     /// 注意：
-    /// - TreeIndex 不包含 name/status/lock 等运行期字段，这里仅构造满足生成流水线所需的最小 SPdmsElement：
+    /// - 索引不包含 name/status/lock 等运行期字段，这里仅构造满足生成流水线所需的最小 SPdmsElement：
     ///   refno/owner/noun/dbnum/sesno（其余字段保持默认值）。
     pub async fn collect_children_elements_from_tree(
         parent: RefnoEnum,
     ) -> anyhow::Result<Vec<SPdmsElement>> {
         let dbnum = Self::resolve_dbnum_for_refno(parent)?;
+
+        if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+            let snap =
+                crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum).await?;
+            let child_u64s = snap.collect_children(parent.refno(), &TreeQueryFilter::default());
+            return Ok(Self::metas_to_min_elements(
+                child_u64s.into_iter().filter_map(|c| snap.node_meta(c)),
+                dbnum,
+            ));
+        }
+
         let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
         let index = manager.load_index(dbnum)?;
 
@@ -767,34 +781,23 @@ impl TreeIndexManager {
             .query_children(parent_u64, TreeQueryFilter::default())
             .await?;
 
-        let mut out: Vec<SPdmsElement> = Vec::with_capacity(child_u64s.len());
-        for child in child_u64s {
-            let Some(meta) = index.node_meta(child) else {
-                continue;
-            };
-            let mut ele = SPdmsElement::default();
-            ele.refno = RefnoEnum::from(meta.refno);
-            ele.owner = RefnoEnum::from(meta.owner);
-            ele.noun = db1_dehash(meta.noun);
-            ele.dbnum = dbnum as i32;
-            ele.sesno = 0;
-            // name/status_code/lock/deleted/... 保持默认值（空/false/None）
-            out.push(ele);
-        }
-
-        Ok(out)
+        Ok(Self::metas_to_min_elements(
+            child_u64s.into_iter().filter_map(|c| index.node_meta(c)),
+            dbnum,
+        ))
     }
 
     /// 收集 BRAN 下所有 CATE/管件子孙节点（含孙子层，用于修复 ELBO 等非直子场景）
     ///
     /// 当 ELBO 等管件不是 BRAN 的直接子节点（如 BRAN->CONN->ELBO）时，
     /// `collect_children_elements_from_tree` 会漏掉。本方法用 BFS 子孙收集 + BRAN_COMPONENT 过滤。
+    ///
+    /// specs/023 M2 双源：pe_owner（默认）走 pe 快照——修 §0-3（BRAN 增量新增管件
+    /// 从旧 `.tree` 收集不到被静默漏掉）；`AIOS_TREE_QUERY_SOURCE=tree` 回退旧路径。
     pub async fn collect_bran_cate_descendant_elements_from_tree(
         parent: RefnoEnum,
     ) -> anyhow::Result<Vec<SPdmsElement>> {
         let dbnum = Self::resolve_dbnum_for_refno(parent)?;
-        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-        let index = manager.load_index(dbnum)?;
 
         let noun_hashes: std::collections::HashSet<u32> = BRAN_COMPONENT_NOUN_NAMES
             .iter()
@@ -809,23 +812,44 @@ impl TreeIndexManager {
             },
             prune_on_match: false,
         };
-        let descendant_u64s = index.collect_descendants_bfs(parent.refno(), &options);
 
-        let mut out: Vec<SPdmsElement> = Vec::with_capacity(descendant_u64s.len());
-        for child in descendant_u64s {
-            let Some(meta) = index.node_meta(child) else {
-                continue;
-            };
-            let mut ele = SPdmsElement::default();
-            ele.refno = RefnoEnum::from(meta.refno);
-            ele.owner = RefnoEnum::from(meta.owner);
-            ele.noun = db1_dehash(meta.noun);
-            ele.dbnum = dbnum as i32;
-            ele.sesno = 0;
-            out.push(ele);
+        if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+            let snap =
+                crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum).await?;
+            let descendant_u64s = snap.collect_descendants_bfs(parent.refno(), &options);
+            return Ok(Self::metas_to_min_elements(
+                descendant_u64s.into_iter().filter_map(|c| snap.node_meta(c)),
+                dbnum,
+            ));
         }
 
-        Ok(out)
+        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
+        let index = manager.load_index(dbnum)?;
+        let descendant_u64s = index.collect_descendants_bfs(parent.refno(), &options);
+
+        Ok(Self::metas_to_min_elements(
+            descendant_u64s.into_iter().filter_map(|c| index.node_meta(c)),
+            dbnum,
+        ))
+    }
+
+    /// meta → 最小 SPdmsElement（refno/owner/noun/dbnum，其余默认值）。
+    fn metas_to_min_elements(
+        metas: impl Iterator<Item = aios_core::tree_query::TreeNodeMeta>,
+        dbnum: u32,
+    ) -> Vec<SPdmsElement> {
+        metas
+            .map(|meta| {
+                let mut ele = SPdmsElement::default();
+                ele.refno = RefnoEnum::from(meta.refno);
+                ele.owner = RefnoEnum::from(meta.owner);
+                ele.noun = db1_dehash(meta.noun);
+                ele.dbnum = dbnum as i32;
+                ele.sesno = 0;
+                // name/status_code/lock/deleted/... 保持默认值（空/false/None）
+                ele
+            })
+            .collect()
     }
 
     /// 检查节点是否存在

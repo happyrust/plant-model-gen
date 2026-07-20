@@ -67,7 +67,7 @@ use serde_json::json;
 
 use sha2::{Digest, Sha256};
 
-use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+use crate::fast_model::gen_model::model_record_id::model_refno_range;
 
 use crate::fast_model::export_model::export_common::{ExportData, TubiRecord, collect_export_data};
 
@@ -85,6 +85,9 @@ use crate::fast_model::instance_cache::InstanceCacheManager;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
+
+// specs/023 M2：层级枚举走双源视图（pe_owner 快照默认 / .tree 回退）
+use crate::fast_model::gen_model::hier_view::HierView;
 
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 
@@ -415,7 +418,7 @@ pub async fn export_prepack_lod_for_refnos(
                 WHERE owner_type = 'EQUI' AND owner_refno IN $owner_refnos
             "#
             );
-            let mut resp = aios_core::model_primary_db()
+            let mut resp = aios_core::project_primary_db()
                 .query(sql)
                 .bind(("owner_refnos", owner_refnos))
                 .await
@@ -618,7 +621,7 @@ pub async fn export_prepack_lod_for_refnos(
                 WHERE owner_type in ['BRAN', 'HANG'] AND owner_refno IN $owner_refnos
             "#
             );
-            let mut resp = aios_core::model_primary_db()
+            let mut resp = aios_core::project_primary_db()
                 .query(sql)
                 .bind(("owner_refnos", owner_refnos))
                 .await
@@ -665,7 +668,7 @@ pub async fn export_prepack_lod_for_refnos(
                 WHERE owner_type = 'EQUI' AND owner_refno IN $owner_refnos
             "#
             );
-            let mut resp = aios_core::model_primary_db()
+            let mut resp = aios_core::project_primary_db()
                 .query(sql)
                 .bind(("owner_refnos", owner_refnos))
                 .await
@@ -2284,7 +2287,9 @@ pub async fn export_all_relates_prepack_lod(
                     .await
                     .unwrap_or_default()
             } else {
-                query_provider::query_by_noun_all_db(&nouns).unwrap_or_default()
+                query_provider::query_by_noun_all_db(&nouns)
+                    .await
+                    .unwrap_or_default()
             }
         }
     };
@@ -2353,13 +2358,13 @@ pub async fn export_all_relates_prepack_lod(
     );
 
     let equi_refnos: Vec<RefnoEnum> = if let Some(dbnum) = dbnum {
-        let mut resp = aios_core::model_primary_db()
+        let mut resp = aios_core::project_primary_db()
             .query(&equi_sql)
             .bind(("dbnum", dbnum))
             .await?;
         resp.take(0)?
     } else {
-        aios_core::model_primary_db()
+        aios_core::project_primary_db()
             .query_take(&equi_sql, 0)
             .await?
     };
@@ -2377,7 +2382,7 @@ pub async fn export_all_relates_prepack_lod(
         "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(id)))",
         db_filter
     );
-    let mut query = aios_core::model_primary_db()
+    let mut query = aios_core::project_primary_db()
         .query(&sql_all)
         .bind(("owner_types", owner_types_filter));
     if let Some(dbnum) = dbnum {
@@ -2597,7 +2602,9 @@ pub async fn export_all_relates_prepack_lod_parquet(
                     .await
                     .unwrap_or_default()
             } else {
-                query_provider::query_by_noun_all_db(&nouns).unwrap_or_default()
+                query_provider::query_by_noun_all_db(&nouns)
+                    .await
+                    .unwrap_or_default()
             }
         }
     };
@@ -2655,13 +2662,13 @@ pub async fn export_all_relates_prepack_lod_parquet(
     );
 
     let equi_refnos: Vec<RefnoEnum> = if let Some(dbnum) = dbnum {
-        let mut resp = aios_core::model_primary_db()
+        let mut resp = aios_core::project_primary_db()
             .query(&equi_sql)
             .bind(("dbnum", dbnum))
             .await?;
         resp.take(0)?
     } else {
-        aios_core::model_primary_db()
+        aios_core::project_primary_db()
             .query_take(&equi_sql, 0)
             .await?
     };
@@ -2677,7 +2684,7 @@ pub async fn export_all_relates_prepack_lod_parquet(
         "SELECT value in.id FROM inst_relate WHERE {} AND (array::len($owner_types) = 0 OR owner_type IN $owner_types) AND record::exists(type::record('inst_relate_aabb', record::id(id)))",
         db_filter
     );
-    let mut query = aios_core::model_primary_db()
+    let mut query = aios_core::project_primary_db()
         .query(&sql_all)
         .bind(("owner_types", owner_types_filter));
     if let Some(dbnum) = dbnum {
@@ -3248,7 +3255,7 @@ async fn query_trans_by_hashes(
 
     verbose: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    use aios_core::model_primary_db;
+    use aios_core::project_primary_db;
 
     let mut result = HashMap::new();
 
@@ -3272,7 +3279,7 @@ async fn query_trans_by_hashes(
             println!("   查询 trans: {} 个", chunk.len());
         }
 
-        let rows: Vec<TransQueryRow> = model_primary_db()
+        let rows: Vec<TransQueryRow> = project_primary_db()
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
@@ -3349,7 +3356,7 @@ async fn query_aabb_by_hashes(
 
     verbose: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
-    use aios_core::model_primary_db;
+    use aios_core::project_primary_db;
 
     let mut result = HashMap::new();
 
@@ -3371,7 +3378,7 @@ async fn query_aabb_by_hashes(
             println!("   查询 aabb: {} 个", chunk.len());
         }
 
-        let rows: Vec<AabbQueryRow> = model_primary_db()
+        let rows: Vec<AabbQueryRow> = project_primary_db()
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
@@ -3639,31 +3646,34 @@ pub async fn export_dbnum_instances_json(
     fs::create_dir_all(output_dir)
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
-    // 1. 使用 TreeIndex 获取 dbnum 下的所有 refno（或指定 root_refno 的 visible 子孙）
+    // 1. 使用层级视图获取 dbnum 下的所有 refno（或指定 root_refno 的 visible 子孙）
+    //    specs/023 M2：pe_owner 快照默认 / .tree 回退（AIOS_TREE_QUERY_SOURCE=tree）
 
     if verbose {
-        println!("🔍 加载 TreeIndex...");
+        println!("🔍 加载层级视图...");
     }
 
-    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-
-    let tree_dir = tree_manager.tree_dir().to_path_buf();
+    let tree_dir = TreeIndexManager::with_default_dir(vec![dbnum])
+        .tree_dir()
+        .to_path_buf();
 
     let tree_path = tree_dir.join(format!("{}.tree", dbnum));
 
-    // 尝试加载 TreeIndex；若提供了 root_refno 且 TreeIndex 不可用，
-
+    // 尝试加载层级视图；若提供了 root_refno 且视图不可用，
     // 可直接从 inst_relate 查询该 owner 的子节点（无需 pe 表数据）。
 
-    // Tree 文件由预检查阶段（precheck）统一保证：若 tree 文件缺失，请先运行预检查。
-
-    let tree_index_result = load_index_with_large_stack(&tree_dir, dbnum)
-        .with_context(|| format!("加载 TreeIndex 失败: {}", tree_path.display()));
+    let hier_view_result = HierView::load(vec![dbnum]).await.with_context(|| {
+        format!(
+            "加载层级视图失败: dbnum={}（tree 回退路径对应 {}）",
+            dbnum,
+            tree_path.display()
+        )
+    });
 
     // 获取待导出的 refno 列表
 
     let mut all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
-        if let Ok(ref _tree_index) = tree_index_result {
+        if let Ok(ref _hier_view) = hier_view_result {
             // 与 web/v3/parquet 导出保持一致：
             // root_refno 模式优先按“深度可见实例”收集子树，而不是只抓可见几何节点。
             // 这样 BRAN/HANG 根在导出 instances.json 时不会意外得到空集合。
@@ -3680,11 +3690,11 @@ pub async fn export_dbnum_instances_json(
             list.sort_by_key(|r| r.to_string());
             list
         } else {
-            // TreeIndex 不可用：直接从 inst_relate 查询该 owner 的子节点
+            // 层级视图不可用：直接从 inst_relate 查询该 owner 的子节点
 
             if verbose {
                 println!(
-                    "⚠️  TreeIndex 不可用，直接从 inst_relate 查询 {} 的子节点...",
+                    "⚠️  层级视图不可用，直接从 inst_relate 查询 {} 的子节点...",
                     root
                 );
             }
@@ -3694,7 +3704,8 @@ pub async fn export_dbnum_instances_json(
                 root
             );
 
-            let refno_strs: Vec<String> = aios_core::model_primary_db().query_take(&sql, 0).await?;
+            let refno_strs: Vec<String> =
+                aios_core::project_primary_db().query_take(&sql, 0).await?;
 
             if refno_strs.is_empty() {
                 anyhow::bail!("inst_relate 中未找到 owner_refno={} 的子节点", root);
@@ -3714,16 +3725,12 @@ pub async fn export_dbnum_instances_json(
                 .collect()
         }
     } else {
-        // 无 root_refno：必须有 TreeIndex
+        // 无 root_refno：必须有层级视图
 
-        let tree_index = tree_index_result
-            .with_context(|| format!("按需生成 TreeIndex 失败: {}", tree_path.display()))?;
+        let hier_view = hier_view_result
+            .with_context(|| format!("层级视图不可用（dbnum={}），无法枚举全库 refno", dbnum))?;
 
-        tree_index
-            .all_refnos()
-            .into_iter()
-            .map(RefnoEnum::from)
-            .collect()
+        hier_view.all_refnos()
     };
 
     all_refnos.sort_by_key(|r| r.to_string());
@@ -3874,7 +3881,7 @@ pub async fn export_dbnum_instances_json(
 
             for owner_refno in owners_chunk {
                 let owner_key = owner_refno.to_pe_key();
-                let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
+                let tubi_range = model_refno_range("tubi_relate", *owner_refno);
 
                 sql_batch.push_str(&format!(
                     r#"
@@ -3883,7 +3890,7 @@ pub async fn export_dbnum_instances_json(
 
                         {owner_key} as refno,
 
-                        id[3] as index,
+                        id[2] as index,
 
                         in as leave,
 
@@ -3909,7 +3916,7 @@ pub async fn export_dbnum_instances_json(
                 ));
             }
 
-            let mut resp = aios_core::model_primary_db()
+            let mut resp = aios_core::project_primary_db()
                 .query_response(&sql_batch)
                 .await?;
 
@@ -5933,7 +5940,7 @@ pub async fn export_global_trans_aabb_json(
             PAGE_SIZE, trans_offset
         );
 
-        let trans_results: Vec<TransRow> = aios_core::model_primary_db()
+        let trans_results: Vec<TransRow> = aios_core::project_primary_db()
             .query_take(&trans_sql, 0)
             .await
             .unwrap_or_default();
@@ -6041,7 +6048,7 @@ pub async fn export_global_trans_aabb_json(
             PAGE_SIZE, aabb_offset
         );
 
-        let aabb_results: Vec<AabbRow> = aios_core::model_primary_db()
+        let aabb_results: Vec<AabbRow> = aios_core::project_primary_db()
             .query_take(&aabb_sql, 0)
             .await
             .unwrap_or_default();

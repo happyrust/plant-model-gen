@@ -96,8 +96,6 @@ pub struct TaskParameters {
     // 同步任务参数
     #[serde(rename = "syncMode")]
     pub sync_mode: Option<String>,
-    #[serde(rename = "targetSesno")]
-    pub target_sesno: Option<u32>,
 
     // 通用参数
     #[serde(rename = "maxConcurrent")]

@@ -707,7 +707,7 @@ pub async fn query_inst_relate_batch(
     include_name: bool,
     verbose: bool,
 ) -> Result<Vec<InstRelateRow>> {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
 
     if refnos.is_empty() {
         return Ok(Vec::new());
@@ -752,7 +752,7 @@ pub async fn query_inst_relate_batch(
             "#
         );
 
-        let mut chunk_rows: Vec<InstRelateRow> = model_primary_db().query_take(&sql, 0).await?;
+        let mut chunk_rows: Vec<InstRelateRow> = project_primary_db().query_take(&sql, 0).await?;
         rows.append(&mut chunk_rows);
     }
 
@@ -767,7 +767,7 @@ pub async fn query_inst_relate_aabb_batch(
     refnos: &[RefnoEnum],
     verbose: bool,
 ) -> Result<std::collections::HashMap<RefnoEnum, String>> {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
 
     let mut map = std::collections::HashMap::new();
     if refnos.is_empty() {
@@ -802,7 +802,7 @@ pub async fn query_inst_relate_aabb_batch(
             "#
         );
 
-        let chunk_rows: Vec<InstRelateAabbRow> = model_primary_db().query_take(&sql, 0).await?;
+        let chunk_rows: Vec<InstRelateAabbRow> = project_primary_db().query_take(&sql, 0).await?;
 
         for row in chunk_rows {
             if let Some(hash) = row.aabb_hash {

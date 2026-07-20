@@ -9,7 +9,6 @@ pub mod cache_flush;
 pub mod foyer_cache;
 pub mod instance_cache;
 pub mod model_cache;
-pub mod model_store;
 
 pub mod reuse_unit;
 

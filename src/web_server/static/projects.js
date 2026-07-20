@@ -500,8 +500,7 @@
         `<div><span class=\"text-gray-500\">生成模型/网格/空间树：</span>${cfg.gen_model?'是':'否'} / ${cfg.gen_mesh?'是':'否'} / ${cfg.gen_spatial_tree?'是':'否'}</div>`,
         `<div><span class=\"text-gray-500\">布尔运算：</span>${cfg.apply_boolean_operation?'是':'否'}</div>`,
         `<div><span class=\"text-gray-500\">网格容差：</span>${escHtml(cfg.mesh_tol_ratio)}</div>`,
-        cfg.room_keyword? `<div><span class=\"text-gray-500\">房间关键字：</span>${escHtml(cfg.room_keyword)}</div>`: '',
-        cfg.target_sesno? `<div><span class=\"text-gray-500\">目标会话号：</span>${escHtml(cfg.target_sesno)}</div>`: ''
+        cfg.room_keyword? `<div><span class=\"text-gray-500\">房间关键字：</span>${escHtml(cfg.room_keyword)}</div>`: ''
       ].filter(Boolean);
 
       const metaLines = [];
@@ -599,7 +598,6 @@
         '<div class=\"grid grid-cols-1 md:grid-cols-2 gap-2 text-sm\">',
         `  <div><span class=\"text-gray-500\">网格容差比率：</span>${escHtml(cfg.mesh_tol_ratio)}</div>`,
         cfg.room_keyword ? `  <div><span class=\"text-gray-500\">房间关键字：</span>${escHtml(cfg.room_keyword)}</div>` : '',
-        cfg.target_sesno ? `  <div><span class=\"text-gray-500\">目标会话号：</span>${escHtml(cfg.target_sesno)}</div>` : '',
         '</div></div>'
       ].filter(Boolean);
 
@@ -1294,8 +1292,7 @@
         gen_spatial_tree: formData.has('gen_spatial_tree'),
         apply_boolean_operation: formData.has('apply_boolean_operation'),
         mesh_tol_ratio: parseFloat(formData.get('mesh_tol_ratio')),
-        room_keyword: formData.get('room_keyword'),
-        target_sesno: null
+        room_keyword: formData.get('room_keyword')
       };
       
       // 发送更新请求

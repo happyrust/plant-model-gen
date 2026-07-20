@@ -17,7 +17,6 @@ pub async fn trigger_file_download(
     _state: State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    use crate::data_interface::tidb_manager::AiosDBManager;
     use crate::mqtt_service::SyncE3dFileMsg;
 
     let file_names = request["file_names"]
@@ -43,7 +42,8 @@ pub async fn trigger_file_download(
     // 创建一个临时的 watcher（实际使用时应该从全局状态获取）
     let watcher = pdms_io::watch::PdmsWatcher::new(Vec::<std::path::PathBuf>::new());
 
-    match AiosDBManager::exec_delta_clone_remotes(&watcher, sync_e3d).await {
+    match crate::data_interface::mqtt_file_sync::exec_delta_clone_remotes(&watcher, sync_e3d).await
+    {
         Ok(_) => Ok(Json(json!({
             "status": "success",
             "message": "文件下载已触发"

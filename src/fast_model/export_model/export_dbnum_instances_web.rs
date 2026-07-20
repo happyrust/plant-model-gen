@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::types::SurrealValue;
 
-use crate::fast_model::gen_model::model_record_id::model_refno_sesno_range;
+use crate::fast_model::gen_model::model_record_id::model_refno_range;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
@@ -155,7 +155,7 @@ async fn resolve_trans_to_matrices(
     hashes: &HashSet<String>,
     verbose: bool,
 ) -> Result<HashMap<String, DMat4>> {
-    use aios_core::model_primary_db;
+    use aios_core::project_primary_db;
 
     let mut result = HashMap::new();
     if hashes.is_empty() {
@@ -174,7 +174,7 @@ async fn resolve_trans_to_matrices(
             println!("   查询 trans: {} 个", chunk.len());
         }
 
-        let rows: Vec<TransQueryRow> = model_primary_db()
+        let rows: Vec<TransQueryRow> = project_primary_db()
             .query_take(&sql, 0)
             .await
             .unwrap_or_default();
@@ -294,12 +294,12 @@ async fn query_tubi_relate_web(
     for owners_chunk in owner_refnos.chunks(50) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
+            let tubi_range = model_refno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
                     {owner_refno} as refno,
-                    id[3] as index,
+                    id[2] as index,
                     in as leave,
                     record::id(world_trans) as world_trans_hash,
                     record::id(geo) as geo_hash,
@@ -310,7 +310,7 @@ async fn query_tubi_relate_web(
             ));
         }
 
-        let mut resp = aios_core::model_primary_db()
+        let mut resp = aios_core::project_primary_db()
             .query_response(&sql_batch)
             .await?;
 
@@ -383,14 +383,11 @@ pub async fn export_dbnum_instances_web(
     });
 
     // =========================================================================
-    // 1. 加载 TreeIndex → 获取 refno 列表
+    // 1. 加载层级视图（specs/023 M2：pe_owner 快照默认 / .tree 回退）→ 获取 refno 列表
     // =========================================================================
     if verbose {
-        println!("🔍 加载 TreeIndex...");
+        println!("🔍 加载层级视图...");
     }
-
-    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let tree_dir = tree_manager.tree_dir().to_path_buf();
 
     let all_refnos: Vec<RefnoEnum> = if let Some(root) = root_refno {
         use crate::fast_model::query_compat::query_deep_visible_inst_refnos;
@@ -404,7 +401,18 @@ pub async fn export_dbnum_instances_web(
         }
         list.sort_by_key(|r| r.to_string());
         list
+    } else if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+        crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum)
+            .await
+            .with_context(|| format!("加载 pe 快照失败: dbnum={}", dbnum))?
+            .all_refnos()
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect()
     } else {
+        let tree_dir = TreeIndexManager::with_default_dir(vec![dbnum])
+            .tree_dir()
+            .to_path_buf();
         let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
             .with_context(|| format!("加载 TreeIndex 失败: dbnum={}", dbnum))?;
         tree_index

@@ -8,7 +8,7 @@ use aios_core::pdms_types::*;
 use aios_core::types::*;
 use aios_core::{
     SurrealQueryExt, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, get_db_option,
-    model_primary_db, model_query_response,
+    project_primary_db,
 };
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -27,7 +27,7 @@ use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
 use super::model_record_id::{
-    geo_relate_id, geo_relate_id_for_inst, model_refno_id, model_refno_sesno_range, neg_relate_id,
+    geo_relate_id, geo_relate_id_for_inst, model_refno_id, model_refno_range, neg_relate_id,
     ngmr_relate_id,
 };
 use crate::data_interface::tidb_manager::AiosDBManager;
@@ -153,9 +153,12 @@ pub async fn save_tubi_info_batch_with_replace(
         }
         if !rows.is_empty() {
             let sql = format!("INSERT IGNORE INTO tubi_info [{}];", rows.join(","));
-            model_query_response(&sql)
+            project_primary_db()
+                .query_response(&sql)
                 .await
-                .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?;
+                .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?
+                .check()
+                .with_context(|| format!("写入 tubi_info 语句失败 (insert ignore): {}", written))?;
         }
     }
 
@@ -168,7 +171,7 @@ async fn delete_inst_relate_by_in_with_dbnum(
     dbnum: u32,
 ) -> anyhow::Result<()> {
     for sql in build_delete_inst_relate_by_in_sql(refnos, chunk_size, Some(dbnum)) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -179,7 +182,7 @@ async fn delete_geo_relate_by_inst_info_ids(
     chunk_size: usize,
 ) -> anyhow::Result<()> {
     for sql in build_delete_geo_relate_by_inst_info_ids_sql(inst_info_ids, chunk_size) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -195,7 +198,7 @@ async fn delete_boolean_relations_by_carriers(
     chunk_size: usize,
 ) -> anyhow::Result<()> {
     for sql in build_delete_boolean_relations_by_carriers_sql(carrier_refnos, chunk_size) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -215,7 +218,7 @@ async fn delete_inst_relate_bool_records(
     }
 
     for sql in build_delete_inst_relate_bool_records_sql(refnos, chunk_size) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -235,7 +238,7 @@ pub(crate) async fn delete_tubi_relate_by_branch_refnos(
     }
 
     for sql in build_delete_tubi_relate_by_branch_refnos_sql(branch_refnos, chunk_size) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -276,7 +279,7 @@ fn build_delete_tubi_relate_by_branch_refnos_sql(
         for branch_refno in chunk {
             statements.push(format!(
                 "LET $ids = SELECT VALUE id FROM {}; DELETE $ids;",
-                model_refno_sesno_range("tubi_relate", *branch_refno)
+                model_refno_range("tubi_relate", *branch_refno)
             ));
         }
         out.push(statements.join("\n"));
@@ -296,7 +299,7 @@ fn build_delete_model_records_by_refno_sql(refno: RefnoEnum) -> String {
         sql.push_str(&format!("DELETE {};\n", model_refno_id(table, refno)));
     }
     for table in ["neg_relate", "ngmr_relate", "geo_relate"] {
-        let range = model_refno_sesno_range(table, refno);
+        let range = model_refno_range(table, refno);
         sql.push_str(&format!(
             "LET $ids = SELECT VALUE id FROM {range}; DELETE $ids;\n"
         ));
@@ -326,7 +329,7 @@ mod tests {
         let sqls = build_delete_tubi_relate_by_branch_refnos_sql(&refnos, 100);
         assert_eq!(sqls.len(), 1);
         for refno in refnos {
-            assert!(sqls[0].contains(&model_refno_sesno_range("tubi_relate", refno)));
+            assert!(sqls[0].contains(&model_refno_range("tubi_relate", refno)));
         }
     }
 
@@ -361,7 +364,7 @@ mod tests {
 /// 导致“代码已修、--regen-model 已跑、但数据库仍是旧值”的假象。
 async fn delete_inst_geo_by_hashes(geo_hashes: &[u64], chunk_size: usize) -> anyhow::Result<()> {
     for sql in build_delete_inst_geo_by_hashes_sql(geo_hashes, chunk_size) {
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
 }
@@ -446,7 +449,7 @@ async fn query_refno_dbnum_map(refnos: &[RefnoEnum], chunk_size: usize) -> HashM
             .join(",");
         let sql = format!("SELECT record::id(id) AS rid, dbnum FROM [{}];", ids);
 
-        match model_primary_db().query_response(&sql).await {
+        match project_primary_db().query_response(&sql).await {
             Ok(mut resp) => {
                 let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                 for row in rows {
@@ -673,7 +676,7 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
                 let mut cleanup_sql = String::new();
                 let mut geo_query_sql = String::new();
                 for refno in &chunk_vec {
-                    let geo_range = model_refno_sesno_range("geo_relate", *refno);
+                    let geo_range = model_refno_range("geo_relate", *refno);
                     geo_query_sql
                         .push_str(&format!("SELECT VALUE record::id(out) FROM {geo_range};\n"));
                     cleanup_sql.push_str(&build_delete_model_records_by_refno_sql(*refno));
@@ -681,9 +684,9 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
                 let mut geo_hashes = Vec::new();
                 if !geo_query_sql.trim().is_empty() {
-                    let mut resp = model_primary_db().query_response(&geo_query_sql).await?;
+                    let mut resp = project_primary_db().query_response(&geo_query_sql).await?;
                     for stmt_idx in 0..chunk_vec.len() {
-                        let rows: Vec<String> = resp.take(stmt_idx).unwrap_or_default();
+                        let rows: Vec<String> = resp.take(stmt_idx)?;
                         geo_hashes.extend(rows);
                     }
                 }
@@ -693,11 +696,14 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
                     .filter_map(|s| parse_inst_geo_hash(s))
                     .collect::<Vec<_>>();
                 if !hashes.is_empty() {
-                    let _ = delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await;
+                    delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await?;
                 }
 
                 if !cleanup_sql.trim().is_empty() {
-                    let _ = model_query_response(&cleanup_sql).await;
+                    project_primary_db()
+                        .query_response(&cleanup_sql)
+                        .await?
+                        .check()?;
                 }
 
                 Ok::<(), anyhow::Error>(())
@@ -705,11 +711,16 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
         })
         .buffer_unordered(limit_concurrency);
 
+    let mut cleanup_errors = Vec::new();
     while let Some(res) = chunk_stream.next().await {
         completed_chunks += 1;
         match res {
-            Ok(Err(e)) => eprintln!("[pre_cleanup_for_regen] range chunk 处理失败返回: {}", e),
-            Err(e) => eprintln!("[pre_cleanup_for_regen] range chunk tokio 任务崩溃: {}", e),
+            Ok(Err(e)) => cleanup_errors.push(format!(
+                "range chunk {completed_chunks}/{total_chunks} 处理失败: {e}"
+            )),
+            Err(e) => cleanup_errors.push(format!(
+                "range chunk {completed_chunks}/{total_chunks} tokio 任务崩溃: {e}"
+            )),
             _ => {}
         }
         if completed_chunks == 1
@@ -731,6 +742,12 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
             );
             last_progress = Instant::now();
         }
+    }
+    if !cleanup_errors.is_empty() {
+        anyhow::bail!(
+            "pre_cleanup_for_regen 未完整完成，禁止继续模型生成:\n{}",
+            cleanup_errors.join("\n")
+        );
     }
 
     if !bran_refnos.is_empty() {
@@ -1068,13 +1085,13 @@ pub async fn save_instance_data_with_report(
                 let sql = carrier_chunk
                     .iter()
                     .map(|carrier_refno| {
-                        let range = model_refno_sesno_range("geo_relate", *carrier_refno);
+                        let range = model_refno_range("geo_relate", *carrier_refno);
                         format!(
                             "SELECT id AS gr_id FROM {range} WHERE geo_type IN ['Neg', 'CataNeg'];"
                         )
                     })
                     .join("\n");
-                let mut resp = model_primary_db().query_response(&sql).await?;
+                let mut resp = project_primary_db().query_response(&sql).await?;
                 for (query_idx, carrier_refno) in carrier_chunk.iter().enumerate() {
                     let rows: Vec<serde_json::Value> = resp.take(query_idx).unwrap_or_default();
                     for row in rows {
@@ -1177,7 +1194,7 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                     target.to_pe_key(),
                     carrier.to_pe_key()
                 );
-                let rows: Vec<serde_json::Value> = model_primary_db()
+                let rows: Vec<serde_json::Value> = project_primary_db()
                     .query_take(&sql, 0)
                     .await
                     .unwrap_or_default();
@@ -2001,7 +2018,7 @@ impl TransactionBatcher {
                     || msg.contains("This transaction can be retried")
             }
 
-            // 注意：不要对 model_primary_db() 做 clone 再 query。
+            // 注意：不要对 project_primary_db() 做 clone 再 query。
             // 在当前 surrealdb client 实现中，clone 后可能丢失已选定的 namespace/database，
             // 从而随机触发 “Specify a namespace to use” 并导致整块事务回滚。
             //
@@ -2016,7 +2033,7 @@ impl TransactionBatcher {
                 attempt += 1;
 
                 let run_once = async {
-                    match model_query_response(&query).await {
+                    match project_primary_db().query_response(&query).await {
                         Ok(mut resp) => take_all_results_or_err!(resp),
                         Err(err) => Err(err),
                     }
@@ -2044,7 +2061,7 @@ impl TransactionBatcher {
                             );
                             let repair_sql = "REMOVE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb; \
 DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno;";
-                            let _ = model_query_response(repair_sql).await;
+                            let _ = project_primary_db().query_response(repair_sql).await;
                             continue;
                         }
 
@@ -2055,7 +2072,7 @@ DEFINE INDEX idx_inst_relate_aabb_refno ON TABLE inst_relate_aabb FIELDS refno;"
                             );
                             let repair_sql = "REMOVE INDEX unique_neg_relate ON TABLE neg_relate; \
 DEFINE INDEX unique_neg_relate ON TABLE neg_relate COLUMNS in, out UNIQUE;";
-                            let _ = model_query_response(repair_sql).await;
+                            let _ = project_primary_db().query_response(repair_sql).await;
                             continue;
                         }
 
@@ -2177,7 +2194,7 @@ pub async fn save_tubi_info_batch(
         let values: Vec<String> = chunk.iter().map(|e| e.value().to_surreal_json()).collect();
 
         let sql = format!("INSERT IGNORE INTO tubi_info [{}];", values.join(","));
-        model_query_response(&sql).await?;
+        project_primary_db().query_response(&sql).await?.check()?;
         submitted += chunk.len();
 
         debug_model_debug!(
@@ -2298,7 +2315,7 @@ pub async fn reconcile_missing_neg_relate(
             WHERE geo_type IN ['Neg', 'CataNeg']
               AND geom_refno IN [{pe_list}]"#
         );
-        let mut response = model_primary_db().query_response(&sql).await?;
+        let mut response = project_primary_db().query_response(&sql).await?;
         let neg_geos: Vec<serde_json::Value> = response.take(0)?;
         for val in &neg_geos {
             let gr_id = val
@@ -2356,7 +2373,7 @@ pub async fn reconcile_missing_neg_relate(
             "SELECT record::id(id) as carrier_id, record::id(owner) as parent_id FROM [{}];",
             carrier_chunk.join(",")
         );
-        let mut response = model_primary_db().query_response(&sql).await?;
+        let mut response = project_primary_db().query_response(&sql).await?;
         let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
         for row in rows {
             let carrier_id = row
@@ -2443,7 +2460,7 @@ pub async fn reconcile_missing_neg_relate(
             .collect::<Vec<_>>()
             .join(",");
         let check_sql = format!("SELECT VALUE record::id(in) FROM [{gr_id_list}]->neg_relate");
-        let mut check_resp = model_primary_db().query_response(&check_sql).await?;
+        let mut check_resp = project_primary_db().query_response(&check_sql).await?;
         let existing_vec: Vec<String> = check_resp.take(0).unwrap_or_default();
         existing.extend(existing_vec);
         if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_check_chunks {
@@ -2530,7 +2547,7 @@ pub async fn reconcile_missing_neg_relate(
                 "INSERT RELATION IGNORE INTO neg_relate [{}];",
                 relation_chunk.join(",")
             );
-            model_query_response(&sql).await?;
+            project_primary_db().query_response(&sql).await?.check()?;
             if chunk_idx == 0 || (chunk_idx + 1) % 50 == 0 || chunk_idx + 1 == total_insert_chunks {
                 println!(
                     "[reconcile] insert chunk {}/{} created_so_far={} elapsed_ms={}",
@@ -2618,7 +2635,7 @@ impl InstRelatePrecomputed {
                     "SELECT record::id(id) AS rid, dbnum, sesno FROM [{}];",
                     chunk.join(",")
                 );
-                match model_primary_db().query_response(&sql).await {
+                match project_primary_db().query_response(&sql).await {
                     Ok(mut resp) => {
                         let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                         for row in rows {
@@ -2653,7 +2670,7 @@ impl InstRelatePrecomputed {
                         "SELECT record::id(id) AS rid, date FROM [{}];",
                         chunk.join(",")
                     );
-                    match model_primary_db().query_response(&sql).await {
+                    match project_primary_db().query_response(&sql).await {
                         Ok(mut resp) => {
                             let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
                             for row in rows {

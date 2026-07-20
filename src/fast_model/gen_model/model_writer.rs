@@ -71,8 +71,7 @@ pub struct ModelWriterContractEvidence {
     pub runs_downstream_pipeline: bool,
     pub stages: Vec<ModelWriterStageReport>,
     /// Phase 1 raw tables intentionally NOT written by this backend.
-    /// Empty for surreal/drain-only; ducklake reports the 6 trait-gap tables
-    /// (tubi/transforms/refno_assoc) per goals/ducklake-model-writer/brief.md Q1=C scope.
+    /// Empty for surreal/drain-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_gap_tables: Vec<&'static str>,
 }
@@ -354,7 +353,7 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
             ));
         }
 
-        aios_core::model_primary_db()
+        aios_core::project_primary_db()
             .query(&update_sql)
             .await
             .map_err(|e| {
@@ -715,23 +714,6 @@ pub fn create_model_writer(
             missing_neg_carriers,
         )),
         ModelWriterMode::DrainOnly => Arc::new(DrainOnlyModelWriterBackend::new()),
-        ModelWriterMode::DuckLake => {
-            #[cfg(feature = "model-writer-ducklake")]
-            {
-                Arc::new(
-                    crate::fast_model::gen_model::model_writer_ducklake::DuckLakeModelWriterBackend::new(
-                        crate::fast_model::gen_model::model_writer_ducklake::DuckLakeConfig::default(),
-                    ),
-                )
-            }
-            #[cfg(not(feature = "model-writer-ducklake"))]
-            {
-                panic!(
-                    "ModelWriterMode::DuckLake reached create_model_writer without feature `model-writer-ducklake`; \
-                     validate_model_writer_features() must be called first (see goals/ducklake-model-writer/)"
-                )
-            }
-        }
     }
 }
 
@@ -756,22 +738,14 @@ pub async fn run_drain_only_sink(
 }
 
 pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContractEvidence {
-    let (
-        backend,
-        writes_to_surreal,
-        runs_downstream_pipeline,
-        drain_only_reason,
-        ducklake_phase2_skip,
-    ) = match mode {
-        ModelWriterMode::Surreal => ("surreal", true, true, None, false),
+    let (backend, writes_to_surreal, runs_downstream_pipeline, drain_only_reason) = match mode {
+        ModelWriterMode::Surreal => ("surreal", true, true, None),
         ModelWriterMode::DrainOnly => (
             "drain-only",
             false,
             false,
             Some("drain-only safely skips persistence and destructive stages"),
-            false,
         ),
-        ModelWriterMode::DuckLake => ("ducklake", false, false, None, true),
     };
 
     let lifecycle = [
@@ -790,37 +764,15 @@ pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContr
             Some(reason) if !matches!(stage, "init" | "base_batch" | "finalize") => {
                 ModelWriterStageReport::skipped(stage, reason, 0)
             }
-            _ if ducklake_phase2_skip && stage == "boolean_bridge" => {
-                ModelWriterStageReport::skipped(
-                    stage,
-                    "phase2 boolean tables out of scope for ducklake (goals/ducklake-model-writer)",
-                    0,
-                )
-            }
             _ => ModelWriterStageReport::implemented(stage),
         })
         .collect();
-
-    let known_gap_tables: Vec<&'static str> = if ducklake_phase2_skip {
-        // Mirror DUCKLAKE_KNOWN_GAP_TABLES from model_writer_ducklake.rs.
-        // Kept in sync manually; if either list changes, the other must
-        // change too. See goals/ducklake-model-writer/brief.md Q1=C scope.
-        vec![
-            "raw_tubi_info",
-            "raw_tubi_relate",
-            "raw_aabb(tubi)",
-            "raw_trans",
-            "raw_vec3(tubi)",
-        ]
-    } else {
-        Vec::new()
-    };
 
     ModelWriterContractEvidence {
         backend,
         writes_to_surreal,
         runs_downstream_pipeline,
         stages,
-        known_gap_tables,
+        known_gap_tables: Vec::new(),
     }
 }

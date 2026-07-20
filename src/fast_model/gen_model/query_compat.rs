@@ -17,10 +17,13 @@ use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
 use crate::fast_model::query_provider;
+// specs/023 M2：latest 层级查询主路径切 pe_owner 快照；`AIOS_TREE_QUERY_SOURCE=tree` 回退
+use crate::versioned_db::pe_owner_snapshot::{PeDbnumSnapshot, get_or_load_pe_snapshot};
+use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
 use aios_core::RefnoEnum;
 use aios_core::pdms_types::{TOTAL_NEG_NOUN_NAMES, VISBILE_GEO_NOUNS};
 use aios_core::tool::db_tool::db1_hash;
-use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter, TreeQueryOptions};
+use aios_core::tree_query::{TreeIndex, TreeNodeMeta, TreeQuery, TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
@@ -52,6 +55,11 @@ async fn load_tree_index_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<TreeI
     load_index_with_large_stack(&tree_dir, dbnum)
 }
 
+async fn load_snapshot_for_refno(refno: RefnoEnum) -> anyhow::Result<Arc<PeDbnumSnapshot>> {
+    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno)?;
+    get_or_load_pe_snapshot(dbnum).await
+}
+
 fn build_noun_hashes(nouns: &[&str]) -> Option<HashSet<u32>> {
     if nouns.is_empty() {
         None
@@ -80,7 +88,6 @@ async fn query_descendants_bfs(
     include_self: bool,
     range_str: Option<&str>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    let index = load_tree_index_for_refno(refno).await?;
     let options = TreeQueryOptions {
         include_self,
         max_depth: parse_max_depth(range_str),
@@ -90,6 +97,15 @@ async fn query_descendants_bfs(
         },
         prune_on_match: false,
     };
+    if latest_tree_source_is_pe_owner() {
+        let snap = load_snapshot_for_refno(refno).await?;
+        return Ok(snap
+            .collect_descendants_bfs(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect());
+    }
+    let index = load_tree_index_for_refno(refno).await?;
     let descendants = index.query_descendants_bfs(refno.refno(), options).await?;
     Ok(descendants.into_iter().map(RefnoEnum::from).collect())
 }
@@ -98,13 +114,31 @@ async fn query_children_filtered(
     refno: RefnoEnum,
     noun_hashes: Option<HashSet<u32>>,
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    let index = load_tree_index_for_refno(refno).await?;
     let filter = TreeQueryFilter {
         noun_hashes,
         ..Default::default()
     };
+    if latest_tree_source_is_pe_owner() {
+        let snap = load_snapshot_for_refno(refno).await?;
+        return Ok(snap
+            .collect_children(refno.refno(), &filter)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect());
+    }
+    let index = load_tree_index_for_refno(refno).await?;
     let children = index.query_children(refno.refno(), filter).await?;
     Ok(children.into_iter().map(RefnoEnum::from).collect())
+}
+
+/// 双源 node_meta 点查（query_deep_visible_inst_refnos 的 BRAN/HANG 判定用）。
+async fn get_node_meta_dual(refno: RefnoEnum) -> anyhow::Result<Option<TreeNodeMeta>> {
+    if latest_tree_source_is_pe_owner() {
+        let snap = load_snapshot_for_refno(refno).await?;
+        return Ok(snap.node_meta(refno.refno()));
+    }
+    let index = load_tree_index_for_refno(refno).await?;
+    Ok(index.get_node_meta(refno.refno()).await?)
 }
 
 fn sort_dedup_refnos(mut refnos: Vec<RefnoEnum>) -> Vec<RefnoEnum> {
@@ -238,17 +272,18 @@ pub async fn query_negative_geo_descendants(
     .await
 }
 
-/// 查询深度可见实例（模型生成路径：TreeIndex）
+/// 查询深度可见实例（模型生成路径：pe_owner 快照主路径 / TreeIndex 回退）
 pub async fn query_deep_visible_inst_refnos(refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
-    let index = load_tree_index_for_refno(refno).await?;
-    let Some(meta) = index.get_node_meta(refno.refno()).await? else {
+    let Some(meta) = get_node_meta_dual(refno).await? else {
         return Ok(Vec::new());
     };
 
     let owner_hash = if meta.owner.is_unset() {
         None
     } else {
-        index.get_node_meta(meta.owner).await?.map(|m| m.noun)
+        get_node_meta_dual(RefnoEnum::from(meta.owner))
+            .await?
+            .map(|m| m.noun)
     };
 
     if owner_hash == Some(*BRAN_HASH) || owner_hash == Some(*HANG_HASH) {
@@ -308,7 +343,6 @@ pub async fn query_filter_ancestors(
     refno: RefnoEnum,
     nouns: &[&str],
 ) -> anyhow::Result<Vec<RefnoEnum>> {
-    let index = load_tree_index_for_refno(refno).await?;
     let options = TreeQueryOptions {
         include_self: false,
         max_depth: None,
@@ -318,6 +352,15 @@ pub async fn query_filter_ancestors(
         },
         prune_on_match: false,
     };
+    if latest_tree_source_is_pe_owner() {
+        let snap = load_snapshot_for_refno(refno).await?;
+        return Ok(snap
+            .collect_ancestors_root_to_parent(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect());
+    }
+    let index = load_tree_index_for_refno(refno).await?;
     let ancestors = index
         .query_ancestors_root_to_parent(refno.refno(), options)
         .await?;

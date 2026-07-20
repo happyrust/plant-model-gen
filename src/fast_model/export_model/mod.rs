@@ -1,5 +1,7 @@
 mod export_common;
 
+pub mod anchor_export;
+
 pub mod export_glb;
 
 pub mod export_gltf;
@@ -49,6 +51,7 @@ pub mod export_dbnum_instances_parquet;
 #[cfg(feature = "parquet-export")]
 pub(super) mod spec_info;
 
+pub use anchor_export::AnchorExportContext;
 pub use export_common::*;
 
 pub use name_config::NameConfig;

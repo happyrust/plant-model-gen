@@ -1,5 +1,5 @@
 use crate::fast_model::gen_model::model_record_id::model_refno_id;
-use aios_core::{RefnoEnum, model_primary_db};
+use aios_core::{RefnoEnum, project_primary_db};
 /// SurrealDB 极简版：单表存储所有关联数据
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -52,9 +52,7 @@ pub async fn pre_cleanup_for_regen_surreal(seed_refnos: &[RefnoEnum]) -> Result<
             .collect::<Vec<_>>()
             .join("\n");
 
-        if let Err(e) = model_primary_db().query(&sql).await {
-            eprintln!("[cleanup_surreal] chunk delete error: {}", e);
-        }
+        project_primary_db().query(&sql).await?.check()?;
     }
 
     println!(
@@ -84,7 +82,10 @@ pub async fn save_refno_relations_surreal(relations: &[RefnoRelations]) -> Resul
         ));
     }
 
-    model_primary_db().query(&sqls.join("\n")).await?;
+    project_primary_db()
+        .query(&sqls.join("\n"))
+        .await?
+        .check()?;
     Ok(())
 }
 
@@ -101,7 +102,7 @@ pub async fn load_refno_relations_surreal(refnos: &[RefnoEnum]) -> Result<Vec<Re
         .join(",");
 
     let sql = format!("SELECT * FROM refno_relations WHERE id IN [{}];", refno_ids);
-    let results: Vec<RefnoRelations> = model_primary_db().query(&sql).await?.take(0)?;
+    let results: Vec<RefnoRelations> = project_primary_db().query(&sql).await?.check()?.take(0)?;
 
     Ok(results)
 }

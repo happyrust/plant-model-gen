@@ -1,11 +1,10 @@
-use aios_core::{RefU64, RefnoEnum, tool::hash_tool::hash_str};
+use aios_core::{RefnoEnum, tool::hash_tool::hash_str};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct ModelRefnoIdParts {
     pub ref0: u32,
     pub ref1: u32,
-    pub sesno: u32,
 }
 
 pub fn refno_id_parts(refno: RefnoEnum) -> ModelRefnoIdParts {
@@ -13,16 +12,7 @@ pub fn refno_id_parts(refno: RefnoEnum) -> ModelRefnoIdParts {
     ModelRefnoIdParts {
         ref0: base.get_0(),
         ref1: base.get_1(),
-        sesno: refno.sesno().unwrap_or(0),
     }
-}
-
-pub fn refno_from_parts(ref0: u32, ref1: u32) -> RefnoEnum {
-    RefnoEnum::from(RefU64::from_two_nums(ref0, ref1))
-}
-
-pub fn refno_with_sesno(ref0: u32, ref1: u32, sesno: u32) -> RefnoEnum {
-    RefnoEnum::from((RefU64::from_two_nums(ref0, ref1), sesno))
 }
 
 pub fn model_refno_id(table: &str, refno: RefnoEnum) -> String {
@@ -30,28 +20,13 @@ pub fn model_refno_id(table: &str, refno: RefnoEnum) -> String {
     model_refno_id_from_parts(table, parts)
 }
 
-pub fn model_refno_id_with_sesno(table: &str, base_refno: RefnoEnum, sesno: u32) -> String {
-    let base = base_refno.refno();
-    model_refno_id_from_parts(
-        table,
-        ModelRefnoIdParts {
-            ref0: base.get_0(),
-            ref1: base.get_1(),
-            sesno,
-        },
-    )
-}
-
 pub fn model_refno_id_from_parts(table: &str, parts: ModelRefnoIdParts) -> String {
-    format!("{table}:[{},{},{}]", parts.ref0, parts.ref1, parts.sesno)
+    format!("{table}:[{},{}]", parts.ref0, parts.ref1)
 }
 
 pub fn geo_relate_id(carrier: RefnoEnum, geo_index: usize) -> String {
     let parts = refno_id_parts(carrier);
-    format!(
-        "geo_relate:[{},{},{},{}]",
-        parts.ref0, parts.ref1, parts.sesno, geo_index
-    )
+    format!("geo_relate:[{},{},{}]", parts.ref0, parts.ref1, geo_index)
 }
 
 pub fn geo_relate_id_for_inst(carrier: RefnoEnum, geo_index: usize, inst_info_id: &str) -> String {
@@ -60,8 +35,8 @@ pub fn geo_relate_id_for_inst(carrier: RefnoEnum, geo_index: usize, inst_info_id
     // 导致 "number cannot fit within a 64bit signed integer"，故掩码到 63 位非负范围。
     let inst_id_hash = hash_str(inst_info_id) & (i64::MAX as u64);
     format!(
-        "geo_relate:[{},{},{},{},{}]",
-        parts.ref0, parts.ref1, parts.sesno, geo_index, inst_id_hash
+        "geo_relate:[{},{},{},{}]",
+        parts.ref0, parts.ref1, geo_index, inst_id_hash
     )
 }
 
@@ -85,10 +60,7 @@ pub fn ngmr_relate_id(
 
 pub fn tubi_relate_id(branch_refno: RefnoEnum, tubi_index: usize) -> String {
     let parts = refno_id_parts(branch_refno);
-    format!(
-        "tubi_relate:[{},{},{},{}]",
-        parts.ref0, parts.ref1, parts.sesno, tubi_index
-    )
+    format!("tubi_relate:[{},{},{}]", parts.ref0, parts.ref1, tubi_index)
 }
 
 fn target_owned_relation_id(
@@ -101,15 +73,8 @@ fn target_owned_relation_id(
     let target = refno_id_parts(target);
     let carrier = refno_id_parts(carrier);
     format!(
-        "{table}:[{},{},{},{},{},{},{},{}]",
-        target.ref0,
-        target.ref1,
-        target.sesno,
-        carrier.ref0,
-        carrier.ref1,
-        carrier.sesno,
-        geo_index,
-        relation_index
+        "{table}:[{},{},{},{},{},{}]",
+        target.ref0, target.ref1, carrier.ref0, carrier.ref1, geo_index, relation_index
     )
 }
 
@@ -122,14 +87,6 @@ pub fn model_refno_range(table: &str, refno: RefnoEnum) -> String {
     format!(
         "{table}:[{}, {}, NONE]..=[{}, {}, ..]",
         parts.ref0, parts.ref1, parts.ref0, parts.ref1
-    )
-}
-
-pub fn model_refno_sesno_range(table: &str, refno: RefnoEnum) -> String {
-    let parts = refno_id_parts(refno);
-    format!(
-        "{table}:[{}, {}, {}, NONE]..=[{}, {}, {}, ..]",
-        parts.ref0, parts.ref1, parts.sesno, parts.ref0, parts.ref1, parts.sesno
     )
 }
 
@@ -154,11 +111,10 @@ pub struct ModelRecordIdEvidence {
 pub struct ModelRecordIdRangeEvidence {
     pub inst_relate_ref0: String,
     pub inst_relate_refno: String,
-    pub inst_relate_refno_sesno: String,
-    pub geo_relate_refno_sesno: String,
-    pub neg_relate_target_refno_sesno: String,
-    pub ngmr_relate_target_refno_sesno: String,
-    pub tubi_relate_refno_sesno: String,
+    pub geo_relate_refno: String,
+    pub neg_relate_target_refno: String,
+    pub ngmr_relate_target_refno: String,
+    pub tubi_relate_refno: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,11 +140,10 @@ pub fn build_model_record_id_evidence(refno: RefnoEnum) -> ModelRecordIdEvidence
         ranges: ModelRecordIdRangeEvidence {
             inst_relate_ref0: model_ref0_range("inst_relate", parts.ref0),
             inst_relate_refno: model_refno_range("inst_relate", refno),
-            inst_relate_refno_sesno: model_refno_sesno_range("inst_relate", refno),
-            geo_relate_refno_sesno: model_refno_sesno_range("geo_relate", refno),
-            neg_relate_target_refno_sesno: model_refno_sesno_range("neg_relate", refno),
-            ngmr_relate_target_refno_sesno: model_refno_sesno_range("ngmr_relate", refno),
-            tubi_relate_refno_sesno: model_refno_sesno_range("tubi_relate", refno),
+            geo_relate_refno: model_refno_range("geo_relate", refno),
+            neg_relate_target_refno: model_refno_range("neg_relate", refno),
+            ngmr_relate_target_refno: model_refno_range("ngmr_relate", refno),
+            tubi_relate_refno: model_refno_range("tubi_relate", refno),
         },
         cleanup: ModelRecordIdCleanupEvidence {
             exact_delete_ids: [
@@ -203,7 +158,7 @@ pub fn build_model_record_id_evidence(refno: RefnoEnum) -> ModelRecordIdEvidence
             .collect(),
             range_delete_ranges: ["geo_relate", "neg_relate", "ngmr_relate", "tubi_relate"]
                 .iter()
-                .map(|table| model_refno_sesno_range(table, refno))
+                .map(|table| model_refno_range(table, refno))
                 .collect(),
         },
     }

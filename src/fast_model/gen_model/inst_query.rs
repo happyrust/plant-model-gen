@@ -37,12 +37,12 @@ use aios_core::prim_geo::basic::TUBI_GEO_HASH;
 use aios_core::rs_surreal::geometry_query::PlantTransform;
 use aios_core::shape::pdms_shape::RsVec3;
 use aios_core::types::PlantAabb;
-use aios_core::{GeomInstQuery, RefnoEnum, SurrealQueryExt, model_primary_db};
+use aios_core::{GeomInstQuery, RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use surrealdb::types::SurrealValue;
 
-use super::model_record_id::{model_refno_id, model_refno_sesno_range};
+use super::model_record_id::{model_refno_id, model_refno_range};
 
 #[derive(Serialize, Deserialize, Debug, SurrealValue)]
 struct TubiQueryResult {
@@ -117,7 +117,7 @@ pub async fn query_insts_with_batch(
                 bool_keys = bool_keys_str
             );
 
-            let mut bool_results: Vec<GeomInstQuery> = model_primary_db()
+            let mut bool_results: Vec<GeomInstQuery> = project_primary_db()
                 .query_take(&bool_sql, 0)
                 .await
                 .with_context(|| format!("query_insts_with_batch bool SQL: {}", bool_sql))?;
@@ -142,7 +142,7 @@ pub async fn query_insts_with_batch(
                 let mut geo_sql_batch = String::new();
                 for r in &non_bool_refnos {
                     let inst_relate_key = model_refno_id("inst_relate", *r);
-                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    let geo_range = model_refno_range("geo_relate", *r);
                     // 直接从 pe_transform 表获取 world_trans（pe.world_trans 已废弃）。
                     // geo_relate 必须按同版本 range 查询，避免共享 inst_info 时串读其它 sesno。
                     geo_sql_batch.push_str(&format!(
@@ -165,7 +165,7 @@ pub async fn query_insts_with_batch(
                     ));
                 }
 
-                let mut resp = model_primary_db()
+                let mut resp = project_primary_db()
                     .query_response(&geo_sql_batch)
                     .await
                     .with_context(|| {
@@ -181,7 +181,7 @@ pub async fn query_insts_with_batch(
             let mut sql_batch = String::new();
             for r in chunk {
                 let inst_relate_key = model_refno_id("inst_relate", *r);
-                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                let geo_range = model_refno_range("geo_relate", *r);
                 // 利用 pe 表的计算字段简化查询；geo_relate 按目标版本 range 读取。
                 sql_batch.push_str(&format!(
                     r#"
@@ -203,7 +203,7 @@ pub async fn query_insts_with_batch(
                 ));
             }
 
-            let mut resp = model_primary_db()
+            let mut resp = project_primary_db()
                 .query_response(&sql_batch)
                 .await
                 .with_context(|| format!("query_insts_with_batch SQL: {}", sql_batch))?;
@@ -217,7 +217,7 @@ pub async fn query_insts_with_batch(
         // tubi_relate 使用复合 ID（pe, index）；这里为每个 refno 发起 range 查询并合并为 is_tubi 实例。
         let mut tubi_sql_batch = String::new();
         for r in chunk {
-            let tubi_range = model_refno_sesno_range("tubi_relate", *r);
+            let tubi_range = model_refno_range("tubi_relate", *r);
             tubi_sql_batch.push_str(&format!(
                 r#"
                 SELECT
@@ -228,7 +228,7 @@ pub async fn query_insts_with_batch(
                     start_pt.d as start_pt,
                     end_pt.d as end_pt,
                     record::id(geo) as geo_hash,
-                    id[3] as index
+                    id[2] as index
                 FROM {tubi_range};
                 "#,
                 owner_refno = r.to_pe_key()
@@ -236,7 +236,7 @@ pub async fn query_insts_with_batch(
         }
 
         if !tubi_sql_batch.is_empty() {
-            let mut resp = model_primary_db()
+            let mut resp = project_primary_db()
                 .query_response(&tubi_sql_batch)
                 .await
                 .with_context(|| format!("query_insts_with_batch tubi SQL: {}", tubi_sql_batch))?;

@@ -131,6 +131,83 @@ pub fn query_descendants_map_by_dbnum(
     Ok(out)
 }
 
+/// specs/023 M2 双源版本：pe_owner（默认）走 per-dbnum 内存快照（数据源 SurrealDB，
+/// 增量后新鲜）；`AIOS_TREE_QUERY_SOURCE=tree` 回退上面的 `.tree` 实现。
+///
+/// 语义与 `query_descendants_map_by_dbnum` 一致（best-effort、加载失败跳过该 dbnum、
+/// 缺映射 roots 预填空集）。
+pub async fn query_descendants_map_by_dbnum_dual(
+    tree_dir: impl AsRef<Path>,
+    roots: &[RefnoEnum],
+    nouns: &[&str],
+    include_self: bool,
+) -> anyhow::Result<HashMap<RefnoEnum, Vec<RefnoEnum>>> {
+    use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
+    use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
+
+    if !latest_tree_source_is_pe_owner() {
+        return query_descendants_map_by_dbnum(tree_dir, roots, nouns, include_self);
+    }
+    if roots.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let _ = db_meta().ensure_loaded();
+    let (grouped, missing_dbnum) =
+        group_by_dbnum_best_effort(roots, |r| db_meta().get_dbnum_by_refno(r));
+
+    let noun_hashes: Option<HashSet<u32>> = if nouns.is_empty() {
+        None
+    } else {
+        Some(nouns.iter().map(|n| db1_hash(n)).collect())
+    };
+    let options = TreeQueryOptions {
+        include_self,
+        max_depth: None,
+        filter: TreeQueryFilter {
+            noun_hashes,
+            ..Default::default()
+        },
+        prune_on_match: false,
+    };
+
+    let mut out: HashMap<RefnoEnum, Vec<RefnoEnum>> = HashMap::new();
+    for (dbnum, db_roots) in grouped {
+        let snap = match get_or_load_pe_snapshot(dbnum).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "[neg_query] pe 快照加载失败，跳过 dbnum={} 的 {} 个 roots: {}",
+                    dbnum,
+                    db_roots.len(),
+                    e
+                );
+                continue;
+            }
+        };
+        for root in db_roots {
+            if !snap.contains_refno(root.refno()) {
+                continue;
+            }
+            let mut seen: HashSet<RefnoEnum> = HashSet::new();
+            let mut rows: Vec<RefnoEnum> = Vec::new();
+            for r in snap.collect_descendants_bfs(root.refno(), &options) {
+                let r = RefnoEnum::from(r);
+                if r.is_valid() && seen.insert(r) {
+                    rows.push(r);
+                }
+            }
+            out.insert(root, rows);
+        }
+    }
+
+    for r in missing_dbnum {
+        out.entry(r).or_default();
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

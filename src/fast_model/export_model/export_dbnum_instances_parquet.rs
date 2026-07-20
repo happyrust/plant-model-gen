@@ -36,10 +36,10 @@ use serde_json::json;
 use std::str::FromStr;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
-use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_sesno_range};
-use crate::fast_model::gen_model::tree_index_manager::{
-    TreeIndexManager, load_index_with_large_stack,
-};
+// specs/023 M2：层级/元信息读取统一走 HierView（pe_owner 快照默认 / .tree 回退）
+use crate::fast_model::gen_model::hier_view::HierView;
+use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_range};
+use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
@@ -267,7 +267,7 @@ fn record_geo_hash_usage(
     *row_count_by_hash.entry(hash.to_string()).or_insert(0) += 1;
 }
 
-fn tree_owner_refno(tree_manager: &TreeIndexManager, refno: RefnoEnum) -> Option<RefnoEnum> {
+fn tree_owner_refno(tree_manager: &HierView, refno: RefnoEnum) -> Option<RefnoEnum> {
     let meta = tree_manager.get_node_meta(refno)?;
     (meta.owner.0 != 0).then(|| RefnoEnum::from(meta.owner))
 }
@@ -275,7 +275,7 @@ fn tree_owner_refno(tree_manager: &TreeIndexManager, refno: RefnoEnum) -> Option
 fn resolve_spec_value_with_ancestors(
     refno: RefnoEnum,
     owner_refno: Option<RefnoEnum>,
-    tree_manager: &TreeIndexManager,
+    tree_manager: &HierView,
     spec_info_map: &HashMap<u64, i64>,
     cache: &mut HashMap<u64, i64>,
 ) -> i64 {
@@ -326,7 +326,7 @@ fn append_tubing_rows_for_owner(
     owner_refno: &RefnoEnum,
     tubis: &[TubiQueryResult],
     spec_info_map: &HashMap<u64, i64>,
-    tree_manager: &TreeIndexManager,
+    tree_manager: &HierView,
     spec_lookup_cache: &mut HashMap<u64, i64>,
     dbnum: u32,
     tubing_rows: &mut Vec<TubingRow>,
@@ -973,7 +973,7 @@ fn build_aabb_batch(rows: &[AabbRow]) -> Result<RecordBatch> {
 
 fn append_owner_chain_rows(
     instance_rows: &mut Vec<InstanceRow>,
-    tree_manager: &TreeIndexManager,
+    tree_manager: &HierView,
     spec_info_map: &HashMap<u64, i64>,
     spec_lookup_cache: &mut HashMap<u64, i64>,
     dbnum: u32,
@@ -1923,7 +1923,7 @@ async fn query_export_insts_local(
                 let mut geo_sql_batch = String::new();
                 for r in &non_bool_refnos {
                     let inst_relate_key = model_refno_id("inst_relate", *r);
-                    let geo_range = model_refno_sesno_range("geo_relate", *r);
+                    let geo_range = model_refno_range("geo_relate", *r);
                     geo_sql_batch.push_str(&format!(
                         r#"
                         SELECT
@@ -1967,7 +1967,7 @@ async fn query_export_insts_local(
             let mut sql_batch = String::new();
             for r in chunk {
                 let inst_relate_key = model_refno_id("inst_relate", *r);
-                let geo_range = model_refno_sesno_range("geo_relate", *r);
+                let geo_range = model_refno_range("geo_relate", *r);
                 sql_batch.push_str(&format!(
                     r#"
                     SELECT
@@ -2045,12 +2045,12 @@ async fn query_tubi_relate(
     for owners_chunk in owner_refnos.chunks(200) {
         let mut sql_batch = String::new();
         for owner_refno in owners_chunk {
-            let tubi_range = model_refno_sesno_range("tubi_relate", *owner_refno);
+            let tubi_range = model_refno_range("tubi_relate", *owner_refno);
             sql_batch.push_str(&format!(
                 r#"
                 SELECT
                     {owner_refno} as refno,
-                    id[3] as index,
+                    id[2] as index,
                     in as leave,
                     record::id(aabb) as world_aabb_hash,
                     record::id(world_trans) as world_trans_hash,
@@ -2304,8 +2304,12 @@ pub async fn export_dbnum_instances_parquet(
     let mesh_base_dir = mesh_base_dir_from_db_option(&db_option);
 
     // 构建/加载 spec_info（BRAN/HANG/EQUI/WALL/FLOOR 专业信息），用于 spec_value=0 时回填
-    let tree_manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let tree_dir = tree_manager.tree_dir();
+    // specs/023 M2：层级/元信息读取走 HierView（pe_owner 快照默认 / .tree 回退）
+    let tree_manager = HierView::load(vec![dbnum]).await?;
+    let tree_dir_buf = TreeIndexManager::with_default_dir(vec![dbnum])
+        .tree_dir()
+        .to_path_buf();
+    let tree_dir = tree_dir_buf.as_path();
     let spec_info_map = match crate::fast_model::export_model::spec_info::load_or_build_spec_info(
         dbnum, tree_dir, output_dir, verbose,
     )

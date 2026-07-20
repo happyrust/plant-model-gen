@@ -1,46 +1,31 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aios_core::accel_tree::acceleration_tree::{AccelerationTree, RStarBoundingBox};
 use aios_core::file_helper::collect_db_dirs;
 use aios_core::get_db_option;
 use aios_core::options::DbOption;
 use aios_core::pdms_types::*;
-use aios_core::project_primary_db;
 use dashmap::DashMap;
-use futures::StreamExt;
 use glam::Vec3;
-use indexmap::IndexMap;
 use itertools::Itertools;
-use log::{error, info};
 use once_cell::sync::Lazy;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use parry3d::math::Vector;
 use parry3d::query::{Ray, RayCast};
-#[cfg(feature = "mqtt")]
-use pdms_io::sync::clone::{CloneOptions, execute_clone};
-// use pdms_io::sync::clone::{execute_clone, CloneOptions};
 use pdms_io::watch::PdmsWatcher;
 use rayon::prelude::*;
-#[cfg(feature = "mqtt")]
-use rumqttc::Event::Incoming;
-#[cfg(feature = "mqtt")]
-use rumqttc::{Packet, QoS};
 #[cfg(feature = "sql")]
 use sqlx::pool::PoolOptions;
 #[cfg(feature = "sql")]
 use sqlx::{Executor, MySql, MySqlPool, Pool, Row};
-use tokio::sync::Mutex;
 
 use crate::consts::*;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::defines::CACHED_MDB_SITE_MAP;
-#[cfg(feature = "mqtt")]
-use crate::mqtt_service::{SyncE3dFileMsg, new_mqtt_inst};
 
 // PDMS/RVM treats sub-2 mm endpoint residue as a coincident connection rather
 // than a physical tubing segment. Keeping the same tolerance avoids exporting
@@ -50,275 +35,12 @@ pub const TUBI_TOL: f32 = 2.0f32;
 // project + mdb + module
 pub static GLOBAL_MDB_WORLD_MAP: Lazy<DashMap<String, PdmsElement>> = Lazy::new(DashMap::new);
 
-//创建一个监控mqtt是否连接的全局变量,使用Mutex<bool>
-pub static MQTT_CONNECT_STATUS: Lazy<Mutex<Option<bool>>> = Lazy::new(|| Mutex::new(None));
-
 impl AiosDBManager {
     /// 从默认配置文件初始化
     pub async fn init_form_config() -> anyhow::Result<Self> {
         let db_option = get_db_option();
-        let mut mgr = Self::init(&db_option).await?;
+        let mgr = Self::init(&db_option).await?;
         Ok(mgr)
-    }
-
-    //初始化watcher
-    pub async fn exec_watcher(mgr: Arc<AiosDBManager>) -> anyhow::Result<()> {
-        mgr.init_watcher().await.unwrap();
-        mgr.async_watch().await.unwrap();
-        Ok(())
-    }
-
-    //开启定时同步更新任务
-    #[cfg(feature = "mqtt")]
-    pub async fn run_e3d_clone_bg_task(mgr: Arc<AiosDBManager>) -> anyhow::Result<()> {
-        dbg!("定时同步数据任务开启");
-        let forever = tokio::spawn(async move {
-            //10分钟强制刷一遍
-            let mut interval = tokio::time::interval(Duration::from_secs(60 * 10));
-            loop {
-                interval.tick().await;
-                //todo，需要配置各个db对应的映射, 不同区域对应不同的db
-                // Self::exec_delta_clone_remotes(&mgr.watcher, &[]).await.unwrap();
-            }
-        });
-        forever.await?
-    }
-
-    //增量从服务器里的数据clone到本地
-    #[cfg(feature = "mqtt")]
-    pub async fn exec_delta_clone_remotes(
-        watcher: &PdmsWatcher,
-        sync_msg: SyncE3dFileMsg,
-    ) -> anyhow::Result<bool> {
-        if sync_msg.file_names.is_empty() {
-            return Ok(false);
-        }
-        let loc_dbs = &get_db_option().location_dbs;
-        let remote_url = sync_msg.file_server_host.as_str();
-        for file_name in &sync_msg.file_names {
-            let url = format!("{}/{}.cba", remote_url, file_name);
-            dbg!(&file_name);
-            //todo 如果没有需要新加数据
-            let pb = if let Some(pb) = watcher.file_name_full_path_map.get(file_name) {
-                pb.value().clone()
-            } else {
-                // 如果找不到文件名，使用 SJZ 项目路径和正确的扩展名（仅用于测试）
-                std::path::PathBuf::from(format!(
-                    "/Volumes/DPC/work/e3d_models/test_sjz/AvevaMarineSample/ams000/{}_clone",
-                    file_name
-                ))
-            };
-            dbg!(&pb);
-
-            //还需要检查location dbnum，如果不一致，就需要clone
-            //必须不是当前区域的db 才能clone, 只能clone别的区域的数据
-            if let Some(dbnum) = watcher.get_dbno(&pb) {
-                dbg!(dbnum);
-                //跳过当前区域的dbnos
-                if let Some(dbs) = loc_dbs {
-                    if dbs.contains(&dbnum) {
-                        continue;
-                    }
-                }
-            }
-
-            println!(
-                "Start delta clone db files num: {} from {}",
-                sync_msg.file_names.len(),
-                &url
-            );
-            let e3d_file: PathBuf = pb.clone();
-            let mut clone_time = Instant::now();
-            let remote_clone_opt = CloneOptions::new_remote(url.as_str(), e3d_file);
-            match execute_clone(remote_clone_opt).await {
-                Ok(r) => {
-                    if r {
-                        //需要保存更新记录
-                        println!(
-                            "Clone {} cost: {:?}s",
-                            file_name,
-                            clone_time.elapsed().as_secs_f64()
-                        );
-                        //clone完了,再执行增量更新
-                    } else {
-                        println!("Clone {} returned false", file_name);
-                    }
-                }
-                Err(e) => {
-                    println!("Clone {} failed: {}", file_name, e);
-                }
-            }
-        }
-
-        Ok(true)
-    }
-
-    pub async fn spawn_exec_watcher(mgr: Arc<AiosDBManager>) -> anyhow::Result<()> {
-        let f = tokio::spawn(async move {
-            mgr.init_watcher().await.unwrap();
-            mgr.async_watch().await.unwrap();
-        });
-        Ok(f.await?)
-    }
-
-    #[cfg(feature = "mqtt")]
-    pub async fn demo_mqtt_requests() {
-        let mut mqtt_inst = new_mqtt_inst("test-1");
-        let client = mqtt_inst.client.clone();
-        let f = tokio::spawn(async move {
-            for i in 1..=10000 {
-                let test_data = SyncE3dFileMsg {
-                    file_names: vec![format!("Hello-{}", i)],
-                    file_hashes: vec![],
-                    file_server_host: "http://50c170h624.zicp.vip:56785/assets/archives"
-                        .to_string(),
-                    location: "bj".to_string(),
-                    timestamp: Default::default(),
-                };
-                let _ = client
-                    .publish("Sync/E3d", QoS::ExactlyOnce, false, test_data)
-                    .await
-                    .unwrap();
-
-                dbg!(i);
-
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            // tokio::time::sleep(Duration::from_secs(120)).await;
-        });
-
-        loop {
-            let event = mqtt_inst.el.poll().await;
-        }
-
-        f.await.expect("demo_mqtt_requests panic");
-    }
-
-    ///另外将里面可能有关联的db，也要同步检查后一下？？
-    ///处理mqtt的消息, 通知需要处理的db 文件名，然后对应的归属地也需要发送
-    #[cfg(feature = "mqtt")]
-    pub async fn poll_sync_e3d_mqtt_events(watcher: Arc<PdmsWatcher>) {
-        let db_option = get_db_option();
-        let location = db_option.location.clone();
-        let f = tokio::spawn(async move {
-            //订阅消息处理更新
-            let mut mqtt_inst = new_mqtt_inst(&format!(
-                "{}-{}-sub",
-                db_option.location.as_str(),
-                db_option.project_code
-            ));
-            mqtt_inst
-                .client
-                .subscribe("Sync/E3d", QoS::ExactlyOnce)
-                .await
-                .unwrap();
-            // 连接超时已在 MqttOptions 上配置，无需再从 EventLoop 访问网络选项
-            loop {
-                let event = mqtt_inst.el.poll().await;
-                match &event {
-                    Ok(v) => {
-                        match v {
-                            Incoming(Packet::Publish(p)) => {
-                                let sync_e3d = SyncE3dFileMsg::from(p.payload.to_vec());
-                                // println!("payload = {:?}", &sync_e3d);
-                                //检查是否和本地的location一致，如果不一致，才发生更新
-                                if sync_e3d.location != location {
-                                    //自己本地也要保存, todo 后续还是要配置哪些dbs，哪个地方能修改，哪个地方是不能改的
-                                    project_primary_db()
-                                        .query(format!(
-                                            "INSERT IGNORE INTO e3d_sync {} ",
-                                            serde_json::to_string(&sync_e3d).unwrap()
-                                        ))
-                                        .await
-                                        .unwrap();
-                                    //执行指定文件的clone
-                                    Self::exec_delta_clone_remotes(&watcher, sync_e3d)
-                                        .await
-                                        .unwrap();
-                                }
-                            }
-                            _ => {
-                                // dbg!(v);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // println!("Error = {e:?}");
-                        // return Ok(());
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                    _ => {}
-                }
-            }
-        });
-        f.await.expect("demo_mqtt_requests panic");
-    }
-
-    ///处理mqtt的消息，带重连退避（单位ms）
-    #[cfg(feature = "mqtt")]
-    pub async fn poll_sync_e3d_mqtt_events_with_backoff(
-        watcher: Arc<PdmsWatcher>,
-        initial_backoff_ms: u64,
-        max_backoff_ms: u64,
-    ) {
-        let db_option = get_db_option();
-        let location = db_option.location.clone();
-        let mut backoff = initial_backoff_ms.max(100);
-        let max_backoff = max_backoff_ms.max(backoff);
-
-        loop {
-            // 构造新的连接实例
-            let mut mqtt_inst = new_mqtt_inst(&format!(
-                "{}-{}-sub",
-                db_option.location.as_str(),
-                db_option.project_code
-            ));
-            let _ = mqtt_inst
-                .client
-                .subscribe("Sync/E3d", QoS::ExactlyOnce)
-                .await;
-
-            // 轮询事件，直到错误发生
-            loop {
-                let event = mqtt_inst.el.poll().await;
-                match &event {
-                    Ok(v) => match v {
-                        Incoming(Packet::Publish(p)) => {
-                            let sync_e3d = SyncE3dFileMsg::from(p.payload.to_vec());
-                            if sync_e3d.location != location {
-                                let _ = project_primary_db()
-                                    .query(format!(
-                                        "INSERT IGNORE INTO e3d_sync {} ",
-                                        serde_json::to_string(&sync_e3d).unwrap()
-                                    ))
-                                    .await;
-                                let _ = Self::exec_delta_clone_remotes(&watcher, sync_e3d).await;
-                            }
-                            // 收到消息，视为连接正常，重置退避
-                            backoff = initial_backoff_ms.max(100);
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        {
-                            let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
-                            if mqtt_connect_status.is_none() {
-                                *mqtt_connect_status = Some(false);
-                                error!("Init MQTT Connection error encountered: {}", e);
-                            } else if (*mqtt_connect_status).unwrap() {
-                                *mqtt_connect_status = Some(false);
-                                error!("MQTT Connection error encountered: {}", e);
-                            }
-                        }
-                        // 发生错误，退出内层循环以重建连接
-                        break;
-                    }
-                }
-            }
-            // 退避等待后重建连接
-            tokio::time::sleep(Duration::from_millis(backoff)).await;
-            backoff = (backoff.saturating_mul(2)).min(max_backoff);
-        }
     }
 
     ///快速获得table名称
@@ -440,67 +162,14 @@ impl AiosDBManager {
             db_paths.push(db_option.project_path.clone().into());
         }
         dbg!(&db_paths); // 调试输出：看看收集到的目录路径
-        let mut watcher = PdmsWatcher::new(db_paths);
+        let watcher = PdmsWatcher::new(db_paths);
         #[cfg(feature = "debug_watch")]
         {
             dbg!(&db_paths);
             dbg!(watcher.headers.len());
             dbg!(watcher.file_name_full_path_map.len());
         }
-        #[cfg(feature = "mqtt")]
-        let mqtt_client = {
-            let mut mqtt_inst = new_mqtt_inst(&format!(
-                "{}-{}-pub",
-                db_option.location.as_str(),
-                db_option.project_code
-            ));
-            let mqtt_client = Arc::new(mqtt_inst.client);
-            tokio::task::spawn(async move {
-                loop {
-                    let event = mqtt_inst.el.poll().await;
-                    match event {
-                        Ok(event) => match event {
-                            rumqttc::Event::Incoming(Packet::Publish(_)) => {
-                                // Currently unused, but we can subscribe to topics to get messages here
-                            }
-                            rumqttc::Event::Incoming(Packet::ConnAck(_)) => {
-                                // Connection was established. Notify the client to send all discovery messages
-                                // info!("Connected to MQTT broker.");
-
-                                //判断MQTT_CONNECT_STATUS,如果为false,则发送连接成功的消息,修改为true
-                                let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
-                                if mqtt_connect_status.is_none() {
-                                    *mqtt_connect_status = Some(true);
-                                    info!("Init connected to MQTT broker.");
-                                } else {
-                                    if !(*mqtt_connect_status).unwrap() {
-                                        *mqtt_connect_status = Some(true);
-                                        info!("Connected to MQTT broker.");
-                                    }
-                                }
-                            }
-                            _ => {}
-                        },
-                        Err(e) => {
-                            let mut mqtt_connect_status = MQTT_CONNECT_STATUS.lock().await;
-                            if mqtt_connect_status.is_none() {
-                                *mqtt_connect_status = Some(false);
-                                error!("Init MQTT Connection error encountered: {}", e);
-                            } else {
-                                if (*mqtt_connect_status).unwrap() {
-                                    *mqtt_connect_status = Some(false);
-                                    error!("MQTT Connection error encountered: {}", e);
-                                }
-                            }
-
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            });
-            mqtt_client
-        };
-        let mut mgr = AiosDBManager {
+        let mgr = AiosDBManager {
             #[cfg(feature = "sql")]
             project_map,
             projects,
@@ -508,15 +177,8 @@ impl AiosDBManager {
             project_path: dir,
             db_option: db_option.clone(),
             watcher: Arc::new(watcher),
-            #[cfg(feature = "mqtt")]
-            mqtt_client,
             rtree: None,
         };
-        // 临时修复：手动初始化 watcher 以便监听文件变更
-        // 忽略错误，防止启动失败
-        if let Err(e) = mgr.init_watcher().await {
-            error!("Watcher initialization failed (ignored): {}", e);
-        }
         Ok(mgr)
     }
 

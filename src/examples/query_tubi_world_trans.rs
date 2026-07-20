@@ -1,6 +1,6 @@
 //! 查询指定 BRAN/HANG 的 tubi_relate world_trans，用于对比形态异常
 
-use aios_core::{project_primary_db, SurrealQueryExt, init_surreal};
+use aios_core::{SurrealQueryExt, init_surreal, project_primary_db};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -9,13 +9,13 @@ async fn main() -> anyhow::Result<()> {
     // 固定查询目标：24381_103385（可按需改）
     let sql = r#"
         SELECT
-            record::id(id[0]) as refno,
+            [id[0], id[1]] as refno_parts,
             record::id(in) as owner,
             world_trans.d as world_trans,
             aabb.d as world_aabb,
             record::id(geo) as geo_hash,
-            id[1] as index
-        FROM tubi_relate:[pe:24381_103385, 0]..[pe:24381_103385, ..];
+            id[2] as index
+        FROM tubi_relate:[24381, 103385, NONE]..=[24381, 103385, ..];
     "#;
 
     println!("SQL:\n{sql}");

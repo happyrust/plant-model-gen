@@ -324,6 +324,9 @@ pub struct WorkflowRecord {
     pub rect_annotations: Vec<serde_json::Value>,
     pub obb_annotations: Vec<serde_json::Value>,
     pub measurements: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension_document: Option<serde_json::Value>,
+    pub dimension_document_version: u64,
     pub note: String,
     pub confirmed_at: String,
 }

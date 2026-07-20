@@ -4,8 +4,11 @@
 
 use super::tree_index_manager::TreeIndexManager;
 use crate::fast_model::resolve_desi_comp;
+// specs/023 M2：cata_hash 分组主路径切 pe_owner 快照（pe.cata_hash 字段）；tree 回退
+use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
+use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
 use aios_core::parsed_data::geo_params_data::CateGeoParam::{BoxImplied, TubeImplied};
-use aios_core::pdms_types::{CataHashRefnoKV, USE_CATE_NOUN_NAMES};
+use aios_core::pdms_types::{BRAN_COMPONENT_NOUN_NAMES, CataHashRefnoKV, USE_CATE_NOUN_NAMES};
 use aios_core::prim_geo::tubing::TubiSize;
 use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter};
@@ -185,6 +188,87 @@ async fn build_cata_hash_map_from_tree_index(
     Ok(result_map)
 }
 
+/// 可能持有 cata_hash 的 noun 集合（元件引用件 + BRAN 子管件）。
+/// pe_owner 快照路径下，这些 noun 若 cata_hash 缺失（站点未回填），回退 attmap 计算并记 miss。
+static CATA_HASH_BEARING_NOUN_HASHES: Lazy<HashSet<u32>> = Lazy::new(|| {
+    USE_CATE_NOUN_NAMES
+        .iter()
+        .chain(BRAN_COMPONENT_NOUN_NAMES.iter())
+        .map(|noun| db1_hash(noun))
+        .collect()
+});
+
+/// 快照路径的单节点入组：pe.cata_hash 优先；元件类 noun 缺 hash 时回退 attmap
+/// 计算（`model-version backfill-pe-cata-hash` 未跑的存量站点），并记 cache_miss_report。
+async fn insert_cata_hash_refno_from_snapshot(
+    map: &DashMap<String, CataHashRefnoKV>,
+    refno: RefnoEnum,
+    noun_hash: u32,
+    cata_hash: Option<u64>,
+) {
+    let mut cata_hash = cata_hash;
+    if cata_hash.is_none()
+        && !is_bran_or_hang(noun_hash)
+        && CATA_HASH_BEARING_NOUN_HASHES.contains(&noun_hash)
+    {
+        super::cache_miss_report::with_global_report(|report| {
+            report.record_refno_miss(
+                "build_cata_hash_map",
+                "pe_cata_hash_missing",
+                refno,
+                Some("pe.cata_hash 缺失，回退 attmap 计算（建议 backfill-pe-cata-hash）"),
+            );
+        });
+        cata_hash = aios_core::get_named_attmap(refno)
+            .await
+            .ok()
+            .and_then(|att| att.cal_cata_hash());
+    }
+    insert_cata_hash_refno_by_values(map, refno, noun_hash, cata_hash);
+}
+
+/// 基于 pe_owner 快照（按 dbnum）构建 cata_hash 分组：roots 自身 + 直接子节点，
+/// 与 tree 路径 `build_cata_hash_map_from_tree_index` 同构。
+async fn build_cata_hash_map_from_snapshot_by_dbnum(
+    dbnum: u32,
+    refnos: &[RefnoEnum],
+) -> Result<DashMap<String, CataHashRefnoKV>> {
+    let snap = get_or_load_pe_snapshot(dbnum).await?;
+    let mut visited: HashSet<RefU64> = HashSet::new();
+    let result_map: DashMap<String, CataHashRefnoKV> = DashMap::new();
+
+    for refno in refnos {
+        let root = refno.refno();
+        if visited.insert(root) {
+            if let Some(meta) = snap.node_meta(root) {
+                insert_cata_hash_refno_from_snapshot(
+                    &result_map,
+                    RefnoEnum::from(meta.refno),
+                    meta.noun,
+                    meta.cata_hash,
+                )
+                .await;
+            }
+        }
+        for child in snap.collect_children(root, &TreeQueryFilter::default()) {
+            if !visited.insert(child) {
+                continue;
+            }
+            if let Some(meta) = snap.node_meta(child) {
+                insert_cata_hash_refno_from_snapshot(
+                    &result_map,
+                    RefnoEnum::from(meta.refno),
+                    meta.noun,
+                    meta.cata_hash,
+                )
+                .await;
+            }
+        }
+    }
+
+    Ok(result_map)
+}
+
 /// 基于 tree 文件（按 dbnum）构建 cata_hash 分组
 pub async fn build_cata_hash_map_from_tree_by_dbnum(
     dbnum: u32,
@@ -192,6 +276,10 @@ pub async fn build_cata_hash_map_from_tree_by_dbnum(
 ) -> Result<DashMap<String, CataHashRefnoKV>> {
     if refnos.is_empty() {
         return Ok(DashMap::new());
+    }
+    // specs/023 M2 双源：pe_owner（默认）→ pe 快照；AIOS_TREE_QUERY_SOURCE=tree → .tree
+    if latest_tree_source_is_pe_owner() {
+        return build_cata_hash_map_from_snapshot_by_dbnum(dbnum, refnos).await;
     }
     let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
     let index = manager.load_index(dbnum)?;

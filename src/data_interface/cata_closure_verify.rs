@@ -169,7 +169,7 @@ fn pairs_to_map(rows: Vec<serde_json::Value>) -> BTreeMap<String, String> {
 
 /// 按需侧（全局连接）查询。
 async fn ondemand_json(sql: &str) -> Result<Vec<serde_json::Value>> {
-    let mut resp = aios_core::model_primary_db()
+    let mut resp = aios_core::project_primary_db()
         .query_response(sql)
         .await
         .with_context(|| format!("按需站点查询失败: {sql}"))?;

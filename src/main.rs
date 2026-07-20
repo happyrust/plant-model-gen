@@ -81,21 +81,6 @@ fn format_cli_refno(refno: aios_core::pdms_types::RefnoEnum) -> String {
 }
 
 #[cfg(not(feature = "gui"))]
-fn parse_cli_model_record_refno(
-    refno: &str,
-    sesno: Option<u32>,
-) -> anyhow::Result<aios_core::pdms_types::RefnoEnum> {
-    let parsed = parse_cli_refno(refno)?;
-    Ok(match sesno {
-        Some(sesno) => {
-            let base = parsed.refno();
-            aios_core::pdms_types::RefnoEnum::from((base, sesno))
-        }
-        None => parsed,
-    })
-}
-
-#[cfg(not(feature = "gui"))]
 async fn promote_generation_refnos_to_bran_hang_roots(
     refnos: &[String],
     verbose: bool,
@@ -163,12 +148,6 @@ async fn promote_generation_refnos_to_bran_hang_roots(
 #[cfg(not(feature = "gui"))]
 use aios_database::version_management::increment_run::{IncrementRunOptions, IncrementRunResult};
 
-#[cfg(all(not(feature = "gui"), feature = "sqlite-index"))]
-struct WatchSourceObservationGate {
-    manifest_path: PathBuf,
-    manifest_hash: String,
-}
-
 #[cfg(not(feature = "gui"))]
 async fn run_incremental_sesno_once(
     db_option_ext: &aios_database::options::DbOptionExt,
@@ -180,147 +159,6 @@ async fn run_incremental_sesno_once(
         || async { crate::cli_modes::ensure_surreal_connected(db_option_ext).await },
     )
     .await
-}
-
-#[cfg(all(not(feature = "gui"), feature = "sqlite-index"))]
-fn build_watch_source_observation_gate(
-    db_option_ext: &aios_database::options::DbOptionExt,
-    rec: &aios_database::data_interface::db_index::DbFileRecord,
-    from_sesno: u32,
-    to_sesno: u32,
-    observation_dir: &Path,
-    quiescence_window_ms: u64,
-) -> anyhow::Result<WatchSourceObservationGate> {
-    let observation_id = format!(
-        "watch-db{}-{}-to-{}-{}",
-        rec.dbnum,
-        from_sesno,
-        to_sesno,
-        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
-    );
-    let manifest_path = observation_dir.join(format!("{observation_id}.json"));
-    let manifest =
-        aios_database::version_management::source_observation::build_source_observation_manifest(
-            aios_database::version_management::source_observation::SourceObservationBuildRequest {
-                observation_id,
-                project_name: db_option_ext.inner.project_name.clone(),
-                dbnum: rec.dbnum,
-                primary_file: PathBuf::from(&rec.file_path),
-                dependency_files: Vec::new(),
-                requested_sesno: Some(format!("{}..{}", from_sesno + 1, to_sesno)),
-                resolved_sesno: Some(to_sesno),
-                quiescence_window_ms,
-            },
-        )?;
-    let manifest_hash =
-        aios_database::version_management::source_observation::write_source_observation_manifest(
-            &manifest_path,
-            &manifest,
-        )?;
-    Ok(WatchSourceObservationGate {
-        manifest_path,
-        manifest_hash,
-    })
-}
-
-#[cfg(not(feature = "gui"))]
-fn print_incremental_sesno_summary(result: &IncrementRunResult) {
-    println!(
-        "✅ incremental-sesno 完成: files={} sessions={} elements={} total_changes={}",
-        result.summary["file_count"],
-        result.summary["session_count"],
-        result.summary["element_count"],
-        result.summary["category_counts"]["total"]
-    );
-    println!(
-        "   prim={} loop_owner={} bran_hanger={} basic_cata={} delete={}",
-        result.summary["category_counts"]["prim"],
-        result.summary["category_counts"]["loop_owner"],
-        result.summary["category_counts"]["bran_hanger"],
-        result.summary["category_counts"]["basic_cata"],
-        result.summary["category_counts"]["delete"]
-    );
-    if let Some(success) = result.generation_success {
-        println!("   generate_model_success={}", success);
-    }
-    if let Some(tree_index) = result.summary.get("tree_index")
-        && !tree_index.is_null()
-    {
-        let ready = tree_index
-            .get("ready")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        let mode = tree_index
-            .get("mode")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let missing = tree_index
-            .get("missing_dbnums")
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "[]".to_string());
-        println!(
-            "   tree_index: ready={} mode={} missing_dbnums={}",
-            ready, mode, missing
-        );
-    }
-    if let Some(export) = &result.parquet_export {
-        if export
-            .get("enabled")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            println!(
-                "   parquet_export: dbnums={} skipped={:?}",
-                export
-                    .get("exported_dbnums")
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "[]".to_string()),
-                export.get("skipped_reason").and_then(|value| value.as_str())
-            );
-        }
-    }
-    if let Some(handoff) = result.summary.get("publication_handoff") {
-        if handoff
-            .get("enabled")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            println!(
-                "   publication_handoff: candidates={} manifest={}",
-                handoff
-                    .get("candidate_count")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                handoff
-                    .get("manifest_path")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-            );
-        }
-    }
-    if result
-        .summary
-        .get("data_persist_enabled")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true)
-    {
-        println!(
-            "   data_persist: sessions={} pe={} att={} uda={} deletes={} dbnum_info={}",
-            result.persist_stats.session_count,
-            result.persist_stats.pe_rows,
-            result.persist_stats.att_rows,
-            result.persist_stats.uda_rows,
-            result.persist_stats.delete_count,
-            result.persist_stats.dbnum_info_updates
-        );
-    } else {
-        let reason = result
-            .summary
-            .get("data_persist_skipped_reason")
-            .and_then(|value| value.as_str())
-            .unwrap_or("--no-persist requested");
-        println!("   data_persist: skipped ({})", reason);
-    }
 }
 
 #[cfg(not(feature = "gui"))]
@@ -1161,7 +999,7 @@ async fn main() -> anyhow::Result<()> {
                 .arg(
                     Arg::new("generate-model")
                         .long("generate-model")
-                        .help("收集增量后调用 gen_all_geos_data(..., Some(update_log), None)")
+                        .help("收集增量后调用 gen_all_geos_data(..., Some(update_log))")
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
@@ -1169,31 +1007,6 @@ async fn main() -> anyhow::Result<()> {
                         .long("require-tree-index")
                         .help("增量模型生成前要求 scene_tree/<dbnum>.tree 已存在；缺失时快速失败，不进入模型生成")
                         .action(clap::ArgAction::SetTrue),
-                )
-                .arg(
-                    Arg::new("source-observation-manifest")
-                        .long("source-observation-manifest")
-                        .help("model-version observe-source 生成的 source observation manifest；启用后会在增量任务前后校验源 DB hash")
-                        .value_name("FILE"),
-                )
-                .arg(
-                    Arg::new("source-observation-manifest-hash")
-                        .long("source-observation-manifest-hash")
-                        .help("可选的 source observation manifest SHA-256，防止 manifest 路径被替换")
-                        .value_name("SHA256"),
-                )
-                .arg(
-                    Arg::new("publication-handoff-dir")
-                        .long("publication-handoff-dir")
-                        .help("增量生成成功后写入 release publication handoff manifest 的目录；不自动注册 release")
-                        .value_name("DIR"),
-                )
-                .arg(
-                    Arg::new("release-id-prefix")
-                        .long("release-id-prefix")
-                        .help("publication handoff 中建议 release_id 的前缀")
-                        .value_name("PREFIX")
-                        .default_value("incremental-sesno"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1245,33 +1058,6 @@ async fn main() -> anyhow::Result<()> {
                         .long("require-tree-index")
                         .help("watcher 触发增量模型生成前要求 scene_tree/<dbnum>.tree 已存在；缺失时快速失败，不进入模型生成")
                         .action(clap::ArgAction::SetTrue),
-                )
-                .arg(
-                    Arg::new("observation-quiescence-window-ms")
-                        .long("observation-quiescence-window-ms")
-                        .help("发现增量后生成 source observation manifest 时，两次源文件 hash/size 检查之间的静默窗口")
-                        .value_name("MS")
-                        .value_parser(clap::value_parser!(u64))
-                        .default_value("1000"),
-                )
-                .arg(
-                    Arg::new("source-observation-dir")
-                        .long("source-observation-dir")
-                        .help("watch-incremental 自动写入 source observation manifest 的目录")
-                        .value_name("DIR"),
-                )
-                .arg(
-                    Arg::new("publication-handoff-dir")
-                        .long("publication-handoff-dir")
-                        .help("增量生成成功后写入 release publication handoff manifest 的目录；不自动注册 release")
-                        .value_name("DIR"),
-                )
-                .arg(
-                    Arg::new("release-id-prefix")
-                        .long("release-id-prefix")
-                        .help("publication handoff 中建议 release_id 的前缀")
-                        .value_name("PREFIX")
-                        .default_value("incremental-sesno"),
                 )
                 .arg(
                     Arg::new("json")
@@ -1361,19 +1147,13 @@ async fn main() -> anyhow::Result<()> {
                         .value_name("REFNO"),
                 )
                 .arg(
-                    Arg::new("sesno")
-                        .long("sesno")
-                        .help("模型数据版本号；省略时按 current/latest sesno=0")
-                        .value_parser(clap::value_parser!(u32))
-                        .value_name("SESNO"),
-                )
-                .arg(
                     Arg::new("json")
                         .long("json")
                         .help("以 pretty JSON 输出")
                         .action(clap::ArgAction::SetTrue),
                 ),
         )
+        .subcommand(aios_database::version_management::cli::repair_missing_meshes_command())
         .subcommand(aios_database::version_management::cli::model_version_command())
         .subcommand(
             Command::new("serve")
@@ -1609,10 +1389,26 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(mv) = matches.subcommand_matches("model-version") {
         if mv.subcommand_matches("history").is_some()
+            || mv.subcommand_matches("export").is_some()
             || mv.subcommand_matches("resolve-anchor").is_some()
+            || mv.subcommand_matches("backfill-pe-cata-hash").is_some()
         {
             crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         }
+    }
+    if matches
+        .subcommand_matches("repair-missing-meshes")
+        .is_some()
+    {
+        crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
+    }
+    if aios_database::version_management::cli::handle_repair_missing_meshes_command(
+        &matches,
+        &db_option_ext,
+    )
+    .await?
+    {
+        return Ok(());
     }
     if aios_database::version_management::cli::handle_model_version_command(
         &matches,
@@ -1708,21 +1504,22 @@ async fn main() -> anyhow::Result<()> {
     }
     db_option_ext.validate_model_writer_features()?;
     if let Some(backend) = matches.get_one::<String>("transform-write-backend") {
-        db_option_ext.transform_write_backend = parse_transform_write_backend(Some(backend));
+        db_option_ext.transform_write_backend = parse_transform_write_backend(Some(backend))?;
         println!(
             "🔧 pe_transform 写入后端: {}",
             db_option_ext.transform_write_backend.as_str()
         );
     }
     if let Some(backend) = matches.get_one::<String>("transform-read-backend") {
-        db_option_ext.transform_read_backend = parse_transform_read_backend(Some(backend));
+        db_option_ext.transform_read_backend = parse_transform_read_backend(Some(backend))?;
         println!(
             "🔧 pe_transform 读取后端: {}",
             db_option_ext.transform_read_backend.as_str()
         );
     }
     if let Some(backends) = matches.get_one::<String>("transform-compare-backends") {
-        db_option_ext.transform_compare_backends = parse_transform_compare_backends(Some(backends));
+        db_option_ext.transform_compare_backends =
+            parse_transform_compare_backends(Some(backends))?;
         let labels = db_option_ext
             .transform_compare_backends
             .iter()
@@ -3138,6 +2935,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 incremental-sesno 子命令 ==========
     if let Some(incr_matches) = matches.subcommand_matches("incremental-sesno") {
+        let _mutation_lock = aios_database::version_management::project_mutation_lock::
+            ProjectMutationLock::acquire_for_current_command(&db_option_ext)?;
         let from_sesno = incr_matches
             .get_one::<u32>("from-sesno")
             .copied()
@@ -3155,16 +2954,6 @@ async fn main() -> anyhow::Result<()> {
             persist_data: !incr_matches.get_flag("no-persist"),
             recover_pending: incr_matches.get_flag("recover-pending"),
             generate_model: incr_matches.get_flag("generate-model"),
-            source_observation_manifest: incr_matches
-                .get_one::<String>("source-observation-manifest")
-                .map(PathBuf::from),
-            source_observation_manifest_hash: incr_matches
-                .get_one::<String>("source-observation-manifest-hash")
-                .cloned(),
-            publication_handoff_dir: incr_matches
-                .get_one::<String>("publication-handoff-dir")
-                .map(PathBuf::from),
-            release_id_prefix: incr_matches.get_one::<String>("release-id-prefix").cloned(),
             require_tree_index: incr_matches.get_flag("require-tree-index"),
             verbose,
         };
@@ -3179,7 +2968,9 @@ async fn main() -> anyhow::Result<()> {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result.summary)?);
         } else {
-            print_incremental_sesno_summary(&result);
+            aios_database::version_management::watch_incremental::print_incremental_sesno_summary(
+                &result,
+            );
         }
 
         aios_database::perf_metrics::finalize_task_metrics(true);
@@ -3188,190 +2979,28 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 watch-incremental 子命令 ==========
     if let Some(watch_matches) = matches.subcommand_matches("watch-incremental") {
-        let interval_secs = watch_matches
-            .get_one::<u64>("interval-secs")
-            .copied()
-            .unwrap_or(30)
-            .max(1);
-        let once = watch_matches.get_flag("once");
-        let generate_model = watch_matches.get_flag("generate-model");
-        let require_tree_index = watch_matches.get_flag("require-tree-index");
-        let json_output = watch_matches.get_flag("json");
-        let observation_quiescence_window_ms = watch_matches
-            .get_one::<u64>("observation-quiescence-window-ms")
-            .copied()
-            .expect("default value ensures this exists");
-        let source_observation_dir = watch_matches
-            .get_one::<String>("source-observation-dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                db_option_ext
-                    .get_project_output_dir()
-                    .join("model_versions")
-                    .join("source_observations")
-                    .join("watch-incremental")
-            });
-        let publication_handoff_dir = watch_matches
-            .get_one::<String>("publication-handoff-dir")
-            .map(PathBuf::from);
-        let release_id_prefix = watch_matches
-            .get_one::<String>("release-id-prefix")
-            .cloned();
-        let requested_dbnums: Vec<u32> = watch_matches
-            .get_many::<u32>("dbnum")
-            .map(|values| values.copied().collect())
-            .unwrap_or_default();
-
-        #[cfg(feature = "sqlite-index")]
-        {
-            let index_path = aios_database::data_interface::db_index::default_index_path(
-                &db_option_ext.inner.project_name,
-            );
-            if !index_path.exists() || watch_matches.get_flag("force-initial-scan") {
-                let report =
-                    aios_database::data_interface::db_index::rebuild_from_config(true).await?;
-                println!(
-                    "✅ watch-incremental 初始 db_index: {} 个库, {} 条 ref0 映射",
-                    report.db_files, report.ref0_total
-                );
-            }
-
-            let mut baselines = {
-                let store =
-                    aios_database::data_interface::db_index::DbIndexStore::open(&index_path)?;
-                store
-                    .all_db_files()
-                    .into_iter()
-                    .filter(|rec| {
-                        requested_dbnums.is_empty() || requested_dbnums.contains(&rec.dbnum)
-                    })
-                    .map(|rec| (rec.dbnum, rec.latest_sesno))
-                    .collect::<std::collections::BTreeMap<_, _>>()
-            };
-            if baselines.is_empty() {
-                anyhow::bail!("watch-incremental 未找到可监控 db 文件，请先检查 DbOption 工程路径");
-            }
-            println!(
-                "👀 watch-incremental 启动: dbnums={} interval={}s generate_model={}",
-                baselines.len(),
-                interval_secs,
-                generate_model
-            );
-
-            loop {
-                let report =
-                    aios_database::data_interface::db_index::rebuild_from_config(false).await?;
-                let records = {
-                    let store =
-                        aios_database::data_interface::db_index::DbIndexStore::open(&index_path)?;
-                    store.all_db_files()
-                };
-                let mut cycle_summaries = Vec::new();
-                let mut update_count = 0usize;
-
-                for rec in records {
-                    if !requested_dbnums.is_empty() && !requested_dbnums.contains(&rec.dbnum) {
-                        continue;
-                    }
-                    let Some(previous) = baselines.get(&rec.dbnum).copied() else {
-                        baselines.insert(rec.dbnum, rec.latest_sesno);
-                        continue;
-                    };
-                    if rec.latest_sesno <= previous {
-                        continue;
-                    }
-
-                    println!(
-                        "🔄 dbnum={} sesno {} -> {}，开始增量更新",
-                        rec.dbnum, previous, rec.latest_sesno
-                    );
-                    let source_observation = build_watch_source_observation_gate(
-                        &db_option_ext,
-                        &rec,
-                        previous,
-                        rec.latest_sesno,
-                        &source_observation_dir,
-                        observation_quiescence_window_ms,
-                    )?;
-                    println!(
-                        "🧾 source observation: {} sha256={}",
-                        source_observation.manifest_path.display(),
-                        source_observation.manifest_hash
-                    );
-                    let result = run_incremental_sesno_once(
-                        &db_option_ext,
-                        IncrementRunOptions {
-                            file: None,
-                            dbnums: vec![rec.dbnum],
-                            from_sesno: previous,
-                            to_sesno: Some(rec.latest_sesno),
-                            rescan_index: false,
-                            persist_data: true,
-                            recover_pending: false,
-                            generate_model,
-                            source_observation_manifest: Some(
-                                source_observation.manifest_path.clone(),
-                            ),
-                            source_observation_manifest_hash: Some(
-                                source_observation.manifest_hash.clone(),
-                            ),
-                            publication_handoff_dir: publication_handoff_dir.clone(),
-                            release_id_prefix: release_id_prefix.clone(),
-                            require_tree_index,
-                            verbose,
-                        },
-                    )
-                    .await?;
-                    baselines.insert(rec.dbnum, rec.latest_sesno);
-                    update_count += 1;
-                    if json_output {
-                        cycle_summaries.push(result.summary);
-                    } else {
-                        print_incremental_sesno_summary(&result);
-                    }
-                }
-
-                if json_output {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "scanned": report.scanned,
-                            "skipped": report.skipped,
-                            "db_files": report.db_files,
-                            "updates": cycle_summaries,
-                        }))?
-                    );
-                } else if update_count == 0 {
-                    println!(
-                        "ℹ️ watch-incremental 本轮无 sesno 增长 (scanned={} skipped={})",
-                        report.scanned, report.skipped
-                    );
-                }
-
-                if once {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-            }
-
-            return Ok(());
-        }
-        #[cfg(not(feature = "sqlite-index"))]
-        {
-            let _ = (
-                interval_secs,
-                once,
-                generate_model,
-                json_output,
-                observation_quiescence_window_ms,
-                source_observation_dir,
-                publication_handoff_dir,
-                release_id_prefix,
-                require_tree_index,
-                requested_dbnums,
-            );
-            anyhow::bail!("watch-incremental 需要 sqlite-index feature");
-        }
+        crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
+        aios_database::version_management::watch_incremental::run_watch_incremental(
+            &db_option_ext,
+            aios_database::version_management::watch_incremental::WatchIncrementalOptions {
+                requested_dbnums: watch_matches
+                    .get_many::<u32>("dbnum")
+                    .map(|values| values.copied().collect())
+                    .unwrap_or_default(),
+                interval_secs: watch_matches
+                    .get_one::<u64>("interval-secs")
+                    .copied()
+                    .unwrap_or(30),
+                once: watch_matches.get_flag("once"),
+                force_initial_scan: watch_matches.get_flag("force-initial-scan"),
+                generate_model: watch_matches.get_flag("generate-model"),
+                require_tree_index: watch_matches.get_flag("require-tree-index"),
+                json_output: watch_matches.get_flag("json"),
+                verbose,
+            },
+        )
+        .await?;
+        return Ok(());
     }
 
     // ========== 处理 scan-db-index 子命令 ==========
@@ -3463,8 +3092,7 @@ async fn main() -> anyhow::Result<()> {
         let refno = record_id_matches
             .get_one::<String>("refno")
             .expect("required by clap");
-        let sesno = record_id_matches.get_one::<u32>("sesno").copied();
-        let refno = parse_cli_model_record_refno(refno, sesno)?;
+        let refno = parse_cli_refno(refno)?;
         let evidence =
             aios_database::fast_model::gen_model::model_record_id::build_model_record_id_evidence(
                 refno,
@@ -3474,8 +3102,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             println!("input_refno: {}", evidence.input_refno);
             println!(
-                "parts: ref0={} ref1={} sesno={}",
-                evidence.parts.ref0, evidence.parts.ref1, evidence.parts.sesno
+                "parts: ref0={} ref1={}",
+                evidence.parts.ref0, evidence.parts.ref1
             );
             println!("inst_relate: {}", evidence.inst_relate);
             println!("inst_relate_aabb: {}", evidence.inst_relate_aabb);

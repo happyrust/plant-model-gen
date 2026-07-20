@@ -81,7 +81,6 @@ export interface DatabaseConfig {
   apply_boolean_operation: boolean
   mesh_tol_ratio: number
   room_keyword: string
-  target_sesno: number | null
   meshes_path: string | null
   export_json: boolean
   export_parquet: boolean

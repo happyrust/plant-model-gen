@@ -1427,6 +1427,7 @@ fn build_confirmed_record_snapshot_hash(
     rect_annotations: &[serde_json::Value],
     obb_annotations: &[serde_json::Value],
     measurements: &[serde_json::Value],
+    dimension_document: Option<&serde_json::Value>,
     note: &str,
 ) -> String {
     let normalized = normalize_snapshot_json(serde_json::json!({
@@ -1436,12 +1437,60 @@ fn build_confirmed_record_snapshot_hash(
         "rectAnnotations": rect_annotations,
         "obbAnnotations": obb_annotations,
         "measurements": measurements,
+        "dimensionDocument": dimension_document,
         "note": note,
     }));
     let serialized = serde_json::to_string(&normalized).unwrap_or_else(|_| normalized.to_string());
     let mut hasher = Sha256::new();
     hasher.update(serialized.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DimensionDocumentVersionPlan {
+    Preserve {
+        version: u64,
+    },
+    Create {
+        next_version: u64,
+    },
+    Update {
+        base_version: u64,
+        next_version: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DimensionDocumentVersionConflict {
+    latest_version: u64,
+}
+
+fn plan_dimension_document_version(
+    record_exists: bool,
+    existing_version: Option<u64>,
+    has_dimension_document: bool,
+    base_version: u64,
+) -> Result<DimensionDocumentVersionPlan, DimensionDocumentVersionConflict> {
+    let latest_version = existing_version.unwrap_or(0);
+    if !has_dimension_document {
+        return Ok(DimensionDocumentVersionPlan::Preserve {
+            version: latest_version,
+        });
+    }
+    if !record_exists {
+        return if base_version == 0 {
+            Ok(DimensionDocumentVersionPlan::Create { next_version: 1 })
+        } else {
+            Err(DimensionDocumentVersionConflict { latest_version: 0 })
+        };
+    }
+    if base_version != latest_version {
+        return Err(DimensionDocumentVersionConflict { latest_version });
+    }
+    Ok(DimensionDocumentVersionPlan::Update {
+        base_version,
+        next_version: base_version + 1,
+    })
 }
 
 async fn lookup_task_form_id(id: &str) -> Option<String> {
@@ -2684,6 +2733,10 @@ pub struct ConfirmedRecordData {
     #[serde(default)]
     pub measurements: Vec<serde_json::Value>,
     #[serde(default)]
+    pub dimension_document: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dimension_document_base_version: u64,
+    #[serde(default)]
     pub note: String,
 }
 
@@ -2711,6 +2764,9 @@ pub struct ConfirmedRecordWithMeta {
     pub rect_annotations: Vec<serde_json::Value>,
     pub obb_annotations: Vec<serde_json::Value>,
     pub measurements: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension_document: Option<serde_json::Value>,
+    pub dimension_document_version: u64,
     pub note: String,
     pub confirmed_at: i64,
 }
@@ -2726,6 +2782,8 @@ struct ReviewRecordRow {
     rect_annotations: Option<Vec<serde_json::Value>>,
     obb_annotations: Option<Vec<serde_json::Value>>,
     measurements: Option<Vec<serde_json::Value>>,
+    dimension_document: Option<serde_json::Value>,
+    dimension_document_version: Option<u64>,
     note: Option<String>,
     confirmed_at: Option<surrealdb::types::Datetime>,
     current_node: Option<String>,
@@ -2746,6 +2804,8 @@ fn confirmed_record_with_meta_from_row(row: ReviewRecordRow) -> ConfirmedRecordW
         rect_annotations: row.rect_annotations.unwrap_or_default(),
         obb_annotations: row.obb_annotations.unwrap_or_default(),
         measurements: row.measurements.unwrap_or_default(),
+        dimension_document: row.dimension_document,
+        dimension_document_version: row.dimension_document_version.unwrap_or(0),
         note: row.note.unwrap_or_default(),
         confirmed_at: parse_datetime_value(&row.confirmed_at),
     }
@@ -2833,15 +2893,6 @@ async fn create_record(
     };
     let note = request.note.trim().to_string();
     let slot_key = build_confirmed_record_slot_key(&form_id, &current_node, &operator_id);
-    let snapshot_hash = build_confirmed_record_snapshot_hash(
-        &record_type,
-        &request.annotations,
-        &request.cloud_annotations,
-        &request.rect_annotations,
-        &request.obb_annotations,
-        &request.measurements,
-        &note,
-    );
     let record_id = build_confirmed_record_stable_id(&slot_key);
     let db = match fresh_review_db().await {
         Ok(db) => db,
@@ -2882,6 +2933,48 @@ async fn create_record(
             );
         }
     };
+
+    let record_existed = existing_row.is_some();
+    let dimension_version_plan = match plan_dimension_document_version(
+        record_existed,
+        existing_row
+            .as_ref()
+            .and_then(|row| row.dimension_document_version),
+        request.dimension_document.is_some(),
+        request.dimension_document_base_version,
+    ) {
+        Ok(plan) => plan,
+        Err(conflict) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: existing_row.map(confirmed_record_with_meta_from_row),
+                    records: None,
+                    error_message: Some(format!(
+                        "尺寸文档版本冲突：当前版本为 {}，请刷新后确认是否重放本地修改",
+                        conflict.latest_version
+                    )),
+                }),
+            );
+        }
+    };
+
+    let effective_dimension_document = request.dimension_document.as_ref().or_else(|| {
+        existing_row
+            .as_ref()
+            .and_then(|row| row.dimension_document.as_ref())
+    });
+    let snapshot_hash = build_confirmed_record_snapshot_hash(
+        &record_type,
+        &request.annotations,
+        &request.cloud_annotations,
+        &request.rect_annotations,
+        &request.obb_annotations,
+        &request.measurements,
+        effective_dimension_document,
+        &note,
+    );
 
     if let Some(existing_row) = existing_row {
         if existing_row.snapshot_hash.as_deref() == Some(snapshot_hash.as_str()) {
@@ -2958,25 +3051,93 @@ async fn create_record(
         }
     }
 
-    let upsert_sql = r#"
-        UPSERT type::record('review_records', $id) CONTENT {
-            task_id: $task_id,
-            form_id: $form_id,
-            type: $type,
-            annotations: $annotations,
-            cloud_annotations: $cloud_annotations,
-            rect_annotations: $rect_annotations,
-            obb_annotations: $obb_annotations,
-            measurements: $measurements,
-            note: $note,
-            current_node: $current_node,
-            operator_id: $operator_id,
-            operator_name: $operator_name,
-            slot_key: $slot_key,
-            snapshot_hash: $snapshot_hash,
-            confirmed_at: time::now()
-        } RETURN AFTER
-    "#;
+    let write_sql = match dimension_version_plan {
+        DimensionDocumentVersionPlan::Update { .. } => {
+            r#"
+            UPDATE type::record('review_records', $id) MERGE {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                dimension_document: $dimension_document,
+                dimension_document_version: $next_dimension_document_version,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            }
+            WHERE (
+                dimension_document_version = $base_dimension_document_version
+                OR (
+                    dimension_document_version = NONE
+                    AND $base_dimension_document_version = 0
+                )
+            )
+            RETURN AFTER
+            "#
+        }
+        DimensionDocumentVersionPlan::Preserve { .. } if record_existed => {
+            r#"
+            UPDATE type::record('review_records', $id) MERGE {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            } RETURN AFTER
+            "#
+        }
+        DimensionDocumentVersionPlan::Create { .. }
+        | DimensionDocumentVersionPlan::Preserve { .. } => {
+            r#"
+            CREATE ONLY type::record('review_records', $id) CONTENT {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                dimension_document: $dimension_document,
+                dimension_document_version: $next_dimension_document_version,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            } RETURN AFTER
+            "#
+        }
+    };
+    let (base_dimension_document_version, next_dimension_document_version) =
+        match dimension_version_plan {
+            DimensionDocumentVersionPlan::Preserve { version } => (version, version),
+            DimensionDocumentVersionPlan::Create { next_version } => (0, next_version),
+            DimensionDocumentVersionPlan::Update {
+                base_version,
+                next_version,
+            } => (base_version, next_version),
+        };
 
     let sync_form_id = form_id.clone();
     let sync_node = current_node.clone();
@@ -2985,8 +3146,8 @@ async fn create_record(
     let sync_role = claims.role.clone().unwrap_or_default();
 
     match await_review_query(
-        "review.records.upsert",
-        db.query(upsert_sql)
+        "review.records.write",
+        db.query(write_sql)
             .bind(("id", record_id.clone()))
             .bind(("task_id", request.task_id.clone()))
             .bind(("form_id", form_id))
@@ -2996,6 +3157,15 @@ async fn create_record(
             .bind(("rect_annotations", request.rect_annotations.clone()))
             .bind(("obb_annotations", request.obb_annotations.clone()))
             .bind(("measurements", request.measurements.clone()))
+            .bind(("dimension_document", request.dimension_document.clone()))
+            .bind((
+                "base_dimension_document_version",
+                base_dimension_document_version,
+            ))
+            .bind((
+                "next_dimension_document_version",
+                next_dimension_document_version,
+            ))
             .bind(("note", note))
             .bind(("current_node", current_node))
             .bind(("operator_id", operator_id))
@@ -3032,22 +3202,83 @@ async fn create_record(
                 )
             } else {
                 warn!(
-                    "Confirmed record upsert returned empty result: task_id={}, record_id={}",
+                    "Confirmed record write returned empty result: task_id={}, record_id={}",
                     request.task_id, record_id
                 );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ConfirmedRecordResponse {
-                        success: false,
-                        record: None,
-                        records: None,
-                        error_message: Some("保存记录失败：数据库未返回确认记录".to_string()),
-                    }),
-                )
+                if matches!(
+                    dimension_version_plan,
+                    DimensionDocumentVersionPlan::Update { .. }
+                ) {
+                    let latest = await_review_query(
+                        "review.records.reload_conflict",
+                        db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+                            .bind(("id", record_id.clone())),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|mut response| {
+                        response
+                            .take::<Vec<ReviewRecordRow>>(0)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().next())
+                    });
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: latest.map(confirmed_record_with_meta_from_row),
+                            records: None,
+                            error_message: Some(
+                                "尺寸文档版本冲突，请刷新后确认是否重放本地修改".to_string(),
+                            ),
+                        }),
+                    )
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: None,
+                            records: None,
+                            error_message: Some("保存记录失败：数据库未返回确认记录".to_string()),
+                        }),
+                    )
+                }
             }
         }
         Err(e) => {
-            warn!("Failed to upsert record: {}", e);
+            warn!("Failed to write record: {}", e);
+            if matches!(
+                dimension_version_plan,
+                DimensionDocumentVersionPlan::Create { .. }
+            ) {
+                let latest = await_review_query(
+                    "review.records.reload_create_conflict",
+                    db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+                        .bind(("id", record_id)),
+                )
+                .await
+                .ok()
+                .and_then(|mut response| {
+                    response
+                        .take::<Vec<ReviewRecordRow>>(0)
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                });
+                if latest.is_some() {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: latest.map(confirmed_record_with_meta_from_row),
+                            records: None,
+                            error_message: Some(
+                                "尺寸文档版本冲突，请刷新后确认是否重放本地修改".to_string(),
+                            ),
+                        }),
+                    );
+                }
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ConfirmedRecordResponse {
@@ -6563,5 +6794,120 @@ mod tests {
         assert_eq!(user.name, "李审核员");
         assert_eq!(user.role, "reviewer");
         assert_eq!(user.email, "sh@company.com");
+    }
+
+    #[test]
+    fn test_confirmed_record_dimension_contract_is_camel_case_and_legacy_safe() {
+        let legacy: ConfirmedRecordData = serde_json::from_value(json!({
+            "taskId": "task-legacy",
+            "type": "batch",
+            "annotations": [],
+            "cloudAnnotations": [],
+            "rectAnnotations": [],
+            "obbAnnotations": [],
+            "measurements": [],
+            "note": ""
+        }))
+        .expect("legacy confirmed record request");
+        assert_eq!(legacy.dimension_document, None);
+        assert_eq!(legacy.dimension_document_base_version, 0);
+
+        let document = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc-1",
+            "records": []
+        });
+        let request: ConfirmedRecordData = serde_json::from_value(json!({
+            "taskId": "task-dimension",
+            "type": "batch",
+            "annotations": [],
+            "cloudAnnotations": [],
+            "rectAnnotations": [],
+            "obbAnnotations": [],
+            "measurements": [],
+            "dimensionDocument": document,
+            "dimensionDocumentBaseVersion": 4,
+            "note": ""
+        }))
+        .expect("dimension confirmed record request");
+        assert_eq!(request.dimension_document.as_ref(), Some(&document));
+        assert_eq!(request.dimension_document_base_version, 4);
+
+        let serialized = serde_json::to_value(request).expect("serialize confirmed record request");
+        assert_eq!(serialized.get("dimensionDocument"), Some(&document));
+        assert_eq!(
+            serialized
+                .get("dimensionDocumentBaseVersion")
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+        assert!(serialized.get("dimension_document").is_none());
+    }
+
+    #[test]
+    fn test_dimension_document_version_plan_covers_create_update_stale_and_legacy_preserve() {
+        assert_eq!(
+            plan_dimension_document_version(false, None, true, 0),
+            Ok(DimensionDocumentVersionPlan::Create { next_version: 1 })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(1), true, 1),
+            Ok(DimensionDocumentVersionPlan::Update {
+                base_version: 1,
+                next_version: 2,
+            })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(2), true, 1),
+            Err(DimensionDocumentVersionConflict { latest_version: 2 })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, None, true, 0),
+            Ok(DimensionDocumentVersionPlan::Update {
+                base_version: 0,
+                next_version: 1,
+            })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(7), false, 0),
+            Ok(DimensionDocumentVersionPlan::Preserve { version: 7 })
+        );
+    }
+
+    #[test]
+    fn test_dimension_document_changes_confirmed_record_snapshot_hash() {
+        let document_a = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc",
+            "records": [{ "id": "dimension-a" }]
+        });
+        let document_b = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc",
+            "records": [{ "id": "dimension-b" }]
+        });
+
+        let hash_a = build_confirmed_record_snapshot_hash(
+            "batch",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&document_a),
+            "",
+        );
+        let hash_b = build_confirmed_record_snapshot_hash(
+            "batch",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&document_b),
+            "",
+        );
+
+        assert_ne!(hash_a, hash_b);
     }
 }

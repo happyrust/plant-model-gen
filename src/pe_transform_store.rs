@@ -22,18 +22,9 @@ pub async fn save_entries_with_backend(
         TransformWriteBackend::Parquet => {
             save_entries_to_parquet(db_option, entries)?;
         }
-        TransformWriteBackend::DuckLake => {
-            save_entries_to_parquet(db_option, entries)?;
-            #[cfg(feature = "transform-store-ducklake")]
-            register_ducklake(db_option).await?;
-        }
         TransformWriteBackend::Dual => {
             save_pe_transform_entries(entries).await?;
             save_entries_to_parquet(db_option, entries)?;
-            #[cfg(feature = "transform-store-ducklake")]
-            if db_option.transform_write_backend.uses_ducklake() {
-                register_ducklake(db_option).await?;
-            }
         }
     }
 
@@ -53,9 +44,7 @@ pub async fn load_entries_with_backend(
         TransformReadBackend::Auto | TransformReadBackend::Surreal => {
             load_entries_from_surreal(refnos).await
         }
-        TransformReadBackend::Parquet | TransformReadBackend::DuckLake => {
-            load_entries_from_parquet(db_option, refnos)
-        }
+        TransformReadBackend::Parquet => load_entries_from_parquet(db_option, refnos),
         TransformReadBackend::Rkyv => load_entries_from_rkyv(refnos).await,
         TransformReadBackend::Memory => load_entries_from_memory(refnos),
     }
@@ -441,13 +430,6 @@ fn load_entries_from_memory(refnos: &[RefnoEnum]) -> Result<Vec<PeTransformEntry
 #[cfg(not(feature = "gen_model"))]
 fn load_entries_from_memory(_refnos: &[RefnoEnum]) -> Result<Vec<PeTransformEntry>> {
     anyhow::bail!("memory 读取后端需要 gen_model feature")
-}
-
-// ── DuckLake stub ──────────────────────────────────────────────
-
-#[cfg(feature = "transform-store-ducklake")]
-async fn register_ducklake(_db_option: &DbOptionExt) -> Result<()> {
-    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────

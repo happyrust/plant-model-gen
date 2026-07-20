@@ -28,7 +28,7 @@ use aios_core::{
     query_geom_mesh_data, query_negative_entities_batch,
 };
 
-use aios_core::{RefnoEnum, model_primary_db, utils::RecordIdExt};
+use aios_core::{RefnoEnum, project_primary_db, utils::RecordIdExt};
 
 use aios_core::geometry::{EleGeosInfo, EleInstGeosData, GeoBasicType};
 
@@ -72,7 +72,7 @@ async fn filter_out_bran_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<Refn
 
     let sql = format!("SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'");
 
-    model_primary_db().query_take(&sql, 0).await
+    project_primary_db().query_take(&sql, 0).await
 }
 
 /// 根据 mesh_id 和当前 LOD 配置构建完整的 mesh 文件路径
@@ -318,7 +318,7 @@ async fn query_inst_geo_param(mesh_id: &str) -> anyhow::Result<Option<PdmsGeoPar
         escaped_id
     );
 
-    let mut response = model_primary_db().query(&sql).await?;
+    let mut response = project_primary_db().query(&sql).await?;
     let mut params: Vec<PdmsGeoParam> = response.take(0).unwrap_or_default();
     Ok(params.pop())
 }
@@ -1053,7 +1053,7 @@ pub async fn apply_cata_neg_boolean_manifold(
                 }
             }
 
-            if let Err(e) = model_primary_db().query(update_sql.clone()).await {
+            if let Err(e) = project_primary_db().query(update_sql.clone()).await {
                 debug_model_warn!(
                     "[boolean_worker] 执行 update_sql 失败: {}\nSQL(len={}):\n{}",
                     e,
@@ -1109,7 +1109,7 @@ async fn apply_boolean_for_query(
         );
 
         let existing_status: Vec<Option<String>> =
-            model_primary_db().query_take(&check_sql, 0).await?;
+            project_primary_db().query_take(&check_sql, 0).await?;
 
         if matches!(
             existing_status.first().and_then(|s| s.as_deref()),
@@ -1773,7 +1773,7 @@ impl BoolResultWriter for DbBoolWriter {
         if sql.trim().is_empty() {
             return Ok(());
         }
-        model_primary_db().query(sql).await?;
+        project_primary_db().query(sql).await?;
         Ok(())
     }
 }
@@ -2291,7 +2291,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in FROM [{}] WHERE status = 'Success'",
             ids.join(",")
         );
-        match model_primary_db()
+        match project_primary_db()
             .query_take::<Vec<RefnoEnum>>(&sql, 0)
             .await
         {
@@ -2312,7 +2312,7 @@ async fn batch_query_bool_success_refnos(
             "SELECT VALUE in.refno FROM [{}] WHERE status = 'Success'",
             cata_ids.join(",")
         );
-        match model_primary_db()
+        match project_primary_db()
             .query_take::<Vec<RefnoEnum>>(&cata_sql, 0)
             .await
         {

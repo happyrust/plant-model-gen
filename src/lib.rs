@@ -387,24 +387,6 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
     let mgr = Arc::new(AiosDBManager::init_form_config().await?);
 
-    /// 创建db manager
-    if sync_live {
-        mgr.init_watcher().await?;
-        // 启动补增量（config 门控 AIOS_WATCH_STARTUP_CATCHUP，默认关闭）：
-        // 追赶停机期间落后区间，走与 async_watch 同一 Version Commit seam。
-        match mgr.startup_catchup().await {
-            Ok(stats) if !stats.anchors.is_empty() => {
-                log::info!(
-                    "启动补增量完成：固化锚点 {} 个，失败 {} 个",
-                    stats.anchors.len(),
-                    stats.commit_failures.len()
-                );
-            }
-            Ok(_) => {}
-            Err(e) => log::warn!("启动补增量失败（不阻断服务启动）：{}", e),
-        }
-    }
-
     // SQLite R*-tree initialization is handled automatically
 
     // progress_sender.send(10)?;
@@ -420,6 +402,10 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
 
     #[cfg(feature = "gen_model")]
     if db_option.is_gen_mesh_or_model() {
+        let _mutation_lock =
+            crate::version_management::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+                &db_option_ext,
+            )?;
         log::info!("正在生成模型");
 
         let mut time = Instant::now();
@@ -465,10 +451,13 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                 generate_ms,
             );
         }
-        if let Err(e) = gen_result {
-            crate::perf_metrics::finalize_task_metrics(false);
-            return Err(e.into());
-        }
+        let gen_result = match gen_result {
+            Ok(result) => result,
+            Err(error) => {
+                crate::perf_metrics::finalize_task_metrics(false);
+                return Err(error.into());
+            }
+        };
 
         let parquet_report =
             crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
@@ -483,6 +472,13 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                 parquet_report.skipped_reason
             );
         }
+        crate::versioned_db::version_commit::publish_model_gen_anchors_after_generation(
+            &db_option_ext,
+            gen_result.success,
+            "full-generation",
+            true,
+        )
+        .await?;
         crate::perf_metrics::finalize_task_metrics(true);
     }
 
@@ -534,21 +530,32 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
     }
 
     if sync_live {
-        // cur_mgr.clone().unwrap().async_watch().await.unwrap();
-
-        //todo 如何处理初始化的同步，第一次启动一定要同步一次，首先生成archive文件，然后再同步
-
-        //是否需要重构下面的这行代码？
+        let watch_options = crate::version_management::watch_incremental::WatchIncrementalOptions {
+            requested_dbnums: db_option.manual_db_nums.clone().unwrap_or_default(),
+            generate_model: db_option.is_gen_mesh_or_model(),
+            ..Default::default()
+        };
 
         #[cfg(feature = "mqtt")]
-
-        tokio::join!(
-            mgr.async_watch(),
-            AiosDBManager::poll_sync_e3d_mqtt_events(mgr.watcher.clone()),
-        );
+        {
+            crate::data_interface::mqtt_file_sync::initialize_file_index(&mgr.watcher).await?;
+            let watcher = mgr.watcher.clone();
+            let (watch_result, _) = tokio::join!(
+                crate::version_management::watch_incremental::run_watch_incremental(
+                    &db_option_ext,
+                    watch_options,
+                ),
+                crate::data_interface::mqtt_file_sync::poll_sync_e3d_mqtt_events(watcher),
+            );
+            watch_result?;
+        }
 
         #[cfg(not(feature = "mqtt"))]
-        mgr.async_watch().await;
+        crate::version_management::watch_incremental::run_watch_incremental(
+            &db_option_ext,
+            watch_options,
+        )
+        .await?;
     }
 
     Ok(())

@@ -131,7 +131,7 @@ pub async fn import_sql_file(
     path: &std::path::Path,
     batch_size: usize,
 ) -> anyhow::Result<(usize, usize)> {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
     use std::io::BufRead;
 
     // 轻量扫描：统计有效语句数（用于进度显示），不保存内容
@@ -208,7 +208,7 @@ pub async fn import_sql_file(
 /// 执行一个批次的 SQL 语句（事务包裹 + 重试）。
 /// 返回 (成功条数, 失败条数)。
 async fn execute_batch(stmts: &[String], batch_idx: usize) -> (usize, usize) {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
 
     let block = format!(
         "BEGIN TRANSACTION;\n{}\nCOMMIT TRANSACTION;",
@@ -219,7 +219,7 @@ async fn execute_batch(stmts: &[String], batch_idx: usize) -> (usize, usize) {
     let mut retries = 0u32;
     let max_retries = 3u32;
     loop {
-        match model_primary_db().query_response(&block).await {
+        match project_primary_db().query_response(&block).await {
             Ok(_) => return (count, 0),
             Err(e) => {
                 retries += 1;

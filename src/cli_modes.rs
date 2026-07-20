@@ -24,9 +24,7 @@ use aios_database::options::DbOptionExt;
 use aios_database::perf_timer::{PerfReport, PerfTimer};
 use parry3d::bounding_volume::BoundingVolume;
 // use aios_database::fast_model::export_xkt::XktExporter;
-use aios_database::fast_model::gen_model::model_record_id::{
-    model_refno_id, model_refno_sesno_range,
-};
+use aios_database::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_range};
 use aios_database::fast_model::model_exporter::{
     CommonExportConfig, ExportStats, GlbExportConfig, GltfExportConfig, ModelExporter,
     ObjExportConfig, XktExportConfig, collect_export_refnos,
@@ -1880,10 +1878,28 @@ fn start_generate_progress_heartbeat(
     }
 }
 
+async fn publish_model_gen_anchors_after_generation(
+    db_option_ext: &DbOptionExt,
+    gen_result: &aios_database::fast_model::gen_model::GenModelResult,
+    stage: &str,
+) -> Result<Vec<aios_database::versioned_db::version_commit::ModelGenAnchor>> {
+    aios_database::versioned_db::version_commit::publish_model_gen_anchors_after_generation(
+        db_option_ext,
+        gen_result.success,
+        stage,
+        false,
+    )
+    .await
+}
+
 pub async fn run_generate_model(
     config: &ExportConfig,
     db_option_ext: &DbOptionExt,
 ) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
+    let _mutation_lock =
+        aios_database::version_management::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+            db_option_ext,
+        )?;
     println!("\n🔧 --debug-model：开始增量生成几何体数据...");
     println!(
         "   ⚠️  增量语义：不清理既有模型关系（inst_relate/geo_relate/tubi_relate）。\n\
@@ -1966,6 +1982,8 @@ pub async fn run_generate_model(
     }
     aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
+    publish_model_gen_anchors_after_generation(&db_option_override, &gen_result, "generate")
+        .await?;
     println!("✅ 模型增量生成完成");
     Ok(gen_result)
 }
@@ -1976,6 +1994,10 @@ pub async fn run_regen_model(
     config: &ExportConfig,
     db_option_ext: &DbOptionExt,
 ) -> Result<aios_database::fast_model::gen_model::GenModelResult> {
+    let _mutation_lock =
+        aios_database::version_management::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+            db_option_ext,
+        )?;
     println!("\n🔄 --regen-model：开始重新生成几何体数据...");
     println!("   - 强制开启 gen_mesh 和 apply_boolean_operation");
 
@@ -2033,14 +2055,9 @@ pub async fn run_regen_model(
             None,
             generate_started.elapsed().as_millis() as u64,
         );
-        // 先清理 legacy 模型关系（含 inst_relate / geo_relate / tubi_relate），
-        // 再清理 refno_relations 扁平表，避免 regen 后导出仍读到历史 tubi 脏数据。
+        // 在统一清理入口中删除全部模型关系，避免 regen 后残留旧数据。
         aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
             .await?;
-        aios_database::fast_model::gen_model::pdms_inst_surreal::pre_cleanup_for_regen_surreal(
-            &target_refnos,
-        )
-        .await?;
     } else {
         println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
     }
@@ -2080,6 +2097,7 @@ pub async fn run_regen_model(
     }
     aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
+    publish_model_gen_anchors_after_generation(&db_option_override, &gen_result, "regen").await?;
     println!("✅ 模型重新生成完成");
     Ok(gen_result)
 }
@@ -3283,7 +3301,7 @@ pub async fn export_dbnum_instances_json_mode(
             use aios_core::shape::pdms_shape::RsVec3;
             use aios_core::types::PlantAabb;
             use aios_core::{SurrealQueryExt, project_primary_db};
-            use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+            use aios_database::fast_model::gen_model::hier_view::HierView;
             use aios_database::fast_model::model_cache::ModelCacheContext;
             use serde::{Deserialize, Serialize};
             use surrealdb::types as surrealdb_types;
@@ -3298,17 +3316,15 @@ pub async fn export_dbnum_instances_json_mode(
                 anyhow::bail!("model cache 上下文不可用，无法写入缓存");
             };
 
+            // specs/023 M2：层级/元信息走双源视图（pe_owner 快照默认 / .tree 回退）
+            let view = HierView::load(vec![dbnum]).await?;
             let branch_refnos: Vec<RefnoEnum> = if let Some(r) = root_refno.filter(|r| r.is_valid())
             {
-                let is_branch = TreeIndexManager::with_default_dir(vec![dbnum])
-                    .load_index(dbnum)
-                    .ok()
-                    .and_then(|idx| idx.node_meta(r.refno()))
-                    .is_some_and(|m| {
-                        let bran = aios_core::tool::db_tool::db1_hash("BRAN");
-                        let hang = aios_core::tool::db_tool::db1_hash("HANG");
-                        m.noun == bran || m.noun == hang
-                    });
+                let is_branch = view.get_node_meta(r).is_some_and(|m| {
+                    let bran = aios_core::tool::db_tool::db1_hash("BRAN");
+                    let hang = aios_core::tool::db_tool::db1_hash("HANG");
+                    m.noun == bran || m.noun == hang
+                });
                 if is_branch {
                     vec![r]
                 } else {
@@ -3316,9 +3332,8 @@ pub async fn export_dbnum_instances_json_mode(
                     return Ok(());
                 }
             } else {
-                let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                let mut v = manager.query_noun_refnos("BRAN", None);
-                v.extend(manager.query_noun_refnos("HANG", None));
+                let mut v = view.query_noun_refnos("BRAN", None);
+                v.extend(view.query_noun_refnos("HANG", None));
                 v
             };
 
@@ -3350,10 +3365,10 @@ pub async fn export_dbnum_instances_json_mode(
                     .unwrap_or_default();
                 let owner_type = owner_att.get_type_str().to_string();
 
-                // 注意：tubi_relate 的复合 ID 为 [ref0, ref1, sesno, index]；
+                // 注意：tubi_relate 的复合 ID 为 [ref0, ref1, index]；
                 // in/out 对应 leave/arrive；refno 导出侧以 leave_refno 为主键。
                 let owner_key = owner.to_pe_key();
-                let tubi_range = model_refno_sesno_range("tubi_relate", *owner);
+                let tubi_range = model_refno_range("tubi_relate", *owner);
                 let sql = format!(
                     r#"
                     SELECT
@@ -3364,7 +3379,7 @@ pub async fn export_dbnum_instances_json_mode(
                         aabb.d as world_aabb,
                         start_pt.d as start_pt,
                         end_pt.d as end_pt,
-                        id[3] as index
+                        id[2] as index
                     FROM {tubi_range};
                     "#
                 );
@@ -3518,12 +3533,16 @@ pub async fn export_dbnum_instances_json_mode(
                         // 连接数据库（生成需要从 SurrealDB 读取输入数据）
                         ensure_surreal_connected(db_option_ext).await?;
 
-                        // Step 1: 检测 TreeIndex 是否存在，若缺失则通过 gen_tree_only 解析生成
+                        // Step 1: 检测 TreeIndex 是否存在，若缺失则通过 gen_tree_only 解析生成。
+                        // specs/023 M2：pe_owner 主路径层级来自 pe 快照，无需 .tree 文件——
+                        // 仅在 AIOS_TREE_QUERY_SOURCE=tree 回退时保留该自动生成。
                         let tree_path = db_option_ext
                             .get_project_output_dir()
                             .join("scene_tree")
                             .join(format!("{}.tree", dbnum));
-                        if !tree_path.exists() {
+                        let need_tree_file =
+                            !aios_database::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner();
+                        if need_tree_file && !tree_path.exists() {
                             println!("📂 检测到 TreeIndex 缺失: {}", tree_path.display());
                             println!("🔄 正在通过 PDMS 解析生成 TreeIndex (gen_tree_only 模式)...");
 

@@ -1399,7 +1399,7 @@ pub async fn test_http_site(
 
 /// 运行时状态查询
 pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
-    use crate::data_interface::db_model::MQTT_CONNECT_STATUS;
+    use crate::data_interface::mqtt_file_sync::MQTT_CONNECT_STATUS;
     use crate::web_server::remote_runtime::REMOTE_RUNTIME;
     let guard = REMOTE_RUNTIME.read().await;
     let active = guard.is_some();

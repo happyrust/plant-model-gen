@@ -39,9 +39,8 @@ async fn main() -> anyhow::Result<()> {
     let config_file = format!("{}.toml", config_path);
     let cwd = std::env::current_dir().unwrap_or_default();
     let config_path_full = cwd.join(&config_file);
-    let config_content = std::fs::read_to_string(&config_file).unwrap_or_else(|e| {
-        panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e)
-    });
+    let config_content = std::fs::read_to_string(&config_file)
+        .unwrap_or_else(|e| panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e));
     let db_option: aios_core::options::DbOption = toml::from_str(&config_content)
         .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
     // versioned 存储参数是 DbOptionExt 扩展字段（specs/022），从同一 toml 直接提取
@@ -57,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .unwrap_or("90d")
+            .unwrap_or("0")
             .to_string();
         (versioned, retention)
     };

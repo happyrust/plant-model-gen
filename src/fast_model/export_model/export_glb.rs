@@ -211,7 +211,7 @@ async fn filter_refnos_with_inst_relate_aabb(refnos: &[RefnoEnum]) -> Vec<RefnoE
         return Vec::new();
     }
 
-    // inst_relate_aabb 使用版本化 array record id，与 inst_relate:[ref0,ref1,sesno] 对齐。
+    // inst_relate_aabb 使用纯 refno array record id，与 inst_relate:[ref0,ref1] 对齐。
     let ids = refnos
         .iter()
         .map(|r| model_refno_id("inst_relate_aabb", *r))

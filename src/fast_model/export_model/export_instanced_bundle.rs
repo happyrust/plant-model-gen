@@ -537,21 +537,36 @@ pub async fn export_instanced_bundle_for_refnos(
 
     // 筛选 BRAN/HANG 类型的 refnos 作为 bran_roots（TUBI 管道数据查询依赖）
     //
-    // 约定：过滤逻辑统一走 indextree（TreeIndex），避免在 cache-only 导出路径里隐式依赖 SurrealDB。
+    // specs/023 M2：过滤逻辑走双源层级视图（pe_owner 快照默认 / .tree 回退）。
     let mut bran_roots: Vec<RefnoEnum> = Vec::new();
     if !all_refnos.is_empty() {
+        use crate::fast_model::gen_model::hier_view::HierView;
         use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
         use std::collections::HashMap;
 
-        let mut managers: HashMap<u32, TreeIndexManager> = HashMap::new();
+        let mut views: HashMap<u32, HierView> = HashMap::new();
         for &refno in &all_refnos {
             let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno) else {
                 continue;
             };
-            let manager = managers
-                .entry(dbnum)
-                .or_insert_with(|| TreeIndexManager::with_default_dir(vec![dbnum]));
-            let Some(noun) = manager.get_noun(refno) else {
+            if !views.contains_key(&dbnum) {
+                match HierView::load(vec![dbnum]).await {
+                    Ok(view) => {
+                        views.insert(dbnum, view);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "   ⚠️ 加载层级视图失败 dbnum={}（跳过该库 BRAN/HANG 过滤）: {}",
+                            dbnum, e
+                        );
+                        continue;
+                    }
+                }
+            }
+            let Some(view) = views.get(&dbnum) else {
+                continue;
+            };
+            let Some(noun) = view.get_noun(refno) else {
                 continue;
             };
             let noun = noun.to_uppercase();

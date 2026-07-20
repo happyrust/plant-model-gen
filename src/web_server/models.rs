@@ -251,9 +251,6 @@ pub struct DatabaseConfig {
     pub mesh_tol_ratio: f64,
     /// 房间关键字
     pub room_keyword: String,
-    /// 目标会话号（可选）：基于特定sesno的增量生成
-    #[serde(default)]
-    pub target_sesno: Option<u32>,
     /// Mesh 文件输出目录（可选）
     #[serde(default)]
     pub meshes_path: Option<String>,
@@ -291,7 +288,6 @@ impl Default for DatabaseConfig {
             apply_boolean_operation: true,
             mesh_tol_ratio: 3.0,
             room_keyword: "-RM".to_string(),
-            target_sesno: None,
             meshes_path: None,
             export_json: false,
             export_parquet: true,
@@ -340,7 +336,6 @@ impl DatabaseConfig {
             apply_boolean_operation: opt.apply_boolean_operation,
             mesh_tol_ratio,
             room_keyword,
-            target_sesno: None,
             meshes_path: opt.meshes_path.clone(),
             export_json: opt.export_json,
             export_parquet: opt.export_parquet,
@@ -1135,7 +1130,7 @@ pub struct CreateManagedSiteRequest {
     /// specs/022：新建站点时是否开启 versioned（建库属性；默认 false）。
     #[serde(default)]
     pub versioned_storage: Option<bool>,
-    /// specs/022：新建站点 retention，默认 "90d"。
+    /// specs/024：新建站点 retention，默认 "0"（无限保留）。
     #[serde(default)]
     pub version_retention: Option<String>,
 }
@@ -2098,9 +2093,9 @@ pub struct IncrementalUpdateRequest {
     pub force_update: bool,
     /// 更新类型
     pub update_type: UpdateType,
-    /// 可选目标会话号
+    /// 可选增量区间上界；缺省时读取源文件最新 sesno。
     #[serde(default)]
-    pub target_sesno: Option<u32>,
+    pub to_sesno: Option<u32>,
 }
 
 /// 更新类型

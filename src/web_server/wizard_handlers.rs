@@ -491,7 +491,6 @@ pub async fn get_wizard_templates(
             apply_boolean_operation: true,
             mesh_tol_ratio: 3.0,
             room_keyword: "-RM".to_string(),
-            target_sesno: None,
             meshes_path: None,
             export_json: false,
             export_parquet: true,

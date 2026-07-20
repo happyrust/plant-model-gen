@@ -19,12 +19,15 @@ use crate::data_interface::db_meta;
 use crate::fast_model::gen_model::tree_index_manager::{
     TreeIndexManager, load_index_with_large_stack,
 };
+use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
+use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
 use aios_core::RefnoEnum;
 use aios_core::query_provider::*;
 use aios_core::tool::db_tool::db1_hash;
 use aios_core::tree_query::{TreeQueryFilter, TreeQueryOptions};
 use aios_core::types::{NamedAttrMap as NamedAttMap, SPdmsElement as PE};
 use anyhow::Context;
+use async_trait::async_trait;
 use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,9 +47,301 @@ pub async fn get_model_query_provider() -> anyhow::Result<Arc<dyn QueryProvider>
     Ok(provider)
 }
 
-/// 初始化查询提供者
+// ============================================================================
+// specs/023 M2/T6：PeOwnerSnapshotProvider（层级查询走 per-run pe 快照）
+// ============================================================================
+
+/// pe_owner 快照查询提供者：层级查询走 `versioned_db::pe_owner_snapshot`
+/// （per-dbnum 按需加载、run 级失效），其余（PE/属性/类型查询）委托 SurrealDB——
+/// 与 `TreeIndexQueryProvider` 的委托结构完全同构。
+struct PeOwnerSnapshotProvider {
+    name: String,
+    surreal_provider: SurrealQueryProvider,
+}
+
+impl PeOwnerSnapshotProvider {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            name: "PeOwnerSnapshot".to_string(),
+            surreal_provider: SurrealQueryProvider::new()
+                .map_err(|e| anyhow::anyhow!("初始化 SurrealQueryProvider 失败: {e}"))?,
+        })
+    }
+
+    /// 解析 refno 所属快照；dbnum 解析失败/快照缺该节点时返回 None（对齐
+    /// TreeIndexQueryProvider::find_index 的"找不到 → 空结果"语义）。
+    async fn snapshot_for(
+        &self,
+        refno: RefnoEnum,
+    ) -> QueryResult<Option<Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>>> {
+        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno) else {
+            return Ok(None);
+        };
+        let snap = get_or_load_pe_snapshot(dbnum)
+            .await
+            .map_err(|e| QueryError::ExecutionError(format!("加载 pe 快照失败 dbnum={dbnum}: {e}")))?;
+        Ok(Some(snap))
+    }
+
+    fn build_filter(nouns: &[&str]) -> TreeQueryFilter {
+        let noun_hashes = if nouns.is_empty() {
+            None
+        } else {
+            Some(nouns.iter().map(|n| db1_hash(n)).collect())
+        };
+        TreeQueryFilter {
+            noun_hashes,
+            ..Default::default()
+        }
+    }
+
+    fn descendants_options(
+        nouns: &[&str],
+        max_depth: Option<usize>,
+        include_self: bool,
+    ) -> TreeQueryOptions {
+        TreeQueryOptions {
+            include_self,
+            max_depth,
+            filter: Self::build_filter(nouns),
+            prune_on_match: false,
+        }
+    }
+}
+
+#[async_trait]
+impl HierarchyQuery for PeOwnerSnapshotProvider {
+    async fn get_children(&self, refno: RefnoEnum) -> QueryResult<Vec<RefnoEnum>> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(snap
+            .collect_children(refno.refno(), &TreeQueryFilter::default())
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect())
+    }
+
+    async fn get_descendants(
+        &self,
+        refno: RefnoEnum,
+        max_depth: Option<usize>,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(Vec::new());
+        };
+        let options = Self::descendants_options(&[], max_depth, false);
+        Ok(snap
+            .collect_descendants_bfs(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect())
+    }
+
+    async fn get_ancestors(&self, refno: RefnoEnum) -> QueryResult<Vec<RefnoEnum>> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(Vec::new());
+        };
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: TreeQueryFilter::default(),
+            prune_on_match: false,
+        };
+        Ok(snap
+            .collect_ancestors_root_to_parent(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect())
+    }
+
+    async fn get_ancestors_of_type(
+        &self,
+        refno: RefnoEnum,
+        nouns: &[&str],
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(Vec::new());
+        };
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: Self::build_filter(nouns),
+            prune_on_match: false,
+        };
+        Ok(snap
+            .collect_ancestors_root_to_parent(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect())
+    }
+
+    async fn get_descendants_filtered(
+        &self,
+        refno: RefnoEnum,
+        nouns: &[&str],
+        max_depth: Option<usize>,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(Vec::new());
+        };
+        let options = Self::descendants_options(nouns, max_depth, false);
+        Ok(snap
+            .collect_descendants_bfs(refno.refno(), &options)
+            .into_iter()
+            .map(RefnoEnum::from)
+            .collect())
+    }
+
+    async fn get_children_pes(&self, refno: RefnoEnum) -> QueryResult<Vec<PE>> {
+        self.surreal_provider.get_children_pes(refno).await
+    }
+}
+
+#[async_trait]
+impl TypeQuery for PeOwnerSnapshotProvider {
+    async fn query_by_type(
+        &self,
+        nouns: &[&str],
+        dbnum: i32,
+        has_children: Option<bool>,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        self.surreal_provider
+            .query_by_type(nouns, dbnum, has_children)
+            .await
+    }
+
+    async fn query_by_type_name_contains(
+        &self,
+        nouns: &[&str],
+        dbnum: i32,
+        keyword: &str,
+        case_sensitive: bool,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        self.surreal_provider
+            .query_by_type_name_contains(nouns, dbnum, keyword, case_sensitive)
+            .await
+    }
+
+    async fn query_by_type_multi_db(
+        &self,
+        nouns: &[&str],
+        dbnums: &[i32],
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        self.surreal_provider
+            .query_by_type_multi_db(nouns, dbnums)
+            .await
+    }
+
+    async fn get_world(&self, dbnum: i32) -> QueryResult<Option<RefnoEnum>> {
+        self.surreal_provider.get_world(dbnum).await
+    }
+
+    async fn get_sites(&self, dbnum: i32) -> QueryResult<Vec<RefnoEnum>> {
+        self.surreal_provider.get_sites(dbnum).await
+    }
+
+    async fn count_by_type(&self, noun: &str, dbnum: i32) -> QueryResult<usize> {
+        self.surreal_provider.count_by_type(noun, dbnum).await
+    }
+}
+
+#[async_trait]
+impl BatchQuery for PeOwnerSnapshotProvider {
+    async fn get_pes_batch(&self, refnos: &[RefnoEnum]) -> QueryResult<Vec<PE>> {
+        self.surreal_provider.get_pes_batch(refnos).await
+    }
+
+    async fn get_attmaps_batch(&self, refnos: &[RefnoEnum]) -> QueryResult<Vec<NamedAttMap>> {
+        self.surreal_provider.get_attmaps_batch(refnos).await
+    }
+
+    async fn get_full_names_batch(
+        &self,
+        refnos: &[RefnoEnum],
+    ) -> QueryResult<Vec<(RefnoEnum, String)>> {
+        self.surreal_provider.get_full_names_batch(refnos).await
+    }
+}
+
+#[async_trait]
+impl GraphQuery for PeOwnerSnapshotProvider {
+    async fn query_multi_descendants(
+        &self,
+        refnos: &[RefnoEnum],
+        nouns: &[&str],
+        include_self: bool,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        if refnos.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 与 TreeIndexQueryProvider 一致：按输入顺序拼接每个 root 的 BFS 结果。
+        let options = Self::descendants_options(nouns, None, include_self);
+        let mut result = Vec::new();
+        for &refno in refnos {
+            let Some(snap) = self.snapshot_for(refno).await? else {
+                continue;
+            };
+            result.extend(snap.collect_descendants_bfs(refno.refno(), &options));
+        }
+        Ok(result.into_iter().map(RefnoEnum::from).collect())
+    }
+
+    async fn find_shortest_path(
+        &self,
+        from: RefnoEnum,
+        to: RefnoEnum,
+    ) -> QueryResult<Vec<RefnoEnum>> {
+        self.surreal_provider.find_shortest_path(from, to).await
+    }
+
+    async fn get_node_depth(&self, refno: RefnoEnum) -> QueryResult<usize> {
+        let Some(snap) = self.snapshot_for(refno).await? else {
+            return Ok(0);
+        };
+        let options = TreeQueryOptions {
+            include_self: false,
+            max_depth: None,
+            filter: TreeQueryFilter::default(),
+            prune_on_match: false,
+        };
+        Ok(snap
+            .collect_ancestors_root_to_parent(refno.refno(), &options)
+            .len())
+    }
+}
+
+#[async_trait]
+impl QueryProvider for PeOwnerSnapshotProvider {
+    async fn get_pe(&self, refno: RefnoEnum) -> QueryResult<Option<PE>> {
+        self.surreal_provider.get_pe(refno).await
+    }
+
+    async fn get_attmap(&self, refno: RefnoEnum) -> QueryResult<Option<NamedAttMap>> {
+        self.surreal_provider.get_attmap(refno).await
+    }
+
+    async fn exists(&self, refno: RefnoEnum) -> QueryResult<bool> {
+        self.surreal_provider.exists(refno).await
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.name
+    }
+
+    async fn health_check(&self) -> QueryResult<bool> {
+        self.surreal_provider.health_check().await
+    }
+}
+
+/// 初始化查询提供者（specs/023 M2：`AIOS_TREE_QUERY_SOURCE` 双源开关，M4 删除 tree 分支）
 async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
-    log::info!("使用 TreeIndex 查询提供者（层级查询走 indextree）");
+    if latest_tree_source_is_pe_owner() {
+        log::info!("使用 PeOwnerSnapshot 查询提供者（层级查询走 pe 快照，数据源 SurrealDB）");
+        return Ok(Arc::new(PeOwnerSnapshotProvider::new()?));
+    }
+
+    log::info!("使用 TreeIndex 查询提供者（层级查询走 indextree；AIOS_TREE_QUERY_SOURCE=tree 回退路径）");
 
     let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
         .tree_dir()
@@ -283,17 +578,17 @@ pub async fn query_by_type(
 ///
 /// # 实现说明
 ///
-/// 此函数使用 TreeIndexManager 查询全库范围内的所有实例。
-pub fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
+/// specs/023 M2：双源——pe_owner（默认，HierView 快照）| tree（TreeIndexManager 回退）。
+pub async fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
     if nouns.is_empty() {
         return Ok(Vec::new());
     }
     let dbnums = resolve_tree_dbnums()?;
-    let manager = TreeIndexManager::with_default_dir(dbnums);
+    let view = crate::fast_model::gen_model::hier_view::HierView::load(dbnums).await?;
     let mut seen = HashSet::new();
     let mut refnos = Vec::new();
     for noun in nouns {
-        for refno in manager.query_noun_refnos(noun, None) {
+        for refno in view.query_noun_refnos(noun, None) {
             if refno.is_valid() && seen.insert(refno) {
                 refnos.push(refno);
             }
@@ -302,20 +597,20 @@ pub fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
     Ok(refnos)
 }
 
-/// 统计指定 noun 在全库范围内的实例数量（GROUP ALL + LIMIT 1）
-pub fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
+/// 统计指定 noun 在全库范围内的实例数量
+pub async fn count_noun_all_db(noun: &str) -> anyhow::Result<u64> {
     if noun.is_empty() {
         return Ok(0);
     }
     let dbnums = resolve_tree_dbnums()?;
-    let manager = TreeIndexManager::with_default_dir(dbnums);
-    let mut refnos = manager.query_noun_refnos(noun, None);
+    let view = crate::fast_model::gen_model::hier_view::HierView::load(dbnums).await?;
+    let mut refnos = view.query_noun_refnos(noun, None);
     refnos.retain(|r| r.is_valid());
     Ok(refnos.len() as u64)
 }
 
 /// 根据分页参数获取指定 noun 的 refno 列表
-pub fn query_noun_page_all_db(
+pub async fn query_noun_page_all_db(
     noun: &str,
     start: usize,
     limit: usize,
@@ -324,8 +619,8 @@ pub fn query_noun_page_all_db(
         return Ok(Vec::new());
     }
     let dbnums = resolve_tree_dbnums()?;
-    let manager = TreeIndexManager::with_default_dir(dbnums);
-    let mut refnos = manager.query_noun_refnos(noun, None);
+    let view = crate::fast_model::gen_model::hier_view::HierView::load(dbnums).await?;
+    let mut refnos = view.query_noun_refnos(noun, None);
     refnos.retain(|r| r.is_valid());
     if start >= refnos.len() {
         return Ok(Vec::new());
@@ -477,27 +772,61 @@ pub async fn query_multi_descendants_with_self(
         return Ok(Vec::new());
     }
 
-    // cache-only 语义：这里不应触发 “缺失 tree 自动从 DB 生成” 的路径；
-    // 若 tree 文件缺失，直接报错提示用户先生成 tree 索引即可。
-    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
-        .tree_dir()
-        .to_path_buf();
-
     let mut root_dbnums: Vec<(RefnoEnum, u32)> = Vec::with_capacity(refnos.len());
     for &root in refnos {
         let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root)?;
         root_dbnums.push((root, dbnum));
     }
 
-    // 这里直接用 TreeIndex 查询（并在大栈线程加载 `.tree`），避免依赖全局 Provider 的初始化时机。
     let noun_hashes: Option<HashSet<u32>> = if nouns.is_empty() {
         None
     } else {
         Some(nouns.iter().map(|&n| db1_hash(n)).collect())
     };
+    let options = TreeQueryOptions {
+        include_self,
+        max_depth: None,
+        filter: TreeQueryFilter {
+            noun_hashes,
+            ..Default::default()
+        },
+        prune_on_match: false,
+    };
 
     let mut out: Vec<RefnoEnum> = Vec::new();
     let mut seen: HashSet<RefnoEnum> = HashSet::new();
+
+    // specs/023 M2：pe_owner 主路径走 per-dbnum 快照（数据源 SurrealDB，增量后新鲜）。
+    if latest_tree_source_is_pe_owner() {
+        let mut snap_cache: HashMap<
+            u32,
+            Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>,
+        > = HashMap::new();
+        for (root, dbnum) in root_dbnums {
+            let snap = match snap_cache.get(&dbnum) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = get_or_load_pe_snapshot(dbnum)
+                        .await
+                        .with_context(|| format!("加载 pe 快照失败 dbnum={dbnum}"))?;
+                    snap_cache.insert(dbnum, s.clone());
+                    s
+                }
+            };
+            for r in snap.collect_descendants_bfs(root.refno(), &options) {
+                let r = RefnoEnum::from(r);
+                if r.is_valid() && seen.insert(r) {
+                    out.push(r);
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    // tree 回退：cache-only 语义——tree 文件缺失直接报错，不自动生成。
+    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
+        .tree_dir()
+        .to_path_buf();
     let mut index_cache: HashMap<u32, Arc<aios_core::tree_query::TreeIndex>> = HashMap::new();
 
     for (root, dbnum) in root_dbnums {
@@ -510,16 +839,6 @@ pub async fn query_multi_descendants_with_self(
                 index_cache.insert(dbnum, idx.clone());
                 idx
             }
-        };
-
-        let options = TreeQueryOptions {
-            include_self,
-            max_depth: None,
-            filter: TreeQueryFilter {
-                noun_hashes: noun_hashes.clone(),
-                ..Default::default()
-            },
-            prune_on_match: false,
         };
 
         for r in index.collect_descendants_bfs(root.refno(), &options) {

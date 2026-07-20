@@ -31,25 +31,42 @@ pub async fn stop_runtime() {
 pub async fn start_runtime(env_id: String) -> anyhow::Result<()> {
     let (init_ms, max_ms) = query_backoff_ms(&env_id).unwrap_or((1000, 30_000));
     let mgr = Arc::new(AiosDBManager::init_form_config().await?);
-    // 初始化 watcher（避免 async_watch 前缺少初始扫描）
-    mgr.init_watcher().await.ok();
+    crate::fast_model::utils::ensure_surreal_init().await?;
+    let db_option_ext = crate::options::get_db_option_ext();
+    let requested_dbnums = db_option_ext
+        .inner
+        .manual_db_nums
+        .clone()
+        .unwrap_or_default();
 
-    // 启动文件监听
-    let mgr_clone = mgr.clone();
+    // 与 CLI/sync_live 共用唯一轮询实现。
     let watcher_handle = tokio::spawn(async move {
-        // 忽略错误并常驻循环
-        let _ = mgr_clone.async_watch().await;
+        if let Err(error) = crate::version_management::watch_incremental::run_watch_incremental(
+            &db_option_ext,
+            crate::version_management::watch_incremental::WatchIncrementalOptions {
+                requested_dbnums,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            log::error!("remote runtime watch-incremental 退出: {error:#}");
+        }
     });
 
     // 启动 MQTT 订阅（仅在 mqtt feature 启用时）
     let mqtt_handle = {
         #[cfg(feature = "mqtt")]
         {
+            crate::data_interface::mqtt_file_sync::initialize_file_index(&mgr.watcher).await?;
             let watcher_arc = mgr.watcher.clone();
             Some(tokio::spawn(async move {
-                // 忽略错误并常驻循环
-                AiosDBManager::poll_sync_e3d_mqtt_events_with_backoff(watcher_arc, init_ms, max_ms)
-                    .await;
+                crate::data_interface::mqtt_file_sync::poll_sync_e3d_mqtt_events_with_backoff(
+                    watcher_arc,
+                    init_ms,
+                    max_ms,
+                )
+                .await;
             }))
         }
         #[cfg(not(feature = "mqtt"))]

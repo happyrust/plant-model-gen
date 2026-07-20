@@ -345,12 +345,12 @@ struct PeIdentRow {
 
 /// 按元素全名精确查 pe。返回 (refno, noun);多解/无解返回 None。
 async fn query_pe_by_name(dbnum: u32, name: &str) -> Result<Option<(RefnoEnum, Option<String>)>> {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
     let sql = format!(
         "SELECT record::id(id) AS key, noun FROM pe WHERE dbnum = {dbnum} AND name = '{}' LIMIT 2;",
         escape_surreal_str(name)
     );
-    let rows: Vec<PeIdentRow> = match model_primary_db().query_take(&sql, 0).await {
+    let rows: Vec<PeIdentRow> = match project_primary_db().query_take(&sql, 0).await {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!("[rvm-import] PE name lookup unavailable, fallback to ATT refs: {e}");
@@ -369,12 +369,12 @@ async fn query_pe_by_name(dbnum: u32, name: &str) -> Result<Option<(RefnoEnum, O
 
 /// 查 owner 的有序子元素(图遍历保持成员序),返回 (key, noun) 列表。
 async fn query_owner_children(owner: RefnoEnum) -> Result<Vec<PeIdentRow>> {
-    use aios_core::{SurrealQueryExt, model_primary_db};
+    use aios_core::{SurrealQueryExt, project_primary_db};
     let owner_key = owner.to_pe_key();
     let sql = format!(
         "SELECT VALUE (<-pe_owner.in).{{key: record::id(id), noun: noun}} FROM ONLY {owner_key} LIMIT 1;"
     );
-    match model_primary_db().query_take(&sql, 0).await {
+    match project_primary_db().query_take(&sql, 0).await {
         Ok(rows) => Ok(rows),
         Err(e) => {
             eprintln!("[rvm-import] PE owner-child lookup unavailable, fallback to ATT refs: {e}");

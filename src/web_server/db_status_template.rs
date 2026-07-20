@@ -716,20 +716,13 @@ pub fn db_status_page() -> String {
             }
             
             try {
-                // 可选目标 sesno 提示
-                let ses = prompt('可选: 输入目标 sesno（留空则按最新）');
-                let targetValue = null;
-                if (ses !== null && ses.trim() !== '' && !Number.isNaN(Number(ses))) {
-                    targetValue = Number(ses);
-                }
                 const response = await fetch('/api/db-status/update', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         dbnums: dbnums,
                         force_update: false,
-                        update_type: 'ParseAndModel',
-                        ...(targetValue !== null ? { target_sesno: targetValue } : {})
+                        update_type: 'ParseAndModel'
                     })
                 });
                 
@@ -750,20 +743,13 @@ pub fn db_status_page() -> String {
             }
             
             try {
-                // 可选目标 sesno 提示
-                let ses = prompt('可选: 输入目标 sesno（留空则按最新）');
-                let targetValue = null;
-                if (ses !== null && ses.trim() !== '' && !Number.isNaN(Number(ses))) {
-                    targetValue = Number(ses);
-                }
                 const response = await fetch('/api/db-status/update', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         dbnums: [dbnum],
                         force_update: false,
-                        update_type: 'Full',
-                        ...(targetValue !== null ? { target_sesno: targetValue } : {})
+                        update_type: 'Full'
                     })
                 });
                 

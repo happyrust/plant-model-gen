@@ -8,10 +8,7 @@ use std::time::SystemTime;
 
 use crate::web_server::{
     AppState,
-    models::{
-        DbStatusInfo, DbStatusQuery, FileVersionInfo, IncrementalUpdateRequest, MeshStatus,
-        ModelStatus, ParseStatus, UpdateType,
-    },
+    models::{DbStatusInfo, DbStatusQuery, FileVersionInfo, MeshStatus, ModelStatus, ParseStatus},
 };
 
 // 引入真实实现作为委托
@@ -124,25 +121,8 @@ pub async fn get_db_status_detail(
     }
 }
 
-#[cfg(feature = "sqlite-index")]
-pub async fn execute_incremental_update(
-    State(state): State<AppState>,
-    Json(request): Json<IncrementalUpdateRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 委托给真实实现：创建并启动任务
-    real_handlers::execute_incremental_update(State(state), Json(request)).await
-}
-
-#[cfg(not(feature = "sqlite-index"))]
-pub async fn execute_incremental_update(
-    State(_state): State<AppState>,
-    Json(_request): Json<IncrementalUpdateRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // sqlite-index feature not enabled
-    Ok(Json(
-        serde_json::json!({"status": "error", "message": "sqlite-index feature not enabled"}),
-    ))
-}
+// execute_incremental_update 委托层已删除：/api/db-status/update 直接路由到
+// incremental_update_handlers::execute_incremental_update（IncrementRun seam）。
 
 #[cfg(feature = "sqlite-index")]
 pub async fn check_file_versions(

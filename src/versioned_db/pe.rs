@@ -114,6 +114,10 @@ pub async fn save_pes(
             #[cfg(feature = "surreal-save")]
             {
                 let mut json = pe_data.gen_sur_json(Some(refno.to_pe_key()));
+                // specs/023 M0/T2（D1 方案 A）：cata_hash 直接落 pe 行（string 存储，
+                // u64 哈希可能超出 Surreal int/i64 范围）。与下方 ele_reuse_relate 边同源，
+                // 但 pe 行字段由增量路径持续维护（边只在 full 解析时重建）。
+                let cata_hash = att_map.cal_cata_hash();
                 // 将 children 字段注入到 JSON（Surreal 对象字面量）中；若无子节点则为空数组
                 let children_links = if let Some(children) = db_basic.children_map.get(&refno) {
                     if children.is_empty() {
@@ -141,6 +145,12 @@ pub async fn save_pes(
                         } else {
                             json.push_str("children: []}");
                         }
+                    }
+                }
+                if let Some(hash) = cata_hash {
+                    if json.ends_with('}') {
+                        json.pop();
+                        json.push_str(&format!(", cata_hash: '{}'}}", hash));
                     }
                 }
                 insert_jsons.push(json);
@@ -171,7 +181,7 @@ pub async fn save_pes(
                     .or_insert_with(Vec::new)
                     .push(simple_json);
 
-                if let Some(cata_hash) = att_map.cal_cata_hash() {
+                if let Some(cata_hash) = cata_hash {
                     let pe_key = refno.to_pe_key();
                     let inst_key = format!("inst_info:⟨{}⟩", cata_hash);
                     let relate_json = format!(
@@ -427,38 +437,48 @@ pub async fn save_pes_mysql(
 }
 
 //使用insert relations 去保存图数据关联关系
+//
+// specs/023 T007：每个 owner 先删后插，保证同库重解析/重灌幂等
+// （撞 id 且值不同直接报错、`INSERT IGNORE RELATION` 语法不存在——research.md C6/C7）。
+// 批内元素为**完整 SQL 语句**（DELETE / INSERT RELATION），sink 直接拼接执行；
+// 单个 owner 的语句不跨批，保证删-插顺序。
 #[cfg(feature = "surreal-save")]
 pub async fn save_pe_relates(db_basic: &DbBasicData, output: flume::Sender<SenderJsonsData>) {
-    let mut all_relate_jsons = vec![];
+    const ROWS_PER_INSERT: usize = 500;
+    const STMTS_PER_BATCH: usize = 200;
+    let mut stmts: Vec<String> = vec![];
     for kv in &db_basic.children_map {
         let owner = kv.0;
         let children = kv.1;
         if children.is_empty() {
             continue;
         }
-        let relate_json = children
-            .iter()
-            .enumerate()
-            .map(|(i, child)| {
-                let cp = child.to_pe_key();
-                let op = owner.to_pe_key();
-                format!("{{ id: pe_owner:[{1}, {i}], in: {0}, out: {1} }}", cp, op)
-            })
-            .collect::<Vec<String>>();
-        all_relate_jsons.extend_from_slice(&relate_json);
-        if all_relate_jsons.len() >= 500 {
+        let op = owner.to_pe_key();
+        stmts.push(format!("DELETE {op}<-pe_owner;"));
+        for (chunk_idx, chunk) in children.chunks(ROWS_PER_INSERT).enumerate() {
+            let rows = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    let order = chunk_idx * ROWS_PER_INSERT + i;
+                    format!(
+                        "{{ id: pe_owner:[{op}, {order}], in: {}, out: {op} }}",
+                        child.to_pe_key()
+                    )
+                })
+                .collect::<Vec<String>>()
+                .join(",");
+            stmts.push(format!("INSERT RELATION INTO pe_owner [{rows}];"));
+        }
+        if stmts.len() >= STMTS_PER_BATCH {
             output
-                .send(SenderJsonsData::PERelateJson(std::mem::take(
-                    &mut all_relate_jsons,
-                )))
+                .send(SenderJsonsData::PERelateJson(std::mem::take(&mut stmts)))
                 .expect("send pe_relates error");
         }
     }
-    if !all_relate_jsons.is_empty() {
+    if !stmts.is_empty() {
         output
-            .send(SenderJsonsData::PERelateJson(std::mem::take(
-                &mut all_relate_jsons,
-            )))
+            .send(SenderJsonsData::PERelateJson(std::mem::take(&mut stmts)))
             .expect("send pe_relates error");
     }
 }

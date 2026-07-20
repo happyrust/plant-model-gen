@@ -39,6 +39,39 @@ fn site_name_to_spec_value(name: &str) -> i64 {
     }
 }
 
+/// 层级数据源（specs/023 M2 双源）：pe_owner 快照（默认）或 `.tree`（回退）。
+enum SpecHierSource {
+    Snapshot(std::sync::Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>),
+    Tree(std::sync::Arc<aios_core::tree_query::TreeIndex>),
+}
+
+impl SpecHierSource {
+    fn all_refnos(&self) -> Vec<RefU64> {
+        match self {
+            Self::Snapshot(s) => s.all_refnos(),
+            Self::Tree(t) => t.all_refnos(),
+        }
+    }
+
+    fn node_meta(&self, r: RefU64) -> Option<aios_core::tree_query::TreeNodeMeta> {
+        match self {
+            Self::Snapshot(s) => s.node_meta(r),
+            Self::Tree(t) => t.node_meta(r),
+        }
+    }
+
+    fn collect_descendants_bfs_grouped(
+        &self,
+        root: RefU64,
+        options: &TreeQueryOptions,
+    ) -> std::collections::HashMap<u32, Vec<RefU64>> {
+        match self {
+            Self::Snapshot(s) => s.collect_descendants_bfs_grouped(root, options),
+            Self::Tree(t) => t.collect_descendants_bfs_grouped(root, options),
+        }
+    }
+}
+
 /// 构建 spec_info 并写出 Parquet，返回 refno -> spec_value 映射供导出使用
 pub async fn build_spec_info_parquet(
     dbnum: u32,
@@ -46,8 +79,19 @@ pub async fn build_spec_info_parquet(
     output_path: &Path,
     verbose: bool,
 ) -> Result<HashMap<u64, i64>> {
-    let index = load_index_with_large_stack(tree_dir, dbnum)
-        .with_context(|| format!("加载 TreeIndex dbnum={} 失败", dbnum))?;
+    // specs/023 M2 双源：pe_owner（默认）→ pe 快照（tree_dir 入参仅回退路径使用）
+    let index = if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+        SpecHierSource::Snapshot(
+            crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum)
+                .await
+                .with_context(|| format!("加载 pe 快照 dbnum={} 失败", dbnum))?,
+        )
+    } else {
+        SpecHierSource::Tree(
+            load_index_with_large_stack(tree_dir, dbnum)
+                .with_context(|| format!("加载 TreeIndex dbnum={} 失败", dbnum))?,
+        )
+    };
 
     let all_count = index.all_refnos().len();
     let site_refnos: Vec<RefU64> = index
@@ -66,7 +110,7 @@ pub async fn build_spec_info_parquet(
 
     if verbose {
         println!(
-            "   📋 spec_info: TreeIndex {} 节点, SITE {} 个",
+            "   📋 spec_info: 层级源 {} 节点, SITE {} 个",
             all_count,
             site_refnos.len()
         );

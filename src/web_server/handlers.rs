@@ -5354,19 +5354,10 @@ async fn execute_real_task(state: AppState, task_id: String) {
             config.excluded_nouns.clone().unwrap_or_default();
         db_option_ext.index_tree_debug_limit_per_target_type = config.debug_limit_per_noun_type;
 
-        // specs/022 候选3：target_sesno 依赖的 element_changes 表从未有写入方，路径已移除；
-        // 显式携带 target_sesno 的请求快速失败并指引改用 incremental-sesno。
-        let gen_result: anyhow::Result<()> = if let Some(sesno) = config.target_sesno {
-            Err(anyhow::anyhow!(
-                "target_sesno={} 已废弃：element_changes 表从未有写入方，按 sesno 的增量生成请改用 CLI incremental-sesno --dbnum ... --from-sesno/--to-sesno --generate-model（specs/022）",
-                sesno
-            ))
-        } else {
-            gen_all_geos_data(vec![], &db_option_ext, None)
-                .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from)
-        };
+        let gen_result: anyhow::Result<()> = gen_all_geos_data(vec![], &db_option_ext, None)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from);
         if let Err(e) = gen_result {
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
@@ -6198,83 +6189,10 @@ pub async fn get_db_status_detail(
     }
 }
 
-/// 执行增量更新
-pub async fn execute_incremental_update(
-    State(state): State<AppState>,
-    Json(request): Json<IncrementalUpdateRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 创建增量更新任务
-    let task_name = format!("增量更新数据库: {:?}", request.dbnums);
-    let task_type = match request.update_type {
-        UpdateType::ParseOnly => TaskType::ParsePdmsData,
-        UpdateType::ParseAndModel => TaskType::FullGeneration,
-        UpdateType::Full => TaskType::FullGeneration,
-    };
-
-    // 构建任务配置
-    let config = DatabaseConfig {
-        name: task_name.clone(),
-        manual_db_nums: request.dbnums.clone(),
-        gen_model: matches!(
-            request.update_type,
-            UpdateType::ParseAndModel | UpdateType::Full
-        ),
-        gen_mesh: matches!(request.update_type, UpdateType::Full),
-        gen_spatial_tree: matches!(request.update_type, UpdateType::Full),
-        apply_boolean_operation: false,
-        mesh_tol_ratio: 3.0,
-        room_keyword: "-RM".to_string(),
-        project_name: "AvevaMarineSample".to_string(),
-        project_code: 1516,
-        target_sesno: request.target_sesno,
-        ..Default::default()
-    };
-
-    // 在 dbnum_info_table 标记 updating = true
-    if !config.manual_db_nums.is_empty() {
-        let mut sql = String::new();
-        for db in &config.manual_db_nums {
-            sql.push_str(&format!(
-                "UPDATE dbnum_info_table SET updating = true WHERE dbnum = {};",
-                db
-            ));
-        }
-        let _ = project_primary_db().query(sql).await;
-    }
-
-    // 创建并启动任务
-    let mut task_manager = state.task_manager.lock().await;
-    let mut task = TaskInfo::new(task_name, task_type, config);
-    // 直接进入运行状态（该接口即创建即执行）
-    task.status = TaskStatus::Running;
-    task.started_at = Some(SystemTime::now());
-    task.add_log(LogLevel::Info, "增量更新任务开始执行".to_string());
-    let task_id = task.id.clone();
-
-    task_manager
-        .active_tasks
-        .insert(task_id.clone(), task.clone());
-    drop(task_manager);
-
-    // 启动任务执行（并发限流）
-    let state_cp = state.clone();
-    let id_cp = task_id.clone();
-    tokio::spawn(async move {
-        let _permit = TASK_EXEC_SEMAPHORE
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore");
-        execute_real_task(state_cp, id_cp).await;
-    });
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "增量更新任务已启动",
-        "task_id": task_id,
-        "dbnums": request.dbnums
-    })))
-}
+// 「执行增量更新」旁路已删除（specs/022：写路径统一走 Version Commit seam）：
+// 旧实现把"增量更新"映射为 sync_pdms(total_sync=true) 全量重解析，且硬编码
+// project_name AvevaMarineSample/1516。现路由 /api/db-status/update 指向
+// incremental_update_handlers::execute_incremental_update（IncrementRun seam）。
 
 async fn set_update_finalize(dbnums: &[u32], result: &str) {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -8996,18 +8914,10 @@ async fn execute_refno_model_generation(
     }
 
     // 重新获取 options (避免借用问题，虽然这里 clone 了)
-    // specs/022 候选3：target_sesno 的 element_changes 反查路径已移除，显式传入时快速失败。
-    let result: anyhow::Result<()> = if let Some(sesno) = config.target_sesno {
-        Err(anyhow::anyhow!(
-            "target_sesno={} 已废弃：element_changes 表从未有写入方，按 sesno 的增量生成请改用 CLI incremental-sesno（specs/022）",
-            sesno
-        ))
-    } else {
-        gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from)
-    };
+    let result: anyhow::Result<()> = gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from);
 
     let duration = start_time.elapsed();
 
@@ -9484,8 +9394,7 @@ pub async fn api_show_by_refno(
 
     // 5. 调用生成函数
     let result =
-        crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None)
-            .await;
+        crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None).await;
 
     match result {
         Ok(_) => {

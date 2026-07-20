@@ -183,3 +183,22 @@ history.txt
 artifacts/
 .cursor/plans/
 .plannotator/
+
+# ═══════════════════════════════════════════════════════════════
+# AI Agent 工具配置 / 会话过程数据（非项目源码，各工具自行生成）
+# ═══════════════════════════════════════════════════════════════
+/.factory/
+/.trellis/
+/.specify/
+/.agents/
+/.agent/
+/.context/
+/.planning/
+/goals/
+/garden-gpt-image-2/
+/evidence/
+
+# 一次性调试脚本与验证截图（非可复用测试基线）
+/debug_scripts/
+/verification/*.png
+/verification/**/*.png

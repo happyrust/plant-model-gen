@@ -1,5 +1,7 @@
 # 022 ↔ 023 共存说明
 
+> **2026-07-20 废止**：023 DuckLake 交付单元版本链已由 `specs/024-unified-rocksdb-versioning` 决议整体退役（`docs/adr/0001`），本共存说明仅作历史记录保留。
+
 **Date**: 2026-07-16
 
 | 维度 | specs/022 PE/ATT versioned | specs/023 DuckLake unit version |

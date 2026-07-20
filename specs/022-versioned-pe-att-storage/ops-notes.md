@@ -1,5 +1,7 @@
 # 运维说明与决策沉淀: PE/ATT versioned 存储 (specs/022)
 
+> **2026-07-20 更新**：版本化架构已由 `specs/024-unified-rocksdb-versioning` 统一收敛（模型锚点、DuckLake 交付链退役、retention=0 前提），本文与 023 的共存表述以 024 与 `docs/adr/0001` 为准。
+
 **Date**: 2026-07-16 | 对应 tasks.md T024 / T025（已关闭）
 
 > 七项决策与运维约束已沉淀于此；**运维约束精简版**已搬入根目录 `AGENTS.md`（T024，`alwaysApply`）。切换手册见 `quickstart.md`。

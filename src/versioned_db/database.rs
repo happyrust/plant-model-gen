@@ -584,15 +584,6 @@ async fn write_full_version_anchors(pending: &[(u32, u32)]) {
     }
 }
 
-#[cfg(feature = "sql")]
-pub trait MySqlMethods {
-    fn add_to_args(&self, args: &mut sqlx::mysql::MySqlArguments);
-
-    fn get_query(count: usize) -> anyhow::Result<String>;
-
-    fn name() -> String;
-}
-
 /// 初始化project database
 #[cfg(feature = "sql")]
 pub async fn create_project_database(project: &str, url: &str) -> anyhow::Result<()> {

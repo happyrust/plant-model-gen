@@ -115,8 +115,6 @@ parse_pdms_db = { path = "../pdms-io-fork/crates/parse_pdms_db" }
 | `gen_model/orchestrator.rs` | `gen_model/orchestrator.rs` |
 | `gen_model/pdms_inst.rs` | `gen_model/pdms_inst.rs` |
 | `gen_model/pdms_inst_surreal.rs` | `gen_model/pdms_inst_surreal.rs` |
-| `gen_model/pdms_inst_v2.rs` | `gen_model/pdms_inst_v2.rs` |
-| `gen_model/pdms_inst_v3.rs` | `gen_model/pdms_inst_v3.rs` |
 | `gen_model/precheck_coordinator.rs` | `gen_model/precheck_coordinator.rs` |
 | `gen_model/prim_model.rs` | `gen_model/prim_model.rs` |
 | `gen_model/prim_processor.rs` | `gen_model/prim_processor.rs` |

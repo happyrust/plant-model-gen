@@ -838,31 +838,6 @@ pub async fn sync_file_metadata(Json(req) → Result<Json<serde_json::Val...
 pub async fn rescan_and_cache(Json(req) → Result<Json<serde_json::Val...
 ```
 
-### src\fast_model\gen_model\pdms_inst_v2.rs
-```
-pub async fn pre_cleanup_for_regen_v2(seed_refnos: &[RefnoEnum]) → Result<()>
-pub async fn save_instance_data_to_sqlite(dbnum: u32, inst_relates: &[crate::model_relation_store::InstRelateRecord], geo_relates: &[(u64, u64) → Result<()>
-```
-
-### src\fast_model\gen_model\pdms_inst_v3.rs
-```
-pub async fn pre_cleanup_for_regen_v3(seed_refnos: &[RefnoEnum]) → Result<()>
-pub async fn save_model_relations_v3(dbnum: u32, refno_data_map: HashMap<RefnoEnum, RefnoRelations>,) → Result<()>
-```
-
-### src\model_relation_store_v3.rs
-```
-pub struct RefnoRelations
-pub struct ModelRelationStoreV3
-impl ModelRelationStoreV3
-  pub fn new(base_path: impl AsRef<Path>) → Self
-  pub fn cleanup_by_refnos(&self, dbnum: u32, refnos: &[RefnoEnum]) → Result<usize>
-  pub fn save_relations(&self, dbnum: u32, relations: &[RefnoRelations]) → Result<()>
-  pub fn load_relations(&self, dbnum: u32, refnos: &[RefnoEnum]) → Result<Vec<RefnoRelations>>
-  pub fn get_stats(&self, dbnum: u32) → Result<usize>
-pub fn global_store_v3() → &'static ModelRelationStoreV3
-```
-
 ### src\fast_model\export_model\export_dbnum_instances_parquet.rs
 ```
 pub struct ParquetExportStats
@@ -1325,7 +1300,6 @@ pub async fn api_spatial_stats() → Response
 ### src\versioned_db\database.rs
 ```
 pub enum SenderJsonsData
-pub trait MySqlMethods
 pub async fn create_project_database(project: &str, url: &str) → anyhow::Result<()>
 pub async fn create_info_database(db_option: &DbOption) → anyhow::Result<()>
 pub async fn sync_pdms_with_callback(db_option: &DbOption, mut progress_callback: Option<F>,) → anyhow::Result<()> where F:...

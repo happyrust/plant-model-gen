@@ -665,6 +665,18 @@ pub async fn start_web_server_with_config(
             "/api/model/parquet-version/{dbno}",
             get(model_runtime::api_parquet_version),
         )
+        .route(
+            "/api/model/units/{unit_refno}/versions",
+            get(model_runtime::api_model_unit_versions),
+        )
+        .route(
+            "/api/model/units/{unit_refno}/versions/latest",
+            get(model_runtime::api_latest_model_unit_version),
+        )
+        .route(
+            "/api/model/units/{unit_refno}/versions/{sesno}",
+            get(model_runtime::api_model_unit_version),
+        )
         // 获取指定 dbno 的 Parquet 文件列表
         .route(
             "/api/model/{dbno}/files",

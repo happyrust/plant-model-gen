@@ -136,6 +136,8 @@ pub mod dblist_parser;
 
 pub mod expression_fix;
 
+pub mod generation_read;
+
 pub mod tables;
 
 // pub mod ssc;
@@ -167,6 +169,7 @@ pub mod scene_tree;
 
 // pub mod xeokit_xtk_generator; // 暂时注释掉，待实现
 
+pub mod version_store;
 pub mod versioned_db;
 
 #[cfg(feature = "mqtt")]

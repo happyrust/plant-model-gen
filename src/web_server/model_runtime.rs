@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -25,6 +25,11 @@ pub struct RealtimeInstancesRequest {
 pub struct ParquetIncrementalEnqueueRequest {
     pub dbnum: Option<u32>,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelUnitVersionQuery {
+    pub dbnum: u32,
 }
 
 pub fn ensure_runtime_started() {
@@ -166,6 +171,158 @@ pub async fn api_parquet_version(Path(dbno): Path<u32>) -> impl IntoResponse {
             "dbno": dbno,
             "version": 0,
         })),
+    )
+}
+
+pub async fn api_model_unit_versions(
+    Path(unit_refno): Path<String>,
+    Query(query): Query<ModelUnitVersionQuery>,
+) -> impl IntoResponse {
+    #[cfg(feature = "generation-read-ducklake")]
+    {
+        let dbnum = query.dbnum;
+        let unit_refno = normalize_refno_key(&unit_refno);
+        let config = crate::options::get_db_option_ext().ducklake_config();
+        let result = tokio::task::spawn_blocking(move || {
+            let authority = crate::version_store::DuckLakeAuthority::open_readonly(config)?;
+            authority.list_model_unit_commits(dbnum, &unit_refno)
+        })
+        .await;
+        return match result {
+            Ok(Ok(commits)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "data": commits.into_iter().map(model_unit_commit_json).collect::<Vec<_>>(),
+                })),
+            ),
+            Ok(Err(error)) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => model_unit_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("DuckLake read task failed: {error}"),
+            ),
+        };
+    }
+    #[cfg(not(feature = "generation-read-ducklake"))]
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "success": false,
+            "message": "服务端未启用 generation-read-ducklake feature",
+        })),
+    )
+}
+
+pub async fn api_model_unit_version(
+    Path((unit_refno, sesno)): Path<(String, u32)>,
+    Query(query): Query<ModelUnitVersionQuery>,
+) -> impl IntoResponse {
+    #[cfg(feature = "generation-read-ducklake")]
+    {
+        let dbnum = query.dbnum;
+        let unit_refno = normalize_refno_key(&unit_refno);
+        let query_refno = unit_refno.clone();
+        let config = crate::options::get_db_option_ext().ducklake_config();
+        let result = tokio::task::spawn_blocking(move || {
+            let authority = crate::version_store::DuckLakeAuthority::open_readonly(config)?;
+            authority.model_unit_commit(dbnum, &query_refno, sesno)
+        })
+        .await;
+        return match result {
+            Ok(Ok(Some(commit))) => (
+                StatusCode::OK,
+                Json(json!({ "success": true, "data": model_unit_commit_json(commit) })),
+            ),
+            Ok(Ok(None)) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "未找到模型提交: ({}, {}, {})",
+                        dbnum, unit_refno, sesno
+                    ),
+                })),
+            ),
+            Ok(Err(error)) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => model_unit_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("DuckLake read task failed: {error}"),
+            ),
+        };
+    }
+    #[cfg(not(feature = "generation-read-ducklake"))]
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "success": false,
+            "message": "服务端未启用 generation-read-ducklake feature",
+        })),
+    )
+}
+
+pub async fn api_latest_model_unit_version(
+    Path(unit_refno): Path<String>,
+    Query(query): Query<ModelUnitVersionQuery>,
+) -> impl IntoResponse {
+    #[cfg(feature = "generation-read-ducklake")]
+    {
+        let dbnum = query.dbnum;
+        let unit_refno = normalize_refno_key(&unit_refno);
+        let query_refno = unit_refno.clone();
+        let config = crate::options::get_db_option_ext().ducklake_config();
+        let result = tokio::task::spawn_blocking(move || {
+            let authority = crate::version_store::DuckLakeAuthority::open_readonly(config)?;
+            authority.latest_model_unit_commit(dbnum, &query_refno)
+        })
+        .await;
+        return match result {
+            Ok(Ok(Some(commit))) => (
+                StatusCode::OK,
+                Json(json!({ "success": true, "data": model_unit_commit_json(commit) })),
+            ),
+            Ok(Ok(None)) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "未找到模型提交: ({}, {})",
+                        dbnum, unit_refno
+                    ),
+                })),
+            ),
+            Ok(Err(error)) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+            Err(error) => model_unit_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                anyhow::anyhow!("DuckLake read task failed: {error}"),
+            ),
+        };
+    }
+    #[cfg(not(feature = "generation-read-ducklake"))]
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "success": false,
+            "message": "服务端未启用 generation-read-ducklake feature",
+        })),
+    )
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn model_unit_commit_json(commit: crate::version_store::ModelUnitCommit) -> serde_json::Value {
+    json!({
+        "manifest_url": commit.manifest_url(),
+        "commit": commit,
+    })
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn model_unit_error(
+    status: StatusCode,
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(json!({ "success": false, "message": error.to_string() })),
     )
 }
 

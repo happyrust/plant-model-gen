@@ -515,6 +515,28 @@ fn operation_kind(operation: &EleOperationData) -> &'static str {
     }
 }
 
+fn modified_element_affects_model(modified: &pdms_io::io::ModifiedElement) -> bool {
+    if modified.children_changed.is_some() {
+        return true;
+    }
+    modified
+        .added_attrs
+        .keys()
+        .chain(modified.deleted_attrs.keys())
+        .chain(modified.modified_attrs.keys())
+        .chain(modified.added_explicit_attrs.keys())
+        .chain(modified.deleted_explicit_attrs.keys())
+        .chain(modified.modified_explicit_attrs.keys())
+        .any(|name| crate::version_management::model_impact::attribute_affects_model(name))
+}
+
+fn operation_is_known_model_noop(operation: &EleOperationData) -> bool {
+    matches!(
+        &operation.detail,
+        EleOperationDetail::Modified(modified) if !modified_element_affects_model(modified)
+    )
+}
+
 fn apply_pdms_operation(
     io: &mut PdmsIO,
     update_log: &mut IncrGeoUpdateLog,
@@ -525,6 +547,10 @@ fn apply_pdms_operation(
         EleOperationDetail::Deleted => insert_change_by_noun(update_log, refno, "DELETED", true)
             .map(|category| PdmsModelChangeTarget { refno, category }),
         EleOperationDetail::None => {
+            remove_refno_from_log(update_log, refno);
+            None
+        }
+        EleOperationDetail::Modified(modified) if !modified_element_affects_model(modified) => {
             remove_refno_from_log(update_log, refno);
             None
         }
@@ -1102,7 +1128,9 @@ pub fn collect_pdms_increment_for_file_with_operations(
             }
 
             let model_change = apply_pdms_operation(&mut io, &mut update_log, operation);
-            let classified = model_change.is_some() || is_none_operation;
+            let classified = model_change.is_some()
+                || is_none_operation
+                || operation_is_known_model_noop(operation);
             if !classified {
                 println!(
                     "警告：未知 PDMS noun/type {} 对于 refno {}",

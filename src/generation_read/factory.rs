@@ -9,16 +9,41 @@ use crate::version_store::SurrealReplicaStore;
 use super::error::{GenerationReadError, GenerationReadResult};
 use super::surreal::SurrealVersionedReadBackend;
 use super::traits::{GenerationReadBackend, VersionedReadSession};
-use super::types::{DataVersion, InputVersionManifest};
+use super::types::{DataVersion, GenerationReadMode, GenerationReadSpec, InputVersionManifest};
 
 /// specs/027（ADR-0008）：生成读取唯一后端 = Surreal 主库。
 ///
-/// DuckLake/compare 后端已随 ADR-0007 退役；输入版本清单降级为观测记录，
-/// 由当前 Committed Watermark 构造，不再有“权威 snapshot 来源”或 fail-closed
-/// 覆盖校验。
+/// 兼容入口只用于 initialization/live 读取。需要绑定数据锚点的调用方必须使用
+/// [`open_generation_read_session_with_spec`] 显式传入读取契约。
 pub async fn open_generation_read_session(
     options: &DbOptionExt,
 ) -> GenerationReadResult<Arc<dyn VersionedReadSession>> {
+    let spec = GenerationReadSpec::live();
+    open_generation_read_session_with_spec(options, &spec).await
+}
+
+/// 按一次生成 run 的不可变读取契约打开 session。
+///
+/// 当前 generation-replica adapter 只能保持既有 live 行为；主表
+/// `VERSION AT` adapter 落地前，显式 `read_at` 必须失败关闭，不能退回最新态。
+pub async fn open_generation_read_session_with_spec(
+    options: &DbOptionExt,
+    spec: &GenerationReadSpec,
+) -> GenerationReadResult<Arc<dyn VersionedReadSession>> {
+    spec.validate()?;
+    match spec.mode() {
+        GenerationReadMode::Live => {}
+        GenerationReadMode::ReadAt => {
+            let read_at = spec.read_at().ok_or_else(|| {
+                GenerationReadError::InvalidReadSpec("read_at 模式必须提供锚点时间".to_string())
+            })?;
+            return Err(GenerationReadError::UnsupportedReadAt {
+                backend: "surreal-generation-replica",
+                read_at: read_at.to_string(),
+            });
+        }
+    }
+
     let manifest = Arc::new(resolve_input_version_manifest(options).await?);
     let surreal: Arc<dyn GenerationReadBackend> = Arc::new(SurrealVersionedReadBackend::new(
         SurrealReplicaStore::default(),
@@ -45,12 +70,13 @@ pub async fn resolve_input_version_manifest(
 
     let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table GROUP BY dbnum;\n\
                SELECT dbnum, math::max(sesno) AS sesno FROM sesno_version_anchor \
-               WHERE source IN ['full', 'incremental'] GROUP BY dbnum;";
-    let backend_error = |operation: &'static str, message: String| GenerationReadError::BackendQuery {
-        backend: "surreal",
-        operation,
-        message,
-    };
+               WHERE source IN ['full', 'incremental_baseline', 'incremental'] GROUP BY dbnum;";
+    let backend_error =
+        |operation: &'static str, message: String| GenerationReadError::BackendQuery {
+            backend: "surreal",
+            operation,
+            message,
+        };
     let mut response = project_primary_db()
         .query(sql)
         .await

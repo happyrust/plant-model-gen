@@ -2,6 +2,9 @@
 
 > 日期：2026-07-22 ｜ 方式：grill-with-docs（关键决策见文末 ADR 0009、术语见 `CONTEXT.md`）
 > 依据分析：`docs/reverse/core_dll_noun_att_model_update.md`（core.dll/Core3D 逆向 + §13 几何输入属性 + §14 三方交叉校验）
+>
+> **2026-07-23 语义修订**：`wnoevt` 只代表 core 事件边界；模型影响基线应近似
+> `DCHC/EVALAT`。本计划的 M1/M2 实施事实保留，旧函数名与后续方向按当前代码修正。
 
 ## 1. 背景与现状（事实，来自代码）
 
@@ -9,17 +12,22 @@
 
 - 判定函数：`src/version_management/model_impact.rs::attribute_affects_model(name)` —— 一张"几何影响属性白名单"（`matches!` + `starts_with("PARA"/"PARAM")`），带 `att.`/`ATT.` 前缀规整与大写归一。
 - 接入点：`src/data_interface/sesno_increment.rs`
-  - `modified_element_affects_model()` 用它扫 `ModifiedElement.{modified,added,deleted}_attrs`（含 explicit 变体）与 `children_changed`；
-  - `operation_is_known_model_noop()` / `apply_pdms_operation()` 把"只改非几何属性"的 `Modified` 从 `IncrGeoUpdateLog` 剔除（不进 prim/loop_owner/bran_hanger/basic_cata 桶）。
+  - `classify_modified_element()` 汇总普通/explicit/UDA 属性差异，并实施
+    trigger / known-neutral / unknown-fallback 三态；
+  - `apply_pdms_operation()` 只跳过全 known-neutral 的 `Modified`；
+    `apply_critical_model_expansion()` 另补旧/新 owner 与 children 差集。
 - 数据基础：`pdms-io` 已提供属性级 delta，**无需额外采集**。
 - 另一入口：`field_path_affects_model(path)`（PE/ATT 历史 diff 路径）复用同一函数。
-- 权威语义（逆向所得）：E3D 内核里 "是否触发下游" 的最终开关是每属性字典标志 `wnoevt`（`DB_Attribute` off184 / dabacon 字段 `299311034`）；但 `wnoevt` 是**内核字典数据、不随模型库同步、静态不可导出**（详见逆向文档 §14.2）。
+- 对照语义（逆向所得）：`wnoevt`（字段 `299311034`）控制 core 事件；
+  `DCHC`（字段 `596407`）经 `IDCHNG/EVALAT` 控制 Core3D 设计变化及传播。
+  `att_meta` 当前两者都未同步，白名单只是离线、宁多勿漏的模型影响基线。
 
 ## 2. 目标（范围：对齐/加固 + 校验）
 
 1. 把 `attribute_affects_model` 白名单**补齐 §13/§14 发现的几何相关缺口**，并明确边界（宁多勿漏）。
 2. 增加**可复现的校验**（CLI+JSON / HTTP，**不写 `cargo test`**，遵 `AGENTS.md`）：白名单 vs 权威属性字典 `att_meta` 覆盖体检 + 行为回归（几何编辑触发、元数据编辑剔除）。
-3. 明确**不在本计划**的项（波及闭包、placement-vs-mesh、wnoevt 权威管线）为记录在案的后续项。
+3. 明确**不在本计划**的项（完整波及闭包、placement-vs-mesh、
+   DCHC/effect 动态管线）为记录在案的后续项。
 
 **取舍原则（见 ADR 0009）**：白名单保持"硬编码 + 宁多勿漏"。漏判 = 模型陈旧（正确性 bug），误判 = 多算一次（成本可控）；故对"可能影响几何"的属性一律纳入。
 
@@ -41,12 +49,13 @@
 ## 4. 具体改动（T-任务）
 
 - **T1｜白名单补缺**：编辑 `src/version_management/model_impact.rs`，按 §3 分组把缺口属性加入 `matches!` 臂；`CURTYP` 为 6 字母，确认归一后按整名匹配（非 `starts_with`）。
-- **T2｜边界注释**：在函数上方补一行来源说明（"清单交叉校验自 core.dll/Core3D 逆向 §13/§14，宁多勿漏；wnoevt 为内核权威、见 ADR 0009"）。
+- **T2｜边界注释**：在函数上方说明清单交叉校验自 core.dll/Core3D 逆向，
+  目标语义近似 `DCHC/EVALAT`，`wnoevt` 只属于事件边界。
 - **T3｜字典覆盖体检（CLI/JSON，非 cargo test）**：新增一个只读校验入口（复用现有 CLI 子命令或加一个 `--verify-model-impact-attrs` 模式），对运行中 SurrealDB `att_meta` 做：
   - 报告白名单里"形似 dabacon 名(4–6 大写)但不在 `att_meta`"的项（typo/不存在守卫）；
   - 报告 §13.2 几何输入属性对白名单的覆盖率（应 100%）。
   - 输出 JSON，便于 CI/人工核对（对齐 `AGENTS.md`：aios-database 用 CLI+JSON 验证）。
-- **T4｜行为回归（CLI/HTTP，非 cargo test）**：用现成增量 CLI 对一段已知 sesno 范围跑 `collect_pdms_increment_*`，检查产物 `element_changes[].{classified, model_category}` 与 `IncrGeoUpdateLog`：
+- **T4｜行为回归（CLI/HTTP，非 cargo test）**：用现成增量 CLI 对一段已知 sesno 范围跑 `collect_pdms_increment_*`，检查产物 `element_changes[].{impact_decision, impact_reason, classified, model_category}` 与 `IncrGeoUpdateLog`：
   - 断言：几何编辑（如改 `PZ`/`ZDIS`/`CTYP` 的元素）进入相应桶；
   - 断言：纯元数据编辑（`NAME`/`DESC`）被剔除、不进桶。
 - **T5｜文档**：更新逆向文档 §13.4/§14 交叉引用到本计划与 `model_impact.rs`；本计划与 ADR 0009、CONTEXT 术语同批提交。
@@ -55,9 +64,13 @@
 
 ## 5. 不在本计划（记录在案的后续项/风险）
 
-1. **波及闭包（cascade）**：per-element 门控不处理 "owner 摆放变 → 子树几何(世界变换)需刷新"、"`CATR`/`SPRE` 变 → 所有引用该 SCOM 的实例需重算"、克隆/分布式副本波及（逆向 §10.3/§11.3）。现有仅 loop-container→owner 上溯。→ 后续单独计划。
+1. **波及闭包（cascade）**：当前已补旧/新 owner、children 差集和 transform 子树失效，
+   但仍缺 `CATR/SPRE/SCOM`→所有引用实例、克隆/分布式副本及通用
+   SignificantOwner + Members。→ 后续单独计划。
 2. **placement-vs-mesh**：`POS`/`ORI` 改动理论上只需**变换刷新**（`pe_transform`）而非**网格重算**；当前 `attribute_affects_model` 把它们计为几何变化会触发重算。可与 `2026-03-29-transform-refresh-cross-repo-fix.md` 合并优化。→ 后续。
-3. **wnoevt 权威管线**：把内核 `wnoevt` 从活 E3D 导出 / 扩展字典导入落入 `att_meta.wnoevt` 列，令 `attribute_affects_model` 改为查表。→ 需活 E3D，见 ADR 0009 与逆向 §14.2。
+3. **DCHC/effect 权威管线**：从活 E3D 或扩展字典导入
+   `DCHC/PLCF/wnoevt`，记录 `(noun, attr, DCHC, QCHGLS ref/code)`；分类升级为
+   `(noun, attr, effect, raw_dchc)`。`wnoevt` 仅用于事件兼容。→ 见 ADR-0009 与逆向 §14.2。
 
 ## 6. 验收标准
 

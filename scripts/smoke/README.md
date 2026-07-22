@@ -6,11 +6,16 @@
 
 ### `model_gen_debt_smoke.ps1`
 
-只读运行 `model-version catch-up --dry-run --json`，断言数据/模型水位、欠账区间、
-覆盖性与 `needs_full_regen` 字段齐全，并确认 dry-run 不发布模型锚点。
+只读运行 `model-version catch-up --dry-run --json`，断言数据/模型水位、全部与可消费欠账区间、
+stale 欠账、gap、五桶规模、覆盖性与 `needs_full_regen` 字段齐全，并确认 dry-run
+不整理 stale 欠账、不发布模型锚点。
+省略 `-Dbnum` 时覆盖全部 data-anchor/debt 候选库。
 
 ```powershell
 pwsh -File scripts/smoke/model_gen_debt_smoke.ps1 -Dbnum 1112
+
+# 审计全部候选库
+pwsh -File scripts/smoke/model_gen_debt_smoke.ps1
 ```
 
 ### `external_workflow_smoke.ps1`

@@ -7,6 +7,8 @@ use surrealdb::types::SurrealValue;
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 
+pub const MODEL_GEN_DEBT_RANGE_SEMANTICS: &str = "[from_sesno,to_sesno]";
+
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct ModelGenDebtRecord {
     pub dbnum: u32,
@@ -23,10 +25,6 @@ pub struct ModelGenDebtRecord {
     pub basic_cata_refnos: Vec<String>,
     #[serde(default)]
     pub delete_refnos: Vec<String>,
-    #[serde(default)]
-    pub created_at: Option<String>,
-    #[serde(default)]
-    pub consumed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,10 +35,64 @@ pub struct ModelGenDebtWriteOutcome {
     pub idempotent: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelGenDebtBucketCounts {
+    pub prim: usize,
+    pub loop_owner: usize,
+    pub bran_hanger: usize,
+    pub basic_cata: usize,
+    pub delete: usize,
+    pub total: usize,
+}
+
+impl ModelGenDebtBucketCounts {
+    fn from_record(record: &ModelGenDebtRecord) -> Self {
+        let prim = record.prim_refnos.len();
+        let loop_owner = record.loop_owner_refnos.len();
+        let bran_hanger = record.bran_hanger_refnos.len();
+        let basic_cata = record.basic_cata_refnos.len();
+        let delete = record.delete_refnos.len();
+        Self {
+            prim,
+            loop_owner,
+            bran_hanger,
+            basic_cata,
+            delete,
+            total: prim + loop_owner + bran_hanger + basic_cata + delete,
+        }
+    }
+
+    fn from_log(log: &IncrGeoUpdateLog) -> Self {
+        let prim = log.prim_refnos.len();
+        let loop_owner = log.loop_owner_refnos.len();
+        let bran_hanger = log.bran_hanger_refnos.len();
+        let basic_cata = log.basic_cata_refnos.len();
+        let delete = log.delete_refnos.len();
+        Self {
+            prim,
+            loop_owner,
+            bran_hanger,
+            basic_cata,
+            delete,
+            total: prim + loop_owner + bran_hanger + basic_cata + delete,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelGenDebtRange {
     pub from_sesno: u32,
     pub to_sesno: u32,
+    pub commit_fingerprint: String,
+    pub bucket_counts: ModelGenDebtBucketCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelGenDebtGap {
+    pub missing_from_sesno: u32,
+    pub missing_to_sesno: u32,
+    pub next_debt_from_sesno: Option<u32>,
+    pub next_debt_to_sesno: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +100,19 @@ pub struct ModelGenDebtCoverage {
     pub dbnum: u32,
     pub data_watermark: u32,
     pub model_generation_watermark: u32,
+    pub range_semantics: String,
+    /// 全部尚未消费且不高于 data watermark 的 debt 行，包括已被模型水位覆盖的遗留行。
     pub debt_ranges: Vec<ModelGenDebtRange>,
+    /// 从 model watermark 开始连续可消费的前缀。
+    pub consumable_debt_ranges: Vec<ModelGenDebtRange>,
+    /// 尚未标记 consumed、但已被 model watermark 覆盖的遗留行。
+    pub stale_debt_ranges: Vec<ModelGenDebtRange>,
+    /// 所有未覆盖区间；不会因首个 gap 而隐藏后续 debt。
+    pub gap_ranges: Vec<ModelGenDebtGap>,
+    /// 全部存活 debt（含尚未整理的 stale 行）的五桶去重规模。
+    pub debt_bucket_counts: ModelGenDebtBucketCounts,
+    /// 连续可消费前缀合并后的五桶去重规模。
+    pub consumable_bucket_counts: ModelGenDebtBucketCounts,
     pub coverage_complete: bool,
     pub needs_full_regen: bool,
     pub merged_update_log: IncrGeoUpdateLog,
@@ -82,8 +146,15 @@ fn record_from_log(
         bran_hanger_refnos: normalized_refnos(log.bran_hanger_refnos.iter().copied()),
         basic_cata_refnos: normalized_refnos(log.basic_cata_refnos.iter().copied()),
         delete_refnos: normalized_refnos(log.delete_refnos.iter().copied()),
-        created_at: None,
-        consumed_at: None,
+    }
+}
+
+fn range_from_record(record: &ModelGenDebtRecord) -> ModelGenDebtRange {
+    ModelGenDebtRange {
+        from_sesno: record.from_sesno,
+        to_sesno: record.to_sesno,
+        commit_fingerprint: record.commit_fingerprint.clone(),
+        bucket_counts: ModelGenDebtBucketCounts::from_record(record),
     }
 }
 
@@ -135,8 +206,8 @@ pub async fn write_model_gen_debt(
     let requested = record_from_log(dbnum, from_sesno, to_sesno, commit_fingerprint, log);
     let select = format!(
         "SELECT dbnum, from_sesno, to_sesno, commit_fingerprint, prim_refnos, \
-         loop_owner_refnos, bran_hanger_refnos, basic_cata_refnos, delete_refnos, \
-         created_at, consumed_at FROM model_gen_debt:[{dbnum}, {to_sesno}];"
+         loop_owner_refnos, bran_hanger_refnos, basic_cata_refnos, delete_refnos \
+         FROM model_gen_debt:[{dbnum}, {to_sesno}];"
     );
     let mut response = project_primary_db().query(select).await?.check()?;
     let existing: Vec<ModelGenDebtRecord> = response.take(0)?;
@@ -149,9 +220,7 @@ pub async fn write_model_gen_debt(
                 idempotent: true,
             });
         }
-        bail!(
-            "immutable model_gen_debt conflict: dbnum={dbnum} to_sesno={to_sesno}"
-        );
+        bail!("immutable model_gen_debt conflict: dbnum={dbnum} to_sesno={to_sesno}");
     }
 
     let sql = format!(
@@ -190,6 +259,45 @@ pub async fn model_generation_watermark(dbnum: u32) -> anyhow::Result<u32> {
     Ok(response.take::<Option<u32>>(0)?.unwrap_or_default())
 }
 
+pub async fn list_model_gen_candidate_dbnums() -> anyhow::Result<Vec<u32>> {
+    ensure_model_gen_debt_schema().await?;
+    super::database::ensure_sesno_version_anchor_schema().await?;
+    let sql = r#"
+SELECT VALUE dbnum FROM sesno_version_anchor
+    WHERE source IN ['full', 'incremental_baseline', 'incremental'];
+SELECT VALUE dbnum FROM model_gen_debt;
+"#;
+    let mut response = project_primary_db().query(sql).await?.check()?;
+    let mut dbnums = std::collections::BTreeSet::new();
+    for idx in 0..2 {
+        let values: Vec<i64> = response.take(idx)?;
+        dbnums.extend(
+            values
+                .into_iter()
+                .filter_map(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0),
+        );
+    }
+    Ok(dbnums.into_iter().collect())
+}
+
+pub async fn reconcile_model_gen_debt_covered_by_watermark(
+    dbnum: u32,
+    model_generation_watermark: u32,
+) -> anyhow::Result<()> {
+    ensure_model_gen_debt_schema().await?;
+    if model_generation_watermark == 0 {
+        return Ok(());
+    }
+    let sql = format!(
+        "UPDATE model_gen_debt SET consumed_at = time::now() \
+         WHERE dbnum = {dbnum} AND consumed_at = NONE \
+         AND to_sesno <= {model_generation_watermark};"
+    );
+    project_primary_db().query(sql).await?.check()?;
+    Ok(())
+}
+
 fn extend_bucket(
     target: &mut std::collections::HashSet<RefnoEnum>,
     values: &[String],
@@ -203,57 +311,91 @@ fn extend_bucket(
     Ok(())
 }
 
+fn extend_log(target: &mut IncrGeoUpdateLog, debt: &ModelGenDebtRecord) -> anyhow::Result<()> {
+    extend_bucket(&mut target.prim_refnos, &debt.prim_refnos)?;
+    extend_bucket(&mut target.loop_owner_refnos, &debt.loop_owner_refnos)?;
+    extend_bucket(&mut target.bran_hanger_refnos, &debt.bran_hanger_refnos)?;
+    extend_bucket(&mut target.basic_cata_refnos, &debt.basic_cata_refnos)?;
+    extend_bucket(&mut target.delete_refnos, &debt.delete_refnos)?;
+    Ok(())
+}
+
 pub async fn analyze_model_gen_debt(dbnum: u32) -> anyhow::Result<ModelGenDebtCoverage> {
     ensure_model_gen_debt_schema().await?;
     let data_watermark = super::version_commit::committed_watermark(dbnum).await?;
     let model_generation_watermark = model_generation_watermark(dbnum).await?;
     let sql = format!(
         "SELECT dbnum, from_sesno, to_sesno, commit_fingerprint, prim_refnos, \
-         loop_owner_refnos, bran_hanger_refnos, basic_cata_refnos, delete_refnos, \
-         created_at, consumed_at FROM model_gen_debt \
+         loop_owner_refnos, bran_hanger_refnos, basic_cata_refnos, delete_refnos \
+         FROM model_gen_debt \
          WHERE dbnum = {dbnum} AND consumed_at = NONE AND to_sesno <= {data_watermark} \
-         ORDER BY to_sesno ASC;"
+         ORDER BY from_sesno ASC, to_sesno ASC;"
     );
     let mut response = project_primary_db().query(sql).await?.check()?;
-    let debts: Vec<ModelGenDebtRecord> = response.take(0)?;
+    let mut debts: Vec<ModelGenDebtRecord> = response.take(0)?;
+    debts.sort_by_key(|debt| (debt.from_sesno, debt.to_sesno));
 
-    let mut cursor = model_generation_watermark;
-    let mut debt_ranges = Vec::new();
-    let mut merged_update_log = IncrGeoUpdateLog::default();
-    for debt in debts {
-        if debt.to_sesno <= cursor {
-            continue;
+    let debt_ranges = debts.iter().map(range_from_record).collect::<Vec<_>>();
+    let stale_debt_ranges = debts
+        .iter()
+        .filter(|debt| debt.to_sesno <= model_generation_watermark)
+        .map(range_from_record)
+        .collect::<Vec<_>>();
+    let mut all_live_log = IncrGeoUpdateLog::default();
+    for debt in &debts {
+        extend_log(&mut all_live_log, debt)?;
+    }
+    let pending_debts = debts
+        .iter()
+        .filter(|debt| debt.to_sesno > model_generation_watermark)
+        .collect::<Vec<_>>();
+
+    let mut observed_cursor = model_generation_watermark;
+    let mut gap_ranges = Vec::new();
+    for debt in &pending_debts {
+        if debt.from_sesno > observed_cursor.saturating_add(1) {
+            gap_ranges.push(ModelGenDebtGap {
+                missing_from_sesno: observed_cursor.saturating_add(1),
+                missing_to_sesno: debt.from_sesno.saturating_sub(1),
+                next_debt_from_sesno: Some(debt.from_sesno),
+                next_debt_to_sesno: Some(debt.to_sesno),
+            });
         }
-        if debt.from_sesno > cursor.saturating_add(1) {
+        observed_cursor = observed_cursor.max(debt.to_sesno);
+    }
+    if observed_cursor < data_watermark {
+        gap_ranges.push(ModelGenDebtGap {
+            missing_from_sesno: observed_cursor.saturating_add(1),
+            missing_to_sesno: data_watermark,
+            next_debt_from_sesno: None,
+            next_debt_to_sesno: None,
+        });
+    }
+
+    let mut consumable_cursor = model_generation_watermark;
+    let mut consumable_debt_ranges = Vec::new();
+    let mut merged_update_log = IncrGeoUpdateLog::default();
+    for debt in pending_debts {
+        if debt.from_sesno > consumable_cursor.saturating_add(1) {
             break;
         }
-        extend_bucket(&mut merged_update_log.prim_refnos, &debt.prim_refnos)?;
-        extend_bucket(
-            &mut merged_update_log.loop_owner_refnos,
-            &debt.loop_owner_refnos,
-        )?;
-        extend_bucket(
-            &mut merged_update_log.bran_hanger_refnos,
-            &debt.bran_hanger_refnos,
-        )?;
-        extend_bucket(
-            &mut merged_update_log.basic_cata_refnos,
-            &debt.basic_cata_refnos,
-        )?;
-        extend_bucket(&mut merged_update_log.delete_refnos, &debt.delete_refnos)?;
-        debt_ranges.push(ModelGenDebtRange {
-            from_sesno: debt.from_sesno,
-            to_sesno: debt.to_sesno,
-        });
-        cursor = cursor.max(debt.to_sesno);
+        extend_log(&mut merged_update_log, debt)?;
+        consumable_debt_ranges.push(range_from_record(debt));
+        consumable_cursor = consumable_cursor.max(debt.to_sesno);
     }
     let coverage_complete = model_generation_watermark >= data_watermark
-        || (data_watermark > 0 && cursor >= data_watermark);
+        || (data_watermark > 0 && consumable_cursor >= data_watermark);
     Ok(ModelGenDebtCoverage {
         dbnum,
         data_watermark,
         model_generation_watermark,
+        range_semantics: MODEL_GEN_DEBT_RANGE_SEMANTICS.to_string(),
         debt_ranges,
+        consumable_debt_ranges,
+        stale_debt_ranges,
+        gap_ranges,
+        debt_bucket_counts: ModelGenDebtBucketCounts::from_log(&all_live_log),
+        consumable_bucket_counts: ModelGenDebtBucketCounts::from_log(&merged_update_log),
         coverage_complete,
         needs_full_regen: data_watermark > model_generation_watermark && !coverage_complete,
         merged_update_log,

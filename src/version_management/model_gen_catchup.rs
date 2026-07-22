@@ -14,6 +14,7 @@ pub struct ModelGenCatchUpOptions {
 pub struct ModelGenCatchUpResult {
     pub dbnum: u32,
     pub coverage: ModelGenDebtCoverage,
+    pub stale_debt_reconciled: usize,
     pub generation_success: Option<bool>,
     pub full_regen: bool,
     pub pe_owner_evidence: Option<serde_json::Value>,
@@ -26,10 +27,43 @@ pub async fn catch_up_model_generation(
     dbnum: u32,
     options: ModelGenCatchUpOptions,
 ) -> anyhow::Result<ModelGenCatchUpResult> {
-    let coverage = analyze_model_gen_debt(dbnum).await?;
+    let mutation_lock =
+        super::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+            db_option_ext,
+        )?;
+    catch_up_model_generation_with_lock(db_option_ext, dbnum, options, mutation_lock.held(), true)
+        .await
+}
+
+pub(crate) async fn catch_up_model_generation_with_lock(
+    db_option_ext: &DbOptionExt,
+    dbnum: u32,
+    options: ModelGenCatchUpOptions,
+    _mutation_lock: super::project_mutation_lock::HeldProjectMutationLock<'_>,
+    finalize: bool,
+) -> anyhow::Result<ModelGenCatchUpResult> {
+    let mut coverage = analyze_model_gen_debt(dbnum).await?;
+    let stale_debt_reconciled = if !options.dry_run
+        && db_option_ext.use_surrealdb
+        && db_option_ext.model_writer_mode.writes_to_surreal()
+        && !db_option_ext.gen_model_dry_run
+        && !coverage.stale_debt_ranges.is_empty()
+    {
+        let count = coverage.stale_debt_ranges.len();
+        crate::versioned_db::model_gen_debt::reconcile_model_gen_debt_covered_by_watermark(
+            dbnum,
+            coverage.model_generation_watermark,
+        )
+        .await?;
+        coverage = analyze_model_gen_debt(dbnum).await?;
+        count
+    } else {
+        0
+    };
     let mut result = ModelGenCatchUpResult {
         dbnum,
         coverage,
+        stale_debt_reconciled,
         generation_success: None,
         full_regen: false,
         pe_owner_evidence: None,
@@ -42,7 +76,12 @@ pub async fn catch_up_model_generation(
     {
         return Ok(result);
     }
-    if result.coverage.needs_full_regen && !options.allow_full_regen {
+    if result.coverage.needs_full_regen {
+        if options.allow_full_regen && !options.dry_run {
+            anyhow::bail!(
+                "bare full regeneration is disabled for dbnum={dbnum}; use the controlled repair seam bound to an existing data anchor"
+            );
+        }
         return Ok(result);
     }
 
@@ -51,11 +90,9 @@ pub async fn catch_up_model_generation(
 
     #[cfg(feature = "gen_model")]
     {
-        let evidence = super::increment_run::build_pe_owner_evidence(
-            &[dbnum],
-            options.require_pe_owner_ready,
-        )
-        .await;
+        let evidence =
+            super::increment_run::build_pe_owner_evidence(&[dbnum], options.require_pe_owner_ready)
+                .await;
         result.pe_owner_evidence = Some(evidence.summary.clone());
         if options.require_pe_owner_ready && !evidence.ready {
             anyhow::bail!(
@@ -66,16 +103,14 @@ pub async fn catch_up_model_generation(
 
         let mut generation_options = db_option_ext.clone();
         generation_options.inner.manual_db_nums = Some(vec![dbnum]);
-        let full_regen = result.coverage.needs_full_regen && options.allow_full_regen;
-        result.full_regen = full_regen;
         let update_log = result.coverage.merged_update_log.clone();
-        let generation_success = if !full_regen && update_log.count() == 0 {
+        let generation_success = if update_log.count() == 0 {
             true
         } else {
             let generation = crate::fast_model::gen_all_geos_data(
                 Vec::new(),
                 &generation_options,
-                (!full_regen).then_some(update_log),
+                Some(update_log),
             )
             .await?;
             if !generation.success {
@@ -92,6 +127,7 @@ pub async fn catch_up_model_generation(
         };
         result.generation_success = Some(generation_success);
         if generation_success
+            && finalize
             && generation_options.use_surrealdb
             && generation_options.model_writer_mode.writes_to_surreal()
             && !generation_options.gen_model_dry_run

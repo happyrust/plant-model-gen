@@ -7,6 +7,9 @@
 > 与本仓库 Rust 实现的逐层对照见 `docs/reverse/incremental_update_vs_core_dll.md`。
 > 日期：2026-07-23。
 >
+> 证据文档与 ADR-0009 已在 2026-07-23 同步纠偏：统一采用
+> `wnoevt=事件边界、DCHC/EVALAT=模型影响、noun/ref/SignificantOwner=目标与粒度`。
+>
 > 地址前缀约定：`core!` 表示 DABACON 数据库层 `core.dll`，`Core3D!` 表示
 > 设计/图形消费层 `Core3D.dll`。证据标记中，**强**表示可由当前版本直接反编译
 > 或交叉引用确认，**中**表示控制流已闭合但部分全局量/业务名仍靠语义推断，
@@ -527,15 +530,22 @@ reorderAfter / reorderBefore      core!0x594bce0 / 0x594c100
 
 | core.dll / Core3D | plant-model-gen | 状态 |
 |---|---|---|
-| `wnoevt` 事件门 | Rust 没有完全等价层 | 上游 history 已给出变化，Rust 通常无需复刻事件广播 |
-| `DCHC` 设计变化码 + EVALAT | `model_impact.rs::attribute_affects_model` 白名单（ADR-0009） | **更准确的语义对应**；Rust 把多值传播码收敛为 bool |
-| `geomset` NOUN 门 | noun 名单分桶（prim/loop_owner/bran_hanger/basic_cata）/ `is_geo_noun` | 对齐，靠名单非字典 |
+| `wnoevt` 事件门 | 没有完全等价层；sesno 数据采集、数据提交与模型筛选彼此分离 | **不是 Rust 模型白名单的对应物** |
+| `DCHC` + `EVALAT` 设计变化分类 | `classify_attribute_model_impact` + `classify_modified_element` | **最接近的语义对应**；Rust 收敛为 trigger / neutral / unknown-fallback，未保留 1..4 code |
+| `geomset` 等 NOUN 元数据 | `insert_change_by_noun` / `targets_from_candidates` 的 noun 名单分桶 | 只近似“直接生成目标与执行路由”，不是与 `wnoevt` 组成的严格前置与门 |
 | `elementsChangedBetween(sesno)` | `collect_increment_eles(anchor+1..=end)` + `sesno_version_anchor` | 一致 |
-| `DB_UserChanges::AttributesModified` | `ModifiedElement.{added,deleted,modified}_attrs` | 一致 |
-| `DCHC=0` 数据-only | `operation_is_known_model_noop` / known-neutral 元数据跳过 | 语义近似 |
-| `SignificantOwner + Members` 粒度 | 仅 loop 容器→owner 上溯 ≤6 层 | **缺口**（后续项） |
+| `DB_UserChanges::AttributesModified` | `EleOperationData` / `ModifiedElement` / `PdmsSesnoElementChange` | 原始变化层基本一致 |
+| `QCHGLS(ref, changeCode)` | `IncrGeoUpdateLog` → `GenerationTargets` | 目标集合近似，但 change code、反向依赖和传播原因会丢失 |
+| `DCHC=0` 数据-only | `KnownNeutral`（当前为 NAME/DESC/PURP/FUNCTION） | 语义近似；未知属性/UDA 会保守触发，不会静默跳过 |
+| owner / members 结构变化 | `apply_critical_model_expansion` 补入旧/新 owner 与 children 差集 | 已部分覆盖结构波及 |
+| `SignificantOwner + Members` 通用粒度 | loop 容器→owner 上溯 ≤6 层，加上述结构特例 | **仍缺通用粒度展开** |
 | 克隆/CATR→实例 波及闭包 | 当前代码仅把 CATR/SPRE 作为直接影响属性；未见 SCOM→实例反查 | **缺口**（后续项） |
 | 摆放传播 | 子树 `pe_transform` BFS 失效（mesh 仍整体重算） | 部分覆盖 |
+| 当前批变化的同步交付 | data anchor → `model_gen_debt` → 连续欠账合并/追平 → model_gen anchor | Rust 的持久化容错扩展，不应与 `DB_UserChanges` 或 `QCHGLS` 混为一个对象 |
+
+因此，Rust 侧也应保持三层概念分离：**原始 sesno 数据变化**、**模型影响分类**、
+**生成目标/粒度扩展**。`IncrGeoUpdateLog` 是经过筛选和分桶后的模型欠账，不是
+原始 `DB_UserChanges` 的同义替代。
 
 ---
 
@@ -587,7 +597,10 @@ reorderAfter / reorderBefore      core!0x594bce0 / 0x594c100
 | QCHGLS 与整批 `DB_UserChanges` 的唯一桥接点 | 未知 | 两条链都已确认，但未发现单一直接转换函数 |
 | `ModelState=4` 的静态入口 | 未知 | Granularity 有分支，现有静态 callers 只传 0/1/3 |
 
-对当前 Rust 实现最重要的修正是：`attribute_affects_model` 更接近
+对当前 Rust 实现最重要的修正是：`attribute_affects_model` 通过
+`classify_attribute_model_impact` / `classify_modified_element` 使用时，更接近
 **`DCHC != 0`（再加 EVALAT 的引用/owner 传播规则）**，而不是简单等价于
-`wnoevt == false`。这也解释了为什么仅导出 `wnoevt` 清单仍不足以复刻
-Core3D 的增量模型判定。
+`wnoevt == false`。当前实现还会让未知属性与 UDA 走 `unknown_fallback` 保守触发；
+只有明确的 known-neutral 才跳过模型欠账。`wnoevt` 只适合解释 core 的事件边界，
+不能用于跳过 Rust 的版本数据提交；仅导出 `wnoevt` 清单也不足以复刻 Core3D 的
+增量模型判定。

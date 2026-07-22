@@ -12,7 +12,10 @@ mod types;
 
 pub use catalog::{CatalogClosure, CatalogResolver, CatalogResolverConfig};
 pub use error::{GenerationReadError, GenerationReadResult};
-pub use factory::{open_generation_read_session, resolve_input_version_manifest};
+pub use factory::{
+    open_generation_read_session, open_generation_read_session_with_spec,
+    resolve_input_version_manifest,
+};
 pub use hierarchy::{HierarchyNode, HierarchyQuery, HierarchySnapshot};
 pub use surreal::{SurrealVersionedReadBackend, SurrealVersionedReadSession};
 pub use traits::{
@@ -22,9 +25,9 @@ pub use traits::{
 pub(crate) use types::hash_serializable;
 pub use types::{
     AttributeReference, AttributeSet, AttributeValue, BatchLookup, CatalogNode, DataVersion,
-    ElementQuery, ElementSnapshot, GenerationReadBackendKind, HierarchyRow, InputVersionManifest,
-    SessionMetricsSnapshot, TransformSnapshot, decode_attribute_set_payload,
-    encode_attribute_set_payload,
+    ElementQuery, ElementSnapshot, GenerationReadBackendKind, GenerationReadMode,
+    GenerationReadSpec, HierarchyRow, InputVersionManifest, SessionMetricsSnapshot,
+    TransformSnapshot, decode_attribute_set_payload, encode_attribute_set_payload,
 };
 
 #[cfg(test)]

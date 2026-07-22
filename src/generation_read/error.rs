@@ -42,6 +42,15 @@ pub enum GenerationReadError {
         message: String,
     },
 
+    #[error("生成读取契约非法: {0}")]
+    InvalidReadSpec(String),
+
+    #[error("读取后端 {backend} 尚不能兑现显式 read_at={read_at}；已拒绝读取，未回退到 latest")]
+    UnsupportedReadAt {
+        backend: &'static str,
+        read_at: String,
+    },
+
     #[error("双后端对拍不一致: capability={capability}, detail={detail}")]
     ParityMismatch {
         capability: &'static str,

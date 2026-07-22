@@ -34,7 +34,7 @@
 
 ## Functional Requirements
 
-- **FR-001**: 数据版本提交成功 MUST 同流程幂等写入该 dbnum 的欠账行（五桶 refno + `(from_sesno, to_sesno]` 区间）；欠账行写入失败 MUST 告警并按洞语义处理，不回滚已生效的数据提交。
+- **FR-001**: 数据版本提交成功 MUST 同流程幂等写入该 dbnum 的欠账行（五桶 refno + `[from_sesno, to_sesno]` 闭区间，`from_sesno` 为本批首个实际 sesno，与 Version Commit 既有范围编码一致）；欠账行写入失败 MUST 告警并按洞语义处理，不回滚已生效的数据提交。
 - **FR-002**: 模型生成水位 MUST 定义为该 dbnum `model_gen` 锚点的最高 sesno（无锚点视为 0）。
 - **FR-003**: watch 每轮 MUST 对每个候选 dbnum 比对模型生成水位与已提交水位；落后且欠账行完整覆盖区间时 MUST 合并五桶并集执行一次 Incremental scope 生成。
 - **FR-004**: 追平成功 MUST 只发布一个 `model_gen` 锚点（sesno = 数据水位）并标记所消费欠账行；生成或后处理失败 MUST NOT 发锚点、MUST NOT 消费欠账行。

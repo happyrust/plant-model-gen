@@ -3,7 +3,7 @@
 ## Architecture
 
 1. `model_gen_debt` 表与写入：persist 流程尾部（数据锚点之后）幂等 UPSERT，key `[dbnum, to_sesno]`，字段含 `from_sesno`、五桶 refno、`created_at`、`consumed_at`（空 = 存活欠账）。
-2. 模型生成水位与欠账读取 helper：max `model_gen` 锚点 sesno、存活欠账行、区间链 `(from, to]` 覆盖性检查（新模块 `versioned_db/model_gen_debt.rs`，与 `version_commit.rs` 同层）。
+2. 模型生成水位与欠账读取 helper：max `model_gen` 锚点 sesno、存活欠账行、区间链 `[from, to]` 覆盖性检查（`from` 为本批首个实际 sesno；连续条件为 `next.from <= cursor + 1`，与 Version Commit 一致；新模块 `versioned_db/model_gen_debt.rs`，与 `version_commit.rs` 同层）。
 3. 从 `run_increment` 提炼可复用的追赶核心：合并欠账五桶 → pe_owner 证据检查 → Incremental scope 生成 → 后处理 → 发锚点 → 标记消费；本轮增量路径与 watch 追赶路径共用同一函数。
 4. watch 循环接入：数据步之后对每个候选 dbnum 执行水位比对与追赶；失败隔离沿用加固计划 T2 语义（per-dbnum continue，不退进程）。
 5. `generate_model` 默认翻转 + `--no-generate-model` 逃生口；`incremental-sesno` 与 web 增量入口对齐同一默认。

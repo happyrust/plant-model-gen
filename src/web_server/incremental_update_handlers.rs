@@ -71,6 +71,7 @@ async fn run_increment_once(
     let options = crate::version_management::increment_run::IncrementRunOptions {
         file: None,
         dbnums: vec![dbnum],
+        dbnum_ranges: Vec::new(),
         from_sesno,
         to_sesno,
         rescan_index: false,

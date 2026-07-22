@@ -22,6 +22,11 @@ pub struct ProjectMutationLock {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HeldProjectMutationLock<'a> {
+    _lock: &'a ProjectMutationLock,
+}
+
 impl ProjectMutationLock {
     pub fn acquire(db_option: &DbOptionExt, command: impl Into<String>) -> Result<Self> {
         let path = lock_path(db_option);
@@ -83,6 +88,10 @@ impl ProjectMutationLock {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn held(&self) -> HeldProjectMutationLock<'_> {
+        HeldProjectMutationLock { _lock: self }
     }
 }
 

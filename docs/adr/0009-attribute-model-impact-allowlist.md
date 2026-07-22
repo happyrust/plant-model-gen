@@ -3,20 +3,60 @@ status: accepted
 date: 2026-07-22
 ---
 
-# 属性→模型影响判定采用「硬编码·宁多勿漏」白名单，而非内核 wnoevt 权威
+# 属性→模型影响判定采用「硬编码·宁多勿漏」基线，目标语义对齐 DCHC/EVALAT
 
-增量生成需要判定"一次属性改动要不要重算该元素的几何"。我们决定：**`attribute_affects_model` 保持为一张硬编码、宁多勿漏（inclusive）的几何影响属性白名单，其内容以 core.dll/Core3D 逆向分析 + 运行库属性字典 `att_meta` 交叉校验为依据；不从 E3D 内核的权威 `wnoevt` 标志取数。**
+增量生成需要判定“一次属性改动是否形成模型欠账，以及欠账应扩散到哪些目标”。
+我们决定：**当前继续以 `attribute_affects_model` 为硬编码、宁多勿漏（inclusive）的
+生成器输入基线，并由 `classify_attribute_model_impact` /
+`classify_modified_element` 实施 trigger / known-neutral / unknown-fallback 三态；
+它近似的是 Core3D 的 `DCHC/EVALAT` 模型影响层，而不是 core.dll 的
+`wnoevt` 事件门。**
 
 关键取舍：
 
-- **`wnoevt` 才是内核权威，但取不到**：逆向确认 E3D 内核里"改一个属性要不要往下游发事件/重算"的最终开关是每属性字典标志 `wnoevt`（`DB_Attribute` off184 / dabacon 字段 `299311034`）。但它是**内核 dabacon 字典数据**：不随模型库同步（运行库 `att_meta` 只有 `hash`+`meta_cn_name`，702 条无 `wnoevt`）、不在 `dicvir.dat`（版本戳）、静态不可导出；要拿全量需活 E3D 会话导出或扩展字典导入工具。为一个**热路径**的增量门控引入活内核/字典运行时依赖，当前不划算。
+- **分清两道不同语义**：
+  - `wnoevt`（`DB_Attribute` off184 / 字段 `299311034`）只决定 core 是否执行普通
+    属性广播和 `DB_UserChanges::attributeModified`；
+  - Core3D 全局订阅后由 `IDCHNG` 读取 `DCHC`（字段 `596407`），再经 `EVALAT`
+    的强制 code、noun/owner/ref 规则决定是否及如何写 `QCHGLS`。
+  因此 `wnoevt=false` 不是“必然重算”，`wnoevt` 清单也不是模型影响真相源。
 
-- **宁多勿漏（inclusive bias）**：漏判（几何相关属性未列入 → 增量跳过 → 模型陈旧）是**正确性 bug**；误判（非几何属性误列入 → 多重算一次）只是**成本**。故对"可能影响几何"的属性一律纳入。这也决定了本表偏大而非偏小。
+- **当前拿不到完整 DCHC/EVALAT 动态事实**：运行库 `att_meta` 只有属性名、hash 和
+  中文元数据，没有 `DCHC/PLCF/wnoevt`；DCHC 只是传播起点，仍需结合 EVALAT 的
+  `REDRAW/INTUBE` 强制 code 与引用/owner 重定向。为热路径引入活 E3D 依赖当前
+  不划算。
 
-- **不靠内核也能有权威性**：白名单以三方交叉校验支撑（见 `docs/reverse/core_dll_noun_att_model_update.md`）——① `rs-core`/`plant-model-gen` 几何生成实际读取的属性（577 处读取点，§13.2）；② 运行库 `att_meta` 的 702 属性字典全集（名+dabacon 哈希，§13.2 命中率 100%，§14.1）；③ Core3D 消费方（DESDRA/VDESPT）实际引用的属性（§14.3）。三者交集/并集给出足够权威的清单，且**零运行时依赖**。
+- **宁多勿漏（inclusive bias）**：漏判（模型相关属性被当成 neutral → 不写欠账 →
+  模型陈旧）是正确性 bug；误判只是多算成本。当前实现因此让未知属性、未知 UDA、
+  空属性差异保守触发，只有明确的 `NAME/DESC/PURP/FUNCTION` 为 known-neutral；
+  `--no-model-impact-filter` 仍提供“所有 Modified 触发”的逃生口。
 
-- **未来切换点（留钩子、非本次）**：若日后把 `wnoevt` 从活 E3D 导出或扩展字典导入落入 `att_meta.wnoevt` 列，`attribute_affects_model` 可平滑改为查表（权威门控）。届时白名单退化为回退/校验基线。
+- **离线基线的证据来源**：① `rs-core` / `plant-model-gen` 生成链实际读取的属性；
+  ② `att_meta` 的 702 属性名/hash；③ Core3D 的 DCHC 通用路径、标量特例、引用级联
+  和目录解析。该交叉校验足以支撑保守基线，但不宣称等价于 Core3D。
 
-被否决的替代方案：① **现在就用内核 `wnoevt`**——需活 E3D、给热路径加内核/字典运行时依赖，收益不抵成本；② **"任意属性改动即重算"**——废掉增量门控的意义（元数据/外观改动也全量重算）；③ **极小白名单**——漏判风险高、直接导致模型陈旧的正确性问题。
+- **未来演进**：从活 E3D 或扩展字典导入
+  `wnoevt/DCHC/PLCF/isPseudo/casc`，并记录
+  `(source ref, noun, attr, DCHC, QCHGLS ref/code)` 动态轨迹。分类接口升级为
+  `(noun, attr, effect, raw_dchc)`，至少区分 data-only、transform-only、
+  direct-geometry、dependency-cascade、structural-membership、unknown。
+  `wnoevt` 只补事件兼容性，DCHC/EVALAT 事实用于模型影响校验。
 
-参见实现 `src/version_management/model_impact.rs`、接入 `src/data_interface/sesno_increment.rs`，以及开发计划 `docs/plans/2026-07-22-attribute-model-impact-reconciliation-dev-plan.md`。
+被否决的替代方案：
+
+1. **把 `wnoevt=false` 当模型白名单**——语义错误；它是事件超集，会把
+   `DCHC=0` 的数据变化误判为模型变化。
+2. **只查 DCHC、忽略 EVALAT/依赖闭包**——会漏强制 code、owner/ref 重定向、
+   draw-list 依赖、目录反向引用和克隆副本。
+3. **任意属性改动即重算**——可作为逃生口，但不应成为默认热路径。
+4. **极小白名单或未知默认 neutral**——漏判会形成永久模型陈旧。
+
+> 2026-07-23 修订：原 ADR 把 `wnoevt` 写成“模型影响的内核权威”。新逆向证据已确认
+> 该表述错误，现以 `wnoevt=事件边界、DCHC/EVALAT=模型影响、
+> noun/ref/SignificantOwner=目标与粒度` 为准。
+
+参见实现 `src/version_management/model_impact.rs`、
+`src/data_interface/sesno_increment.rs`，逆向总览
+`docs/reverse/core_dll_incremental_update_flow.md`，详细证据
+`docs/reverse/core_dll_noun_att_model_update.md`，以及对照
+`docs/reverse/incremental_update_vs_core_dll.md`。

@@ -192,6 +192,50 @@ pub fn model_version_command() -> Command {
                 .arg(json_arg()),
         )
         .subcommand(
+            Command::new("unit-import")
+                .about("Register an existing validated minimum delivery unit artifact")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Database number; resolved from unit-refno when omitted"),
+                )
+                .arg(
+                    Arg::new("unit-refno")
+                        .long("unit-refno")
+                        .value_name("REFNO")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("unit-noun")
+                        .long("unit-noun")
+                        .value_name("NOUN")
+                        .required(true)
+                        .help("Minimum delivery unit noun: BRAN/HANG/EQUI/WALL/FLOOR"),
+                )
+                .arg(required_u32("sesno"))
+                .arg(
+                    Arg::new("impact-kind")
+                        .long("impact-kind")
+                        .value_parser(["mesh", "placement", "delivery", "noop"])
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("artifact-sesno")
+                        .long("artifact-sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Artifact sesno; defaults to commit sesno"),
+                )
+                .arg(
+                    Arg::new("manifest-path")
+                        .long("manifest-path")
+                        .value_name("RELATIVE_PATH")
+                        .required(true)
+                        .help("Path relative to the configured project output directory"),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
             Command::new("unit-simulate-position")
                 .about("LOCAL SMOKE ONLY: clone one unit artifact and shift one component position")
                 .arg(
@@ -312,10 +356,10 @@ pub fn model_version_command() -> Command {
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
+                        .help("Target dbnum(s); omit to inspect all data-anchor/debt candidates")
                         .value_parser(clap::value_parser!(u32))
                         .action(clap::ArgAction::Append)
-                        .num_args(1..)
-                        .required(true),
+                        .num_args(1..),
                 )
                 .arg(
                     Arg::new("dry-run")
@@ -326,7 +370,9 @@ pub fn model_version_command() -> Command {
                     Arg::new("allow-full-regen")
                         .long("allow-full-regen")
                         .action(clap::ArgAction::SetTrue)
-                        .help("Allow an explicit full regeneration when the debt interval has a gap"),
+                        .help(
+                            "Deprecated compatibility flag; mutating execution is rejected in favor of controlled repair",
+                        ),
                 )
                 .arg(
                     Arg::new("require-pe-owner-ready")
@@ -425,6 +471,7 @@ pub async fn handle_model_version_command(
         Some(("resolve-anchor", sub)) => handle_resolve_anchor_command(sub).await?,
         Some(("unit-export", sub)) => handle_unit_export_command(sub, db_option_ext).await?,
         Some(("unit-list", sub)) => handle_unit_list_command(sub, db_option_ext).await?,
+        Some(("unit-import", sub)) => handle_unit_import_command(sub, db_option_ext).await?,
         Some(("unit-simulate-position", sub)) => {
             handle_unit_simulate_position_command(sub, db_option_ext).await?
         }
@@ -443,14 +490,21 @@ async fn handle_model_gen_catch_up_command(
     sub: &ArgMatches,
     db_option_ext: &DbOptionExt,
 ) -> anyhow::Result<()> {
-    let _mutation_lock = super::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
-        db_option_ext,
-    )?;
-    let dbnums = sub
+    let requested_dbnums = sub
         .get_many::<u32>("dbnum")
-        .expect("required by clap")
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|values| values.copied().collect::<std::collections::BTreeSet<_>>())
+        .unwrap_or_default();
+    let dbnums = if requested_dbnums.is_empty() {
+        crate::versioned_db::model_gen_debt::list_model_gen_candidate_dbnums()
+            .await?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        requested_dbnums
+    };
+    if dbnums.is_empty() {
+        anyhow::bail!("model catch-up found no data-anchor/debt candidate dbnums");
+    }
     let dry_run = sub.get_flag("dry-run");
     let allow_full_regen = sub.get_flag("allow-full-regen");
     let mut results = Vec::new();
@@ -470,7 +524,7 @@ async fn handle_model_gen_catch_up_command(
             Ok(result) => {
                 if result.coverage.needs_full_regen && !allow_full_regen && !dry_run {
                     failures.push(format!(
-                        "dbnum={dbnum} needs --allow-full-regen because debt coverage has a gap"
+                        "dbnum={dbnum} needs controlled repair because debt coverage has a gap"
                     ));
                 }
                 results.push(result);
@@ -489,12 +543,16 @@ async fn handle_model_gen_catch_up_command(
     } else {
         for result in &results {
             println!(
-                "model catch-up dbnum={} data={} model={} coverage_complete={} needs_full_regen={} generated={:?} anchor={}",
+                "model catch-up dbnum={} data={} model={} coverage_complete={} needs_full_regen={} gaps={} debt_buckets={} consumable_buckets={} stale_reconciled={} generated={:?} anchor={}",
                 result.dbnum,
                 result.coverage.data_watermark,
                 result.coverage.model_generation_watermark,
                 result.coverage.coverage_complete,
                 result.coverage.needs_full_regen,
+                result.coverage.gap_ranges.len(),
+                result.coverage.debt_bucket_counts.total,
+                result.coverage.consumable_bucket_counts.total,
+                result.stale_debt_reconciled,
                 result.generation_success,
                 result
                     .model_gen_anchor
@@ -513,11 +571,6 @@ async fn handle_model_gen_catch_up_command(
     Ok(())
 }
 
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
 fn validate_unit_manifest(
     path: &std::path::Path,
     dbnum: u32,
@@ -1008,11 +1061,11 @@ async fn handle_unit_export_command(
     anyhow::bail!("unit-export 需要 generation-read-ducklake、gen_model 与 parquet-export features")
 }
 
-#[cfg(feature = "generation-read-ducklake")]
 async fn handle_unit_list_command(
     sub: &ArgMatches,
-    db_option_ext: &DbOptionExt,
+    _db_option_ext: &DbOptionExt,
 ) -> anyhow::Result<()> {
+    ensure_model_unit_store_connection().await?;
     let unit_refno = sub
         .get_one::<String>("unit-refno")
         .expect("required by clap")
@@ -1023,8 +1076,8 @@ async fn handle_unit_list_command(
         Some(value) => value,
         None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
     };
-    let authority = crate::version_store::DuckLakeAuthority::open(db_option_ext.ducklake_config())?;
-    let commits = authority.list_model_unit_commits(dbnum, &unit_refno)?;
+    let commits =
+        crate::versioned_db::model_unit_commit::list_model_unit_commits(dbnum, &unit_refno).await?;
     let output = commits
         .iter()
         .map(|commit| {
@@ -1050,6 +1103,120 @@ async fn handle_unit_list_command(
                     .unwrap_or_else(|| "<none>".to_string()),
             );
         }
+    }
+    Ok(())
+}
+
+async fn handle_unit_import_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    use crate::versioned_db::model_unit_commit::{
+        ModelUnitCommit, ModelUnitImpactKind, commit_model_unit,
+    };
+    use std::str::FromStr;
+
+    ensure_model_unit_store_connection().await?;
+    let unit_refno = sub
+        .get_one::<String>("unit-refno")
+        .expect("required by clap")
+        .trim()
+        .replace('/', "_");
+    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
+    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
+        Some(value) => value,
+        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
+    };
+    let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+    let artifact_sesno = sub
+        .get_one::<u32>("artifact-sesno")
+        .copied()
+        .unwrap_or(sesno);
+    let impact_kind = ModelUnitImpactKind::from_str(
+        sub.get_one::<String>("impact-kind")
+            .expect("required by clap"),
+    )?;
+    let relative_manifest = sub
+        .get_one::<String>("manifest-path")
+        .expect("required by clap")
+        .trim()
+        .replace('\\', "/");
+    let project_output_dir = db_option_ext.get_project_output_dir();
+    let canonical_project_output =
+        std::fs::canonicalize(&project_output_dir).with_context(|| {
+            format!(
+                "项目输出目录不存在或不可访问: {}",
+                project_output_dir.display()
+            )
+        })?;
+    let manifest_path = project_output_dir.join(&relative_manifest);
+    let canonical_manifest = std::fs::canonicalize(&manifest_path)
+        .with_context(|| format!("最小交付单元 manifest 不存在: {}", manifest_path.display()))?;
+    anyhow::ensure!(
+        canonical_manifest.starts_with(&canonical_project_output),
+        "manifest-path 逃逸项目输出目录: {}",
+        manifest_path.display()
+    );
+
+    let manifest = validate_unit_manifest(&canonical_manifest, dbnum, &unit_refno)?;
+    let generated_at = manifest
+        .get("generated_at")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("manifest 缺少 generated_at: {}", manifest_path.display()))?
+        .to_string();
+    let artifact_hash = crate::version_management::hashing::sha256_file(&canonical_manifest)?;
+    let outcome = commit_model_unit(ModelUnitCommit {
+        dbnum,
+        unit_refno,
+        unit_noun: sub
+            .get_one::<String>("unit-noun")
+            .expect("required by clap")
+            .to_string(),
+        sesno,
+        impact_kind,
+        artifact_sesno,
+        project_name: db_option_ext.inner.project_name.trim().to_string(),
+        manifest_path: relative_manifest,
+        artifact_hash,
+        generated_at,
+    })
+    .await?;
+    let output = serde_json::json!({
+        "success": true,
+        "idempotent": outcome.idempotent,
+        "manifest_url": outcome.commit.manifest_url(),
+        "commit": outcome.commit,
+    });
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "registered ({}, {}, {}) impact={} artifact_sesno={} idempotent={} manifest={}",
+            outcome.commit.dbnum,
+            outcome.commit.unit_refno,
+            outcome.commit.sesno,
+            outcome.commit.impact_kind.as_str(),
+            outcome.commit.artifact_sesno,
+            outcome.idempotent,
+            outcome
+                .commit
+                .manifest_url()
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_model_unit_store_connection() -> anyhow::Result<()> {
+    #[cfg(feature = "gen_model")]
+    {
+        crate::fast_model::utils::ensure_surreal_init().await?;
+    }
+    #[cfg(not(feature = "gen_model"))]
+    {
+        aios_core::init_surreal().await?;
     }
     Ok(())
 }
@@ -1200,14 +1367,6 @@ async fn handle_unit_simulate_position_command(
     anyhow::bail!(
         "unit-simulate-position requires generation-read-ducklake, gen_model and parquet-export features"
     )
-}
-
-#[cfg(not(feature = "generation-read-ducklake"))]
-async fn handle_unit_list_command(
-    _sub: &ArgMatches,
-    _db_option_ext: &DbOptionExt,
-) -> anyhow::Result<()> {
-    anyhow::bail!("unit-list 需要 generation-read-ducklake feature")
 }
 
 #[cfg(feature = "generation-read-ducklake")]

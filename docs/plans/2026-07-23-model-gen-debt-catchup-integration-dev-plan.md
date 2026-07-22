@@ -91,10 +91,10 @@ generation_read_at = 本轮最后一个 data anchor 的 anchored_at
 
 依赖：无。源码改动前硬门。
 
-- [ ] P0.1 按 `specs/027` T002 建立可恢复基线：优先初始化 git 并做基线提交；否则在工作区外创建带时间戳快照并记录恢复命令。
-- [ ] P0.2 保存当前两项成功 `cargo check` 的命令、退出码与日志位置。
+- [x] P0.1 已在分支 `agent/spec026-027-debt-catchup` 创建实现前基线提交 `955c7ff`。
+- [x] P0.2 已执行并记录两项成功检查：`cargo check --lib --features "gen_model,sqlite-index,web_server"` 与 `cargo check --bin aios-database --features "gen_model,sqlite-index,web_server"`。
 - [ ] P0.3 固化现有 `model_gen_debt` 表样例与 `catch-up --dry-run --json` 输出，作为兼容 fixture。
-- [ ] P0.4 明确 sesno 区间字段语义：数据库记录统一使用 `(from_watermark, to_sesno]`；若保留“首个实际 sesno”语义，字段必须改名并同步规格。
+- [x] P0.4 区间沿 Version Commit 既有编码统一为 `[from_sesno, to_sesno]`；`from_sesno` 是本批首个实际 sesno，连续条件为 `next.from <= cursor + 1`，规格与 JSON 同步。
 
 验收：可恢复一个抽样文件；区间语义在 spec、schema、JSON 三处一致。
 

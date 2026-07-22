@@ -2964,8 +2964,6 @@ async fn main() -> anyhow::Result<()> {
 
     // ========== 处理 incremental-sesno 子命令 ==========
     if let Some(incr_matches) = matches.subcommand_matches("incremental-sesno") {
-        let _mutation_lock = aios_database::version_management::project_mutation_lock::
-            ProjectMutationLock::acquire_for_current_command(&db_option_ext)?;
         let from_sesno = incr_matches
             .get_one::<u32>("from-sesno")
             .copied()
@@ -2980,6 +2978,7 @@ async fn main() -> anyhow::Result<()> {
                 .get_many::<u32>("dbnum")
                 .map(|values| values.copied().collect())
                 .unwrap_or_default(),
+            dbnum_ranges: Vec::new(),
             from_sesno,
             to_sesno: incr_matches.get_one::<u32>("to-sesno").copied(),
             rescan_index: incr_matches.get_flag("rescan-index"),

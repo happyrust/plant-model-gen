@@ -14,12 +14,21 @@ use anyhow::Context;
 
 use crate::options::DbOptionExt;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbnumIncrementRange {
+    pub dbnum: u32,
+    pub from_sesno: u32,
+    pub to_sesno: u32,
+}
+
 /// 一次增量运行的全部输入。区间起点语义：从 `from_sesno + 1` 收集到
 /// `to_sesno`（缺省为文件最新 sesno）。
 #[derive(Debug, Clone)]
 pub struct IncrementRunOptions {
     pub file: Option<PathBuf>,
     pub dbnums: Vec<u32>,
+    /// watch 多库轮次使用的逐库范围；与 `dbnums` 中的库不得重复。
+    pub dbnum_ranges: Vec<DbnumIncrementRange>,
     pub from_sesno: u32,
     pub to_sesno: Option<u32>,
     pub rescan_index: bool,
@@ -76,6 +85,29 @@ where
     C: FnOnce() -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    let mutation_lock =
+        super::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+            db_option_ext,
+        )?;
+    run_increment_with_lock(
+        db_option_ext,
+        options,
+        ensure_model_store,
+        mutation_lock.held(),
+    )
+    .await
+}
+
+pub(crate) async fn run_increment_with_lock<C, Fut>(
+    db_option_ext: &DbOptionExt,
+    options: IncrementRunOptions,
+    ensure_model_store: C,
+    mutation_lock: super::project_mutation_lock::HeldProjectMutationLock<'_>,
+) -> anyhow::Result<IncrementRunResult>
+where
+    C: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
     let run_started = std::time::Instant::now();
     let metrics_elapsed = || run_started.elapsed().as_millis() as u64;
     if !options.persist_data && options.generate_model {
@@ -123,8 +155,42 @@ where
         collected_outcome.merge(file_outcome);
     }
 
-    if !options.dbnums.is_empty() {
-        source_count += options.dbnums.len();
+    let dbnum_requests = {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut requests = Vec::new();
+        if !options.dbnums.is_empty() {
+            for dbnum in &options.dbnums {
+                anyhow::ensure!(
+                    seen.insert(*dbnum),
+                    "duplicate dbnum in incremental request: {dbnum}"
+                );
+            }
+            requests.push((options.dbnums.clone(), options.from_sesno, options.to_sesno));
+        }
+        for range in &options.dbnum_ranges {
+            anyhow::ensure!(range.dbnum > 0, "incremental dbnum must be non-zero");
+            anyhow::ensure!(
+                range.to_sesno >= range.from_sesno,
+                "invalid incremental range for dbnum={}: {}..={}",
+                range.dbnum,
+                range.from_sesno,
+                range.to_sesno
+            );
+            anyhow::ensure!(
+                seen.insert(range.dbnum),
+                "duplicate dbnum in incremental request: {}",
+                range.dbnum
+            );
+            requests.push((vec![range.dbnum], range.from_sesno, Some(range.to_sesno)));
+        }
+        requests
+    };
+
+    if !dbnum_requests.is_empty() {
+        source_count += dbnum_requests
+            .iter()
+            .map(|(dbnums, _, _)| dbnums.len())
+            .sum::<usize>();
         #[cfg(feature = "sqlite-index")]
         {
             let index_path = crate::data_interface::db_index::default_index_path(
@@ -142,49 +208,47 @@ where
                     report.db_files, report.ref0_total
                 );
             }
-            let detail = format!("dbnums={:?}", options.dbnums);
-            let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
-                "incremental_sesno_collecting_dbnums",
-                Some(detail.clone()),
-                std::time::Duration::from_secs(15),
-            );
-            let indexed_outcome = match crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations_options(
-                &db_option_ext.inner.project_name,
-                &index_path,
-                &options.dbnums,
-                options.from_sesno,
-                options.to_sesno,
-                options.verbose,
-                options.model_impact_filter,
-            ) {
-                Ok(outcome) => outcome,
-                Err(err) if !options.rescan_index => {
-                    eprintln!("⚠️  db_index 命中失败，按指纹刷新索引后重试: {}", err);
-                    let report =
-                        crate::data_interface::db_index::rebuild_from_config(false)
-                            .await?;
-                    println!(
-                        "✅ db_index 已刷新: {} 个库, {} 条 ref0 映射",
-                        report.db_files, report.ref0_total
-                    );
+            let mut refreshed_after_miss = false;
+            for (dbnums, from_sesno, to_sesno) in dbnum_requests {
+                let detail = format!("dbnums={dbnums:?} from={from_sesno} to={to_sesno:?}");
+                let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
+                    "incremental_sesno_collecting_dbnums",
+                    Some(detail.clone()),
+                    std::time::Duration::from_secs(15),
+                );
+                let collect = || {
                     crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations_options(
                         &db_option_ext.inner.project_name,
                         &index_path,
-                        &options.dbnums,
-                        options.from_sesno,
-                        options.to_sesno,
+                        &dbnums,
+                        from_sesno,
+                        to_sesno,
                         options.verbose,
                         options.model_impact_filter,
-                    )?
-                }
-                Err(err) => return Err(err),
-            };
-            crate::perf_metrics::record_generate_progress(
-                "incremental_sesno_collected_dbnums",
-                Some(&detail),
-                metrics_elapsed(),
-            );
-            collected_outcome.merge(indexed_outcome);
+                    )
+                };
+                let indexed_outcome = match collect() {
+                    Ok(outcome) => outcome,
+                    Err(err) if !options.rescan_index && !refreshed_after_miss => {
+                        eprintln!("⚠️  db_index 命中失败，按指纹刷新索引后重试: {}", err);
+                        let report =
+                            crate::data_interface::db_index::rebuild_from_config(false).await?;
+                        refreshed_after_miss = true;
+                        println!(
+                            "✅ db_index 已刷新: {} 个库, {} 条 ref0 映射",
+                            report.db_files, report.ref0_total
+                        );
+                        collect()?
+                    }
+                    Err(err) => return Err(err),
+                };
+                crate::perf_metrics::record_generate_progress(
+                    "incremental_sesno_collected_dbnums",
+                    Some(&detail),
+                    metrics_elapsed(),
+                );
+                collected_outcome.merge(indexed_outcome);
+            }
         }
         #[cfg(not(feature = "sqlite-index"))]
         {
@@ -321,8 +385,7 @@ where
     if options.persist_data {
         for anchor in &persist_stats.anchors {
             let file = collected_increment_files.iter().find(|file| {
-                file.report.dbnum == anchor.dbnum
-                    && file.report.actual_end_sesno == anchor.sesno
+                file.report.dbnum == anchor.dbnum && file.report.actual_end_sesno == anchor.sesno
             });
             let Some(file) = file else {
                 let message = format!(
@@ -367,7 +430,23 @@ where
         }
     }
 
-    let source_hash_summary = verify_source_hash_gate(&source_hash_gate)?;
+    let commit_failure_dbnums = persist_stats
+        .commit_failures
+        .iter()
+        .map(|failure| failure.dbnum)
+        .collect::<std::collections::BTreeSet<_>>();
+    let generation_barrier_blocked =
+        !commit_failure_dbnums.is_empty() || !debt_blocked_dbnums.is_empty();
+    let generation_barrier_status = if !options.generate_model {
+        "disabled"
+    } else if generation_barrier_blocked {
+        "skipped_due_to_data_barrier"
+    } else {
+        "passed"
+    };
+
+    verify_source_hash_gate(&source_hash_gate)
+        .context("source hash gate failed before model generation")?;
     let committed_dbnums = persist_stats
         .anchors
         .iter()
@@ -377,23 +456,26 @@ where
     let mut coverages = Vec::new();
     if options.persist_data {
         for dbnum in committed_dbnums {
-            if options.generate_model && !debt_blocked_dbnums.contains(&dbnum) {
-                let catch_up = crate::version_management::model_gen_catchup::catch_up_model_generation(
-                    db_option_ext,
-                    dbnum,
-                    crate::version_management::model_gen_catchup::ModelGenCatchUpOptions {
-                        require_pe_owner_ready: options.require_pe_owner_ready,
-                        allow_full_regen: false,
-                        dry_run: db_option_ext.gen_model_dry_run,
-                    },
-                )
-                .await;
+            if options.generate_model && !generation_barrier_blocked {
+                let catch_up =
+                    crate::version_management::model_gen_catchup::catch_up_model_generation_with_lock(
+                        db_option_ext,
+                        dbnum,
+                        crate::version_management::model_gen_catchup::ModelGenCatchUpOptions {
+                            require_pe_owner_ready: options.require_pe_owner_ready,
+                            allow_full_regen: false,
+                            dry_run: db_option_ext.gen_model_dry_run,
+                        },
+                        mutation_lock,
+                        false,
+                    )
+                    .await;
                 match catch_up {
                     Ok(result) => {
                         coverages.push(result.coverage.clone());
                         if result.coverage.needs_full_regen {
                             failures.push(format!(
-                                "dbnum={dbnum} model debt has a gap; run model-version catch-up --allow-full-regen"
+                                "dbnum={dbnum} model debt has a gap; controlled repair is required"
                             ));
                         } else if result.generation_success == Some(false) {
                             failures.push(format!("dbnum={dbnum} model generation failed"));
@@ -414,6 +496,25 @@ where
             }
         }
     }
+    let source_hash_summary = verify_source_hash_gate(&source_hash_gate).context(
+        "source hash gate failed after model generation; no deferred model_gen anchors were published",
+    )?;
+    if db_option_ext.use_surrealdb
+        && db_option_ext.model_writer_mode.writes_to_surreal()
+        && !db_option_ext.gen_model_dry_run
+    {
+        for result in &mut catch_up_results {
+            if result.generation_success == Some(true) && result.model_gen_anchor.is_none() {
+                result.model_gen_anchor = Some(
+                    crate::versioned_db::model_gen_debt::finalize_model_generation(
+                        result.dbnum,
+                        result.coverage.data_watermark,
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
     let model_gen_anchors = catch_up_results
         .iter()
         .filter_map(|result| result.model_gen_anchor.clone())
@@ -426,10 +527,9 @@ where
         .iter()
         .filter_map(|result| result.parquet_export.clone())
         .collect::<Vec<_>>();
-    let parquet_export_value = (!parquet_exports.is_empty()).then_some(serde_json::json!(parquet_exports));
-    let generation_success = options
-        .generate_model
-        .then_some(failures.is_empty());
+    let parquet_export_value =
+        (!parquet_exports.is_empty()).then_some(serde_json::json!(parquet_exports));
+    let generation_success = options.generate_model.then_some(failures.is_empty());
     let model_neutral_changes = outcome
         .element_changes
         .iter()
@@ -450,12 +550,33 @@ where
         .iter()
         .map(|coverage| (coverage.dbnum, coverage.debt_ranges.clone()))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let consumable_debt_ranges = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.consumable_debt_ranges.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let stale_debt_ranges = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.stale_debt_ranges.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let debt_gap_ranges = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.gap_ranges.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let debt_bucket_counts = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.debt_bucket_counts.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let consumable_debt_bucket_counts = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.consumable_bucket_counts.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let coverage_complete = coverages.iter().all(|coverage| coverage.coverage_complete);
     let needs_full_regen = coverages.iter().any(|coverage| coverage.needs_full_regen);
 
     let summary = serde_json::json!({
         "from_sesno": options.from_sesno,
         "to_sesno": options.to_sesno,
+        "dbnum_ranges": options.dbnum_ranges,
         "source_hash_gate": source_hash_summary,
         "pe_owner_evidence": pe_owner_evidence,
         "source_count": source_count,
@@ -472,9 +593,21 @@ where
         "model_neutral_changes": model_neutral_changes,
         "debt_written": debt_written,
         "debt_write_failures": debt_write_failures,
+        "generation_barrier": {
+            "status": generation_barrier_status,
+            "blocked": generation_barrier_blocked,
+            "commit_failure_dbnums": commit_failure_dbnums,
+            "debt_failure_dbnums": debt_blocked_dbnums,
+        },
         "data_watermark": data_watermarks,
         "model_generation_watermark": model_generation_watermarks,
+        "debt_range_semantics": crate::versioned_db::model_gen_debt::MODEL_GEN_DEBT_RANGE_SEMANTICS,
         "debt_ranges": debt_ranges,
+        "consumable_debt_ranges": consumable_debt_ranges,
+        "stale_debt_ranges": stale_debt_ranges,
+        "debt_gap_ranges": debt_gap_ranges,
+        "debt_bucket_counts": debt_bucket_counts,
+        "consumable_debt_bucket_counts": consumable_debt_bucket_counts,
         "coverage_complete": coverage_complete,
         "needs_full_regen": needs_full_regen,
         "generation_failures": failures,

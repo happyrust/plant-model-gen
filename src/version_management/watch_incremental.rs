@@ -1,16 +1,15 @@
 //! `watch-incremental` 的唯一轮询实现。
 //!
 //! CLI、`sync_live` 与 web remote runtime 只能通过本模块触发增量。调用方须先
-//! 初始化项目 SurrealDB；本模块持有项目写锁，并让每个 dbnum 都从 Committed
-//! Watermark 续跑到源文件当前 sesno。
+//! 初始化项目 SurrealDB；每轮把所有待更新 dbnum 交给同一个深层 IncrementRun，
+//! 由该 seam 自持项目写锁并从各自 Committed Watermark 续跑到源文件当前 sesno。
 
 #[cfg(feature = "mqtt")]
 use std::path::PathBuf;
 
 use crate::options::DbOptionExt;
 
-use super::increment_run::{IncrementRunOptions, IncrementRunResult};
-use super::project_mutation_lock::ProjectMutationLock;
+use super::increment_run::{DbnumIncrementRange, IncrementRunOptions, IncrementRunResult};
 
 #[derive(Debug, Clone)]
 pub struct WatchIncrementalOptions {
@@ -44,14 +43,11 @@ impl Default for WatchIncrementalOptions {
 
 /// 运行统一增量轮询。
 ///
-/// 项目锁覆盖整个 watch 生命周期；单轮模式也使用同一把锁，因而不会与
-/// `incremental-sesno`、regen 或另一个 watcher 交错写入。
+/// 每次写入/追赶由深层 seam 自持项目锁，watch 本身不长期占锁。
 pub async fn run_watch_incremental(
     db_option_ext: &DbOptionExt,
     options: WatchIncrementalOptions,
 ) -> anyhow::Result<()> {
-    let _mutation_lock = ProjectMutationLock::acquire_for_current_command(db_option_ext)?;
-
     #[cfg(feature = "sqlite-index")]
     {
         run_with_sqlite_index(db_option_ext, options).await
@@ -118,6 +114,10 @@ async fn run_with_sqlite_index(
         let mut cycle_summaries = Vec::new();
         let mut cycle_failures: Vec<(u32, String)> = Vec::new();
         let mut update_count = 0usize;
+        let mut increment_targets = Vec::new();
+        #[cfg(feature = "mqtt")]
+        let mut increment_records = Vec::new();
+        let mut catch_up_records = Vec::new();
 
         for record in records {
             if !options.requested_dbnums.is_empty()
@@ -149,49 +149,7 @@ async fn run_with_sqlite_index(
                 continue;
             }
             if record.latest_sesno <= watermark {
-                if options.generate_model {
-                    match super::model_gen_catchup::catch_up_model_generation(
-                        db_option_ext,
-                        record.dbnum,
-                        super::model_gen_catchup::ModelGenCatchUpOptions {
-                            require_pe_owner_ready: options.require_pe_owner_ready,
-                            allow_full_regen: false,
-                            dry_run: db_option_ext.gen_model_dry_run,
-                        },
-                    )
-                    .await
-                    {
-                        Ok(result) if result.coverage.needs_full_regen => {
-                            eprintln!(
-                                "⚠️ dbnum={} 模型欠账存在区间洞，需要显式 model-version catch-up --allow-full-regen",
-                                record.dbnum
-                            );
-                            if options.json_output {
-                                cycle_summaries.push(serde_json::to_value(result)?);
-                            }
-                        }
-                        Ok(result) => {
-                            if let Some(anchor) = &result.model_gen_anchor {
-                                update_count += 1;
-                                println!(
-                                    "✅ dbnum={} 模型欠账已追平到 sesno={}",
-                                    anchor.dbnum, anchor.sesno
-                                );
-                            }
-                            if options.json_output
-                                && (result.generation_success.is_some()
-                                    || !result.coverage.coverage_complete)
-                            {
-                                cycle_summaries.push(serde_json::to_value(result)?);
-                            }
-                        }
-                        Err(error) => {
-                            let message = format!("模型欠账追赶失败: {error:#}");
-                            eprintln!("❌ dbnum={} {}", record.dbnum, message);
-                            cycle_failures.push((record.dbnum, message));
-                        }
-                    }
-                }
+                catch_up_records.push(record);
                 continue;
             }
 
@@ -199,13 +157,31 @@ async fn run_with_sqlite_index(
                 "🔄 dbnum={} sesno {} -> {}，开始增量更新",
                 record.dbnum, watermark, record.latest_sesno
             );
+            increment_targets.push(DbnumIncrementRange {
+                dbnum: record.dbnum,
+                from_sesno: watermark,
+                to_sesno: record.latest_sesno,
+            });
+            #[cfg(feature = "mqtt")]
+            increment_records.push(record.clone());
+        }
+
+        let mut generation_barrier_blocked = false;
+        if !increment_targets.is_empty() {
+            let from_sesno = increment_targets
+                .iter()
+                .map(|target| target.from_sesno)
+                .min()
+                .unwrap_or_default();
+            let to_sesno = increment_targets.iter().map(|target| target.to_sesno).max();
             let run_result = super::increment_run::run_increment(
                 db_option_ext,
                 IncrementRunOptions {
                     file: None,
-                    dbnums: vec![record.dbnum],
-                    from_sesno: watermark,
-                    to_sesno: Some(record.latest_sesno),
+                    dbnums: Vec::new(),
+                    dbnum_ranges: increment_targets,
+                    from_sesno,
+                    to_sesno,
                     rescan_index: false,
                     persist_data: true,
                     recover_pending: false,
@@ -220,19 +196,37 @@ async fn run_with_sqlite_index(
 
             match run_result {
                 Ok(result) => {
-                    update_count += 1;
+                    generation_barrier_blocked = result
+                        .summary
+                        .pointer("/generation_barrier/status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("skipped_due_to_data_barrier");
+                    update_count += result.persist_stats.anchors.len();
                     #[cfg(feature = "mqtt")]
-                    if let Err(error) = mqtt_file_publisher
-                        .publish_source_files(&[PathBuf::from(&record.file_path)])
-                        .await
                     {
-                        log::error!(
-                            "dbnum={} 已提交，但 MQTT 源文件发布失败: {error:#}",
-                            record.dbnum
-                        );
+                        let committed_dbnums = result
+                            .persist_stats
+                            .anchors
+                            .iter()
+                            .map(|anchor| anchor.dbnum)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let committed_files = increment_records
+                            .iter()
+                            .filter(|record| committed_dbnums.contains(&record.dbnum))
+                            .map(|record| PathBuf::from(&record.file_path))
+                            .collect::<Vec<_>>();
+                        if !committed_files.is_empty()
+                            && let Err(error) = mqtt_file_publisher
+                                .publish_source_files(&committed_files)
+                                .await
+                        {
+                            log::error!(
+                                "多库增量已部分或全部提交，但 MQTT 源文件发布失败: {error:#}"
+                            );
+                        }
                     }
                     if !result.failures.is_empty() {
-                        cycle_failures.push((record.dbnum, result.failures.join("; ")));
+                        cycle_failures.push((0, result.failures.join("; ")));
                     }
                     if options.json_output {
                         cycle_summaries.push(result.summary);
@@ -241,17 +235,74 @@ async fn run_with_sqlite_index(
                     }
                 }
                 Err(error) => {
+                    generation_barrier_blocked = true;
                     let message = format!("{error:#}");
                     if error_is_normal_contention(&message) {
-                        println!(
-                            "ℹ️ dbnum={} 本轮让路（正常竞争/待人工恢复）: {}",
-                            record.dbnum, message
-                        );
+                        println!("ℹ️ 多库增量轮次让路（正常竞争/待人工恢复）: {message}");
                     } else {
+                        eprintln!("❌ 多库增量轮次失败，下一轮重试: {message}");
+                        cycle_failures.push((0, message));
+                    }
+                }
+            }
+        }
+
+        if generation_barrier_blocked && options.generate_model && !catch_up_records.is_empty() {
+            eprintln!(
+                "⚠️ 本轮数据/欠账 barrier 未通过，跳过 {} 个无新数据 dbnum 的模型欠账追赶",
+                catch_up_records.len()
+            );
+            if options.json_output {
+                cycle_summaries.push(serde_json::json!({
+                    "generation_barrier": {
+                        "status": "skipped_due_to_data_barrier",
+                        "skipped_catch_up_dbnums": catch_up_records
+                            .iter()
+                            .map(|record| record.dbnum)
+                            .collect::<Vec<_>>(),
+                    }
+                }));
+            }
+        } else if options.generate_model {
+            for record in catch_up_records {
+                match super::model_gen_catchup::catch_up_model_generation(
+                    db_option_ext,
+                    record.dbnum,
+                    super::model_gen_catchup::ModelGenCatchUpOptions {
+                        require_pe_owner_ready: options.require_pe_owner_ready,
+                        allow_full_regen: false,
+                        dry_run: db_option_ext.gen_model_dry_run,
+                    },
+                )
+                .await
+                {
+                    Ok(result) if result.coverage.needs_full_regen => {
                         eprintln!(
-                            "❌ dbnum={} 增量更新失败（不影响其它 dbnum，下一轮重试）: {}",
-                            record.dbnum, message
+                            "⚠️ dbnum={} 模型欠账存在区间洞，需要绑定数据锚点的受控 repair",
+                            record.dbnum
                         );
+                        if options.json_output {
+                            cycle_summaries.push(serde_json::to_value(result)?);
+                        }
+                    }
+                    Ok(result) => {
+                        if let Some(anchor) = &result.model_gen_anchor {
+                            update_count += 1;
+                            println!(
+                                "✅ dbnum={} 模型欠账已追平到 sesno={}",
+                                anchor.dbnum, anchor.sesno
+                            );
+                        }
+                        if options.json_output
+                            && (result.generation_success.is_some()
+                                || !result.coverage.coverage_complete)
+                        {
+                            cycle_summaries.push(serde_json::to_value(result)?);
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("模型欠账追赶失败: {error:#}");
+                        eprintln!("❌ dbnum={} {}", record.dbnum, message);
                         cycle_failures.push((record.dbnum, message));
                     }
                 }

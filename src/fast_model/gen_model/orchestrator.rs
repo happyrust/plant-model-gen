@@ -15,7 +15,7 @@ use crate::fast_model::gen_model::model_writer::{
     create_model_writer,
 };
 use crate::fast_model::unit_converter::LengthUnit;
-use crate::generation_read::SessionMetricsSnapshot;
+use crate::generation_read::{GenerationReadSpec, SessionMetricsSnapshot};
 use crate::options::{DbOptionExt, MeshFormat};
 use aios_core::RefnoEnum;
 use dashmap::DashMap;
@@ -147,9 +147,31 @@ pub async fn gen_all_geos_data(
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
 ) -> Result<GenModelResult> {
-    let session = crate::generation_read::open_generation_read_session(db_option)
-        .await
-        .map_err(anyhow::Error::new)?;
+    gen_all_geos_data_with_read_spec(
+        manual_refnos,
+        db_option,
+        incr_updates,
+        GenerationReadSpec::live(),
+    )
+    .await
+}
+
+/// Opens one generation session from an explicit, immutable read contract.
+///
+/// Initialization callers may pass [`GenerationReadSpec::live`]. Incremental,
+/// catch-up, and repair callers should pass [`GenerationReadSpec::at`]; until
+/// the main-table adapter can honor `VERSION AT`, that mode fails closed in the
+/// generation-read factory rather than reading latest state.
+pub async fn gen_all_geos_data_with_read_spec(
+    manual_refnos: Vec<RefnoEnum>,
+    db_option: &DbOptionExt,
+    incr_updates: Option<IncrGeoUpdateLog>,
+    read_spec: GenerationReadSpec,
+) -> Result<GenModelResult> {
+    let session =
+        crate::generation_read::open_generation_read_session_with_spec(db_option, &read_spec)
+            .await
+            .map_err(anyhow::Error::new)?;
     gen_all_geos_data_with_session(manual_refnos, db_option, incr_updates, session).await
 }
 

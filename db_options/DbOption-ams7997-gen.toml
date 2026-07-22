@@ -31,7 +31,7 @@ gen_mesh = true
 replace_mesh = false
 save_db = true
 # 解析存储后端必须显式选择；ducklake 为权威，发布后再原子复制到 Surreal。
-parse_storage_backend = "ducklake"
+parse_storage_backend = "surreal"
 # 生成输入后端必须显式选择；surreal 是分阶段发布的默认值，不会自动回退。
 generation_read_backend = "surreal"
 generation_input_manifest = "db-data/ams7997-generation-manifest.json"

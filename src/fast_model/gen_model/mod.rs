@@ -94,6 +94,7 @@ pub use prim_processor::process_prim_refno_page;
 
 // 编排器：主入口函数
 pub use orchestrator::gen_all_geos_data;
+pub use orchestrator::gen_all_geos_data_with_read_spec;
 pub use orchestrator::gen_all_geos_data_with_session;
 pub use orchestrator::{GenModelResult, GenerationRunProvenance};
 

@@ -43,11 +43,13 @@ pub fn classify_attribute_model_impact(raw_name: &str) -> AttributeModelImpact {
 /// 判断单个 E3D/PDMS 属性是否会改变生成器的模型输入。
 ///
 /// 名称统一按大写比较。该集合来自当前生成链路读取的定位、目录引用、布尔关系、
-/// 管路连接和 primitive 参数；未知属性默认不触发生成，避免“任意属性修改即重建”。
+/// 管路连接和 primitive 参数。此 bool 只表示“命中已知影响集合”；未命中项会由
+/// `classify_attribute_model_impact` 标为 Unknown，并在增量采集层保守触发。
 ///
 /// 清单经 core.dll/Core3D 逆向 + 运行库 `att_meta`(702) 三方交叉校验补齐，取“宁多勿漏”
-/// （漏判=模型陈旧的正确性 bug；误判=多算一次成本可控）。判定权威语义（内核 `wnoevt`）与
-/// 本取舍见 ADR-0009 及 `docs/reverse/core_dll_noun_att_model_update.md` §13/§14。
+/// （漏判=模型陈旧的正确性 bug；误判=多算一次成本可控）。目标语义近似 Core3D 的
+/// `DCHC/EVALAT` 模型影响层；`wnoevt` 仅是 core 事件门。详见 ADR-0009 及
+/// `docs/reverse/core_dll_noun_att_model_update.md` §13/§14。
 pub fn attribute_affects_model(raw_name: &str) -> bool {
     let name = normalize_attribute_name(raw_name);
 

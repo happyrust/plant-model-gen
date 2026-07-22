@@ -175,45 +175,105 @@ pub async fn api_parquet_version(Path(dbno): Path<u32>) -> impl IntoResponse {
 }
 
 pub async fn api_model_unit_versions(
-    Path(_unit_refno): Path<String>,
-    Query(_query): Query<ModelUnitVersionQuery>,
+    Path(unit_refno): Path<String>,
+    Query(query): Query<ModelUnitVersionQuery>,
 ) -> impl IntoResponse {
-    // specs/027（ADR-0007）：模型单元版本台账随 DuckLake 权威退役下线；
-    // T007 将台账迁至 Surreal 后恢复，当前统一返回未实现。
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "success": false,
-            "message": "模型单元版本台账已随 DuckLake 退役下线（specs/027：迁移 Surreal 台账后恢复）",
-        })),
-    )
+    let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+        Ok(dbnum) => dbnum,
+        Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+    };
+    let unit_refno = normalize_refno_key(&unit_refno);
+    match crate::versioned_db::model_unit_commit::list_model_unit_commits(dbnum, &unit_refno).await
+    {
+        Ok(commits) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "data": commits.into_iter().map(model_unit_commit_json).collect::<Vec<_>>(),
+            })),
+        ),
+        Err(error) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 pub async fn api_model_unit_version(
-    Path((_unit_refno, _sesno)): Path<(String, u32)>,
-    Query(_query): Query<ModelUnitVersionQuery>,
+    Path((unit_refno, sesno)): Path<(String, u32)>,
+    Query(query): Query<ModelUnitVersionQuery>,
 ) -> impl IntoResponse {
-    // specs/027（ADR-0007）：见 api_model_unit_versions；台账迁 Surreal 后恢复。
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "success": false,
-            "message": "模型单元版本台账已随 DuckLake 退役下线（specs/027：迁移 Surreal 台账后恢复）",
-        })),
-    )
+    let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+        Ok(dbnum) => dbnum,
+        Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+    };
+    let unit_refno = normalize_refno_key(&unit_refno);
+    match crate::versioned_db::model_unit_commit::model_unit_commit(dbnum, &unit_refno, sesno).await
+    {
+        Ok(Some(commit)) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "data": model_unit_commit_json(commit) })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("未找到模型提交: ({dbnum}, {unit_refno}, {sesno})"),
+            })),
+        ),
+        Err(error) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 pub async fn api_latest_model_unit_version(
-    Path(_unit_refno): Path<String>,
-    Query(_query): Query<ModelUnitVersionQuery>,
+    Path(unit_refno): Path<String>,
+    Query(query): Query<ModelUnitVersionQuery>,
 ) -> impl IntoResponse {
-    // specs/027（ADR-0007）：见 api_model_unit_versions；台账迁 Surreal 后恢复。
+    let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+        Ok(dbnum) => dbnum,
+        Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+    };
+    let unit_refno = normalize_refno_key(&unit_refno);
+    match crate::versioned_db::model_unit_commit::latest_model_unit_commit(dbnum, &unit_refno).await
+    {
+        Ok(Some(commit)) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "data": model_unit_commit_json(commit) })),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("未找到模型提交: ({dbnum}, {unit_refno})"),
+            })),
+        ),
+        Err(error) => model_unit_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
+fn model_unit_commit_json(
+    commit: crate::versioned_db::model_unit_commit::ModelUnitCommit,
+) -> serde_json::Value {
+    json!({
+        "manifest_url": commit.manifest_url(),
+        "commit": commit,
+    })
+}
+
+fn resolve_model_unit_dbnum(unit_refno: &str, dbnum: Option<u32>) -> anyhow::Result<u32> {
+    if let Some(dbnum) = dbnum {
+        anyhow::ensure!(dbnum > 0, "dbnum must be non-zero");
+        return Ok(dbnum);
+    }
+    let refno = aios_core::RefnoEnum::from_str(unit_refno)
+        .map_err(|error| anyhow::anyhow!("无法解析模型单元 refno={unit_refno}: {error:?}"))?;
+    crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(refno)
+}
+
+fn model_unit_error(
+    status: StatusCode,
+    error: anyhow::Error,
+) -> (StatusCode, Json<serde_json::Value>) {
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "success": false,
-            "message": "模型单元版本台账已随 DuckLake 退役下线（specs/027：迁移 Surreal 台账后恢复）",
-        })),
+        status,
+        Json(json!({ "success": false, "message": error.to_string() })),
     )
 }
 

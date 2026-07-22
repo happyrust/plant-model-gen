@@ -11,8 +11,9 @@ pub mod increment_run;
 /// 缺失网格修复：依赖 gen_model 的网格生成管线，瘦构建（sync-cli）不含。
 #[cfg(feature = "gen_model")]
 pub mod missing_mesh_repair;
-pub mod model_impact;
 pub mod model_gen_catchup;
+pub mod model_generation_run;
+pub mod model_impact;
 pub mod project_mutation_lock;
 pub mod watch_incremental;
 

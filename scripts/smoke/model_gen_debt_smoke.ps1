@@ -1,6 +1,5 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [uint32[]]$Dbnum,
+    [uint32[]]$Dbnum = @(),
     [string]$Exe = "$PSScriptRoot\..\..\target\release\aios-database.exe"
 )
 
@@ -28,13 +27,45 @@ $report = $raw.Substring($start, $end - $start + 1) | ConvertFrom-Json
 if (@($report.failures).Count -ne 0) {
     throw "catch-up dry-run reported failures: $($report.failures -join '; ')"
 }
-if (@($report.results).Count -ne $Dbnum.Count) {
+if ($Dbnum.Count -gt 0 -and @($report.results).Count -ne $Dbnum.Count) {
     throw "expected $($Dbnum.Count) result(s), got $(@($report.results).Count)"
 }
+if ($Dbnum.Count -eq 0 -and @($report.results).Count -eq 0) {
+    throw "all-db catch-up returned no candidate results"
+}
 foreach ($result in $report.results) {
-    foreach ($field in @("data_watermark", "model_generation_watermark", "debt_ranges", "coverage_complete", "needs_full_regen")) {
+    if ($null -eq $result.stale_debt_reconciled) {
+        throw "dbnum=$($result.dbnum) missing stale_debt_reconciled"
+    }
+    if ([int]$result.stale_debt_reconciled -ne 0) {
+        throw "dry-run unexpectedly reconciled stale debt for dbnum=$($result.dbnum)"
+    }
+    foreach ($field in @(
+        "data_watermark",
+        "model_generation_watermark",
+        "range_semantics",
+        "debt_ranges",
+        "consumable_debt_ranges",
+        "stale_debt_ranges",
+        "gap_ranges",
+        "debt_bucket_counts",
+        "consumable_bucket_counts",
+        "coverage_complete",
+        "needs_full_regen"
+    )) {
         if ($null -eq $result.coverage.$field) {
             throw "dbnum=$($result.dbnum) missing coverage.$field"
+        }
+    }
+    if ($result.coverage.range_semantics -ne "[from_sesno,to_sesno]") {
+        throw "dbnum=$($result.dbnum) unexpected range semantics: $($result.coverage.range_semantics)"
+    }
+    foreach ($countsName in @("debt_bucket_counts", "consumable_bucket_counts")) {
+        $counts = $result.coverage.$countsName
+        foreach ($field in @("prim", "loop_owner", "bran_hanger", "basic_cata", "delete", "total")) {
+            if ($null -eq $counts.$field) {
+                throw "dbnum=$($result.dbnum) missing coverage.$countsName.$field"
+            }
         }
     }
     if ($null -ne $result.model_gen_anchor) {
@@ -42,5 +73,6 @@ foreach ($result in $report.results) {
     }
 }
 
-Write-Host "PASS model_gen_debt dry-run: dbnums=$($Dbnum -join ',')" -ForegroundColor Green
+$scope = if ($Dbnum.Count -gt 0) { $Dbnum -join ',' } else { "all" }
+Write-Host "PASS model_gen_debt dry-run: dbnums=$scope" -ForegroundColor Green
 exit 0

@@ -27,6 +27,116 @@ impl GenerationReadBackendKind {
     }
 }
 
+/// Controls whether one generation run observes the current database state or
+/// a single, caller-selected historical instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationReadMode {
+    Live,
+    ReadAt,
+}
+
+impl GenerationReadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::ReadAt => "read_at",
+        }
+    }
+}
+
+/// Immutable input-read contract shared by every query in one generation run.
+///
+/// `Live` is reserved for initialization, before a project has a stable data
+/// anchor. Incremental, catch-up, and repair callers must construct `ReadAt`
+/// with the one anchor timestamp and the complete observed watermark vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationReadSpec {
+    mode: GenerationReadMode,
+    read_at: Option<String>,
+    observed_watermarks: BTreeMap<u32, u32>,
+}
+
+impl GenerationReadSpec {
+    /// Read the current state. The session factory observes watermarks while
+    /// opening the session and records them in its input manifest.
+    pub fn live() -> Self {
+        Self {
+            mode: GenerationReadMode::Live,
+            read_at: None,
+            observed_watermarks: BTreeMap::new(),
+        }
+    }
+
+    /// Pin every read in the run to the same data-anchor timestamp.
+    pub fn at(
+        read_at: impl Into<String>,
+        observed_watermarks: BTreeMap<u32, u32>,
+    ) -> GenerationReadResult<Self> {
+        let spec = Self {
+            mode: GenerationReadMode::ReadAt,
+            read_at: Some(read_at.into().trim().to_string()),
+            observed_watermarks,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn mode(&self) -> GenerationReadMode {
+        self.mode
+    }
+
+    pub fn read_at(&self) -> Option<&str> {
+        self.read_at.as_deref()
+    }
+
+    pub fn observed_watermarks(&self) -> &BTreeMap<u32, u32> {
+        &self.observed_watermarks
+    }
+
+    /// Revalidates deserialized values before they cross the adapter boundary.
+    pub fn validate(&self) -> GenerationReadResult<()> {
+        match self.mode {
+            GenerationReadMode::Live => {
+                if self.read_at.is_some() || !self.observed_watermarks.is_empty() {
+                    return Err(GenerationReadError::InvalidReadSpec(
+                        "live 模式不能携带 read_at 或固定 observed_watermarks".to_string(),
+                    ));
+                }
+            }
+            GenerationReadMode::ReadAt => {
+                let read_at = self.read_at.as_deref().ok_or_else(|| {
+                    GenerationReadError::InvalidReadSpec("read_at 模式必须提供锚点时间".to_string())
+                })?;
+                if read_at.is_empty()
+                    || read_at != read_at.trim()
+                    || read_at.contains('\'')
+                    || read_at.contains('\0')
+                {
+                    return Err(GenerationReadError::InvalidReadSpec(
+                        "read_at 必须是非空且不含引号/NUL 的规范时间字符串".to_string(),
+                    ));
+                }
+                if self.observed_watermarks.is_empty() {
+                    return Err(GenerationReadError::InvalidReadSpec(
+                        "read_at 模式必须提供 observed_watermarks".to_string(),
+                    ));
+                }
+                if let Some((dbnum, sesno)) = self
+                    .observed_watermarks
+                    .iter()
+                    .find(|(dbnum, sesno)| **dbnum == 0 || **sesno == 0)
+                {
+                    return Err(GenerationReadError::InvalidReadSpec(format!(
+                        "observed_watermarks 必须为非零 dbnum/sesno: dbnum={dbnum} sesno={sesno}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataVersion {
     pub dbnum: u32,

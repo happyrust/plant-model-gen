@@ -1,11 +1,11 @@
 # Tasks
 
-> 2026-07-23 依据 ADR-0010 重排。`[x]` 只表示任务产物已落地；跨阶段验收仍由 P7 统一关闭。当前目录不是 git 仓库，T002 是所有源码删除和跨文件实现的硬前置。遵守 AGENTS.md：不运行或编译 `cargo test`。
+> 2026-07-23 依据 ADR-0010 重排。`[x]` 只表示任务产物已落地；跨阶段验收仍由 P7 统一关闭。T002 已在分支 `agent/spec026-027-debt-catchup` 以基线提交 `955c7ff` 完成。遵守 AGENTS.md：不运行或编译 `cargo test`。
 
 ## P0 — 决策与安全基线
 
 - [x] **T001 DuckLake 退役删除清单**：已有 `docs/plans/2026-07-22-ducklake-retirement-deletion-manifest.md`，覆盖 adapters、Cargo、CLI、package、tests 和运行遗物。
-- [ ] **T002 建立可恢复基线**：经用户确认后执行 `git init` + 基线提交；若不允许 git，则创建工作区外带时间戳的目录快照并记录恢复步骤。验收：抽样恢复一个文件成功。
+- [x] **T002 建立可恢复基线**：用户选择 Git 方案；分支 `agent/spec026-027-debt-catchup` 的 `955c7ff` 固化实现前工作区，可用 `git show 955c7ff:<path>` 抽样恢复。
 - [x] **T003 冻结第二轮架构决策**：根 `CONTEXT.md`、ADR-0010、ADR-0007/0008 引用、`spec.md` 与 `plan.md` 已统一初始化/增量边界。
 - [ ] **T004 重新盘点实际残留**：更新 T001 清单的状态栏，至少核对 `write_full_version_anchors`、`VersionCommitSource::Full`、`version_store/replica.rs`、`generation_replica_*`、CLI `DuckLakeAuthority`、package 原生扩展和 history 配置分支。验收：每项有符号、处置、依赖任务和 keep/delete 理由。
 
@@ -50,7 +50,7 @@
 ## P5 — DuckLake 退役与 unit ledger（依赖 T026、T028）
 
 - [x] **T031 retired 配置分级检测**：`get_db_option_ext` raw TOML 已对 ducklake/compare 行为值硬错误、惰性键 warning；仍需纳入 T038 手测。
-- [ ] **T032 Surreal `model_unit_commit` repository**：定义 `(dbnum, unit_refno, sesno)` 唯一提交、impact、artifact pointer/hash 与 latest/list API。验收：幂等写、冲突检测和有序查询。
+- [x] **T032 Surreal `model_unit_commit` repository**：定义 `(dbnum, unit_refno, sesno)` 唯一提交、impact、artifact pointer/hash 与 latest/list API。验收：幂等写、冲突检测和有序查询。
 - [ ] **T033 改造 unit-export/rollback/runtime 调用方**：移除 CLI/web 对 `DuckLakeAuthority` 的引用，统一依赖 T032；rollback 继续只允许从 latest 派生。验收：unit-export 后 Surreal 可查且 runtime 可消费。
 - [ ] **T034 可选旧台账救济工具**：外置 PowerShell 调 duckdb CLI 导 JSON，再调用新 CLI dry-run/import；主二进制不重新引入 duckdb。验收：dry-run 数量正确、重复导入幂等、坏 hash 拒绝。
 - [ ] **T035 删除原生 DuckLake 残留**：依 T004 清单删 adapters/CLI/features/perf gate/原生扩展参数和复制；保留前端 viewer 的 duckdb-wasm/parquet 离线资产并在清单说明。验收：`cargo tree -i duckdb` 空，源码命中仅错误/迁移/历史说明。

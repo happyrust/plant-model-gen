@@ -82,11 +82,7 @@ use crate::fast_model::export_model::model_exporter::{
 
 use crate::fast_model::instance_cache::InstanceCacheManager;
 
-use crate::fast_model::gen_model::tree_index_manager::{
-    TreeIndexManager, load_index_with_large_stack,
-};
-
-// specs/023 M2：层级枚举走双源视图（pe_owner 快照默认 / .tree 回退）
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
 use crate::fast_model::gen_model::hier_view::HierView;
 
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
@@ -3613,24 +3609,24 @@ pub async fn export_dbnum_instances_json(
 
     // 关键前置条件说明：instances_*.json 的 geo_instances 依赖 inst_relate/geo_relate/inst_geo 落库数据。
 
-    // 若仅生成树（gen_tree_only=true）或不落库（save_db=false）/不生成 mesh（gen_mesh=false），
+    // 若仅维护 db_meta（gen_db_meta_only=true）或不落库（save_db=false）/不生成 mesh（gen_mesh=false），
 
     // 则导出时通常只能拿到树结构与 pe_transform，geo_instances 很可能为空。
 
     let save_db = db_option.save_db.unwrap_or(false);
 
-    let gen_tree_only = db_option.gen_tree_only;
+    let gen_db_meta_only = db_option.gen_db_meta_only;
 
     let gen_mesh = db_option.gen_mesh;
 
-    if !save_db || gen_tree_only || !gen_mesh {
+    if !save_db || gen_db_meta_only || !gen_mesh {
         eprintln!(
-            "⚠️  当前配置可能导致导出的 geo_instances 为空：save_db={:?}, gen_tree_only={}, gen_mesh={}",
-            db_option.save_db, db_option.gen_tree_only, db_option.gen_mesh
+            "⚠️  当前配置可能导致导出的 geo_instances 为空：save_db={:?}, gen_db_meta_only={}, gen_mesh={}",
+            db_option.save_db, db_option.gen_db_meta_only, db_option.gen_mesh
         );
 
         eprintln!(
-            "   建议：先用 save_db=true, gen_tree_only=false, gen_mesh=true 跑一次模型生成/落库，再执行 --export-dbnum-instances-json"
+            "   建议：先用 save_db=true, gen_db_meta_only=false, gen_mesh=true 跑一次模型生成/落库，再执行 --export-dbnum-instances-json"
         );
     }
 
@@ -3647,28 +3643,15 @@ pub async fn export_dbnum_instances_json(
         .with_context(|| format!("创建输出目录失败: {}", output_dir.display()))?;
 
     // 1. 使用层级视图获取 dbnum 下的所有 refno（或指定 root_refno 的 visible 子孙）
-    //    specs/023 M2：pe_owner 快照默认 / .tree 回退（AIOS_TREE_QUERY_SOURCE=tree）
+    //    层级查询走 pe_owner 快照。
 
     if verbose {
         println!("🔍 加载层级视图...");
     }
 
-    let tree_dir = TreeIndexManager::with_default_dir(vec![dbnum])
-        .tree_dir()
-        .to_path_buf();
-
-    let tree_path = tree_dir.join(format!("{}.tree", dbnum));
-
-    // 尝试加载层级视图；若提供了 root_refno 且视图不可用，
-    // 可直接从 inst_relate 查询该 owner 的子节点（无需 pe 表数据）。
-
-    let hier_view_result = HierView::load(vec![dbnum]).await.with_context(|| {
-        format!(
-            "加载层级视图失败: dbnum={}（tree 回退路径对应 {}）",
-            dbnum,
-            tree_path.display()
-        )
-    });
+    let hier_view_result = HierView::load(vec![dbnum])
+        .await
+        .with_context(|| format!("加载层级视图失败: dbnum={}", dbnum));
 
     // 获取待导出的 refno 列表
 
@@ -4469,10 +4452,40 @@ pub async fn export_dbnum_instances_json(
         }
     }
 
+    // 先增量合并 companion trans/aabb，再把本 dbnum 用到的子集内嵌进 instances JSON
+    // （plant3d-web 只读 instances_{dbnum}.json，不读 companion）
+    if verbose {
+        println!("\n🔍 增量导出 trans/aabb...");
+    }
+
+    let (trans_total, aabb_total, trans_added, aabb_added) = export_trans_aabb_incremental(
+        output_dir,
+        &hash_collector.trans_hashes,
+        &hash_collector.aabb_hashes,
+        &unit_converter,
+        verbose,
+    )
+    .await?;
+
+    let global_trans = load_json_map_or_empty(&output_dir.join("trans.json"))?;
+    let global_aabb = load_json_map_or_empty(&output_dir.join("aabb.json"))?;
+    let mut embedded_trans: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut embedded_aabb: HashMap<String, serde_json::Value> = HashMap::new();
+    for h in &hash_collector.trans_hashes {
+        if let Some(v) = global_trans.get(h) {
+            embedded_trans.insert(h.clone(), v.clone());
+        }
+    }
+    for h in &hash_collector.aabb_hashes {
+        if let Some(v) = global_aabb.get(h) {
+            embedded_aabb.insert(h.clone(), v.clone());
+        }
+    }
+
     // 根据 detailed 参数选择输出格式
 
     let (instances_json_map, instances_json_value) = if detailed {
-        // 详细模式（V3 格式，trans/aabb 通过全局文件加载）
+        // 详细模式（V3 格式，内嵌本文件所需 trans/aabb）
 
         use indexmap::IndexMap;
 
@@ -4490,6 +4503,14 @@ pub async fn export_dbnum_instances_json(
             "instances".to_string(),
             serde_json::to_value(&instances).unwrap(),
         );
+        map.insert(
+            "trans_table".to_string(),
+            serde_json::to_value(&embedded_trans).unwrap(),
+        );
+        map.insert(
+            "aabb_table".to_string(),
+            serde_json::to_value(&embedded_aabb).unwrap(),
+        );
 
         let value = serde_json::to_value(&map).unwrap();
 
@@ -4497,8 +4518,16 @@ pub async fn export_dbnum_instances_json(
     } else {
         // 精简模式（V4 格式）
 
-        let map =
+        let mut map =
             build_compact_instances_json_map(&compact_groups, &compact_instances, &generated_at);
+        map.insert(
+            "trans_table".to_string(),
+            serde_json::to_value(&embedded_trans).unwrap(),
+        );
+        map.insert(
+            "aabb_table".to_string(),
+            serde_json::to_value(&embedded_aabb).unwrap(),
+        );
 
         let value = serde_json::to_value(&map).unwrap();
 
@@ -4523,22 +4552,12 @@ pub async fn export_dbnum_instances_json(
 
     if verbose {
         println!("✅ 主 JSON 文件已写入: {}", output_path.display());
+        println!(
+            "   - 内嵌 trans_table={} aabb_table={}",
+            embedded_trans.len(),
+            embedded_aabb.len()
+        );
     }
-
-    // 增量合并导出 trans/aabb（替代全表扫描）
-
-    if verbose {
-        println!("\n🔍 增量导出 trans/aabb...");
-    }
-
-    let (trans_total, aabb_total, trans_added, aabb_added) = export_trans_aabb_incremental(
-        output_dir,
-        &hash_collector.trans_hashes,
-        &hash_collector.aabb_hashes,
-        &unit_converter,
-        verbose,
-    )
-    .await?;
 
     // 写入元信息（SurrealDB 导出不携带 batch_id，前端可回退 latest 或不传）
 
@@ -5796,6 +5815,15 @@ pub async fn export_dbnum_instances_json_from_cache(
             "instances".to_string(),
             serde_json::to_value(&instances).unwrap(),
         );
+        // plant3d-web 只读 instances_{dbnum}.json，需内嵌 hash 表（不依赖 companion 文件）
+        map.insert(
+            "trans_table".to_string(),
+            serde_json::to_value(&trans_table).unwrap(),
+        );
+        map.insert(
+            "aabb_table".to_string(),
+            serde_json::to_value(&aabb_table).unwrap(),
+        );
 
         let value = serde_json::to_value(&map).unwrap();
 
@@ -5803,8 +5831,16 @@ pub async fn export_dbnum_instances_json_from_cache(
     } else {
         // 精简模式（V4 格式）
 
-        let map =
+        let mut map =
             build_compact_instances_json_map(&compact_groups, &compact_instances, &generated_at);
+        map.insert(
+            "trans_table".to_string(),
+            serde_json::to_value(&trans_table).unwrap(),
+        );
+        map.insert(
+            "aabb_table".to_string(),
+            serde_json::to_value(&aabb_table).unwrap(),
+        );
 
         let value = serde_json::to_value(&map).unwrap();
 
@@ -6852,7 +6888,7 @@ async fn group_refnos_by_dbnum(
             continue;
         }
 
-        match TreeIndexManager::resolve_dbnum_for_refno(refno) {
+        match resolve_dbnum_for_refno(refno) {
             Ok(dbnum) => {
                 grouped.entry(dbnum).or_default().push(refno);
             }
@@ -6997,7 +7033,7 @@ pub async fn export_instances_json_for_dbnos(
 
 ///
 
-/// 本函数使用 `TreeIndexManager::resolve_dbnum_for_refno()` 来正确解析每个 refno 的 dbnum。
+/// 本函数使用 `resolve_dbnum_for_refno()` 来正确解析每个 refno 的 dbnum。
 
 /// 这确保了像 `25688_36110` 这样的 refno 能够被正确解析到其所属的数据库编号，
 
@@ -7132,7 +7168,7 @@ pub async fn export_instances_json_for_refnos_grouped_by_dbno_merge(
         let mut recovered = false;
 
         if let Some(root) = root_refno {
-            match TreeIndexManager::resolve_dbnum_for_refno(root) {
+            match resolve_dbnum_for_refno(root) {
                 Ok(tree_dbnum) if tree_dbnum != dbnum => {
                     if verbose {
                         eprintln!(

@@ -92,6 +92,34 @@ pub async fn clear_pe_transform_for_dbnums(dbnums: &[u32]) -> Result<usize> {
     Ok(total)
 }
 
+/// 按 refno 列表删除 pe_transform 行（不存在的 key 忽略）。
+/// 用于增量 owner/POS 变更后的子树失效，避免整库 `clear_pe_transform_for_dbnums`。
+pub async fn clear_pe_transform_for_refnos(refnos: &[RefnoEnum]) -> Result<usize> {
+    const CHUNK: usize = 100;
+    if refnos.is_empty() {
+        return Ok(0);
+    }
+
+    let mut unique = refnos.to_vec();
+    unique.sort_unstable_by_key(|r| r.to_string());
+    unique.dedup();
+
+    let mut deleted = 0usize;
+    for chunk in unique.chunks(CHUNK) {
+        let keys = chunk
+            .iter()
+            .map(|r| r.to_table_key("pe_transform"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE [{keys}];");
+        SUL_DB.query(&sql).await.with_context(|| {
+            format!("按 refno 清理 pe_transform 失败: chunk_len={}", chunk.len())
+        })?;
+        deleted += chunk.len();
+    }
+    Ok(deleted)
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendCompareStats {
     pub backend: TransformReadBackend,

@@ -76,7 +76,7 @@ async fn run_increment_once(
         persist_data: persist,
         recover_pending: false,
         generate_model,
-        require_tree_index: false,
+        require_pe_owner_ready: false,
         verbose: false,
     };
     // web server 启动时已连 surreal；这里做一次轻量探针即可。

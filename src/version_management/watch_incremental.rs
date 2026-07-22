@@ -19,7 +19,8 @@ pub struct WatchIncrementalOptions {
     pub once: bool,
     pub force_initial_scan: bool,
     pub generate_model: bool,
-    pub require_tree_index: bool,
+    /// specs/023 M3/T8：触发增量模型生成前要求 pe_owner 完整性证据就绪。
+    pub require_pe_owner_ready: bool,
     pub json_output: bool,
     pub verbose: bool,
 }
@@ -32,7 +33,7 @@ impl Default for WatchIncrementalOptions {
             once: false,
             force_initial_scan: false,
             generate_model: false,
-            require_tree_index: false,
+            require_pe_owner_ready: false,
             json_output: false,
             verbose: false,
         }
@@ -164,7 +165,7 @@ async fn run_with_sqlite_index(
                     persist_data: true,
                     recover_pending: false,
                     generate_model: options.generate_model,
-                    require_tree_index: options.require_tree_index,
+                    require_pe_owner_ready: options.require_pe_owner_ready,
                     verbose: options.verbose,
                 },
                 || async { Ok(()) },
@@ -279,22 +280,22 @@ pub fn print_incremental_sesno_summary(result: &IncrementRunResult) {
     if let Some(success) = result.generation_success {
         println!("   generate_model_success={success}");
     }
-    if let Some(tree_index) = result.summary.get("tree_index")
-        && !tree_index.is_null()
+    if let Some(evidence) = result.summary.get("pe_owner_evidence")
+        && !evidence.is_null()
     {
-        let ready = tree_index
+        let ready = evidence
             .get("ready")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let mode = tree_index
+        let mode = evidence
             .get("mode")
             .and_then(|value| value.as_str())
             .unwrap_or("unknown");
-        let missing = tree_index
-            .get("missing_dbnums")
+        let not_ready = evidence
+            .get("not_ready_dbnums")
             .map(|value| value.to_string())
             .unwrap_or_else(|| "[]".to_string());
-        println!("   tree_index: ready={ready} mode={mode} missing_dbnums={missing}");
+        println!("   pe_owner_evidence: ready={ready} mode={mode} not_ready_dbnums={not_ready}");
     }
     if let Some(export) = &result.parquet_export
         && export

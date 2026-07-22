@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aios_core::rs_surreal::pe_transform::{PeTransformEntry, ensure_pe_transform_schema};
@@ -22,7 +22,11 @@ pub async fn refresh_pe_transform_for_dbnums_compat(dbnums: &[u32]) -> Result<us
     refresh_pe_transform_for_dbnums(dbnums, &db_option).await
 }
 
-/// spec 006 T303：探测 pe_transform 表是否已覆盖指定 dbnum。
+/// 探测 pe_transform 是否已覆盖指定 dbnum（整库 count 比较）。
+///
+/// **仅供 L2 全库刷新路径**（`PeTransformPrecheckMode::FullDbnum` / 运维 CLI）。
+/// GenPipeline 默认走 L0（session transforms）或 L1（`refresh_pe_transform_for_root_refnos`），
+/// 不应再以本函数未覆盖为由触发 10 万+ 节点全库刷新。
 ///
 /// 生产路径不能只检查根节点：如果上一次刷新在中间批次被取消，根节点
 /// 可能已经存在，但后续 Parquet/模型查询仍会缺少大量 world transform。
@@ -40,6 +44,46 @@ pub async fn pe_transform_covers_dbnum(dbnum: u32) -> Result<bool> {
         .await
         .with_context(|| format!("探测 pe_transform 覆盖失败: dbnum={dbnum}"))?;
     Ok(covered >= expected)
+}
+
+/// 探测 pe_transform 是否已覆盖指定 dbnum 的**实例**（inst_relate 行）。
+///
+/// 导出只需要实例级 world_trans（`pe_transform[inst_refno].world_trans`），而模型
+/// 生成阶段的专门 `persist_pe_transform` 已按实例落库。因此导出前用
+/// 「pe_transform 命中数 ≥ inst_relate 实例数」判断覆盖：命中即可跳过整库 BFS 刷新；
+/// 仅当未覆盖（旧库/未按新阶段生成）时才回退整库刷新。无实例时视为已覆盖
+/// （导出无内容可导，无需刷新）。
+///
+/// 与 `pe_transform_covers_dbnum`（按全部 pe 节点比对）区别：本函数只关心导出真正
+/// 需要变换的实例集，避免生成阶段已写实例后仍被整库覆盖探测判为「未覆盖」。
+pub async fn pe_transform_covers_instances_for_dbnum(dbnum: u32) -> Result<bool> {
+    let expected = query_inst_relate_count_for_dbnum(dbnum)
+        .await
+        .with_context(|| format!("探测 pe_transform 实例覆盖时统计 dbnum {} inst_relate 失败", dbnum))?;
+    if expected == 0 {
+        return Ok(true);
+    }
+
+    let covered = query_pe_transform_count_for_dbnum(dbnum)
+        .await
+        .with_context(|| format!("探测 pe_transform 实例覆盖失败: dbnum={dbnum}"))?;
+    Ok(covered >= expected)
+}
+
+async fn query_inst_relate_count_for_dbnum(dbnum: u32) -> Result<usize> {
+    let sql = format!(
+        "SELECT count() AS count FROM inst_relate WHERE dbnum = {} GROUP ALL",
+        dbnum
+    );
+    let rows: Vec<Value> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .with_context(|| format!("执行 inst_relate 统计 SQL 失败: {}", sql))?;
+
+    Ok(rows
+        .iter()
+        .find_map(extract_count_from_json_value)
+        .unwrap_or(0) as usize)
 }
 
 pub async fn refresh_pe_transform_for_dbnums(
@@ -222,6 +266,88 @@ pub async fn refresh_pe_transform_for_root_refnos_compat(
 ) -> Result<usize> {
     let db_option = get_db_option_ext();
     refresh_pe_transform_for_root_refnos(root_refnos, &db_option).await
+}
+
+/// 使 roots 及其子孙的 pe_transform 与内存 transform_cache 失效。
+///
+/// 增量 owner / POS / ORI 变更后调用：只清受影响子树，禁止「任一缺口 → 整库」。
+/// 后续读路径靠 session transforms（L0）或 lazy miss 回写补齐。
+pub async fn invalidate_pe_transform_for_root_refnos(root_refnos: &[RefnoEnum]) -> Result<usize> {
+    let started = Instant::now();
+    let affected = collect_subtree_refnos(root_refnos).await?;
+    if affected.is_empty() {
+        return Ok(0);
+    }
+
+    let cleared = crate::pe_transform_store::clear_pe_transform_for_refnos(&affected)
+        .await
+        .context("失效 pe_transform 子树失败")?;
+
+    #[cfg(feature = "gen_model")]
+    {
+        let _ =
+            crate::fast_model::gen_model::transform_cache::clear_global_transform_cache_for_refnos(
+                &affected,
+            );
+    }
+
+    record_transform_refresh_progress(
+        "invalidate_pe_transform_subtree_done",
+        format!(
+            "roots={} affected={} cleared_keys={} elapsed_ms={}",
+            root_refnos.len(),
+            affected.len(),
+            cleared,
+            started.elapsed().as_millis()
+        ),
+        started,
+    );
+    println!(
+        "[pe_transform] invalidate subtree: roots={} affected={} cleared_keys={}",
+        root_refnos.len(),
+        affected.len(),
+        cleared
+    );
+    Ok(affected.len())
+}
+
+/// BFS 收集 roots ∪ 子孙（children 查询失败时仍保留已收集节点）。
+async fn collect_subtree_refnos(root_refnos: &[RefnoEnum]) -> Result<Vec<RefnoEnum>> {
+    let mut roots = root_refnos.to_vec();
+    roots.sort_unstable_by_key(|r| r.to_string());
+    roots.dedup();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    for root in roots {
+        if seen.insert(root) {
+            queue.push_back(root);
+        }
+    }
+
+    let started = Instant::now();
+    while let Some(parent) = queue.pop_front() {
+        match get_children_refnos_with_timeout(parent, started).await {
+            Ok(children) => {
+                for child in children {
+                    if seen.insert(child) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "⚠️  invalidate 收集子节点失败（保留已收集）: {} -> {}",
+                    parent, err
+                );
+            }
+        }
+    }
+
+    Ok(seen.into_iter().collect())
 }
 
 pub async fn refresh_pe_transform_for_root_refnos(

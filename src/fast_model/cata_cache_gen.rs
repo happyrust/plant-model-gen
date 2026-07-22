@@ -699,8 +699,10 @@ pub async fn gen_tubi_for_cache_with_cache_manager(
     let branch_map: DashMap<RefnoEnum, Vec<SPdmsElement>> = DashMap::new();
 
     for &branch_refno in branch_refnos {
-        match crate::fast_model::gen_model::tree_index_manager::TreeIndexManager
-            ::collect_children_elements_from_tree(branch_refno).await
+        match crate::fast_model::gen_model::hier_view::collect_children_elements_from_hierarchy(
+            branch_refno,
+        )
+        .await
         {
             Ok(children) => {
                 for child in &children {

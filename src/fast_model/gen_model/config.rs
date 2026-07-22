@@ -1,6 +1,181 @@
-use super::errors::{IndexTreeError, Result};
+use super::errors::{GenPipelineError, Result};
+use crate::generation_read::hash_serializable;
+use crate::options::{BooleanPipelineMode, DbOptionExt, MeshFormat};
 use aios_core::options::DbOption;
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+
+const GENERATION_CONTRACT_SCHEMA_VERSION: u32 = 1;
+const GEOMETRY_ALGORITHM_VERSION: &str = "plant-model-geometry/v1";
+
+/// Result-affecting inputs for one generation run.
+///
+/// Runtime throughput controls and output destinations intentionally live in
+/// [`ExecutionTuning`] and are excluded from this value and its hash.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct GenerationContract {
+    schema_version: u32,
+    geometry_algorithm_version: &'static str,
+    enabled_nouns: Vec<String>,
+    excluded_nouns: Vec<String>,
+    debug_limit_per_target_type: Option<usize>,
+    validate_sjus_map: bool,
+    strict_validation: bool,
+    mesh_enabled: bool,
+    mesh_precision_hash: String,
+    boolean_enabled: bool,
+    boolean_mode: BooleanPipelineMode,
+    boolean_db_backfill: bool,
+    respect_tufl: bool,
+    dry_run: bool,
+    skip_inst_relate_aabb: bool,
+    skip_final_aabb_sweep: bool,
+}
+
+impl GenerationContract {
+    pub(crate) fn from_db_option(opt: &DbOptionExt, config: &GenPipelineConfig) -> Self {
+        Self::from_db_option_with_integrity(
+            opt,
+            config,
+            env_flag("AIOS_SKIP_INST_RELATE_AABB"),
+            env_flag("AIOS_SKIP_FINAL_AABB_SWEEP"),
+            env_flag("AIOS_RESPECT_TUFL"),
+        )
+    }
+
+    fn from_db_option_with_integrity(
+        opt: &DbOptionExt,
+        config: &GenPipelineConfig,
+        skip_inst_relate_aabb: bool,
+        skip_final_aabb_sweep: bool,
+        respect_tufl: bool,
+    ) -> Self {
+        Self {
+            schema_version: GENERATION_CONTRACT_SCHEMA_VERSION,
+            geometry_algorithm_version: GEOMETRY_ALGORITHM_VERSION,
+            enabled_nouns: canonical_nouns(&config.enabled_categories),
+            excluded_nouns: canonical_nouns(&config.excluded_nouns),
+            debug_limit_per_target_type: config.gen_pipeline_debug_limit_per_target_type,
+            validate_sjus_map: config.validate_sjus_map,
+            strict_validation: config.strict_validation,
+            mesh_enabled: opt.inner.gen_mesh,
+            mesh_precision_hash: stable_hash_serializable(&opt.inner.mesh_precision),
+            boolean_enabled: opt.inner.apply_boolean_operation,
+            boolean_mode: opt.boolean_pipeline_mode.clone(),
+            boolean_db_backfill: opt.enable_db_backfill,
+            respect_tufl,
+            dry_run: opt.gen_model_dry_run,
+            skip_inst_relate_aabb,
+            skip_final_aabb_sweep,
+        }
+    }
+
+    pub(crate) fn contract_hash(&self) -> String {
+        hash_serializable(self)
+    }
+
+    pub(crate) fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    pub(crate) fn respect_tufl(&self) -> bool {
+        self.respect_tufl
+    }
+
+    pub(crate) fn skip_inst_relate_aabb(&self) -> bool {
+        self.skip_inst_relate_aabb
+    }
+
+    pub(crate) fn skip_final_aabb_sweep(&self) -> bool {
+        self.skip_final_aabb_sweep
+    }
+}
+
+/// Non-semantic runtime controls. Changes here may affect throughput or output
+/// location, but must not change `GenerationContract::contract_hash`.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionTuning {
+    pub noun_concurrency: usize,
+    pub noun_batch_size: usize,
+    pub channel_capacity: usize,
+    pub base_write_concurrency: usize,
+    pub mesh_compute_concurrency: usize,
+    pub inst_aabb_write_concurrency: usize,
+    pub read_backend: String,
+    pub writer_backend: String,
+    pub output_root: Option<String>,
+    pub export_formats: Vec<MeshFormat>,
+    pub export_instances: bool,
+    pub export_parquet_after_gen: bool,
+    pub parquet_stream_writer_enabled: bool,
+    pub perf_report_disabled: bool,
+}
+
+impl ExecutionTuning {
+    pub(crate) fn from_db_option(opt: &DbOptionExt) -> Self {
+        Self {
+            noun_concurrency: opt.get_gen_pipeline_concurrency(),
+            noun_batch_size: opt.get_gen_pipeline_batch_size(),
+            channel_capacity: opt.get_batch_channel_capacity(),
+            base_write_concurrency: opt.get_base_write_concurrency(),
+            mesh_compute_concurrency: opt.get_mesh_compute_concurrency(),
+            inst_aabb_write_concurrency: opt.get_inst_aabb_write_concurrency(),
+            read_backend: opt.generation_read_backend.as_str().to_string(),
+            writer_backend: opt.model_writer_mode.as_str().to_string(),
+            output_root: opt.output_root.clone(),
+            export_formats: opt.mesh_formats.clone(),
+            export_instances: opt.export_instances,
+            export_parquet_after_gen: opt.export_parquet_after_gen,
+            parquet_stream_writer_enabled: env_flag("AIOS_ENABLE_PARQUET_STREAM_WRITER"),
+            perf_report_disabled: env_flag("AIOS_DISABLE_PERF_REPORT"),
+        }
+    }
+}
+
+fn canonical_nouns(values: &[String]) -> Vec<String> {
+    let mut values: Vec<_> = values
+        .iter()
+        .map(|value| value.trim().to_uppercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn stable_hash_serializable(value: &impl Serialize) -> String {
+    let value = serde_json::to_value(value).expect("generation contract value must serialize");
+    hash_serializable(&canonical_json(value))
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => {
+            let values = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::to_value(values).expect("canonical generation contract object")
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// 类型安全的并发配置
 ///
@@ -34,7 +209,11 @@ impl Concurrency {
     /// ```
     pub fn new(n: usize) -> Result<Self> {
         if n == 0 {
-            return Err(IndexTreeError::InvalidConcurrency(n, Self::MIN, Self::MAX));
+            return Err(GenPipelineError::InvalidConcurrency(
+                n,
+                Self::MIN,
+                Self::MAX,
+            ));
         }
 
         let clamped = n.clamp(Self::MIN, Self::MAX);
@@ -89,7 +268,7 @@ impl BatchSize {
     /// 创建新的批次大小配置
     pub fn new(n: usize) -> Result<Self> {
         if n == 0 {
-            return Err(IndexTreeError::InvalidBatchSize(n));
+            return Err(GenPipelineError::InvalidBatchSize(n));
         }
 
         let clamped = n.clamp(Self::MIN, Self::MAX);
@@ -124,11 +303,11 @@ impl Default for BatchSize {
     }
 }
 
-/// IndexTree 模式的统一配置
+/// GenPipeline的统一配置
 ///
-/// 封装所有 IndexTree 相关配置，提供类型安全和验证
+/// 封装所有 GenPipeline 相关配置，提供类型安全和验证
 #[derive(Debug, Clone)]
-pub struct IndexTreeConfig {
+pub struct GenPipelineConfig {
     /// 并发处理的 Noun 数量
     pub concurrency: Concurrency,
 
@@ -148,10 +327,10 @@ pub struct IndexTreeConfig {
     pub excluded_nouns: Vec<String>,
 
     /// 调试模式：限制每种 Noun 类型的处理数量（None 表示不限制）
-    pub index_tree_debug_limit_per_target_type: Option<usize>,
+    pub gen_pipeline_debug_limit_per_target_type: Option<usize>,
 }
 
-impl IndexTreeConfig {
+impl GenPipelineConfig {
     /// 从 DbOption 创建配置
     ///
     /// # Arguments
@@ -169,19 +348,19 @@ impl IndexTreeConfig {
 
     /// 从 DbOptionExt 创建配置（推荐）
     ///
-    /// DbOptionExt 在 src/options.rs 中定义，包含 IndexTree 相关字段
+    /// DbOptionExt 在 src/options.rs 中定义，包含 GenPipeline 相关字段
     pub fn from_db_option_ext(opt: &crate::options::DbOptionExt) -> Result<Self> {
-        let concurrency = Concurrency::new(opt.get_index_tree_concurrency())?;
-        let batch_size = BatchSize::new(opt.get_index_tree_batch_size())?;
+        let concurrency = Concurrency::new(opt.get_gen_pipeline_concurrency())?;
+        let batch_size = BatchSize::new(opt.get_gen_pipeline_batch_size())?;
 
         Ok(Self {
             concurrency,
             batch_size,
             validate_sjus_map: true,  // 默认启用验证
             strict_validation: false, // 默认只警告，不报错
-            enabled_categories: opt.index_tree_enabled_target_types.clone(),
-            excluded_nouns: opt.index_tree_excluded_target_types.clone(),
-            index_tree_debug_limit_per_target_type: opt.index_tree_debug_limit_per_target_type,
+            enabled_categories: opt.gen_pipeline_enabled_target_types.clone(),
+            excluded_nouns: opt.gen_pipeline_excluded_target_types.clone(),
+            gen_pipeline_debug_limit_per_target_type: opt.gen_pipeline_debug_limit_per_target_type,
         })
     }
 
@@ -194,7 +373,7 @@ impl IndexTreeConfig {
             strict_validation: false,
             enabled_categories: Vec::new(),
             excluded_nouns: Vec::new(),
-            index_tree_debug_limit_per_target_type: None,
+            gen_pipeline_debug_limit_per_target_type: None,
         }
     }
 
@@ -273,7 +452,7 @@ impl IndexTreeConfig {
     /// 打印配置信息
     pub fn print_info(&self) {
         println!("╔════════════════════════════════════════╗");
-        println!("║    IndexTree 默认管线配置                ║");
+        println!("║    GenPipeline 默认管线配置                ║");
         println!("╠════════════════════════════════════════╣");
         println!("║ 并发 Noun 数: {:<24} ║", self.concurrency.get());
         println!("║ 批次大小: {:<28} ║", self.batch_size.get());
@@ -304,7 +483,7 @@ impl IndexTreeConfig {
             println!("║ 排除 Noun: {:<26} ║", self.excluded_nouns.join(", "));
         }
 
-        if let Some(limit) = self.index_tree_debug_limit_per_target_type {
+        if let Some(limit) = self.gen_pipeline_debug_limit_per_target_type {
             println!("╠════════════════════════════════════════╣");
             println!("║ 调试限制: 每个 Noun 最多 {:<8} 个实例 ║", limit);
         }
@@ -313,7 +492,7 @@ impl IndexTreeConfig {
     }
 }
 
-impl Default for IndexTreeConfig {
+impl Default for GenPipelineConfig {
     fn default() -> Self {
         Self::default()
     }
@@ -322,6 +501,21 @@ impl Default for IndexTreeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn contract_for(
+        opt: &DbOptionExt,
+        skip_inst_relate_aabb: bool,
+        skip_final_aabb_sweep: bool,
+    ) -> GenerationContract {
+        let config = GenPipelineConfig::from_db_option_ext(opt).expect("config");
+        GenerationContract::from_db_option_with_integrity(
+            opt,
+            &config,
+            skip_inst_relate_aabb,
+            skip_final_aabb_sweep,
+            false,
+        )
+    }
 
     #[test]
     fn test_concurrency_valid_range() {
@@ -351,7 +545,7 @@ mod tests {
         let result = Concurrency::new(0);
         assert!(result.is_err());
 
-        if let Err(IndexTreeError::InvalidConcurrency(val, min, max)) = result {
+        if let Err(GenPipelineError::InvalidConcurrency(val, min, max)) = result {
             assert_eq!(val, 0);
             assert_eq!(min, Concurrency::MIN);
             assert_eq!(max, Concurrency::MAX);
@@ -374,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_config_builder() {
-        let config = IndexTreeConfig::default()
+        let config = GenPipelineConfig::default()
             .with_concurrency(Concurrency::new(6).unwrap())
             .with_strict_validation(true);
 
@@ -382,14 +576,96 @@ mod tests {
         assert!(config.strict_validation);
     }
 
+    #[test]
+    fn contract_hash_normalizes_noun_case_order_and_duplicates() {
+        let mut left = DbOptionExt::from(DbOption::default());
+        left.gen_pipeline_enabled_target_types = vec!["bran".into(), "CATE".into(), "BRAN".into()];
+        left.gen_pipeline_excluded_target_types = vec!["box".into(), "CYLI".into()];
+        let mut right = DbOptionExt::from(DbOption::default());
+        right.gen_pipeline_enabled_target_types = vec!["cate".into(), "BRAN".into()];
+        right.gen_pipeline_excluded_target_types = vec!["cyli".into(), "BOX".into()];
+
+        assert_eq!(
+            contract_for(&left, false, false).contract_hash(),
+            contract_for(&right, false, false).contract_hash()
+        );
+    }
+
+    #[test]
+    fn execution_tuning_does_not_change_contract_hash() {
+        let left = DbOptionExt::from(DbOption::default());
+        let mut right = left.clone();
+        right.gen_pipeline_max_concurrent = Some(8);
+        right.gen_pipeline_batch_size = Some(700);
+        right.batch_channel_capacity = 31;
+        right.base_write_concurrency = 7;
+        right.mesh_compute_concurrency = 6;
+        right.inst_aabb_write_concurrency = 5;
+        right.generation_read_backend = crate::options::GenerationReadBackendMode::DuckLake;
+        right.model_writer_mode = crate::options::ModelWriterMode::DrainOnly;
+        right.output_root = Some("somewhere-else".into());
+        right.mesh_formats = vec![MeshFormat::Obj, MeshFormat::Glb];
+        right.export_instances = true;
+        right.export_parquet_after_gen = true;
+
+        assert_eq!(
+            contract_for(&left, false, false).contract_hash(),
+            contract_for(&right, false, false).contract_hash()
+        );
+    }
+
+    #[test]
+    fn semantic_configuration_changes_contract_hash() {
+        let base = DbOptionExt::from(DbOption::default());
+        let base_hash = contract_for(&base, false, false).contract_hash();
+
+        let mut noun = base.clone();
+        noun.gen_pipeline_excluded_target_types.push("BOX".into());
+        assert_ne!(base_hash, contract_for(&noun, false, false).contract_hash());
+
+        let mut precision = base.clone();
+        precision
+            .inner
+            .mesh_precision
+            .non_scalable_geo_types
+            .push("TEST".into());
+        assert_ne!(
+            base_hash,
+            contract_for(&precision, false, false).contract_hash()
+        );
+
+        let mut boolean = base.clone();
+        boolean.inner.apply_boolean_operation = !base.inner.apply_boolean_operation;
+        assert_ne!(
+            base_hash,
+            contract_for(&boolean, false, false).contract_hash()
+        );
+
+        let mut dry_run = base.clone();
+        dry_run.gen_model_dry_run = !base.gen_model_dry_run;
+        assert_ne!(
+            base_hash,
+            contract_for(&dry_run, false, false).contract_hash()
+        );
+
+        assert_ne!(base_hash, contract_for(&base, true, false).contract_hash());
+        assert_ne!(base_hash, contract_for(&base, false, true).contract_hash());
+        let config = GenPipelineConfig::from_db_option_ext(&base).expect("config");
+        assert_ne!(
+            base_hash,
+            GenerationContract::from_db_option_with_integrity(&base, &config, false, false, true,)
+                .contract_hash()
+        );
+    }
+
     // #[test]
     // fn test_config_from_db_option() {
     //     let mut db_opt = DbOption::default();
-    //     db_opt.index_tree_mode = true;
-    //     db_opt.index_tree_max_concurrent_targets = 6;
-    //     db_opt.index_tree_batch_size = 200;
+    //     db_opt.gen_pipeline = true;
+    //     db_opt.gen_pipeline_max_concurrent = 6;
+    //     db_opt.gen_pipeline_batch_size = 200;
 
-    //     let config = IndexTreeConfig::from_db_option(&db_opt).unwrap();
+    //     let config = GenPipelineConfig::from_db_option(&db_opt).unwrap();
 
     //     assert!(config.enabled);
     //     assert_eq!(config.concurrency.get(), 6);

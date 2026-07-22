@@ -2240,7 +2240,7 @@ fn build_parse_config_with_included_files(
     set_toml_bool(table, "incr_sync", false);
     set_toml_bool(table, "sync_history", false);
     set_toml_bool(table, "only_sync_sys", false);
-    set_toml_bool(table, "gen_tree_only", false);
+    set_toml_bool(table, "gen_db_meta_only", false);
     set_toml_bool(table, "enable_log", true);
     set_toml_bool(table, "save_db", true);
     if included_db_files.is_empty() {
@@ -2287,7 +2287,7 @@ fn build_generation_config(
     set_toml_bool(table, "incr_sync", false);
     set_toml_bool(table, "sync_history", false);
     set_toml_bool(table, "only_sync_sys", false);
-    set_toml_bool(table, "gen_tree_only", false);
+    set_toml_bool(table, "gen_db_meta_only", false);
     set_toml_bool(table, "save_db", true);
     set_toml_bool(table, "enable_log", true);
     Ok(toml::to_string_pretty(&value)?)

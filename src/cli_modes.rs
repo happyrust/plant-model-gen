@@ -1919,26 +1919,8 @@ pub async fn run_generate_model(
     ensure_surreal_connected(db_option_ext).await?;
 
     use aios_database::fast_model::gen_all_geos_data;
-    aios_database::perf_metrics::record_generate_progress(
-        "collect_transform_refresh_roots",
-        None,
-        generate_started.elapsed().as_millis() as u64,
-    );
-    let refresh_roots =
-        collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
-            .await?;
-    if !refresh_roots.is_empty() {
-        let refreshed =
-            aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
-                &refresh_roots,
-            )
-            .await?;
-        println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
-        // ponytail: generation already refreshed the exact roots; skip later dbnum-wide refresh.
-        unsafe {
-            std::env::set_var("AIOS_SKIP_DBNUM_PE_TRANSFORM_REFRESH", "1");
-        }
-    }
+    // pe_transform 不再在生成前做子树 BFS 预刷新（与 regen 同）：世界变换由写管线的专门阶段
+    // persist_pe_transform 在生成时按实例就地落库；增量路径另有 orchestrator 子树失效兜底。
     aios_database::perf_metrics::record_generate_progress(
         "collect_generation_targets",
         None,
@@ -2021,26 +2003,10 @@ pub async fn run_regen_model(
 
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;
-    aios_database::perf_metrics::record_generate_progress(
-        "collect_transform_refresh_roots",
-        None,
-        generate_started.elapsed().as_millis() as u64,
-    );
-    let refresh_roots =
-        collect_transform_refresh_roots(config, db_option_ext.inner.manual_db_nums.as_deref())
-            .await?;
-    if !refresh_roots.is_empty() {
-        let refreshed =
-            aios_database::pe_transform_refresh::refresh_pe_transform_for_root_refnos_compat(
-                &refresh_roots,
-            )
-            .await?;
-        println!("   - 已刷新子树 pe_transform: {} 个节点", refreshed);
-        // ponytail: generation already refreshed the exact roots; skip later dbnum-wide refresh.
-        unsafe {
-            std::env::set_var("AIOS_SKIP_DBNUM_PE_TRANSFORM_REFRESH", "1");
-        }
-    }
+    // pe_transform 不再在生成前做子树 BFS 预刷新（旧逐节点 + 30s 超时路径，且与生成重算）。
+    // 世界变换已由写管线的专门阶段 persist_pe_transform 在生成时按实例就地落库
+    // （零重算、scoped）；导出前的实例级覆盖探测（pe_transform_covers_instances_for_dbnum）
+    // 会对旧数据兜底。
     aios_database::perf_metrics::record_generate_progress(
         "collect_generation_targets",
         None,
@@ -2178,55 +2144,6 @@ async fn collect_regen_target_refnos(
         Ok(all_sites)
     } else {
         anyhow::bail!("--regen-model 需要指定 refnos、--dbnum 或启用全库模式");
-    }
-}
-
-async fn collect_transform_refresh_roots(
-    config: &ExportConfig,
-    manual_db_nums: Option<&[u32]>,
-) -> Result<Vec<RefnoEnum>> {
-    if !config.refnos_str.is_empty() {
-        let roots = config.parse_refnos()?;
-        println!("   - transform 刷新 roots: {} 个 refno", roots.len());
-        Ok(roots)
-    } else if let Some(dbnum) = config.dbnum {
-        use aios_database::fast_model::query_provider;
-        let sites: Vec<RefnoEnum> =
-            query_provider::query_by_type(&["SITE"], dbnum as i32, None).await?;
-        if sites.is_empty() {
-            anyhow::bail!("dbnum={} 下未找到任何 SITE，无法刷新 pe_transform", dbnum);
-        }
-        println!(
-            "   - transform 刷新 roots: dbnum={} 下 {} 个 SITE",
-            dbnum,
-            sites.len()
-        );
-        Ok(sites)
-    } else if let Some(dbnums) = manual_db_nums.filter(|dbnums| !dbnums.is_empty()) {
-        let all_sites = collect_sites_for_dbnums(dbnums, "刷新 pe_transform").await?;
-        println!(
-            "   - transform 刷新 roots: manual_db_nums={:?}, 共 {} 个 SITE",
-            dbnums,
-            all_sites.len()
-        );
-        Ok(all_sites)
-    } else if config.run_all_dbnos {
-        use aios_database::fast_model::query_provider;
-        let dbnos: Vec<u32> = query_mdb_db_nums(None, DBType::DESI).await?;
-        let mut all_sites = Vec::new();
-        for db in &dbnos {
-            let sites: Vec<RefnoEnum> =
-                query_provider::query_by_type(&["SITE"], *db as i32, None).await?;
-            all_sites.extend(sites);
-        }
-        println!(
-            "   - transform 刷新 roots: {} 个 dbnum, 共 {} 个 SITE",
-            dbnos.len(),
-            all_sites.len()
-        );
-        Ok(all_sites)
-    } else {
-        Ok(Vec::new())
     }
 }
 
@@ -3533,33 +3450,7 @@ pub async fn export_dbnum_instances_json_mode(
                         // 连接数据库（生成需要从 SurrealDB 读取输入数据）
                         ensure_surreal_connected(db_option_ext).await?;
 
-                        // Step 1: 检测 TreeIndex 是否存在，若缺失则通过 gen_tree_only 解析生成。
-                        // specs/023 M2：pe_owner 主路径层级来自 pe 快照，无需 .tree 文件——
-                        // 仅在 AIOS_TREE_QUERY_SOURCE=tree 回退时保留该自动生成。
-                        let tree_path = db_option_ext
-                            .get_project_output_dir()
-                            .join("scene_tree")
-                            .join(format!("{}.tree", dbnum));
-                        let need_tree_file =
-                            !aios_database::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner();
-                        if need_tree_file && !tree_path.exists() {
-                            println!("📂 检测到 TreeIndex 缺失: {}", tree_path.display());
-                            println!("🔄 正在通过 PDMS 解析生成 TreeIndex (gen_tree_only 模式)...");
-
-                            let mut parse_option = db_option_ext.inner.clone();
-                            parse_option.gen_tree_only = true;
-                            parse_option.total_sync = true;
-                            parse_option.manual_db_nums = Some(vec![dbnum]);
-                            parse_option.save_db = Some(false); // 不写入 SurrealDB
-
-                            if let Err(e) = sync_pdms(&parse_option).await {
-                                println!("⚠️  TreeIndex 生成失败: {}", e);
-                                println!("   请确保 PDMS 数据库文件存在且可访问");
-                                return Err(anyhow!("TreeIndex 生成失败: {}", e));
-                            }
-
-                            println!("✅ TreeIndex 生成完成");
-                        }
+                        // Step 1: 层级数据来自 pe 快照，无需 .tree 文件。
 
                         // Step 2: 构建生成配置
                         let mut db_option_clone = db_option_ext.inner.clone();
@@ -3570,7 +3461,7 @@ pub async fn export_dbnum_instances_json_mode(
                         db_option_ext_override.inner = db_option_clone;
                         db_option_ext_override.inner.save_db = Some(false); // 不写回 SurrealDB
                         db_option_ext_override.export_instances = false; // 禁用自动导出，由我们的代码单独处理
-                        // IndexTree 已默认启用：无需模式开关
+                        // GenPipeline 已默认启用：无需模式开关
 
                         unsafe {
                             std::env::set_var("FORCE_REPLACE_MESH", "true");

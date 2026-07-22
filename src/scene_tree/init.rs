@@ -12,9 +12,8 @@ use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
 use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-// specs/023 M1：scene_node 构建源主路径切 pe_owner（增量后实时）；`AIOS_TREE_QUERY_SOURCE=tree` 回退
-use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
+use crate::versioned_db::pe_owner_tree::PeOwnerTreeStore;
 
 /// 从 DbOption.toml 读取 project_name
 fn get_project_name_from_config() -> String {
@@ -140,7 +139,7 @@ pub async fn init_scene_tree_from_root(
     // 6. 导出 Parquet 文件（使用 root 的 dbnum）
     #[cfg(feature = "parquet-export")]
     {
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root_refno)?;
+        let dbnum = resolve_dbnum_for_refno(root_refno)?;
         let output_dir = crate::versioned_db::db_meta_info::get_project_tree_dir(
             &get_project_name_from_config(),
         );
@@ -243,67 +242,7 @@ DELETE $scene_node_ids;
 async fn build_tree_from_world(
     world_refno: RefnoEnum,
 ) -> Result<(Vec<SceneNodeData>, Vec<(i64, i64)>)> {
-    // specs/023 M1：pe_owner 主路径（DB 实时层级，逐层批查）；`tree` 开关回退 TreeIndex 文件
-    if latest_tree_source_is_pe_owner() {
-        return build_tree_from_world_pe_owner(world_refno).await;
-    }
-
-    let mut nodes = Vec::new();
-    let mut relations = Vec::new();
-    let mut queue = VecDeque::new();
-
-    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno)?;
-    let manager = TreeIndexManager::with_default_dir(vec![dbnum_u32]);
-    let index = manager.load_index(dbnum_u32)?;
-
-    queue.push_back((world_refno, None::<i64>));
-
-    while let Some((refno, parent_id)) = queue.pop_front() {
-        // 1. 获取节点信息
-        let child_u64s = index
-            .query_children(refno.refno(), TreeQueryFilter::default())
-            .await
-            .unwrap_or_default();
-        let refno_i64 = refno.refno().0 as i64;
-        let dbnum = dbnum_u32 as i16;
-
-        // 2. 获取当前节点的 noun
-        let noun = index
-            .node_meta(refno.refno())
-            .map(|m| db1_dehash(m.noun))
-            .unwrap_or_default();
-        let has_geo = is_geo_noun(&noun);
-        let is_leaf = child_u64s.is_empty();
-
-        // 3. 获取几何类型（仅对几何节点查询）
-        let geo_type = if has_geo {
-            get_geo_type_by_refno(refno).await.unwrap_or(None)
-        } else {
-            None
-        };
-
-        // 4. 收集节点
-        nodes.push(SceneNodeData {
-            id: refno_i64,
-            parent: parent_id,
-            has_geo,
-            is_leaf,
-            dbnum,
-            geo_type,
-        });
-
-        // 5. 收集关系
-        if let Some(pid) = parent_id {
-            relations.push((pid, refno_i64));
-        }
-
-        // 5. 将子节点加入队列
-        for child in child_u64s {
-            queue.push_back((RefnoEnum::from(child), Some(refno_i64)));
-        }
-    }
-
-    Ok((nodes, relations))
+    build_tree_from_world_pe_owner(world_refno).await
 }
 
 /// pe_owner 主路径：逐层批查（children 边优先 / pe.children 字段回退，chunk 500），
@@ -313,7 +252,7 @@ async fn build_tree_from_world_pe_owner(
     world_refno: RefnoEnum,
 ) -> Result<(Vec<SceneNodeData>, Vec<(i64, i64)>)> {
     // dbnum 解析仍走 db_meta 驱动实现（不依赖 .tree 文件）
-    let dbnum_u32 = TreeIndexManager::resolve_dbnum_for_refno(world_refno)?;
+    let dbnum_u32 = resolve_dbnum_for_refno(world_refno)?;
     let dbnum = dbnum_u32 as i16;
 
     let mut nodes = Vec::new();

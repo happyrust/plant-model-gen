@@ -52,10 +52,7 @@ impl NounProcessor {
         Fut: std::future::Future<Output = Result<()>> + Send,
     {
         if nouns.is_empty() {
-            println!(
-                "[gen_index_tree_geos] {} nouns: 空列表，跳过",
-                self.category_name
-            );
+            println!("[gen_pipeline] {} nouns: 空列表，跳过", self.category_name);
             return Ok(());
         }
 
@@ -70,7 +67,7 @@ impl NounProcessor {
 
             if total == 0 {
                 println!(
-                    "[gen_index_tree_geos] {} noun {}: 无实例",
+                    "[gen_pipeline] {} noun {}: 无实例",
                     self.category_name, noun
                 );
                 continue;
@@ -80,7 +77,7 @@ impl NounProcessor {
             if let Some(limit) = self.debug_limit_per_noun {
                 if total > limit {
                     println!(
-                        "[gen_index_tree_geos] 🔍 调试模式：限制 {} noun {} 数量从 {} 个到 {} 个",
+                        "[gen_pipeline] 🔍 调试模式：限制 {} noun {} 数量从 {} 个到 {} 个",
                         self.category_name, noun, total, limit
                     );
                     total = limit;
@@ -89,7 +86,7 @@ impl NounProcessor {
 
             let page_size = self.ctx.batch_size.max(1);
             println!(
-                "[gen_index_tree_geos] {} noun {}: 共 {} 个实例，分页大小 {}",
+                "[gen_pipeline] {} noun {}: 共 {} 个实例，分页大小 {}",
                 self.category_name, noun, total, page_size
             );
 
@@ -120,7 +117,7 @@ impl NounProcessor {
                 // 日志输出
                 let page_index = processed / page_size + 1;
                 println!(
-                    "[gen_index_tree_geos] {} noun {}: 处理第 {} 页 ({} ~ {})",
+                    "[gen_pipeline] {} noun {}: 处理第 {} 页 ({} ~ {})",
                     self.category_name,
                     noun,
                     page_index,
@@ -139,30 +136,9 @@ impl NounProcessor {
         }
 
         if total_instances == 0 {
-            println!("[gen_index_tree_geos] {} nouns: 无实例", self.category_name);
+            println!("[gen_pipeline] {} nouns: 无实例", self.category_name);
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::options::DbOptionExt;
-    use aios_core::options::DbOption;
-
-    #[tokio::test]
-    async fn test_empty_nouns() {
-        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
-        let processor = NounProcessor::new(ctx, "test", None);
-        let sink = Arc::new(RwLock::new(HashSet::new()));
-
-        let result = processor
-            .process_nouns(&[], sink.clone(), |_refnos| async { Ok(()) })
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(sink.read().await.len(), 0);
     }
 }

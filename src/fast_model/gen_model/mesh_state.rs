@@ -5,6 +5,40 @@ use std::path::{Path, PathBuf};
 pub const MESH_STATE_SOURCE_ENV: &str = "MESH_STATE_SOURCE";
 pub const MESH_STATE_SOURCE_FILE: &str = "file";
 
+/// 跨 run 的 mesh 存在性只由内容寻址资产文件决定，不能依赖模型数据库状态。
+#[derive(Debug, Clone)]
+pub struct MeshAssetStore {
+    base_dir: PathBuf,
+    default_lod: String,
+}
+
+impl MeshAssetStore {
+    pub fn new(mesh_dir: impl AsRef<Path>) -> Self {
+        Self {
+            base_dir: normalize_mesh_base_dir(mesh_dir.as_ref()),
+            default_lod: format!(
+                "{:?}",
+                aios_core::get_db_option().mesh_precision().default_lod
+            ),
+        }
+    }
+
+    pub fn contains(&self, geo_hash: u64) -> bool {
+        if matches!(geo_hash, 1 | 2 | 3) {
+            return true;
+        }
+        let hash = geo_hash.to_string();
+        let lod_dir = self.base_dir.join(format!("lod_{}", self.default_lod));
+        [
+            lod_dir.join(format!("{}_{}.glb", hash, self.default_lod)),
+            lod_dir.join(format!("{}.glb", hash)),
+            self.base_dir.join(format!("{}.glb", hash)),
+        ]
+        .iter()
+        .any(|path| path.is_file())
+    }
+}
+
 pub fn use_file_mesh_state() -> bool {
     matches!(
         std::env::var(MESH_STATE_SOURCE_ENV).ok().as_deref(),
@@ -18,7 +52,7 @@ pub fn flush_aabb_cache() {
 
 pub fn mesh_exists(geo_hash: u64) -> bool {
     let mesh_dir = aios_core::get_db_option().get_meshes_path();
-    mesh_file_exists_in_dir(&mesh_dir, geo_hash)
+    MeshAssetStore::new(mesh_dir).contains(geo_hash)
 }
 
 pub fn get_cached_or_local_aabb(geo_hash: u64) -> Option<Aabb> {
@@ -57,24 +91,7 @@ pub fn prime_cached_aabb_for_mesh_ids<'a>(mesh_ids: impl IntoIterator<Item = &'a
 }
 
 pub fn mesh_file_exists_in_dir(mesh_dir: &Path, geo_hash: u64) -> bool {
-    if matches!(geo_hash, 1 | 2 | 3) {
-        return true;
-    }
-
-    let hash = geo_hash.to_string();
-    let default_lod = format!(
-        "{:?}",
-        aios_core::get_db_option().mesh_precision().default_lod
-    );
-    let base_dir = normalize_mesh_base_dir(mesh_dir);
-    let lod_dir = base_dir.join(format!("lod_{}", default_lod));
-    [
-        lod_dir.join(format!("{}_{}.glb", hash, default_lod)),
-        lod_dir.join(format!("{}.glb", hash)),
-        base_dir.join(format!("{}.glb", hash)),
-    ]
-    .iter()
-    .any(|p| p.exists())
+    MeshAssetStore::new(mesh_dir).contains(geo_hash)
 }
 
 fn normalize_mesh_base_dir(mesh_dir: &Path) -> PathBuf {

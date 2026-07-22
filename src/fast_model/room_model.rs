@@ -2832,7 +2832,7 @@ async fn query_room_panels_with_tree_index<F>(
 where
     F: Fn(&str) -> bool + Send + Sync,
 {
-    use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+    use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
     use aios_core::tool::db_tool::db1_hash;
     use aios_core::tree_query::{TreeQuery, TreeQueryFilter, TreeQueryOptions};
 
@@ -2847,8 +2847,7 @@ where
     );
 
     // 2. 按 dbnum 分组；解析失败直接报错，避免静默漏算房间
-    let grouped_by_db =
-        group_candidate_rooms_by_dbnum(rooms, |_| true, TreeIndexManager::resolve_dbnum_for_refno)?;
+    let grouped_by_db = group_candidate_rooms_by_dbnum(rooms, |_| true, resolve_dbnum_for_refno)?;
 
     let options = TreeQueryOptions {
         include_self: false,
@@ -2874,95 +2873,38 @@ where
         }
     };
 
-    // specs/023 M2：pe_owner 主路径——先预加载各 dbnum 快照（loader 闭包是同步的），
-    // 闭包内走纯内存 BFS；`AIOS_TREE_QUERY_SOURCE=tree` 回退旧 TreeIndex 路径。
-    if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
-        use crate::versioned_db::pe_owner_snapshot::{
-            preload_pe_snapshots, try_get_cached_pe_snapshot,
-        };
-        let dbnums: Vec<u32> = grouped_by_db.keys().copied().collect();
-        preload_pe_snapshots(&dbnums).await?;
+    use crate::versioned_db::pe_owner_snapshot::{
+        preload_pe_snapshots, try_get_cached_pe_snapshot,
+    };
+    let dbnums: Vec<u32> = grouped_by_db.keys().copied().collect();
+    preload_pe_snapshots(&dbnums).await?;
 
-        return query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
-            let Some(snap) = try_get_cached_pe_snapshot(dbnum) else {
-                anyhow::bail!("pe 层级快照缺失: dbnum={dbnum}（preload 后被失效？）");
-            };
-            let mut out = Vec::new();
-            for (room_refno, room_num) in items {
-                let room_refno_u64 = room_refno.refno();
-                if !snap.contains_refno(room_refno_u64) {
-                    let message = format!(
-                        "pe 层级快照中缺少房间节点: dbnum={dbnum}, room_refno={room_refno}, room_num={room_num}\n\
-                         请确认该房间 pe 行已入库（增量提交完成）后重试。"
-                    );
-                    error!("{}", message);
-                    anyhow::bail!(message);
-                }
-                let descendants = snap
-                    .collect_descendants_bfs(room_refno_u64, &options)
-                    .into_iter()
-                    .map(RefnoEnum::from)
-                    .filter(|refno| refno.is_valid())
-                    .collect::<Vec<_>>();
-                let descendants = filter_visible(room_refno, descendants);
-                if !descendants.is_empty() {
-                    out.push((*room_refno, room_num.clone(), descendants));
-                }
-            }
-            Ok(out)
-        });
-    }
-
-    // 3. 对每个 dbnum 只加载一次 TreeIndex，再批量查询房间面板（tree 回退路径）
     query_grouped_room_panels_with_loader(grouped_by_db, |dbnum, items| {
-        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-        let tree_dir = manager.tree_dir().to_path_buf();
-        // 显式加载当前 dbnum 的 TreeIndex，并在本批次所有房间间复用同一个 index。
-        // 这里不再走 collect_descendant_filter_ids，避免再次退回到隐式查询路径。
-        let index = manager.load_index(dbnum).map_err(|e| {
-            let room_hint = items
-                .first()
-                .map(|(room_refno, room_num)| (*room_refno, room_num.as_str()))
-                .unwrap_or((RefnoEnum::default(), "<empty>"));
-            let message = build_tree_index_load_error_message(
-                dbnum,
-                &tree_dir,
-                room_hint.0,
-                room_hint.1,
-                &e.to_string(),
-            );
-            error!("{}", message);
-            anyhow::anyhow!(message)
-        })?;
+        let Some(snap) = try_get_cached_pe_snapshot(dbnum) else {
+            anyhow::bail!("pe 层级快照缺失: dbnum={dbnum}（preload 后被失效？）");
+        };
         let mut out = Vec::new();
-
         for (room_refno, room_num) in items {
             let room_refno_u64 = room_refno.refno();
-            if !index.contains_refno(room_refno_u64) {
-                let message = build_tree_index_missing_room_error_message(
-                    dbnum,
-                    &tree_dir,
-                    *room_refno,
-                    room_num,
+            if !snap.contains_refno(room_refno_u64) {
+                let message = format!(
+                    "pe 层级快照中缺少房间节点: dbnum={dbnum}, room_refno={room_refno}, room_num={room_num}\n\
+                         请确认该房间 pe 行已入库（增量提交完成）后重试。"
                 );
                 error!("{}", message);
                 anyhow::bail!(message);
             }
-
-            let descendants = index
+            let descendants = snap
                 .collect_descendants_bfs(room_refno_u64, &options)
                 .into_iter()
                 .map(RefnoEnum::from)
                 .filter(|refno| refno.is_valid())
                 .collect::<Vec<_>>();
-
             let descendants = filter_visible(room_refno, descendants);
-
             if !descendants.is_empty() {
                 out.push((*room_refno, room_num.clone(), descendants));
             }
         }
-
         Ok(out)
     })
 }

@@ -2333,8 +2333,27 @@ pub async fn run_bool_worker_from_tasks(
     db_option: Arc<aios_core::options::DbOption>,
     sql_writer: Option<Arc<SqlFileWriter>>,
 ) -> anyhow::Result<BoolWorkerReport> {
+    run_bool_worker_from_tasks_inner(tasks, db_option, sql_writer, false).await
+}
+
+/// 版本化正式路径：当前 run 的 boolean task 是唯一输入事实，不读取既有模型表
+/// 判断是否跳过。即使内容寻址文件已存在，也重新发布本次 run 对应的 writer 结果。
+pub async fn run_bool_worker_from_tasks_versioned(
+    tasks: Vec<BooleanTask>,
+    db_option: Arc<aios_core::options::DbOption>,
+    sql_writer: Option<Arc<SqlFileWriter>>,
+) -> anyhow::Result<BoolWorkerReport> {
+    run_bool_worker_from_tasks_inner(tasks, db_option, sql_writer, true).await
+}
+
+async fn run_bool_worker_from_tasks_inner(
+    tasks: Vec<BooleanTask>,
+    db_option: Arc<aios_core::options::DbOption>,
+    sql_writer: Option<Arc<SqlFileWriter>>,
+    force_execute: bool,
+) -> anyhow::Result<BoolWorkerReport> {
     let started = std::time::Instant::now();
-    let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
+    let replace_exist = force_execute;
     let deferred_mode = sql_writer.is_some();
     let writer: Arc<dyn BoolResultWriter> = if let Some(ref w) = sql_writer {
         Arc::new(SqlBoolWriter::new(w.clone()))

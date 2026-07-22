@@ -5,5 +5,4 @@ pub mod pe;
 pub mod pe_owner_meta;
 pub mod pe_owner_snapshot;
 pub mod pe_owner_tree;
-pub mod tree_export;
 pub mod version_commit;

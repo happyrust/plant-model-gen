@@ -1,0 +1,164 @@
+<mxfile host="Electron" modified="2026-07-17T12:30:00.000Z" agent="Cursor" version="22.1.0" type="device">
+  <diagram id="sesno-anchor-version" name="sesno→anchored_at→VERSION">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="sesno → anchored_at → VERSION（specs/022）" style="text;html=1;fontSize=18;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="280" y="20" width="520" height="36" as="geometry" />
+        </mxCell>
+
+        <mxCell id="biz" value="业务层（只认 sesno）" style="swimlane;horizontal=0;startSize=28;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="200" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="q" value="查询入参
+(dbnum, sesno)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="biz">
+          <mxGeometry x="40" y="50" width="140" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="inc" value="增量/全量落库
+actual_end_sesno" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="biz">
+          <mxGeometry x="40" y="160" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="anchor" value="锚点表 sesno_version_anchor" style="swimlane;horizontal=0;startSize=28;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="360" y="80" width="280" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="row" value="record id: [dbnum, sesno]
+────────────
+dbnum
+sesno
+anchored_at ← time::now()
+source: full | incremental" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=0;" vertex="1" parent="anchor">
+          <mxGeometry x="30" y="50" width="220" height="190" as="geometry" />
+        </mxCell>
+
+        <mxCell id="store" value="存储层（只认时间戳）" style="swimlane;horizontal=0;startSize=28;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="760" y="80" width="280" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="ver" value="SELECT * FROM pe:&lt;id&gt;
+VERSION d'anchored_at'
+────────────
+同刻 ATT: noun:&lt;id&gt;" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=8;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="store">
+          <mxGeometry x="30" y="40" width="220" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="mvcc" value="RocksDB versioned MVCC
+内部 HLC / 行历史" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="store">
+          <mxGeometry x="30" y="170" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=2;" edge="1" parent="1" source="inc" target="row">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e1l" value="整批写完后 UPSERT" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=11;" vertex="1" connectable="0" parent="e1">
+          <mxGeometry x="-0.1" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=2;dashed=1;" edge="1" parent="1" source="q" target="row">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2l" value="resolve_anchor
+精确或 ≤sesno 回退" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=11;" vertex="1" connectable="0" parent="e2">
+          <mxGeometry x="-0.2" relative="1" as="geometry"><mxPoint y="-10" as="offset" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=2;" edge="1" parent="1" source="row" target="ver">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3l" value="取出 anchored_at" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=11;" vertex="1" connectable="0" parent="e3">
+          <mxGeometry x="-0.1" relative="1" as="geometry"><mxPoint as="offset" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=2;" edge="1" parent="1" source="ver" target="mvcc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note" value="对照：sesno=1042 → anchored_at=2026-07-16T08:31:22Z → VERSION d'2026-07-16T08:31:22Z'
+要点：没有从 sesno 直接进 RocksDB 版本号的旁路；锚点是唯一业务可见入口。" style="rounded=0;whiteSpace=wrap;html=1;align=left;spacingLeft=12;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="1000" height="70" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+<diagram id="4voktzfi-jvds" name="增量写入时序"><mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="900" math="0" shadow="0">
+  <root>
+    <mxCell id="0" />
+    <mxCell id="1" parent="0" />
+
+    <mxCell id="t" value="增量写入时序（细化）：落库成功才钉锚点；查询走 resolve-anchor / fn::sesno_version" style="text;html=1;fontSize=15;fontStyle=1;align=left;" vertex="1" parent="1"><mxGeometry x="40" y="20" width="1100" height="30" as="geometry" /></mxCell>
+
+    <!-- lifelines headers -->
+    <mxCell id="a1" value="PDMS 源文件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="60" y="70" width="120" height="40" as="geometry" />
+    </mxCell>
+    <mxCell id="a2" value="incremental-sesno
+(+ persist)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="260" y="70" width="140" height="44" as="geometry" /></mxCell>
+    <mxCell id="a3" value="pe / ATT 表" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="500" y="70" width="120" height="40" as="geometry" />
+    </mxCell>
+    <mxCell id="a4" value="sesno_version_anchor" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="70" width="160" height="40" as="geometry" />
+    </mxCell>
+    <mxCell id="a5" value="resolve-anchor
+/ history CLI" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="980" y="70" width="130" height="44" as="geometry" /></mxCell>
+
+    <!-- lifelines -->
+    <mxCell id="l1" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="120" y="110" as="sourcePoint" /><mxPoint x="120" y="720" as="targetPoint" /></mxGeometry>
+    </mxCell>
+    <mxCell id="l2" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="330" y="110" as="sourcePoint" /><mxPoint x="330" y="720" as="targetPoint" /></mxGeometry>
+    </mxCell>
+    <mxCell id="l3" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="560" y="110" as="sourcePoint" /><mxPoint x="560" y="720" as="targetPoint" /></mxGeometry>
+    </mxCell>
+    <mxCell id="l4" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="800" y="110" as="sourcePoint" /><mxPoint x="800" y="720" as="targetPoint" /></mxGeometry>
+    </mxCell>
+    <mxCell id="l5" value="" style="endArrow=none;dashed=1;html=1;strokeColor=#999999;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="1040" y="110" as="sourcePoint" /><mxPoint x="1040" y="720" as="targetPoint" /></mxGeometry>
+    </mxCell>
+
+    <!-- step 1 -->
+    <mxCell id="s1" value="1. sesno = N…M 差量" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="120" y="160" as="sourcePoint" /><mxPoint x="330" y="160" as="targetPoint" /></mxGeometry>
+    </mxCell>
+
+    <!-- step 2 -->
+    <mxCell id="s2" value="2. UPSERT / DELETE PE·ATT（内部产生 MVCC 版本）" style="endArrow=block;html=1;strokeWidth=2;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="330" y="220" as="sourcePoint" /><mxPoint x="560" y="220" as="targetPoint" /></mxGeometry>
+    </mxCell>
+
+    <!-- note mid-fail -->
+    <mxCell id="n1" value="⚠ 半途失败：PE/ATT 可能已有中间 MVCC，但无锚点 → 业务不可见；重跑覆盖后再钉" style="shape=note;whiteSpace=wrap;html=1;size=14;fillColor=#fff2cc;strokeColor=#d6b656;align=left;spacingLeft=8;" vertex="1" parent="1"><mxGeometry x="360" y="245" width="380" height="55" as="geometry" /></mxCell>
+
+    <!-- step 3 empty batch -->
+    <mxCell id="n2" value="⛔ 空批（actual_start/end=0）或 ? 失败：提前 return，不写锚点" style="shape=note;whiteSpace=wrap;html=1;size=14;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;" vertex="1" parent="1"><mxGeometry x="360" y="308" width="360" height="45" as="geometry" /></mxCell>
+
+    <!-- step 4 write anchor -->
+    <mxCell id="s3" value="3. 成功路径末尾 UPSERT [dbnum, actual_end_sesno=M]
+   source=incremental；anchored_at=time::now()→T" style="endArrow=block;html=1;strokeWidth=2;strokeColor=#d79b00;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="330" y="400" as="sourcePoint" /><mxPoint x="800" y="400" as="targetPoint" /></mxGeometry></mxCell>
+
+    <mxCell id="n3" value="钉子钉上：sesno M ↔ 时刻 T" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="620" y="430" width="220" height="40" as="geometry" />
+    </mxCell>
+
+    <!-- step 5 query -->
+    <mxCell id="s4" value="4. resolve-anchor / fn::sesno_version_hit(dbnum,M)" style="endArrow=block;html=1;strokeWidth=2;dashed=1;strokeColor=#82b366;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="1040" y="520" as="sourcePoint" /><mxPoint x="800" y="520" as="targetPoint" /></mxGeometry></mxCell>
+    <mxCell id="s5" value="5. 返回 anchored_at=T（exact=true）" style="endArrow=open;html=1;dashed=1;strokeWidth=2;strokeColor=#82b366;" edge="1" parent="1"><mxGeometry relative="1" as="geometry"><mxPoint x="800" y="560" as="sourcePoint" /><mxPoint x="1040" y="560" as="targetPoint" /></mxGeometry></mxCell>
+
+    <!-- step 6 VERSION -->
+    <mxCell id="s6" value="6. SELECT … VERSION d'T'" style="endArrow=block;html=1;strokeWidth=2;strokeColor=#9673a6;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="1040" y="620" as="sourcePoint" /><mxPoint x="560" y="620" as="targetPoint" /></mxGeometry>
+    </mxCell>
+    <mxCell id="s7" value="7. 返回 M 落库完成后的 PE/ATT 快照" style="endArrow=open;html=1;dashed=1;strokeWidth=2;strokeColor=#9673a6;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry"><mxPoint x="560" y="680" as="sourcePoint" /><mxPoint x="1040" y="680" as="targetPoint" /></mxGeometry>
+    </mxCell>
+
+    <mxCell id="foot" value="写入：整批 UPSERT/DELETE + dbnum_info 成功后才钉锚点。查询：sesno→anchored_at→VERSION。同 dbnum 增量串行。" style="text;html=1;align=left;fontSize=12;fontColor=#333333;" vertex="1" parent="1"><mxGeometry x="40" y="740" width="1100" height="28" as="geometry" /></mxCell>
+  <mxCell id="n4" value="命令对照：
+• write: incremental-sesno
+• 查锚点: model-version resolve-anchor --dbnum D --sesno M --json
+• 查快照: model-version history snapshot --refno E --dbnum D --sesno M --json
+• SQL: LET $t = fn::sesno_version(D,M); SELECT * FROM pe:… VERSION $t;" style="rounded=0;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;" vertex="1" parent="1"><mxGeometry x="40" y="780" width="1100" height="90" as="geometry" /></mxCell></root>
+</mxGraphModel></diagram></mxfile>

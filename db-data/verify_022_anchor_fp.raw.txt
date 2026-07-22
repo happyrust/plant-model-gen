@@ -1,0 +1,111 @@
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> [{ database: 'anchor_fp', namespace: 'vc_verify' }]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== [0] schema: verbatim ensure_sesno_version_anchor_schema (database.rs) + sesno_version_anchor option fields from ensure_version_commit_schema (version_commit.rs, incl. specs/023 pe_owner_rows) ======']
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> [NONE]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> []
+
+vc_verify/anchor_fp> [[]]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== [1] create-once: CREATE ONLY first succeeds, same id re-CREATE errors (anchor is immutable) ======']
+
+vc_verify/anchor_fp> [">>> [1a] first CREATE ONLY sesno_version_anchor:[9201,10] fingerprint='fp-A' (expect success, RETURN anchored_at):"]
+
+vc_verify/anchor_fp> [{ anchored_at: d'2026-07-19T15:10:35.858233300Z' }]
+
+vc_verify/anchor_fp> [">>> [1b-ERR] re-CREATE ONLY same id with fingerprint='fp-B' (expect error: record already exists => anchor cannot be overwritten):"]
+
+vc_verify/anchor_fp> ['Database record `sesno_version_anchor:[9201, 10]` already exists']
+
+vc_verify/anchor_fp> [">>> [1c] anchor not overwritten (expect still fingerprint='fp-A', pe_rows=12, pe_owner_rows=7):"]
+
+vc_verify/anchor_fp> [[{ dbnum: 9201, fingerprint: 'fp-A', pe_owner_rows: 7, pe_rows: 12, sesno: 10 }]]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== [2] idempotent read-back: verbatim SELECT projection of existing_idempotent_outcome ======']
+
+vc_verify/anchor_fp> [">>> [2a] SELECT on [9201,10] (expect 1 row: fingerprint='fp-A', anchored_at as string, counts 12/34/5/2/1/7 incl. specs/023 pe_owner_rows):"]
+
+vc_verify/anchor_fp> [[{ anchored_at: '2026-07-19T15:10:35.858233300Z', att_rows: 34, dbnum_info_updates: 1, delete_count: 2, fingerprint: 'fp-A', pe_owner_rows: 7, pe_rows: 12, uda_rows: 5 }]]
+
+vc_verify/anchor_fp> ['>>> [2b] same SELECT on missing [9201,99] (expect empty array => Rust side returns None, proceeds as fresh commit):']
+
+vc_verify/anchor_fp> [[]]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== [3] legacy anchor: no fingerprint field => read-back NONE => LegacyAnchor rejection path ======']
+
+vc_verify/anchor_fp> ['>>> [3a] create legacy anchor [9201,20] with only dbnum/sesno/anchored_at/source (expect success, record has no fingerprint):']
+
+vc_verify/anchor_fp> [{ anchored_at: d'2026-07-19T15:10:35.880489600Z', dbnum: 9201, id: sesno_version_anchor:[9201, 20], sesno: 20, source: 'full' }]
+
+vc_verify/anchor_fp> ['>>> [3b] existing_idempotent_outcome projection on [9201,20] (expect fingerprint NONE/absent, counts all NONE):']
+
+vc_verify/anchor_fp> [[{ anchored_at: '2026-07-19T15:10:35.880489600Z', att_rows: NONE, dbnum_info_updates: NONE, delete_count: NONE, fingerprint: NONE, pe_owner_rows: NONE, pe_rows: NONE, uda_rows: NONE }]]
+
+vc_verify/anchor_fp> [">>> [3c] explicit NONE check via ?? (expect 'FINGERPRINT_IS_NONE'):"]
+
+vc_verify/anchor_fp> ['FINGERPRINT_IS_NONE']
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== [4] unique index idx_sesno_version_anchor_dbnum_sesno ======']
+
+vc_verify/anchor_fp> ['>>> [4a] INFO FOR TABLE (expect indexes to contain idx_sesno_version_anchor_dbnum_sesno FIELDS dbnum, sesno UNIQUE):']
+
+vc_verify/anchor_fp> [{ events: {  }, fields: { anchored_at: 'DEFINE FIELD anchored_at ON sesno_version_anchor TYPE datetime DEFAULT time::now() PERMISSIONS FULL', att_rows: 'DEFINE FIELD att_rows ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', dbnum: 'DEFINE FIELD dbnum ON sesno_version_anchor TYPE int PERMISSIONS FULL', dbnum_info_updates: 'DEFINE FIELD dbnum_info_updates ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', delete_count: 'DEFINE FIELD delete_count ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', fingerprint: 'DEFINE FIELD fingerprint ON sesno_version_anchor TYPE none | string PERMISSIONS FULL', from_sesno: 'DEFINE FIELD from_sesno ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', note: 'DEFINE FIELD note ON sesno_version_anchor TYPE none | string PERMISSIONS FULL', pe_owner_rows: 'DEFINE FIELD pe_owner_rows ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', pe_rows: 'DEFINE FIELD pe_rows ON sesno_version_anchor TYPE none | int PERMISSIONS FULL', sesno: 'DEFINE FIELD sesno ON sesno_version_anchor TYPE int PERMISSIONS FULL', source: "DEFINE FIELD source ON sesno_version_anchor TYPE string ASSERT $value INSIDE ['full', 'incremental'] PERMISSIONS FULL", source_observation_hash: 'DEFINE FIELD source_observation_hash ON sesno_version_anchor TYPE none | string PERMISSIONS FULL', uda_rows: 'DEFINE FIELD uda_rows ON sesno_version_anchor TYPE none | int PERMISSIONS FULL' }, indexes: { idx_sesno_version_anchor_dbnum_sesno: 'DEFINE INDEX idx_sesno_version_anchor_dbnum_sesno ON sesno_version_anchor FIELDS dbnum, sesno UNIQUE' }, lives: {  }, tables: {  } }]
+
+vc_verify/anchor_fp> ['>>> [4b-ERR] different record id [9201,21] but duplicate field pair (dbnum,sesno)=(9201,20) (expect rejected by unique index):']
+
+vc_verify/anchor_fp> ['Database index `idx_sesno_version_anchor_dbnum_sesno` already contains [9201, 20], with record `sesno_version_anchor:[9201, 20]`']
+
+vc_verify/anchor_fp> ['>>> [4c] duplicate did not land (expect exactly 2 rows for dbnum=9201: sesno 10 and 20):']
+
+vc_verify/anchor_fp> [[{ fingerprint: 'fp-A', sesno: 10 }, { fingerprint: NONE, sesno: 20 }]]
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> ['====== verify_022_anchor_fp end ======']
+
+vc_verify/anchor_fp> vc_verify/anchor_fp> 

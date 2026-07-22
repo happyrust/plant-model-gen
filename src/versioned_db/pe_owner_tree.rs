@@ -1,6 +1,6 @@
 //! specs/023 M0/T1：latest（不带 sesno）层级查询原语层 `PeOwnerTreeStore`。
 //!
-//! 目标：替代 `TreeIndexManager` 的 `.tree` 文件路径——层级查询全部改走 SurrealDB 3.1
+//! 目标：替代旧 `.tree` 文件路径——层级查询全部改走 SurrealDB 3.1
 //! **图遍历 / 递归 idiom**（语法依据 `D:\work\plant-code\surrealdb`（dev-3.1）
 //! `language-tests/tests/language/graph|idiom` 实测用例），数据源永远是库内最新态：
 //!
@@ -25,7 +25,7 @@
 //! `model-version rebuild-pe-owner`）；逐层 BFS 类接口（`children_batch` /
 //! `collect_target_refnos_*`）为每节点独立回退，不受此限。
 //!
-//! 本模块 M0 阶段纯新增，不改变任何现有调用路径；M1/M2 起逐域替换 `TreeIndexManager` 消费面。
+//! 本模块 M0 阶段纯新增；M1/M2 起逐域替换旧 `.tree` 消费面。
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,18 +37,6 @@ use surrealdb::types::SurrealValue;
 /// 引擎单次递归 idiom 的深度硬上限（surrealdb dev-3.1 `recursion_limits` 实测：
 /// 显式上界 ≤256 且超深时**截断**；无上界 `{..}` 超深会直接报错——因此一律显式带上界）。
 pub const MAX_RECURSE_DEPTH: usize = 256;
-
-/// M1 双源开关（计划 M4 删除）：latest 树查询数据源选择。
-///
-/// `AIOS_TREE_QUERY_SOURCE=pe_owner`（默认，含未设置/未知值）| `tree`（一键回退旧
-/// TreeIndex `.tree` 文件路径）。只影响 latest（不带 sesno）层级查询；versioned
-/// 分支（specs/023）与 `resolve_dbnum_for_refno`（db_meta 驱动）不受此开关控制。
-pub fn latest_tree_source_is_pe_owner() -> bool {
-    match std::env::var("AIOS_TREE_QUERY_SOURCE") {
-        Ok(v) => !v.trim().eq_ignore_ascii_case("tree"),
-        Err(_) => true,
-    }
-}
 
 /// 批量点查/展开的分片大小（对齐 sesno_increment `exec_statements` 粒度）。
 const CHUNK: usize = 500;
@@ -374,7 +362,7 @@ impl PeOwnerTreeStore {
 
     /// 批量 BFS 收集目标 noun refnos，匹配后剪枝（不再深入其子树）。
     ///
-    /// 与 `TreeIndexManager::collect_target_refnos_pruned` 语义一致（include_self=true）。
+    /// 与 `HierView::collect_target_refnos_pruned` 语义一致（include_self=true）。
     /// 剪枝无法用单条递归 idiom 表达（中途过滤是"断链"语义），因此在 Rust 侧逐层
     /// BFS + 批量 meta 判定，展开走 `children_batch`（边优先/字段回退）。
     pub async fn collect_target_refnos_pruned(

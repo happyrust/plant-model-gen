@@ -2,7 +2,7 @@ use crate::consts::*;
 use crate::data_interface::interface::PdmsDataInterface;
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
-use crate::fast_model::query_provider;
+use crate::fast_model::gen_model::{GenerationReadContext, session_query};
 use crate::fast_model::{SEND_INST_SIZE, debug_model_warn, shared};
 use crate::options::DbOptionExt;
 use aios_core::RefU64;
@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, RwLock};
 ///处理带有loop的元件
 pub async fn gen_loop_geos(
     db_option: Arc<DbOptionExt>,
+    generation_read: Arc<GenerationReadContext>,
     loop_owner_refnos: &[RefnoEnum],
     sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
@@ -56,7 +57,7 @@ pub async fn gen_loop_geos(
         let all_loop_owner_refnos = all_refnos.clone();
         let sjus_map_clone = sjus_map_arc.clone();
         let sender = sender.clone();
-        let db_option = db_option.clone();
+        let generation_read = Arc::clone(&generation_read);
         let handle = tokio::spawn(async move {
             let start_idx = i * batch_size;
             if start_idx >= loop_owner_cnt {
@@ -76,37 +77,23 @@ pub async fn gen_loop_geos(
                 println!("当前范围: {start_idx} ~ {end_idx}");
             }
 
-            // ── 批量预取：attmap + transform 并发 ──
-            {
-                let batch_refnos: Vec<RefnoEnum> =
-                    all_loop_owner_refnos[start_idx..end_idx].to_vec();
-                let attmap_futs: Vec<_> = batch_refnos
-                    .iter()
-                    .map(|&r| aios_core::get_named_attmap(r))
-                    .collect();
-                let transform_fut = crate::fast_model::gen_model::transform_cache::get_world_transforms_cache_first_batch(
-                    Some(db_option.as_ref()),
-                    &batch_refnos,
-                );
-                let _ = tokio::join!(futures::future::join_all(attmap_futs), transform_fut,);
-            }
+            // 同一个版本读取会话内批量取 ATT + transform；missing 直接失败关闭。
+            let batch_refnos: Vec<RefnoEnum> = all_loop_owner_refnos[start_idx..end_idx].to_vec();
+            let (mut attributes, transforms) = tokio::try_join!(
+                session_query::get_named_attmaps(&generation_read, &batch_refnos),
+                session_query::get_world_transforms(&generation_read, &batch_refnos),
+            )?;
 
             let mut shape_insts_data = ShapeInstancesData::default();
             for j in start_idx..end_idx {
                 let target_refno = all_loop_owner_refnos[j];
-                let mut target_att = aios_core::get_named_attmap(target_refno)
-                    .await
-                    .unwrap_or_default();
+                let mut target_att = attributes.remove(&target_refno).ok_or_else(|| {
+                    anyhow::anyhow!("loop batch missing attributes for {target_refno}")
+                })?;
                 let target_type = target_att.get_type_str();
-                let Ok(Some(mut trans_origin)) =
-                    crate::fast_model::gen_model::transform_cache::get_world_transform_cache_first(
-                        Some(db_option.as_ref()),
-                        target_refno,
-                    )
-                    .await
-                else {
-                    continue;
-                };
+                let mut trans_origin = transforms.get(&target_refno).copied().ok_or_else(|| {
+                    anyhow::anyhow!("loop batch missing transform for {target_refno}")
+                })?;
                 //判断父节点是否有SJUS，需要调整位置
                 #[cfg(feature = "profile")]
                 let pane_sjus_start = std::time::Instant::now();
@@ -127,13 +114,13 @@ pub async fn gen_loop_geos(
                 }
 
                 if !target_att.is_neg() {
-                    let neg_refnos = query_provider::get_descendants_by_types(
+                    let neg_refnos = session_query::get_descendants_by_types(
+                        &generation_read,
                         target_refno,
                         &GENRAL_NEG_NOUN_NAMES,
                         None,
-                    )
-                    .await
-                    .unwrap_or_default();
+                        false,
+                    )?;
 
                     if !neg_refnos.is_empty() {
                         println!(
@@ -145,18 +132,21 @@ pub async fn gen_loop_geos(
 
                     shape_insts_data.insert_negs(target_refno, &neg_refnos);
                     //检查是否有CMPF
-                    let cmpf_refnos =
-                        query_provider::get_descendants_by_types(target_refno, &["CMPF"], None)
-                            .await
-                            .unwrap_or_default();
+                    let cmpf_refnos = session_query::get_descendants_by_types(
+                        &generation_read,
+                        target_refno,
+                        &["CMPF"],
+                        None,
+                        false,
+                    )?;
                     if !cmpf_refnos.is_empty() {
                         //查询cmpf里面的元素
-                        let cmpf_neg_refnos = query_provider::query_multi_descendants(
+                        let cmpf_neg_refnos = session_query::get_multi_descendants_by_types(
+                            &generation_read,
                             &cmpf_refnos,
                             &GENRAL_NEG_NOUN_NAMES,
-                        )
-                        .await
-                        .unwrap_or_default();
+                            false,
+                        )?;
                         // dbg!(&cmpf_neg_refnos);
                         shape_insts_data.insert_negs(
                             target_refno,

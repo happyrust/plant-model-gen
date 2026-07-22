@@ -1,7 +1,7 @@
 //! specs/022/024 IncrementRun：一次 sesno 增量的完整管线（采集 → 落库/锚点 → 可选生成）。
 //!
 //! 深模块：`run_increment(options)` 一个入口，内部各阶段（源文件写前/写后 hash 门、
-//! 采集、db_meta 刷新、Version Commit 落库、tree-index 证据、模型生成、Parquet 导出、
+//! 采集、db_meta 刷新、Version Commit 落库、pe_owner 完整性证据、模型生成、Parquet 导出、
 //! summary 汇总）全部私有。CLI（`incremental-sesno` /
 //! `watch-incremental`）只是薄参数 adapter；连接策略（端口探测/自启动）留在
 //! adapter 侧，经 `ensure_model_store` 闭包传入——与 `commit_version` 的 apply
@@ -26,7 +26,9 @@ pub struct IncrementRunOptions {
     pub persist_data: bool,
     pub recover_pending: bool,
     pub generate_model: bool,
-    pub require_tree_index: bool,
+    /// specs/023 M3/T8：增量模型生成前要求 pe_owner 完整性证据就绪
+    /// （`pe_owner_version_meta` 存在 + 抽查通过）；不就绪快速失败。
+    pub require_pe_owner_ready: bool,
     pub verbose: bool,
 }
 
@@ -44,10 +46,17 @@ struct SourceHashGate {
     aggregate_sha256: String,
 }
 
+/// specs/023 M3/T8：pe_owner 完整性证据（替代 `.tree` 文件存在性证据）。
+///
+/// latest 层级查询与增量生成的层级展开已统一走 pe_owner/pe（M1/M2），
+/// 生成前的"层级数据可用"判据随之换源：
+/// - `pe_owner_version_meta.maintained_since_sesno` 存在（full 重灌 / rebuild-pe-owner 建立）；
+/// - 轻量抽查：抽样有子 parent 对比 `count(<-pe_owner)` 与 `len(children)`（口径对齐
+///   `db-data/audit_pe_owner_vs_children.surql` [2] 段，样本上限 200/库）。
 #[derive(Debug, Clone)]
-struct TreeIndexEvidence {
+struct PeOwnerEvidence {
     ready: bool,
-    missing_dbnums: Vec<u32>,
+    not_ready_dbnums: Vec<u32>,
     summary: serde_json::Value,
 }
 
@@ -301,23 +310,20 @@ where
         dbnums.into_iter().collect()
     };
 
-    let tree_index_evidence = if options.generate_model {
+    let pe_owner_evidence = if options.generate_model {
         let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
-            "incremental_sesno_checking_tree_index",
+            "incremental_sesno_checking_pe_owner",
             Some(format!("dbnums={generation_dbnums:?}")),
             std::time::Duration::from_secs(15),
         );
-        let evidence = build_tree_index_evidence(
-            db_option_ext,
-            &generation_dbnums,
-            options.require_tree_index,
-        )?;
+        let evidence =
+            build_pe_owner_evidence(&generation_dbnums, options.require_pe_owner_ready).await;
         crate::perf_metrics::record_generate_progress(
-            "incremental_sesno_tree_index_checked",
+            "incremental_sesno_pe_owner_checked",
             Some(if evidence.ready {
-                "tree_index_ready"
+                "pe_owner_ready"
             } else {
-                "tree_index_degraded_or_missing"
+                "pe_owner_degraded_or_missing"
             }),
             metrics_elapsed(),
         );
@@ -339,13 +345,13 @@ where
             println!("ℹ️ 未收集到模型变更，模型生成按成功空操作收尾");
             generation_success = Some(true);
         } else {
-            if let Some(evidence) = &tree_index_evidence
-                && options.require_tree_index
+            if let Some(evidence) = &pe_owner_evidence
+                && options.require_pe_owner_ready
                 && !evidence.ready
             {
                 anyhow::bail!(
-                    "tree_index_missing: --require-tree-index enabled but scene_tree files are missing for dbnums {:?}; checked evidence: {}",
-                    evidence.missing_dbnums,
+                    "pe_owner_not_ready: --require-pe-owner-ready enabled but pe_owner integrity evidence is not ready for dbnums {:?}; run `model-version rebuild-pe-owner --dbnum <n>` (audit: scripts/smoke/pe_owner_children_audit.ps1); checked evidence: {}",
+                    evidence.not_ready_dbnums,
                     serde_json::to_string(&evidence.summary)?
                 );
             }
@@ -425,7 +431,8 @@ where
 
     let source_hash_summary = verify_source_hash_gate(&source_hash_gate)?;
 
-    let mut model_gen_anchors = Vec::new();
+    let mut model_gen_anchors: Vec<crate::versioned_db::version_commit::ModelGenAnchor> =
+        Vec::new();
     #[cfg(feature = "gen_model")]
     if generation_success == Some(true)
         && db_option_ext.use_surrealdb
@@ -468,7 +475,7 @@ where
         "from_sesno": options.from_sesno,
         "to_sesno": options.to_sesno,
         "source_hash_gate": source_hash_summary,
-        "tree_index": tree_index_evidence.as_ref().map(|evidence| evidence.summary.clone()),
+        "pe_owner_evidence": pe_owner_evidence.as_ref().map(|evidence| evidence.summary.clone()),
         "source_count": source_count,
         "file_count": outcome.files.len(),
         "session_count": outcome.total_session_count(),
@@ -579,43 +586,79 @@ fn aggregate_source_hashes(
     ))
 }
 
-fn build_tree_index_evidence(
-    db_option_ext: &DbOptionExt,
+/// specs/023 M3/T8：构建 pe_owner 完整性证据（替代 `.tree` 存在性证据）。
+///
+/// 证据本身是**咨询性**的（degraded_allowed 语义保留）：单库探测失败不终止增量运行，
+/// 记为该 dbnum not_ready 并把错误写进 summary；只有 `--require-pe-owner-ready`（strict）
+/// 才把 not_ready 升级为快速失败（调用方判定）。
+async fn build_pe_owner_evidence(
     generation_dbnums: &[u32],
-    require_tree_index: bool,
-) -> anyhow::Result<TreeIndexEvidence> {
-    let scene_tree_dir = db_option_ext.get_scene_tree_dir();
-    let db_meta_info_file = scene_tree_dir.join("db_meta_info.json");
-    let db_meta_info_exists = db_meta_info_file.is_file();
+    require_pe_owner_ready: bool,
+) -> PeOwnerEvidence {
+    use aios_core::{SurrealQueryExt, project_primary_db};
+    use serde::Deserialize;
+    use surrealdb::types::SurrealValue;
+
+    /// 抽查样本上限（对齐 audit_pe_owner_vs_children.surql [2] 的口径，收敛为轻量在线探测）
+    const SAMPLE_LIMIT: usize = 200;
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct SampleProbe {
+        sampled: i64,
+        mismatched: i64,
+    }
+
     let mut checked_dbnums: Vec<u32> = generation_dbnums.to_vec();
     checked_dbnums.sort_unstable();
     checked_dbnums.dedup();
 
-    let mut files = Vec::new();
-    let mut missing_dbnums = Vec::new();
+    let mut per_dbnum = Vec::new();
+    let mut not_ready_dbnums = Vec::new();
     for dbnum in &checked_dbnums {
-        let tree_file = scene_tree_dir.join(format!("{dbnum}.tree"));
-        let metadata = std::fs::metadata(&tree_file).ok();
-        let exists = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
-        if !exists {
-            missing_dbnums.push(*dbnum);
+        let mut maintained_since: Option<u32> = None;
+        let mut sampled = 0i64;
+        let mut mismatched = 0i64;
+        let mut probe_error: Option<String> = None;
+
+        match crate::versioned_db::pe_owner_meta::get_maintained_since(*dbnum).await {
+            Ok(value) => maintained_since = value,
+            Err(error) => probe_error = Some(format!("meta query failed: {error:#}")),
         }
-        let modified_unix_ms = metadata
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-        files.push(serde_json::json!({
+        if probe_error.is_none() {
+            // 抽样有子 parent，对比边计数与 children 长度（一次请求两条语句）
+            let sql = format!(
+                "LET $s = (SELECT id, array::len(children ?? []) AS child_cnt, count(<-pe_owner) AS edge_cnt FROM pe WHERE dbnum = {dbnum} AND array::len(children ?? []) > 0 LIMIT {SAMPLE_LIMIT});\n\
+                 RETURN {{ sampled: $s.len(), mismatched: $s.filter(|$r| $r.child_cnt != $r.edge_cnt).len() }};"
+            );
+            match project_primary_db()
+                .query_take::<Option<SampleProbe>>(&sql, 1)
+                .await
+            {
+                Ok(Some(probe)) => {
+                    sampled = probe.sampled;
+                    mismatched = probe.mismatched;
+                }
+                Ok(None) => probe_error = Some("sample probe returned no row".to_string()),
+                Err(error) => probe_error = Some(format!("sample probe failed: {error:#}")),
+            }
+        }
+
+        let dbnum_ready = probe_error.is_none() && maintained_since.is_some() && mismatched == 0;
+        if !dbnum_ready {
+            not_ready_dbnums.push(*dbnum);
+        }
+        per_dbnum.push(serde_json::json!({
             "dbnum": dbnum,
-            "path": tree_file,
-            "exists": exists,
-            "bytes": metadata.as_ref().map(|m| m.len()),
-            "modified_unix_ms": modified_unix_ms,
+            "maintained_since_sesno": maintained_since,
+            "sampled": sampled,
+            "mismatched": mismatched,
+            "ready": dbnum_ready,
+            "error": probe_error,
         }));
     }
 
-    let ready = missing_dbnums.is_empty();
-    let mode = if require_tree_index {
+    let ready = not_ready_dbnums.is_empty();
+    let mode = if require_pe_owner_ready {
         "strict_required"
     } else if ready {
         "ready"
@@ -623,34 +666,28 @@ fn build_tree_index_evidence(
         "degraded_allowed"
     };
     let recommendation = if ready {
-        "Tree index files are present for the incremental generation dbnums.".to_string()
-    } else if require_tree_index {
-        format!(
-            "Build or restore scene_tree files for dbnums {:?} before model generation, or rerun without --require-tree-index only when degraded tree coverage is acceptable.",
-            missing_dbnums
-        )
+        "pe_owner edges are maintained and sample-consistent for the incremental generation dbnums."
+            .to_string()
     } else {
         format!(
-            "Generation may continue in degraded mode, but tree-dependent output is incomplete until scene_tree files are built or restored for dbnums {:?}. Do not auto-run long --gen-indextree work from watcher/default incremental paths.",
-            missing_dbnums
+            "Run `model-version rebuild-pe-owner --dbnum <n>` for dbnums {:?} (full audit: scripts/smoke/pe_owner_children_audit.ps1). Generation may continue in degraded mode only when stale hierarchy output is acceptable.",
+            not_ready_dbnums
         )
     };
 
-    Ok(TreeIndexEvidence {
+    PeOwnerEvidence {
         ready,
-        missing_dbnums: missing_dbnums.clone(),
+        not_ready_dbnums: not_ready_dbnums.clone(),
         summary: serde_json::json!({
-            "manifest_version": "incremental_tree_index_evidence:v1",
+            "manifest_version": "incremental_pe_owner_evidence:v1",
             "ready": ready,
             "mode": mode,
-            "required": require_tree_index,
-            "scene_tree_dir": scene_tree_dir,
-            "db_meta_info_file": db_meta_info_file,
-            "db_meta_info_exists": db_meta_info_exists,
+            "required": require_pe_owner_ready,
+            "sample_limit": SAMPLE_LIMIT,
             "checked_dbnums": checked_dbnums,
-            "missing_dbnums": missing_dbnums,
-            "files": files,
+            "not_ready_dbnums": not_ready_dbnums,
+            "dbnums": per_dbnum,
             "recommendation": recommendation,
         }),
-    })
+    }
 }

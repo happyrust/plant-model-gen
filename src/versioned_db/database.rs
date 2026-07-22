@@ -8,6 +8,8 @@ use log::{debug, error, info, warn};
 #[allow(unused_imports)]
 use aios_core::SUL_MEM_DB;
 
+#[cfg(feature = "generation-read-ducklake")]
+use aios_core::db::DbBasicData;
 #[cfg(feature = "sql")]
 use aios_core::db_pool::get_global_pool;
 use aios_core::get_default_pdms_db_info;
@@ -55,13 +57,20 @@ use crate::consts::*;
 use crate::data_interface::tidb_manager::AiosDBManager;
 // use crate::graph_db::pdms_arango::*;
 use crate::tables::*;
+#[cfg(feature = "generation-read-ducklake")]
+use crate::version_store::replica::{ReplicaDbCatalogEntry, ReplicaElement};
+#[cfg(feature = "generation-read-ducklake")]
+use crate::version_store::{
+    DbCatalogEntry, DuckLakeAuthority, DuckLakeConfig, DuckLakeParseStager, ParseStageVersion,
+    ParsedFactBatch, ReplicaApplyBatch, SealedParseStage, SurrealReplicaStore, VersionStoreElement,
+};
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
-use crate::versioned_db::tree_export::{TreeNodeMeta, export_tree_file};
 use crate::versioned_db::version_commit::{
     VersionCommitCounts, VersionCommitError, VersionCommitRequest, VersionCommitSource,
     commit_version, compute_commit_fingerprint, recover_version_commit,
 };
+use aios_core::tree_query::TreeNodeMeta;
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -73,16 +82,7 @@ pub enum SenderJsonsData {
     // 新增：用于更新dbnum_info_table
     DbnumInfoUpdate(Vec<String>),
     // 新增：用于按db_num分表保存简化的PE数据 (table_name, sql)
-    PartitionedPEJson {
-        table_name: String,
-        sql: String,
-    },
-    // 新增：用于 PE Parquet 导出
-    PeParquetData {
-        project_name: String,
-        dbnum: u32,
-        elements: Vec<aios_core::types::SPdmsElement>,
-    },
+    PartitionedPEJson { table_name: String, sql: String },
     // Kuzu 数据: Vec<(PE, NamedAttrMap)>
 }
 
@@ -181,7 +181,7 @@ fn parse_tree_output_dir(source_project_name: &str) -> PathBuf {
     if let Some(active_project_name) = db_meta_info::get_current_project_name() {
         if active_project_name != source_project_name {
             info!(
-                "[tree_export] 使用当前配置输出命名空间: source_project={}, output_project={}, tree_dir={}",
+                "[db_meta] 使用当前配置输出命名空间: source_project={}, output_project={}, tree_dir={}",
                 source_project_name,
                 active_project_name,
                 active_tree_dir.display()
@@ -302,7 +302,7 @@ fn start_parse_progress_heartbeat(
 
 fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow::Result<()> {
     if artifacts.is_empty() {
-        warn!("[indextree] 本轮解析没有实际处理任何 DB 文件，跳过 scene_tree 产物校验");
+        warn!("[db_meta] 本轮解析没有实际处理任何 DB 文件，跳过 db_meta 产物校验");
         return Ok(());
     }
 
@@ -354,20 +354,9 @@ fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow
 
         if artifact.tree_node_count == 0 {
             warn!(
-                "[indextree] dbnum={} file={} db_type={} 解析得到 0 个 tree node，按约定只告警不失败",
+                "[db_meta] dbnum={} file={} db_type={} 解析得到 0 个 hierarchy node，按约定只告警不失败",
                 artifact.dbnum, artifact.file_name, artifact.db_type
             );
-            continue;
-        }
-
-        let tree_path = tree_dir.join(format!("{}.tree", artifact.dbnum));
-        if !tree_path.exists() {
-            errors.push(format!(
-                "dbnum={} file={} 缺少 tree 文件: {}",
-                artifact.dbnum,
-                artifact.file_name,
-                tree_path.display()
-            ));
         }
     }
 
@@ -904,6 +893,23 @@ where
     if db_option.included_projects.is_empty() {
         return Err(anyhow::anyhow!("没有包含的项目"));
     }
+    #[cfg(feature = "generation-read-ducklake")]
+    {
+        let options = crate::options::get_db_option_ext();
+        if options.parse_storage_backend.uses_ducklake() {
+            options.validate_parse_storage_features()?;
+            let callback = progress_callback
+                .as_mut()
+                .map(|callback| callback as &mut SyncProgressCallback<'_>);
+            return sync_pdms_to_ducklake(
+                db_option,
+                options.parse_storage_config(),
+                options.ducklake_config(),
+                callback,
+            )
+            .await;
+        }
+    }
 
     // 开始同步pdms/E3D项目的数据
     info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
@@ -1078,6 +1084,20 @@ where
 pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
     if db_option.included_projects.is_empty() {
         return Err(anyhow::anyhow!("没有包含的项目"));
+    }
+    #[cfg(feature = "generation-read-ducklake")]
+    {
+        let options = crate::options::get_db_option_ext();
+        if options.parse_storage_backend.uses_ducklake() {
+            options.validate_parse_storage_features()?;
+            return sync_pdms_to_ducklake(
+                db_option,
+                options.parse_storage_config(),
+                options.ducklake_config(),
+                None,
+            )
+            .await;
+        }
     }
     // 开始同步pdms/E3D项目的数据
     info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
@@ -1595,9 +1615,6 @@ where
                                 }
                             }
                         }
-                        SenderJsonsData::PeParquetData { .. } => {
-                            // TODO: 处理相关 Parquet 数据包
-                        }
                     }
                 }
             }
@@ -1610,12 +1627,12 @@ where
     // 与非回调版本保持一致的控制参数
     let db_types_clone = db_types.iter().map(|&x| x.to_string()).collect::<Vec<_>>();
     let is_parse_sys = db_types_clone.contains(&"SYST".to_string());
-    let gen_tree_only = db_option.gen_tree_only;
+    let gen_db_meta_only = db_option.gen_db_meta_only;
     #[cfg(feature = "surreal-save")]
     let is_save_db = db_option.is_save_db()
-        // gen_tree_only 仅用于 total_sync 全量解析时“只生成 tree”的场景；
+        // gen_db_meta_only 仅用于 total_sync 全量解析时“只生成 tree”的场景；
         // 其它情况下（尤其是模型生成）不应影响写库。
-        && !(gen_tree_only && db_option.total_sync);
+        && !(gen_db_meta_only && db_option.total_sync);
     #[cfg(not(feature = "surreal-save"))]
     let is_save_db = false;
     let is_sync_history = db_option.is_sync_history();
@@ -2051,21 +2068,6 @@ where
             ));
         }
 
-        if tree_nodes.is_empty() {
-            warn!(
-                "[tree_export] dbnum={} file={} 解析得到 0 个 tree node，跳过 .tree 导出",
-                dbnum, file_name
-            );
-        }
-        export_tree_file(
-            dbnum,
-            db_basic.as_ref(),
-            &tree_nodes,
-            &db_basic.children_map,
-            &output_dir,
-        )
-        .map_err(|e| anyhow::anyhow!("[tree_export] dbnum={} 导出失败: {}", dbnum, e))?;
-
         parsed_artifacts.push(ParsedDbArtifact {
             project_name: project_name.clone(),
             tree_dir: output_dir.clone(),
@@ -2128,6 +2130,541 @@ fn parse_failed_sql_count() -> usize {
     {
         0
     }
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+type SyncProgressCallback<'a> =
+    dyn FnMut(&str, usize, usize, usize, usize, usize, usize) + Send + 'a;
+
+#[cfg(feature = "generation-read-ducklake")]
+#[derive(Debug, Clone, serde::Serialize)]
+struct DuckLakeParseDbReport {
+    run_id: String,
+    project: String,
+    file_name: String,
+    dbnum: u32,
+    db_type: String,
+    sesno: u32,
+    stage_path: PathBuf,
+    stage_fingerprint: String,
+    authoritative_snapshot_id: u64,
+    manifest_hash: String,
+    replica_version_time: String,
+    counts: crate::version_store::ParseStageCounts,
+    authority_idempotent: bool,
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn ducklake_parse_run_id() -> String {
+    static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    if let Ok(explicit) = std::env::var("AIOS_PARSE_RUN_ID")
+        && !explicit.trim().is_empty()
+    {
+        return explicit;
+    }
+    format!(
+        "parse-{}-{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ"),
+        std::process::id(),
+        RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn build_parsed_fact_batch(
+    batch_id: String,
+    dbnum: u32,
+    project: &str,
+    db_type: &str,
+    db_basic: &DbBasicData,
+    total_attr_map: &DashMap<RefU64, NamedAttrMap>,
+    include_catalog: bool,
+) -> anyhow::Result<ParsedFactBatch> {
+    let mut elements = Vec::with_capacity(total_attr_map.len());
+    let mut hierarchy_rows = Vec::with_capacity(total_attr_map.len());
+    let mut ordered = total_attr_map
+        .iter()
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(refno, _)| refno.0);
+    for (raw_refno, attributes) in ordered {
+        let refno = RefnoEnum::from(raw_refno);
+        anyhow::ensure!(refno.is_valid(), "解析结果包含非法 refno={raw_refno}");
+        let owner = attributes.get_owner();
+        anyhow::ensure!(
+            owner.is_valid() || owner.is_unset(),
+            "解析结果包含非法 owner: refno={refno} owner={owner}"
+        );
+        let name =
+            crate::api::element::cal_default_name(raw_refno, &attributes, &db_basic.children_map);
+        let has_children = db_basic
+            .children_map
+            .get(&raw_refno)
+            .is_some_and(|children| !children.is_empty());
+        elements.push(VersionStoreElement {
+            element: crate::generation_read::ElementSnapshot {
+                refno,
+                dbnum,
+                owner,
+                noun: attributes.get_type_str().to_string(),
+                name,
+                has_children,
+            },
+            attributes: crate::generation_read::AttributeSet::from_named_attr_map(
+                refno,
+                &attributes,
+            ),
+        });
+        if owner.is_valid() {
+            let ordinal = db_basic
+                .children_map
+                .get(&owner.refno())
+                .and_then(|children| children.iter().position(|child| *child == raw_refno))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "children_map 缺少 owner-child 顺序: owner={owner} child={refno}"
+                    )
+                })?;
+            hierarchy_rows.push(crate::generation_read::HierarchyRow {
+                dbnum,
+                parent: owner,
+                child: refno,
+                ordinal: u32::try_from(ordinal)
+                    .map_err(|_| anyhow::anyhow!("hierarchy ordinal 超出 u32: {ordinal}"))?,
+            });
+        }
+    }
+
+    let db_catalog = if include_catalog {
+        let mut ref0 = db_basic.world_refno.get_0();
+        if ref0 == 0 || ref0 == 0x8000_0001 {
+            ref0 = db_basic
+                .refno_table_map
+                .iter()
+                .map(|entry| entry.key().get_0())
+                .find(|value| *value != 0 && *value != 0x8000_0001)
+                .unwrap_or_default();
+        }
+        vec![DbCatalogEntry {
+            dbnum,
+            ref0: (ref0 != 0).then_some(ref0),
+            db_type: db_type.to_string(),
+            project: project.to_string(),
+        }]
+    } else {
+        Vec::new()
+    };
+    let batch = ParsedFactBatch {
+        batch_id,
+        dbnum,
+        elements,
+        hierarchy_rows,
+        pline_facts: Vec::new(),
+        db_catalog,
+    };
+    batch.validate()?;
+    Ok(batch)
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn write_ducklake_parse_artifacts(
+    project: &str,
+    path: &PathBuf,
+    file_name: &str,
+    dbnum: u32,
+    db_type: &str,
+    sesno: u32,
+    sesno_timestamp: Option<i64>,
+    db_basic: &DbBasicData,
+    tree_nodes: &HashMap<RefU64, TreeNodeMeta>,
+) -> anyhow::Result<ParsedDbArtifact> {
+    let output_dir = parse_tree_output_dir(project);
+    let ref0s = db_basic
+        .refno_table_map
+        .iter()
+        .map(|entry| entry.key().get_0())
+        .filter(|ref0| *ref0 != 0 && *ref0 != 0x8000_0001)
+        .collect();
+    let header_hex_60 = (|| -> Option<String> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut buffer = [0u8; 60];
+        file.read_exact(&mut buffer).ok()?;
+        Some(hex::encode(buffer))
+    })();
+    db_meta_info::update_db_meta_info_json(
+        &output_dir,
+        db_meta_info::DbFileMetaUpdate {
+            dbnum,
+            db_type,
+            file_name,
+            file_path: path,
+            header_hex_60,
+            header_debug: None,
+            latest_sesno: Some(sesno),
+            sesno_timestamp,
+            ref0s,
+        },
+    )?;
+    Ok(ParsedDbArtifact {
+        project_name: project.to_string(),
+        tree_dir: output_dir,
+        dbnum,
+        db_type: db_type.to_string(),
+        file_name: file_name.to_string(),
+        tree_node_count: tree_nodes.len(),
+    })
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+async fn publish_ducklake_stage(
+    stager: DuckLakeParseStager,
+    version: ParseStageVersion,
+    authority: DuckLakeAuthority,
+    project: String,
+    file_name: String,
+    db_type: String,
+) -> anyhow::Result<DuckLakeParseDbReport> {
+    let counts = stager.finalize_transforms().await?;
+    let sealed = stager.seal(version)?;
+    drop(stager);
+
+    let authority_for_commit = authority.clone();
+    let stage_for_commit = sealed.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        authority_for_commit.commit_staged_db(&stage_for_commit)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("DuckLake staged commit task join failed: {error}"))??;
+
+    let marker = DuckLakeParseStager::open_path(&sealed.path)?;
+    let committed = marker.mark_authority_committed(outcome.snapshot_id)?;
+    drop(marker);
+    let payload = committed.load_payload()?;
+    let previous_snapshot_id = {
+        let authority = authority.clone();
+        tokio::task::spawn_blocking(move || {
+            authority.previous_data_snapshot_id(outcome.snapshot_id)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("读取 DuckLake 前序 snapshot 失败: {error}"))??
+    };
+    let replica = SurrealReplicaStore;
+    let binding = if let Some(binding) = replica.binding(outcome.snapshot_id).await? {
+        anyhow::ensure!(
+            binding.manifest_hash == outcome.manifest.manifest_hash,
+            "已有 replica binding 与 authority manifest 不一致"
+        );
+        binding
+    } else {
+        let batch = ReplicaApplyBatch {
+            authoritative_snapshot_id: outcome.snapshot_id,
+            previous_snapshot_id,
+            manifest: outcome.manifest.clone(),
+            replace_dbnums: BTreeSet::from([committed.dbnum]),
+            upsert_elements: payload
+                .elements
+                .into_iter()
+                .map(|item| ReplicaElement {
+                    element: item.element,
+                    attributes: item.attributes,
+                })
+                .collect(),
+            delete_refnos: BTreeMap::new(),
+            hierarchy_rows: payload.hierarchy_rows,
+            transforms: payload.transforms,
+            db_catalog: payload
+                .db_catalog
+                .into_iter()
+                .map(|entry| ReplicaDbCatalogEntry {
+                    dbnum: entry.dbnum,
+                    db_type: entry.db_type,
+                    project: entry.project,
+                })
+                .collect(),
+            payload_hash: String::new(),
+        }
+        .seal()?;
+        replica.apply(&batch).await?
+    };
+    let replica_manifest = replica.manifest_at(&binding).await?;
+    anyhow::ensure!(
+        replica_manifest.manifest_hash == outcome.manifest.manifest_hash,
+        "replica/authority manifest 双向校验失败: replica={} authority={}",
+        replica_manifest.manifest_hash,
+        outcome.manifest.manifest_hash
+    );
+    let marker = DuckLakeParseStager::open_path(&committed.path)?;
+    let applied = marker.mark_replica_applied(&binding.replica_version_time)?;
+    drop(marker);
+    Ok(DuckLakeParseDbReport {
+        run_id: applied.run_id,
+        project,
+        file_name,
+        dbnum: applied.dbnum,
+        db_type,
+        sesno: applied.version.to_sesno,
+        stage_path: applied.path,
+        stage_fingerprint: applied.fingerprint,
+        authoritative_snapshot_id: outcome.snapshot_id,
+        manifest_hash: outcome.manifest.manifest_hash,
+        replica_version_time: binding.replica_version_time,
+        counts,
+        authority_idempotent: outcome.idempotent,
+    })
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+async fn sync_pdms_to_ducklake(
+    db_option: &DbOption,
+    parse_config: crate::options::ParseStorageConfig,
+    authority_config: DuckLakeConfig,
+    mut progress_callback: Option<&mut SyncProgressCallback<'_>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        parse_config.backend.uses_ducklake(),
+        "sync_pdms_to_ducklake 仅接受 ducklake backend"
+    );
+    anyhow::ensure!(!db_option.included_projects.is_empty(), "没有包含的项目");
+    let save_db = db_option.is_save_db() && !(db_option.gen_db_meta_only && db_option.total_sync);
+    let run_id = ducklake_parse_run_id();
+    let authority = if save_db {
+        Some(
+            tokio::task::spawn_blocking(move || DuckLakeAuthority::open(authority_config))
+                .await
+                .map_err(|error| anyhow::anyhow!("打开 DuckLake authority 失败: {error}"))??,
+        )
+    } else {
+        None
+    };
+    let selected_file_names = selected_db_file_names(db_option);
+    let selected_dbnums = selected_dbnums(db_option);
+    let mut reports = Vec::new();
+    let mut artifacts = Vec::new();
+
+    for (project_index, project) in db_option.included_projects.iter().enumerate() {
+        let project_dir = db_option
+            .get_project_path(project)
+            .ok_or_else(|| anyhow::anyhow!("项目路径不存在: {project}"))?;
+        let files = collect_project_db_files(&project_dir)?;
+        let mut allowed_types = resolve_data_sync_db_types(db_option, project)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if db_option.total_sync || db_option.only_sync_sys {
+            allowed_types.extend(SYSTEM_SYNC_DB_TYPES.iter().map(|value| value.to_string()));
+        }
+        if db_option.only_sync_sys {
+            allowed_types.retain(|value| SYSTEM_SYNC_DB_TYPES.contains(&value.as_str()));
+        }
+        let total_files = files.len();
+        if let Some(callback) = progress_callback.as_deref_mut() {
+            callback(
+                project,
+                project_index + 1,
+                db_option.included_projects.len(),
+                0,
+                total_files,
+                0,
+                0,
+            );
+        }
+
+        for (file_index, path) in files.into_iter().enumerate() {
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow::anyhow!("PDMS 文件名不是 UTF-8: {}", path.display()))?
+                .to_string();
+            if file_name.contains('.') {
+                continue;
+            }
+            let mut header = [0_u8; 60];
+            std::fs::File::open(&path)?.read_exact(&mut header)?;
+            let basic_info = parse_file_basic_info(&header);
+            let dbnum = basic_info.dbnum;
+            let db_type = basic_info.db_type;
+            if !allowed_types.contains(&db_type)
+                || !should_process_sync_file(
+                    &file_name,
+                    dbnum,
+                    &selected_file_names,
+                    &selected_dbnums,
+                    false,
+                )
+            {
+                continue;
+            }
+
+            let (sesno, sesno_timestamp) = {
+                let mut io = PdmsIO::new(project, path.clone(), true);
+                io.open()
+                    .with_context(|| format!("打开 PDMS 文件失败: {}", path.display()))?;
+                let sesno = io
+                    .get_latest_sesno()
+                    .with_context(|| format!("读取 latest sesno 失败: {file_name}"))?;
+                anyhow::ensure!(
+                    !save_db || sesno > 0,
+                    "DuckLake 发布要求有效 sesno: file={file_name}"
+                );
+                (
+                    sesno,
+                    (sesno > 0)
+                        .then(|| io.get_sesno_timestamp(sesno).ok())
+                        .flatten(),
+                )
+            };
+            let db_basic = Arc::new(
+                parse_file_db_basic_data(&path, &file_name, project)
+                    .with_context(|| format!("解析 DB basic data 失败: {file_name}"))?,
+            );
+            let all_refnos = db_basic
+                .refno_table_map
+                .iter()
+                .map(|entry| *entry.key())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(!all_refnos.is_empty(), "DB 文件没有 refno: {file_name}");
+            let cata_filter = crate::data_interface::cata_closure::load_sync_filter(
+                project,
+                std::slice::from_ref(&db_type),
+            );
+            let all_refnos = crate::data_interface::cata_closure::apply_sync_filter(
+                cata_filter.as_ref(),
+                &db_type,
+                dbnum,
+                all_refnos,
+            );
+            let chunk_size = resolve_sync_chunk_size(db_option.sync_chunk_size, 10_000);
+            let chunk_jobs = all_refnos
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(index, chunk)| (index, chunk.to_vec()))
+                .collect::<Vec<_>>();
+            let total_chunks = chunk_jobs.len();
+            let mut stager = if save_db {
+                Some(DuckLakeParseStager::open(
+                    &parse_config.staging_directory,
+                    &run_id,
+                    dbnum,
+                )?)
+            } else {
+                None
+            };
+            let ses_range_map = BTreeMap::new();
+            let concurrency = resolve_indextree_chunk_concurrency(save_db);
+            let mut stream =
+                futures::stream::iter(chunk_jobs.into_iter().map(|(chunk_index, chunk_refnos)| {
+                    let db_basic = db_basic.clone();
+                    let file_name = file_name.clone();
+                    let ses_range_map = ses_range_map.clone();
+                    async move {
+                        (
+                            chunk_index,
+                            parse_file_with_chunk(
+                                db_basic,
+                                &file_name,
+                                project,
+                                &chunk_refnos,
+                                &ses_range_map,
+                                true,
+                            )
+                            .await,
+                        )
+                    }
+                }))
+                .buffered(concurrency);
+            let mut tree_nodes = HashMap::new();
+            let mut parsed_count = 0_usize;
+            while let Some((chunk_index, parsed)) = stream.next().await {
+                let parsed = parsed.with_context(|| {
+                    format!("parse_file_with_chunk 失败: file={file_name} chunk={chunk_index}")
+                })?;
+                let total_attr_map = parsed.total_attr_map;
+                parsed_count += total_attr_map.len();
+                for entry in total_attr_map.iter() {
+                    let refno = *entry.key();
+                    let attributes = entry.value();
+                    tree_nodes.entry(refno).or_insert(TreeNodeMeta {
+                        refno,
+                        owner: attributes.get_owner().refno(),
+                        noun: attributes.get_type_hash(),
+                        cata_hash: attributes.cal_cata_hash(),
+                    });
+                }
+                if let Some(stager) = stager.as_ref() {
+                    let batch = build_parsed_fact_batch(
+                        format!("{file_name}:{chunk_index:08}"),
+                        dbnum,
+                        project,
+                        &db_type,
+                        &db_basic,
+                        &total_attr_map,
+                        chunk_index == 0,
+                    )?;
+                    stager.write_batch(&batch)?;
+                }
+                if let Some(callback) = progress_callback.as_deref_mut() {
+                    callback(
+                        project,
+                        project_index + 1,
+                        db_option.included_projects.len(),
+                        file_index + 1,
+                        total_files,
+                        chunk_index + 1,
+                        total_chunks,
+                    );
+                }
+            }
+            anyhow::ensure!(
+                parsed_count == all_refnos.len(),
+                "解析覆盖不完整: file={file_name} parsed={parsed_count} expected={}",
+                all_refnos.len()
+            );
+            artifacts.push(write_ducklake_parse_artifacts(
+                project,
+                &path,
+                &file_name,
+                dbnum,
+                &db_type,
+                sesno,
+                sesno_timestamp,
+                &db_basic,
+                &tree_nodes,
+            )?);
+            if let (Some(stager), Some(authority)) = (stager.take(), authority.as_ref()) {
+                reports.push(
+                    publish_ducklake_stage(
+                        stager,
+                        ParseStageVersion {
+                            from_sesno: 1,
+                            to_sesno: sesno,
+                            source: "total".to_string(),
+                            source_hash: Some(full_sync_source_evidence(&path)),
+                        },
+                        authority.clone(),
+                        project.clone(),
+                        file_name.clone(),
+                        db_type.clone(),
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
+    anyhow::ensure!(
+        selected_dbnums.is_empty()
+            || selected_dbnums
+                .iter()
+                .all(|dbnum| artifacts.iter().any(|artifact| artifact.dbnum == *dbnum)),
+        "未找到全部 manual_db_nums 对应的 PDMS 文件"
+    );
+    validate_parse_scene_tree_artifacts(&artifacts)?;
+    if save_db {
+        let report_path = parse_config
+            .staging_directory
+            .join(&run_id)
+            .join("parse-report.json");
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&reports)?)?;
+    }
+    Ok(())
 }
 
 //分成两部分，一部分先保存UDA 和 SYS 这些数据
@@ -2398,11 +2935,11 @@ pub async fn sync_total_async_threaded(
         .map(|&x| x.to_string())
         .collect::<Vec<_>>();
     let is_parse_sys = db_types_clone.contains(&"SYST".to_string());
-    let gen_tree_only = db_option.gen_tree_only;
+    let gen_db_meta_only = db_option.gen_db_meta_only;
     #[cfg(feature = "surreal-save")]
     let is_save_db = db_option.is_save_db()
-        // 同上：只在 total_sync 场景下让 gen_tree_only 生效。
-        && !(gen_tree_only && db_option.total_sync);
+        // 同上：只在 total_sync 场景下让 gen_db_meta_only 生效。
+        && !(gen_db_meta_only && db_option.total_sync);
     #[cfg(not(feature = "surreal-save"))]
     let is_save_db = false;
     let is_sync_history = db_option.is_sync_history();
@@ -2761,7 +3298,7 @@ pub async fn sync_total_async_threaded(
                                 .expect("save pes failed");
                                 save_pes_ms = save_t0.elapsed().as_millis() as u64;
                             }
-                            if b_save_mysql && !gen_tree_only {
+                            if b_save_mysql && !gen_db_meta_only {
                                 #[cfg(feature = "sql")]
                                 save_pes_mysql(
                                     &db_basic,
@@ -2894,7 +3431,7 @@ pub async fn sync_total_async_threaded(
 
 
 
-                // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_tree_only=true 也要生成）。
+                // 解析期：每处理完一个 db 文件就更新 db_meta_info.json（即使 save_db=false 且 gen_db_meta_only=true 也要生成）。
                 //
                 // 该文件用于：refno(ref_0) -> dbnum 的快速映射，以及记录 db 文件头的关键信息以便排查。
                 let output_dir = parse_tree_output_dir(&project_name);
@@ -2956,23 +3493,6 @@ pub async fn sync_total_async_threaded(
                 }
                 let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
-                let tree_export_stage_start = Instant::now();
-                if tree_nodes.is_empty() {
-                    warn!(
-                        "[tree_export] dbnum={} file={} 解析得到 0 个 tree node，跳过 .tree 导出",
-                        dbnum, file_name
-                    );
-                }
-                export_tree_file(
-                    dbnum,
-                    db_basic.as_ref(),
-                    &tree_nodes,
-                    &db_basic.children_map,
-                    &output_dir,
-                )
-                .map_err(|e| anyhow::anyhow!("[tree_export] dbnum={} 导出失败: {}", dbnum, e))?;
-                let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
-
                 parsed_artifacts.push(ParsedDbArtifact {
                     project_name: project_name.clone(),
                     tree_dir: output_dir,
@@ -2991,7 +3511,7 @@ pub async fn sync_total_async_threaded(
                 );
 
             info!(
-                "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
+                "解析任务完成 file={} dbnum={} 总耗时={:.3}s 总数量={} [scan={}ms, db_basic={}ms, chunk={}ms, db_meta={}ms]",
                 file_name,
                 dbnum,
                 time.elapsed().as_secs_f32(),
@@ -2999,7 +3519,6 @@ pub async fn sync_total_async_threaded(
                 file_scan_ms,
                 db_basic_parse_ms,
                 chunk_parse_ms,
-                tree_export_ms,
                 db_meta_update_ms
             );
             //单个文件多线程
@@ -3191,28 +3710,7 @@ mod scene_tree_artifact_tests {
     }
 
     #[test]
-    fn validate_parse_scene_tree_artifacts_requires_tree_for_non_empty_db() {
-        with_output_root("missing-tree", |_| {
-            let tree_dir = crate::versioned_db::db_meta_info::get_project_tree_dir("demo");
-            fs::create_dir_all(&tree_dir).unwrap();
-            fs::write(
-                tree_dir.join("db_meta_info.json"),
-                serde_json::to_string(&json!({
-                    "version": 1,
-                    "ref0_to_dbnum": {},
-                    "db_files": { "42": { "dbnum": 42, "db_type": "DESI", "file_name": "DESI0001", "ref0s": [] } }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-
-            let err = validate_parse_scene_tree_artifacts(&[artifact(1)]).unwrap_err();
-            assert!(err.to_string().contains("缺少 tree 文件"));
-        });
-    }
-
-    #[test]
-    fn validate_parse_scene_tree_artifacts_allows_empty_tree_nodes_with_meta() {
+    fn validate_parse_scene_tree_artifacts_allows_empty_hierarchy_nodes_with_meta() {
         with_output_root("empty-tree", |_| {
             let tree_dir = crate::versioned_db::db_meta_info::get_project_tree_dir("demo");
             fs::create_dir_all(&tree_dir).unwrap();
@@ -3362,19 +3860,7 @@ pub async fn parse_single_db_file(
     }
     let chunk_parse_ms = chunk_stage_start.elapsed().as_millis();
 
-    // 导出 tree 文件
-    let tree_export_stage_start = Instant::now();
     let output_dir = parse_tree_output_dir(project_name);
-    if let Err(e) = export_tree_file(
-        target_dbnum,
-        db_basic.as_ref(),
-        &tree_nodes,
-        &db_basic.children_map,
-        &output_dir,
-    ) {
-        anyhow::bail!("export_tree_file 失败: {}", e);
-    }
-    let tree_export_ms = tree_export_stage_start.elapsed().as_millis();
 
     // 收集 ref0s 并更新 db_meta_info.json
     // ref0s 必须基于整库 refno 全集（refno_table_map）收集，而非 tree_nodes：
@@ -3447,12 +3933,11 @@ pub async fn parse_single_db_file(
     }])?;
 
     println!(
-        "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点 [db_basic={}ms, chunk={}ms, tree_export={}ms, db_meta={}ms]",
+        "✅ 解析完成，耗时: {:.2}s，生成 {} 个节点 [db_basic={}ms, chunk={}ms, db_meta={}ms]",
         time.elapsed().as_secs_f32(),
         tree_nodes.len(),
         db_basic_parse_ms,
         chunk_parse_ms,
-        tree_export_ms,
         db_meta_update_ms
     );
 
@@ -3468,7 +3953,7 @@ pub async fn parse_single_db_file(
         time.elapsed().as_millis() as u64,
     );
 
-    // specs/022 R1：本路径只导出 tree / 更新 db_meta，不向 Surreal 写入 PE/ATT，
+    // specs/022 R1：本路径只更新 db_meta，不向 Surreal 写入 PE/ATT，
     // 因此不写 sesno_version_anchor。full 锚点由 sync_pdms* 在写库 join 完成后固化。
     Ok(())
 }

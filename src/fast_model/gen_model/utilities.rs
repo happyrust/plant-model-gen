@@ -2,11 +2,10 @@
 //
 // 从旧 gen_model.rs 迁移的辅助函数
 
-use super::tree_index_manager::TreeIndexManager;
+use super::{GenerationReadContext, session_query};
 use crate::fast_model::resolve_desi_comp;
 // specs/023 M2：cata_hash 分组主路径切 pe_owner 快照（pe.cata_hash 字段）；tree 回退
 use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
-use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
 use aios_core::parsed_data::geo_params_data::CateGeoParam::{BoxImplied, TubeImplied};
 use aios_core::pdms_types::{BRAN_COMPONENT_NOUN_NAMES, CataHashRefnoKV, USE_CATE_NOUN_NAMES};
 use aios_core::prim_geo::tubing::TubiSize;
@@ -88,6 +87,25 @@ pub async fn query_tubi_size(
         }
     }
 
+    Ok(TubiSize::None)
+}
+
+pub async fn query_tubi_size_from_session(
+    read: &GenerationReadContext,
+    tubi_cat_ref: RefnoEnum,
+    is_hang: bool,
+) -> Result<TubiSize> {
+    if !tubi_cat_ref.is_valid() {
+        return Ok(TubiSize::None);
+    }
+    let cat_att = session_query::get_named_attmap(read, tubi_cat_ref).await?;
+    let params = cat_att.get_f32_vec("PARA").unwrap_or_default();
+    if params.len() >= 2 {
+        let tubi_bore = params[if is_hang { 0 } else { 1 }];
+        if tubi_bore > 0.0 {
+            return Ok(TubiSize::BoreSize(tubi_bore));
+        }
+    }
     Ok(TubiSize::None)
 }
 
@@ -277,13 +295,7 @@ pub async fn build_cata_hash_map_from_tree_by_dbnum(
     if refnos.is_empty() {
         return Ok(DashMap::new());
     }
-    // specs/023 M2 双源：pe_owner（默认）→ pe 快照；AIOS_TREE_QUERY_SOURCE=tree → .tree
-    if latest_tree_source_is_pe_owner() {
-        return build_cata_hash_map_from_snapshot_by_dbnum(dbnum, refnos).await;
-    }
-    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let index = manager.load_index(dbnum)?;
-    build_cata_hash_map_from_tree_index(&index, refnos).await
+    build_cata_hash_map_from_snapshot_by_dbnum(dbnum, refnos).await
 }
 
 async fn build_cata_hash_map_from_db(
@@ -369,6 +381,40 @@ pub async fn build_cata_hash_map_from_tree(
     }
 
     Ok(merged_map)
+}
+
+/// 基于固定版本会话构建 cata_hash 分组：roots 自身 + 直接 children。
+pub async fn build_cata_hash_map_from_session(
+    read: &GenerationReadContext,
+    refnos: &[RefnoEnum],
+) -> Result<DashMap<String, CataHashRefnoKV>> {
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    for refno in refnos {
+        if visited.insert(*refno) {
+            ordered.push(*refno);
+        }
+        for child in session_query::get_children(read, *refno) {
+            if visited.insert(child) {
+                ordered.push(child);
+            }
+        }
+    }
+
+    let mut attributes = session_query::get_named_attmaps(read, &ordered).await?;
+    let result = DashMap::new();
+    for refno in ordered {
+        let att = attributes
+            .remove(&refno)
+            .ok_or_else(|| anyhow::anyhow!("cata hash attributes missing refno={refno}"))?;
+        insert_cata_hash_refno_by_values(
+            &result,
+            refno,
+            db1_hash(att.get_type_str()),
+            att.cal_cata_hash(),
+        );
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

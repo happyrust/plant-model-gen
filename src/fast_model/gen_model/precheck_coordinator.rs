@@ -2,22 +2,35 @@
 //!
 //! 在模型生成开始前，统一检查并生成必要的预处理数据：
 //! - Tree 索引文件（{dbnum}.tree）
-//! - model_cache transform_cache（世界坐标变换本地缓存，仅做存在性检查）
+//! - pe_transform（按需：跳过 / 子树 / 整库）
 //! - db_meta_info.json（数据库元信息）
 //!
-//! # 设计原则
+//! # pe_transform 策略（按需）
 //!
-//! - **最小侵入**：在现有流程前插入预检查，不改变核心生成逻辑
-//! - **智能判断**：根据配置自动提取需要检查的 dbnum 列表
-//! - **容错处理**：预检查失败时给出明确的警告信息，不阻断流程
-//! - **性能优先**：使用并行处理提升大规模数据的处理速度
+//! - **Skip (L0)**：GenPipeline 已从 VersionedReadSession 加载 transforms，不刷 pe_transform
+//! - **ScopeRoots (L1)**：仅刷新给定 roots 子树（`refresh_pe_transform_for_root_refnos`）
+//! - **FullDbnum (L2)**：整库覆盖探测 + 全量刷新（显式运维/全量 regen，可能极慢）
+//!
+//! 增量路径另见 `invalidate_pe_transform_for_root_refnos`：owner/POS 变更后只清受影响子树，
+//! 再靠 L0 session 或 lazy miss 回写，禁止「任一缺口 → 整库」。
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use crate::options::DbOptionExt;
+use aios_core::RefnoEnum;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::Path;
+
+/// pe_transform 预检查模式（按需生成）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeTransformPrecheckMode {
+    /// L0：不检查、不刷新（session 已提供 transforms）
+    #[default]
+    Skip,
+    /// L1：只刷新 `pe_transform_roots` 子树
+    ScopeRoots,
+    /// L2：按 dbnum 全库覆盖探测并刷新
+    FullDbnum,
+}
 
 /// 预检查配置
 #[derive(Debug, Clone)]
@@ -26,8 +39,10 @@ pub struct PrecheckConfig {
     pub enabled: bool,
     /// 是否检查 Tree 文件
     pub check_tree: bool,
-    /// 是否检查 transform_cache（model cache）
-    pub check_pe_transform: bool,
+    /// pe_transform 策略
+    pub pe_transform_mode: PeTransformPrecheckMode,
+    /// L1：子树刷新 roots（ScopeRoots 时生效）
+    pub pe_transform_roots: Vec<RefnoEnum>,
     /// 是否检查 db_meta_info
     pub check_db_meta: bool,
     /// Tree 文件输出目录
@@ -39,7 +54,8 @@ impl Default for PrecheckConfig {
         Self {
             enabled: true,
             check_tree: true,
-            check_pe_transform: true,
+            pe_transform_mode: PeTransformPrecheckMode::Skip,
+            pe_transform_roots: Vec::new(),
             check_db_meta: true,
             tree_output_dir: "output/scene_tree".to_string(),
         }
@@ -55,10 +71,12 @@ pub struct PrecheckStats {
     pub tree_generated: usize,
     /// 生成失败的 Tree 文件数量
     pub tree_failed: usize,
-    /// 检查的 transform_cache 数量（沿用字段名以保持兼容）
+    /// pe_transform 探测/刷新涉及的范围计数（dbnum 或 roots）
     pub pe_transform_checked: usize,
-    /// 刷新的 pe_transform 数量（新逻辑不再在 precheck 阶段全量刷新，通常为 0）
+    /// 刷新写入的 pe_transform 节点数
     pub pe_transform_refreshed: usize,
+    /// pe_transform 实际采用的模式
+    pub pe_transform_mode: Option<PeTransformPrecheckMode>,
     /// db_meta_info 是否加载成功
     pub db_meta_loaded: bool,
 }
@@ -128,6 +146,21 @@ fn check_db_meta_info(stats: &mut PrecheckStats) -> Result<()> {
     }
 }
 
+fn pe_transform_status_label(stats: &PrecheckStats) -> &'static str {
+    match stats.pe_transform_mode {
+        Some(PeTransformPrecheckMode::Skip) => "⏭ 跳过(L0 session)",
+        Some(PeTransformPrecheckMode::ScopeRoots) if stats.pe_transform_refreshed > 0 => {
+            "✅ 子树(L1)"
+        }
+        Some(PeTransformPrecheckMode::ScopeRoots) => "⏭ 子树空 roots(L1)",
+        Some(PeTransformPrecheckMode::FullDbnum) if stats.pe_transform_refreshed > 0 => {
+            "✅ 整库(L2)"
+        }
+        Some(PeTransformPrecheckMode::FullDbnum) => "✅ 整库已覆盖(L2)",
+        None => "—",
+    }
+}
+
 /// 输出预检查统计摘要
 fn print_precheck_summary(stats: &PrecheckStats) {
     println!();
@@ -140,14 +173,10 @@ fn print_precheck_summary(stats: &PrecheckStats) {
     if stats.tree_failed > 0 {
         println!("║    - 失败: {} 个 ❌", stats.tree_failed);
     }
-    println!(
-        "║  pe_transform: {}",
-        if stats.pe_transform_refreshed > 0 {
-            "✅"
-        } else {
-            "⚠️"
-        }
-    );
+    println!("║  pe_transform: {}", pe_transform_status_label(stats));
+    if stats.pe_transform_refreshed > 0 {
+        println!("║    - 刷新节点: {}", stats.pe_transform_refreshed);
+    }
     println!(
         "║  db_meta_info: {}",
         if stats.db_meta_loaded {
@@ -160,74 +189,74 @@ fn print_precheck_summary(stats: &PrecheckStats) {
     println!();
 }
 
-/// 检查并生成缺失的 Tree 文件（并行版本）
-///
-/// 使用 tokio::spawn 并行生成多个 Tree 文件，提升性能
+/// 层级数据来自 pe 快照（SurrealDB），不依赖 .tree 文件。
 async fn check_tree_files(
     dbnums: &[u32],
-    output_dir: &str,
+    _output_dir: &str,
     stats: &mut PrecheckStats,
 ) -> Result<()> {
-    // specs/023 M2：pe_owner 主路径不依赖 .tree 文件——层级数据来自 pe 快照（SurrealDB）。
-    // 仅在 AIOS_TREE_QUERY_SOURCE=tree 回退时保留 .tree 存在性检查。
-    if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
-        println!("[precheck] 🌲 层级数据源=pe_owner（快照），跳过 .tree 文件检查");
-        stats.tree_checked = dbnums.len();
-        stats.tree_generated = 0;
-        stats.tree_failed = 0;
-        return Ok(());
-    }
-
-    println!("[precheck] 🌲 检查 Tree 索引文件...");
-
-    let tree_dir = Path::new(output_dir);
-    let manager = TreeIndexManager::new(tree_dir, dbnums.to_vec());
-
-    let missing = manager.get_missing_tree_files();
+    println!("[precheck] 🌲 层级数据源=pe_owner（快照），跳过 .tree 文件检查");
     stats.tree_checked = dbnums.len();
-
-    if missing.is_empty() {
-        println!("[precheck] ✅ 所有 Tree 文件已存在（{} 个）", dbnums.len());
-        return Ok(());
-    }
-
-    println!("[precheck] ⚠️  发现 {} 个缺失的 Tree 文件", missing.len());
-    println!("[precheck] 缺失的数据库: {:?}", missing);
-    println!("[precheck] 🔄 开始并行生成缺失的 Tree 文件...");
-
-    println!(
-        "[precheck] 💡 推荐先冷启动：aios-database -c <配置无扩展名> init-project --dbnums <...>"
-    );
-    println!("[precheck]    （顺序：scene_tree → db_meta → pe_transform）；或全量解析：--parse-db");
-
     stats.tree_generated = 0;
-    stats.tree_failed = missing.len();
-
+    stats.tree_failed = 0;
     Ok(())
 }
 
-/// 检查 transform_cache 与 SurrealDB pe_transform 表覆盖。
-///
-/// spec 006 T303：precheck 真实探测 pe_transform 对目标 dbnum 的覆盖，
-/// 未覆盖则在生成前同步刷新——否则生成期 transform rkyv 构建失败，
-/// 全程回退 DB 逐条查询（基线 CATE 阶段 get_world_transform=14s + 错误刷屏）。
-async fn check_pe_transform(
+/// L1：按 roots 子树刷新 pe_transform（不探测整库覆盖）。
+async fn refresh_pe_transform_scoped(
+    db_option: &DbOptionExt,
+    roots: &[RefnoEnum],
+    stats: &mut PrecheckStats,
+) -> Result<()> {
+    crate::fast_model::transform_cache::init_global_transform_cache();
+    stats.pe_transform_mode = Some(PeTransformPrecheckMode::ScopeRoots);
+    stats.pe_transform_checked = roots.len();
+
+    if roots.is_empty() {
+        println!("[precheck] ⏭ pe_transform L1：roots 为空，跳过刷新");
+        return Ok(());
+    }
+
+    println!(
+        "[precheck] 🔄 pe_transform L1：按 {} 个 roots 刷新子树...",
+        roots.len()
+    );
+    let refreshed =
+        crate::pe_transform_refresh::refresh_pe_transform_for_root_refnos(roots, db_option)
+            .await
+            .with_context(|| {
+                format!(
+                    "precheck L1 刷新 pe_transform 失败: roots_len={}",
+                    roots.len()
+                )
+            })?;
+    stats.pe_transform_refreshed = refreshed;
+    println!(
+        "[precheck] ✅ pe_transform L1 完成: {} 个节点（roots={}）",
+        refreshed,
+        roots.len()
+    );
+    Ok(())
+}
+
+/// L2：整库覆盖探测；未覆盖则全量刷新（可能极慢，仅显式启用）。
+async fn refresh_pe_transform_full_dbnums(
     db_option: &DbOptionExt,
     dbnums: &[u32],
     stats: &mut PrecheckStats,
 ) -> Result<()> {
-    println!("[precheck] 🔄 检查 transform_cache 与 pe_transform 覆盖...");
+    println!("[precheck] 🔄 pe_transform L2：整库覆盖检查 dbnums={dbnums:?}...");
+    println!("[precheck] ⚠️  L2 可能对大库耗时极长；scoped/session 生成应使用 L0/L1");
 
     if dbnums.is_empty() {
         println!("[precheck] ⚠️  没有需要检查的数据库");
         return Ok(());
     }
 
+    crate::fast_model::transform_cache::init_global_transform_cache();
+    stats.pe_transform_mode = Some(PeTransformPrecheckMode::FullDbnum);
     stats.pe_transform_checked = dbnums.len();
     stats.pe_transform_refreshed = 0;
-
-    // transform_cache 已改为纯内存，无需磁盘目录
-    crate::fast_model::transform_cache::init_global_transform_cache();
 
     let mut uncovered: Vec<u32> = Vec::new();
     for &dbnum in dbnums {
@@ -245,23 +274,48 @@ async fn check_pe_transform(
 
     if uncovered.is_empty() {
         println!(
-            "[precheck] ✅ pe_transform 覆盖完好（{} 个 dbnum），transform_cache 已初始化",
+            "[precheck] ✅ pe_transform L2 覆盖完好（{} 个 dbnum），transform_cache 已初始化",
             dbnums.len()
         );
         return Ok(());
     }
 
     println!(
-        "[precheck] 🔄 pe_transform 未覆盖 dbnums={:?}，生成前刷新...",
+        "[precheck] 🔄 pe_transform L2 未覆盖 dbnums={:?}，开始整库刷新...",
         uncovered
     );
     let refreshed =
         crate::pe_transform_refresh::refresh_pe_transform_for_dbnums(&uncovered, db_option)
             .await
-            .with_context(|| format!("precheck 刷新 pe_transform 失败: dbnums={uncovered:?}"))?;
+            .with_context(|| format!("precheck L2 刷新 pe_transform 失败: dbnums={uncovered:?}"))?;
     stats.pe_transform_refreshed = refreshed;
-    println!("[precheck] ✅ pe_transform 刷新完成: {} 个节点", refreshed);
+    println!("[precheck] ✅ pe_transform L2 完成: {} 个节点", refreshed);
     Ok(())
+}
+
+async fn check_pe_transform(
+    db_option: &DbOptionExt,
+    dbnums: &[u32],
+    config: &PrecheckConfig,
+    stats: &mut PrecheckStats,
+) -> Result<()> {
+    match config.pe_transform_mode {
+        PeTransformPrecheckMode::Skip => {
+            crate::fast_model::transform_cache::init_global_transform_cache();
+            stats.pe_transform_mode = Some(PeTransformPrecheckMode::Skip);
+            stats.pe_transform_checked = 0;
+            println!(
+                "[precheck] ⏭ pe_transform L0：跳过（VersionedReadSession / generation_read 已提供 transforms）"
+            );
+            Ok(())
+        }
+        PeTransformPrecheckMode::ScopeRoots => {
+            refresh_pe_transform_scoped(db_option, &config.pe_transform_roots, stats).await
+        }
+        PeTransformPrecheckMode::FullDbnum => {
+            refresh_pe_transform_full_dbnums(db_option, dbnums, stats).await
+        }
+    }
 }
 
 /// 执行模型生成前的预检查
@@ -296,12 +350,12 @@ pub async fn run_precheck(
 
     if dbnums.is_empty() {
         println!("[precheck] ⚠️  未找到需要检查的数据库编号");
-        return Ok(stats);
+        // 仍允许 L0/L1（不依赖 dbnums）
+    } else {
+        println!("[precheck] 📋 检查范围: {} 个数据库", dbnums.len());
+        println!("[precheck] 数据库编号: {:?}", dbnums);
+        println!();
     }
-
-    println!("[precheck] 📋 检查范围: {} 个数据库", dbnums.len());
-    println!("[precheck] 数据库编号: {:?}", dbnums);
-    println!();
 
     // 2. 检查 db_meta_info.json
     if config.check_db_meta {
@@ -313,10 +367,8 @@ pub async fn run_precheck(
         check_tree_files(&dbnums, &config.tree_output_dir, &mut stats).await?;
     }
 
-    // 4. 检查 transform_cache（model cache）：与数据源无关，cache-only / surrealdb 都可用。
-    if config.check_pe_transform {
-        check_pe_transform(db_option, &dbnums, &mut stats).await?;
-    }
+    // 4. pe_transform：按 L0/L1/L2 策略
+    check_pe_transform(db_option, &dbnums, &config, &mut stats).await?;
 
     // 5. 输出统计信息
     print_precheck_summary(&stats);

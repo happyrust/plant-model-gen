@@ -30,10 +30,21 @@ gen_model = true
 gen_mesh = true
 replace_mesh = false
 save_db = true
-# 数据输入来源固定为 SurrealDB（use_surrealdb 已硬编码为 true，无需配置）
+# 解析存储后端必须显式选择；ducklake 为权威，发布后再原子复制到 Surreal。
+parse_storage_backend = "ducklake"
+# 生成输入后端必须显式选择；surreal 是分阶段发布的默认值，不会自动回退。
+generation_read_backend = "surreal"
+ducklake_metadata_catalog = "runtime/ducklake/metadata/generation.sqlite"
+ducklake_data_path = "runtime/ducklake/data"
+ducklake_temp_directory = "runtime/ducklake/temp"
+ducklake_extension_directory = "runtime/ducklake/extensions"
+ducklake_staging_directory = "runtime/ducklake/staging"
+duckdb_memory_limit = "4GB"
+duckdb_threads = 4
+duckdb_pool_size = 2
 defer_db_write = false
-boolean_pipeline_mode = "db_legacy"
-gen_tree_only = false
+boolean_pipeline_mode = "memory_tasks"
+gen_db_meta_only = false
 apply_boolean_operation = true
 mesh_tol_ratio = 3.0
 gen_model_batch_size = 16
@@ -47,23 +58,23 @@ load_spatial_tree = false
 save_spatial_tree_to_db = false
 enable_sqlite_rtree = true
 
-# ====== IndexTree 默认管线调优配置 ======
-index_tree_max_concurrent_targets = 6
-index_tree_batch_size = 200
+# ====== GenPipeline 默认管线调优配置 ======
+gen_pipeline_max_concurrent = 6
+gen_pipeline_batch_size = 200
 
 # 启用的 noun 类别/具体 noun 名称
 # 可选值: "cate", "loop", "prim" 或具体 noun 名称如 "BRAN", "PANE"
 # 空 vec 表示启用所有类别（默认行为）
 # 房间相关类型: FRMW(框架), SBFR(子框架), PANE(面板)
-# index_tree_enabled_target_types = ["BRAN"]
+# gen_pipeline_enabled_target_types = ["BRAN"]
 
 # 排除的 noun 列表
 # 即使类别启用，这里的 noun 也会被过滤掉
-# index_tree_excluded_target_types = ["BOX"]
+# gen_pipeline_excluded_target_types = ["BOX"]
 
 # 调试模式：限制每种 Noun 类型的处理数量
 # 设置为 0 表示不限制（生成所有房间模型）
-index_tree_debug_limit_per_target_type = 0
+gen_pipeline_debug_limit_per_target_type = 0
 
 # 仅生成/计算与目标构件相关的 dbno，避免全库跑
 # manual_db_nums = [1112]
@@ -252,7 +263,7 @@ debug_token = ""
 [web_server]
 port = 3100
 bind_host = "127.0.0.1"
-auto_start_surreal = true
+auto_start_surreal = false
 surreal_bin = "surreal"
 surreal_data_path = "D:/backup-dbs/ams-8020.db"
 surreal_bind = "127.0.0.1:8020"

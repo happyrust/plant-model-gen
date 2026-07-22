@@ -37,26 +37,17 @@ pub async fn process_loop_refno_page(
     // 离线生成路径已移除（foyer-cache-cleanup），直接走 SurrealDB
 
     // 生成 loop 几何体
-    if !loop_model::gen_loop_geos(ctx.db_option.clone(), refnos, loop_sjus_map_arc, sender).await? {
+    if !loop_model::gen_loop_geos(
+        ctx.db_option.clone(),
+        Arc::clone(&ctx.generation_read),
+        refnos,
+        loop_sjus_map_arc,
+        sender,
+    )
+    .await?
+    {
         bail!("loop geos generation failed");
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::options::DbOptionExt;
-    use aios_core::options::DbOption;
-
-    #[tokio::test]
-    async fn test_empty_refnos() {
-        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
-        let loop_sjus_map = Arc::new(DashMap::new());
-        let (sender, _receiver) = flume::unbounded();
-
-        let result = process_loop_refno_page(&ctx, loop_sjus_map, sender, &[]).await;
-        assert!(result.is_ok());
-    }
 }

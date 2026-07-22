@@ -16,11 +16,8 @@
 //! ```
 
 use crate::data_interface::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::{
-    TreeIndexManager, load_index_with_large_stack,
-};
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
 use crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot;
-use crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner;
 use aios_core::RefnoEnum;
 use aios_core::query_provider::*;
 use aios_core::tool::db_tool::db1_hash;
@@ -52,8 +49,7 @@ pub async fn get_model_query_provider() -> anyhow::Result<Arc<dyn QueryProvider>
 // ============================================================================
 
 /// pe_owner 快照查询提供者：层级查询走 `versioned_db::pe_owner_snapshot`
-/// （per-dbnum 按需加载、run 级失效），其余（PE/属性/类型查询）委托 SurrealDB——
-/// 与 `TreeIndexQueryProvider` 的委托结构完全同构。
+/// （per-dbnum 按需加载、run 级失效），其余（PE/属性/类型查询）委托 SurrealDB。
 struct PeOwnerSnapshotProvider {
     name: String,
     surreal_provider: SurrealQueryProvider,
@@ -68,18 +64,17 @@ impl PeOwnerSnapshotProvider {
         })
     }
 
-    /// 解析 refno 所属快照；dbnum 解析失败/快照缺该节点时返回 None（对齐
-    /// TreeIndexQueryProvider::find_index 的"找不到 → 空结果"语义）。
+    /// 解析 refno 所属快照；dbnum 解析失败/快照缺该节点时返回 None（找不到 → 空结果）。
     async fn snapshot_for(
         &self,
         refno: RefnoEnum,
     ) -> QueryResult<Option<Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>>> {
-        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno) else {
+        let Ok(dbnum) = resolve_dbnum_for_refno(refno) else {
             return Ok(None);
         };
-        let snap = get_or_load_pe_snapshot(dbnum)
-            .await
-            .map_err(|e| QueryError::ExecutionError(format!("加载 pe 快照失败 dbnum={dbnum}: {e}")))?;
+        let snap = get_or_load_pe_snapshot(dbnum).await.map_err(|e| {
+            QueryError::ExecutionError(format!("加载 pe 快照失败 dbnum={dbnum}: {e}"))
+        })?;
         Ok(Some(snap))
     }
 
@@ -275,7 +270,7 @@ impl GraphQuery for PeOwnerSnapshotProvider {
         if refnos.is_empty() {
             return Ok(Vec::new());
         }
-        // 与 TreeIndexQueryProvider 一致：按输入顺序拼接每个 root 的 BFS 结果。
+        // 按输入顺序拼接每个 root 的 BFS 结果。
         let options = Self::descendants_options(nouns, None, include_self);
         let mut result = Vec::new();
         for &refno in refnos {
@@ -334,135 +329,10 @@ impl QueryProvider for PeOwnerSnapshotProvider {
     }
 }
 
-/// 初始化查询提供者（specs/023 M2：`AIOS_TREE_QUERY_SOURCE` 双源开关，M4 删除 tree 分支）
+/// 初始化查询提供者（层级查询走 pe 快照，PE/属性委托 SurrealDB）
 async fn init_provider() -> anyhow::Result<Arc<dyn QueryProvider>> {
-    if latest_tree_source_is_pe_owner() {
-        log::info!("使用 PeOwnerSnapshot 查询提供者（层级查询走 pe 快照，数据源 SurrealDB）");
-        return Ok(Arc::new(PeOwnerSnapshotProvider::new()?));
-    }
-
-    log::info!("使用 TreeIndex 查询提供者（层级查询走 indextree；AIOS_TREE_QUERY_SOURCE=tree 回退路径）");
-
-    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
-        .tree_dir()
-        .to_path_buf();
-
-    // 检查 tree 目录是否存在且包含 .tree 文件
-    let tree_files_exist = tree_dir.exists() && has_tree_files(&tree_dir);
-
-    if !tree_files_exist {
-        // tree 目录不存在或为空，自动运行解析生成
-        print_tree_index_missing_help(&tree_dir);
-        println!("🔄 Tree 索引缺失，正在自动解析 PDMS 数据库生成...");
-
-        if let Err(e) = auto_generate_tree_index_by_parse(&tree_dir).await {
-            anyhow::bail!(
-                "Tree 索引自动生成失败: {}\n\
-                 请检查 DbOption.toml 配置是否正确，PDMS 数据库文件是否存在",
-                e
-            );
-        }
-
-        // 再次检查是否生成成功
-        if !has_tree_files(&tree_dir) {
-            anyhow::bail!("Tree 索引生成后仍无 .tree 文件，请检查解析日志");
-        }
-
-        println!("✅ Tree 索引生成完成");
-    }
-
-    // 在 Windows 上，加载/反序列化较大的 `.tree` 文件时可能触发主线程栈溢出；
-    // 这里用大栈线程执行初始化，避免 `STATUS_STACK_OVERFLOW` 直接杀进程。
-    let tree_dir_clone = tree_dir.clone();
-    let handle = std::thread::Builder::new()
-        .name("tree-index-loader".to_string())
-        .stack_size(64 * 1024 * 1024)
-        .spawn(move || TreeIndexQueryProvider::from_tree_dir(tree_dir_clone))
-        .context("创建 tree-index-loader 线程失败")?;
-
-    let provider = handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tree-index-loader 线程 panic（可能由栈溢出导致）"))??;
-    Ok(Arc::new(provider))
-}
-
-/// 检查目录中是否有 .tree 文件
-fn has_tree_files(tree_dir: &std::path::Path) -> bool {
-    if let Ok(entries) = std::fs::read_dir(tree_dir) {
-        for entry in entries.flatten() {
-            if let Some(ext) = entry.path().extension() {
-                if ext == "tree" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// 打印 tree 索引缺失的帮助信息
-fn print_tree_index_missing_help(tree_dir: &std::path::Path) {
-    eprintln!(
-        r#"
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  ⚠️  Tree 索引目录不存在                                                       ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  缺失目录: {}
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  Tree 索引文件用于快速查询节点的层级关系（父子、祖先、子孙）。                    ║
-║  该文件在解析 PDMS 数据库时自动生成。                                           ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  解决方案: 运行数据库解析命令                                                   ║
-║                                                                               ║
-║    cargo run --bin aios-database -- -c DbOption                              ║
-║                                                                               ║
-║  该命令会解析 PDMS 数据库文件并自动生成 tree 索引。                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"#,
-        tree_dir.display()
-    );
-}
-
-/// 自动通过解析 PDMS 数据库生成 Tree 索引
-async fn auto_generate_tree_index_by_parse(tree_dir: &std::path::Path) -> anyhow::Result<()> {
-    use crate::versioned_db::database::sync_pdms;
-
-    // 从 DbOption.toml 加载配置
-    let db_option = load_db_option_for_parse()?;
-
-    println!("📂 解析项目: {}", db_option.project_name);
-    println!("📁 输出目录: {}", tree_dir.display());
-
-    // 确保输出目录存在
-    std::fs::create_dir_all(tree_dir)?;
-
-    // 运行解析
-    sync_pdms(&db_option).await?;
-
-    Ok(())
-}
-
-/// 加载用于解析的 DbOption 配置
-fn load_db_option_for_parse() -> anyhow::Result<aios_core::options::DbOption> {
-    use aios_core::options::DbOption;
-
-    // 通过环境变量或默认路径加载配置
-    let config_name =
-        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
-    let config_path = format!("{}.toml", config_name);
-    if std::path::Path::new(&config_path).exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let mut db_option: DbOption = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
-
-        // 设置解析模式参数
-        db_option.save_db = Some(false); // 不写入 SurrealDB，仅生成本地文件
-        db_option.total_sync = true; // 全量解析
-
-        Ok(db_option)
-    } else {
-        anyhow::bail!("未找到配置文件 {}", config_path)
-    }
+    log::info!("使用 PeOwnerSnapshot 查询提供者（层级查询走 pe 快照，数据源 SurrealDB）");
+    Ok(Arc::new(PeOwnerSnapshotProvider::new()?))
 }
 
 // ============================================================================
@@ -578,7 +448,7 @@ pub async fn query_by_type(
 ///
 /// # 实现说明
 ///
-/// specs/023 M2：双源——pe_owner（默认，HierView 快照）| tree（TreeIndexManager 回退）。
+/// specs/023 M2：层级查询走 pe_owner（HierView 快照）。
 pub async fn query_by_noun_all_db(nouns: &[&str]) -> anyhow::Result<Vec<RefnoEnum>> {
     if nouns.is_empty() {
         return Ok(Vec::new());
@@ -774,7 +644,7 @@ pub async fn query_multi_descendants_with_self(
 
     let mut root_dbnums: Vec<(RefnoEnum, u32)> = Vec::with_capacity(refnos.len());
     for &root in refnos {
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(root)?;
+        let dbnum = resolve_dbnum_for_refno(root)?;
         root_dbnums.push((root, dbnum));
     }
 
@@ -796,52 +666,20 @@ pub async fn query_multi_descendants_with_self(
     let mut out: Vec<RefnoEnum> = Vec::new();
     let mut seen: HashSet<RefnoEnum> = HashSet::new();
 
-    // specs/023 M2：pe_owner 主路径走 per-dbnum 快照（数据源 SurrealDB，增量后新鲜）。
-    if latest_tree_source_is_pe_owner() {
-        let mut snap_cache: HashMap<
-            u32,
-            Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>,
-        > = HashMap::new();
-        for (root, dbnum) in root_dbnums {
-            let snap = match snap_cache.get(&dbnum) {
-                Some(s) => s.clone(),
-                None => {
-                    let s = get_or_load_pe_snapshot(dbnum)
-                        .await
-                        .with_context(|| format!("加载 pe 快照失败 dbnum={dbnum}"))?;
-                    snap_cache.insert(dbnum, s.clone());
-                    s
-                }
-            };
-            for r in snap.collect_descendants_bfs(root.refno(), &options) {
-                let r = RefnoEnum::from(r);
-                if r.is_valid() && seen.insert(r) {
-                    out.push(r);
-                }
-            }
-        }
-        return Ok(out);
-    }
-
-    // tree 回退：cache-only 语义——tree 文件缺失直接报错，不自动生成。
-    let tree_dir = TreeIndexManager::with_default_dir(Vec::new())
-        .tree_dir()
-        .to_path_buf();
-    let mut index_cache: HashMap<u32, Arc<aios_core::tree_query::TreeIndex>> = HashMap::new();
-
+    let mut snap_cache: HashMap<u32, Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>> =
+        HashMap::new();
     for (root, dbnum) in root_dbnums {
-        let index = match index_cache.get(&dbnum) {
-            Some(idx) => idx.clone(),
+        let snap = match snap_cache.get(&dbnum) {
+            Some(s) => s.clone(),
             None => {
-                let idx = load_index_with_large_stack(&tree_dir, dbnum).with_context(|| {
-                    format!("加载 TreeIndex 失败: {}/{}.tree", tree_dir.display(), dbnum)
-                })?;
-                index_cache.insert(dbnum, idx.clone());
-                idx
+                let s = get_or_load_pe_snapshot(dbnum)
+                    .await
+                    .with_context(|| format!("加载 pe 快照失败 dbnum={dbnum}"))?;
+                snap_cache.insert(dbnum, s.clone());
+                s
             }
         };
-
-        for r in index.collect_descendants_bfs(root.refno(), &options) {
+        for r in snap.collect_descendants_bfs(root.refno(), &options) {
             let r = RefnoEnum::from(r);
             if r.is_valid() && seen.insert(r) {
                 out.push(r);

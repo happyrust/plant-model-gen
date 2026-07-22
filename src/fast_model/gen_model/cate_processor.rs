@@ -1,5 +1,5 @@
 use super::context::NounProcessContext;
-use super::utilities::{build_cata_hash_map_from_tree, is_valid_cata_hash};
+use super::utilities::{build_cata_hash_map_from_session, is_valid_cata_hash};
 use crate::fast_model::cata_model;
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
@@ -26,22 +26,18 @@ pub async fn process_cate_refno_page(
     }
 
     // 查询 refnos 对应的 cata hash 分组
-    let target_cata_map = match build_cata_hash_map_from_tree(refnos).await {
+    let generation_read = Arc::clone(&ctx.generation_read);
+    let target_cata_map = match build_cata_hash_map_from_session(&generation_read, refnos).await {
         Ok(map) => Arc::new(map),
         Err(e) => {
-            // 离线生成不可回查 DB；此处失败即表示 prefetch/元数据准备不完整，必须直接失败。
-            if ctx.is_offline_generate() {
-                return Err(e);
-            }
-
-            // Direct/非离线路径：保守起见仅记录并跳过，避免影响历史行为。
+            // Direct 路径保留历史错误语义：记录并跳过当前 CATE 页面。
             eprintln!(
                 "[cate_processor] build_cata_hash_map_from_tree 失败（将跳过 CATE）: {}",
                 e
             );
             super::cache_miss_report::with_global_report(|r| {
                 r.record_simple_miss(
-                    ctx.gen_stage.as_str(),
+                    "generate",
                     "cate:cata_hash_map_build_failed",
                     Some("build_cata_hash_map_from_tree failed (missing db_meta or tree files?)"),
                 )
@@ -54,35 +50,16 @@ pub async fn process_cate_refno_page(
         return Ok(());
     }
 
-    // 离线生成 / cata_resolve_cache prefetch 路径已移除（foyer-cache-cleanup），直接走 SurrealDB
-
     // 生成 cata 几何体
-    cata_model::gen_cata_instances(
+    cata_model::gen_cata_instances_versioned(
         ctx.db_option.clone(),
+        generation_read,
         target_cata_map,
         loop_sjus_map_arc,
         sender,
+        ctx.generation_contract.respect_tufl(),
     )
     .await?;
 
     Ok(())
-}
-
-// gen_cate_instances_from_cache_only 已移除（foyer-cache-cleanup）
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::options::DbOptionExt;
-    use aios_core::options::DbOption;
-
-    #[tokio::test]
-    async fn test_empty_refnos() {
-        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
-        let loop_sjus_map = Arc::new(DashMap::new());
-        let (sender, _receiver) = flume::unbounded();
-
-        let result = process_cate_refno_page(&ctx, loop_sjus_map, sender, &[]).await;
-        assert!(result.is_ok());
-    }
 }

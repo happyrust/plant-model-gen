@@ -1,13 +1,15 @@
 use crate::expression_fix::ExpressionFixer;
+use crate::fast_model::gen_model::{GenerationReadContext, session_query};
 use crate::fast_model::query_gm_params;
 use crate::fast_model::{debug_model, debug_model_debug, debug_model_trace};
 use aios_core::SurrealQueryExt;
 use aios_core::consts::WORD_HASH;
-use aios_core::expression::query_cata::{query_axis_params, resolve_cata_comp};
+use aios_core::expression::query_cata::{get_axis_param, query_axis_params, resolve_cata_comp};
 use aios_core::expression::resolve::{SCOM_INFO_MAP, resolve_axis_param};
 use aios_core::parsed_data::{CateAxisParam, CateGeomsInfo};
 use aios_core::pdms_data::{GmParam, PlinParam, ScomInfo};
-use aios_core::{CataContext, NamedAttrMap, RefU64, RefnoEnum, project_primary_db};
+use aios_core::pdms_types::TOTAL_CATA_GEO_NOUN_NAMES;
+use aios_core::{CataContext, NamedAttrMap, NamedAttrValue, RefU64, RefnoEnum, project_primary_db};
 use anyhow::anyhow;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -61,6 +63,249 @@ async fn query_iparam_from_desi(desi_refno: RefnoEnum) -> anyhow::Result<Vec<f32
     let result: Vec<f32> = project_primary_db().query_take(&sql, 0).await?;
 
     Ok(result)
+}
+
+async fn query_iparam_from_session(
+    read: &GenerationReadContext,
+    desi_att: &NamedAttrMap,
+) -> anyhow::Result<Vec<f32>> {
+    let Some(ispe_refno) = desi_att.get_foreign_refno("ISPE") else {
+        return Ok(Vec::new());
+    };
+    for spco_refno in session_query::get_children(read, ispe_refno) {
+        if !matches!(
+            session_query::get_type_name(read, spco_refno).as_deref(),
+            Ok("SPCO")
+        ) {
+            continue;
+        }
+        let spco = session_query::get_named_attmap(read, spco_refno).await?;
+        let Some(catr_refno) = spco.get_foreign_refno("CATR") else {
+            continue;
+        };
+        return Ok(session_query::get_named_attmap(read, catr_refno)
+            .await?
+            .get_f32_vec("PARA")
+            .unwrap_or_default());
+    }
+    Ok(Vec::new())
+}
+
+async fn query_gm_param_from_session(
+    read: &GenerationReadContext,
+    att: &NamedAttrMap,
+) -> anyhow::Result<GmParam> {
+    let mut paxises = att.get_attr_strings_without_default(&["PAXI", "PAAX", "PBAX", "PCAX"]);
+    if let Some(NamedAttrValue::IntArrayType(values)) = att.get_val("PTS") {
+        paxises.extend(values.iter().map(ToString::to_string));
+    }
+    if let Some(value) = att.get_as_string("PLAX") {
+        paxises.push(value);
+    }
+
+    let refno = att.get_refno_or_default();
+    let type_name = att.get_type_str();
+    let mut verts = Vec::new();
+    let mut frads = Vec::new();
+    let mut dxy = Vec::new();
+    if matches!(type_name, "SEXT" | "NSEX" | "SREV" | "NSRE") {
+        for child in session_query::get_children(read, refno) {
+            if !matches!(
+                session_query::get_type_name(read, child).as_deref(),
+                Ok("SLOO")
+            ) {
+                continue;
+            }
+            let vertices = session_query::get_children(read, child);
+            for vertex in session_query::get_named_attmaps(read, &vertices)
+                .await?
+                .into_values()
+            {
+                verts.push([
+                    vertex.get_as_string("PX").unwrap_or_default(),
+                    vertex.get_as_string("PY").unwrap_or_default(),
+                    vertex.get_as_string("PZ").unwrap_or_default(),
+                ]);
+                frads.push(vertex.get_as_string("PRAD").unwrap_or_default());
+            }
+        }
+    } else if type_name == "SPRO" {
+        let children = session_query::get_children(read, refno);
+        for child in session_query::get_named_attmaps(read, &children)
+            .await?
+            .into_values()
+        {
+            if matches!(child.get_type_str(), "SPVE" | "SVER" | "PVER") {
+                verts.push([
+                    child.get_as_string("PX").unwrap_or_default(),
+                    child.get_as_string("PY").unwrap_or_default(),
+                    child.get_as_string("PZ").unwrap_or_default(),
+                ]);
+                frads.push(child.get_as_string("PRAD").unwrap_or_default());
+                dxy.push([
+                    child.get_as_string("DX").unwrap_or_default(),
+                    child.get_as_string("DY").unwrap_or_default(),
+                ]);
+            }
+        }
+    } else {
+        verts.push([
+            att.get_as_string("PX").unwrap_or_default(),
+            att.get_as_string("PY").unwrap_or_default(),
+            att.get_as_string("PZ").unwrap_or_default(),
+        ]);
+        frads.push(att.get_as_string("PRAD").unwrap_or_default());
+        dxy.push([
+            att.get_as_string("DX").unwrap_or_default(),
+            att.get_as_string("DY").unwrap_or_default(),
+        ]);
+    }
+
+    Ok(GmParam {
+        refno,
+        gm_type: type_name.to_owned(),
+        prad: att.get_as_string("PRAD").unwrap_or_default(),
+        pang: att.get_as_string("PANG").unwrap_or_default(),
+        pwid: att.get_as_string("PWID").unwrap_or_default(),
+        diameters: att.get_attr_strings(&["PDIA", "PBDM", "PTDM", "DIAM"]),
+        distances: att.get_attr_strings(&["PDIS", "PBDI", "PTDI"]),
+        shears: att.get_attr_strings(&["PXTS", "PYTS", "PXBS", "PYBS"]),
+        phei: att.get_as_string("PHEI").unwrap_or_default(),
+        offset: att.get_as_string("POFF").unwrap_or_default(),
+        lengths: att.get_attr_strings(&["PXLE", "PYLE", "PZLE"]),
+        xyz: att.get_attr_strings(&[
+            "PX", "PY", "PZ", "PBBT", "PCBT", "PBTP", "PCTP", "PBOF", "PCOF",
+        ]),
+        verts,
+        frads,
+        dxy,
+        drad: att.get_as_string("DRAD").unwrap_or_default(),
+        dwid: att.get_as_string("DWID").unwrap_or_default(),
+        paxises,
+        centre_line_flag: att.get_bool("CLFL").unwrap_or(false),
+        visible_flag: att.get_bool("TUFL").unwrap_or(true),
+        plax: att.get_as_string("PLAX"),
+    })
+}
+
+async fn query_gm_params_from_session(
+    read: &GenerationReadContext,
+    root: RefnoEnum,
+) -> anyhow::Result<Vec<GmParam>> {
+    let refnos = read.hierarchy.descendants(
+        &[root],
+        &crate::generation_read::HierarchyQuery {
+            include_self: false,
+            nouns: Default::default(),
+            max_depth: Some(2),
+            prune_on_match: false,
+        },
+    )?;
+    let mut attributes = session_query::get_named_attmaps(read, &refnos).await?;
+    let mut result = Vec::new();
+    for refno in refnos {
+        let Some(attribute) = attributes.remove(&refno) else {
+            continue;
+        };
+        if !TOTAL_CATA_GEO_NOUN_NAMES.contains(&attribute.get_type_str())
+            || !attribute.is_visible_by_level(None).unwrap_or(true)
+        {
+            continue;
+        }
+        result.push(query_gm_param_from_session(read, &attribute).await?);
+    }
+    Ok(result)
+}
+
+async fn get_or_create_scom_info_from_session(
+    read: &GenerationReadContext,
+    cata_refno: RefnoEnum,
+) -> anyhow::Result<ScomInfo> {
+    let attr_map = session_query::get_named_attmap(read, cata_refno).await?;
+    let ptref_name = if attr_map.get_type_str() == "SPRF" {
+        "PSTR"
+    } else {
+        "PTRE"
+    };
+    let mut axis_params = Vec::new();
+    let mut axis_param_numbers = Vec::new();
+    if let Some(ptre_refno) = attr_map.get_foreign_refno(ptref_name) {
+        let children = session_query::get_children(read, ptre_refno);
+        for child in session_query::get_named_attmaps(read, &children)
+            .await?
+            .into_values()
+        {
+            if child.get_type_str() == "PLIN" {
+                continue;
+            }
+            if let Some(axis) = get_axis_param(&child) {
+                axis_param_numbers.push(child.get_i32("NUMB").unwrap_or(-1));
+                axis_params.push(axis);
+            }
+        }
+    }
+
+    let gmse_refno = session_query::first_outbound_reference(read, cata_refno, &["GMRE", "GSTR"])
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("SCOM {} missing GMRE/GSTR", cata_refno))?;
+    let mut gm_params = query_gm_params_from_session(read, gmse_refno).await?;
+    for gm in &mut gm_params {
+        normalize_gm_param_expressions_in_place(gm);
+    }
+    let mut ngm_params = Vec::new();
+    if let Some(ngmr_refno) = attr_map.get_foreign_refno("NGMR") {
+        ngm_params = query_gm_params_from_session(read, ngmr_refno).await?;
+        for gm in &mut ngm_params {
+            normalize_gm_param_expressions_in_place(gm);
+        }
+    }
+
+    let mut plin_map = HashMap::new();
+    if let Some(pstr_refno) = attr_map.get_foreign_refno("PSTR") {
+        let children = session_query::get_children(read, pstr_refno);
+        for attribute in session_query::get_named_attmaps(read, &children)
+            .await?
+            .into_values()
+        {
+            if let Some(key) = attribute.get_as_string("PKEY") {
+                plin_map.insert(
+                    key,
+                    PlinParam {
+                        vxy: [
+                            attribute.get_as_string("PX").unwrap_or_else(|| "0".into()),
+                            attribute.get_as_string("PY").unwrap_or_else(|| "0".into()),
+                        ],
+                        dxy: [
+                            attribute.get_as_string("DX").unwrap_or_else(|| "0".into()),
+                            attribute.get_as_string("DY").unwrap_or_else(|| "0".into()),
+                        ],
+                        plax: attribute
+                            .get_as_string("PLAX")
+                            .unwrap_or_else(|| "unset".into()),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(ScomInfo {
+        gtype: attr_map
+            .get_as_string("GTYP")
+            .unwrap_or_else(|| "unset".into()),
+        dtse_params: Vec::new(),
+        gm_params,
+        ngm_params,
+        axis_params,
+        params: attr_map
+            .get_as_string("PARA")
+            .unwrap_or_default()
+            .replace('\n', " ")
+            .replace("  ", " ")
+            .into(),
+        axis_param_numbers,
+        attr_map,
+        plin_map,
+    })
 }
 
 fn insert_iparam_kv(context: &mut CataContext, idx1: usize, v: &str) {
@@ -272,8 +517,233 @@ async fn normalize_catalog_scom_ref(mut catalog_ref: RefnoEnum) -> RefnoEnum {
     catalog_ref
 }
 
+async fn normalize_catalog_scom_ref_from_session(
+    read: &GenerationReadContext,
+    mut catalog_ref: RefnoEnum,
+) -> RefnoEnum {
+    for _ in 0..4 {
+        if !catalog_ref.is_valid() {
+            break;
+        }
+        let Ok(attr) = session_query::get_named_attmap(read, catalog_ref).await else {
+            break;
+        };
+        if matches!(attr.get_type_str(), "SCOM" | "SPRF" | "SFIT" | "JOIN") {
+            break;
+        }
+        let Some(next_ref) = attr.get_foreign_refno("CATR") else {
+            break;
+        };
+        if !next_ref.is_valid() || next_ref == catalog_ref {
+            break;
+        }
+        catalog_ref = next_ref;
+    }
+    catalog_ref
+}
+
+/// Session 版 get_cat_refno：设计件可能只有 SPRE，需 SPRE→SPCO.CATR；或直接 CATR/CAT。
+async fn resolve_catalog_ref_from_session(
+    read: &GenerationReadContext,
+    desi_att: &NamedAttrMap,
+) -> Option<RefnoEnum> {
+    for key in ["CATR", "CAT"] {
+        if let Some(catr) = desi_att.get_foreign_refno(key) {
+            if catr.is_valid() && !catr.is_unset() {
+                return Some(catr);
+            }
+        }
+    }
+    let spre = desi_att.get_foreign_refno("SPRE")?;
+    if !spre.is_valid() || spre.is_unset() {
+        return None;
+    }
+    let spco = session_query::get_named_attmap(read, spre).await.ok()?;
+    let catr = spco.get_foreign_refno("CATR")?;
+    (catr.is_valid() && !catr.is_unset()).then_some(catr)
+}
+
+async fn cata_context_from_session(
+    read: &GenerationReadContext,
+    desi_refno: RefnoEnum,
+    desi_att: &NamedAttrMap,
+    is_tubi: bool,
+) -> anyhow::Result<CataContext> {
+    let mut context = CataContext::default();
+    context.is_tubi = is_tubi;
+    if let Some(value) = desi_att.get_as_string("JUSL") {
+        context.insert("JUSL".to_string(), value);
+    }
+    context.insert("DESI_REFNO".to_string(), desi_refno.to_string());
+    for (index, value) in desi_att
+        .get_f32_vec("DESP")
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        context.insert(format!("DESI{}", index + 1), value.to_string());
+        context.insert(format!("DESP{}", index + 1), value.to_string());
+    }
+    for (index, value) in desi_att.get_ddesp().unwrap_or_default().iter().enumerate() {
+        context.insert(format!("DDES{}", index + 1), value.to_string());
+    }
+    context.insert(
+        "DDHEIGHT".to_string(),
+        desi_att
+            .get_as_string("HEIG")
+            .unwrap_or_else(|| "0.0".into()),
+    );
+    context.insert(
+        "DDANGLE".to_string(),
+        desi_att
+            .get_as_string("ANGL")
+            .unwrap_or_else(|| "0.0".into()),
+    );
+    context.insert(
+        "DDRADIUS".to_string(),
+        desi_att
+            .get_as_string("RADI")
+            .unwrap_or_else(|| "0.0".into()),
+    );
+    for (name, value) in &desi_att.map {
+        let name = name.to_ascii_uppercase();
+        match value {
+            NamedAttrValue::F32Type(value) => {
+                context.insert(name, value.to_string());
+            }
+            NamedAttrValue::F32VecType(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    context.insert(format!("{}{}", name, index + 1), value.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    context.insert("RS_DES_REFNO".to_string(), desi_refno.to_string());
+
+    let cat_refno = desi_att.get_foreign_refno("CATR");
+    if let Some(cat_refno) = cat_refno {
+        let cata_attmap = session_query::get_named_attmap(read, cat_refno).await?;
+        context.insert("RS_CATR_REFNO".to_string(), cat_refno.to_string());
+        for (index, value) in cata_attmap
+            .get_f32_vec("PARA")
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            context.insert(format!("CPAR{}", index + 1), value.to_string());
+            context.insert(format!("PARA{}", index + 1), value.to_string());
+            context.insert(format!("PARAM{}", index + 1), value.to_string());
+            context.insert(format!("IPARA{}", index + 1), "0".to_string());
+            context.insert(format!("IPAR{}", index + 1), "0".to_string());
+        }
+
+        let mut owner_ref = desi_att.get_owner();
+        let mut visited_owners = std::collections::BTreeSet::new();
+        anyhow::ensure!(
+            visited_owners.insert(owner_ref),
+            "CATA context owner cycle at {owner_ref}"
+        );
+        let mut owner_att = session_query::get_named_attmap(read, owner_ref).await?;
+        while !owner_att.contains_key("GTYP")
+            && owner_att.get_refno().is_some()
+            && owner_att.get_type_str() != "ZONE"
+        {
+            owner_ref = owner_att.get_owner();
+            anyhow::ensure!(
+                visited_owners.insert(owner_ref),
+                "CATA context owner cycle at {owner_ref}"
+            );
+            owner_att = session_query::get_named_attmap(read, owner_ref).await?;
+        }
+        if let Some(dtre_refno) = cata_attmap.get_foreign_refno("DTRE") {
+            let children = session_query::get_children(read, dtre_refno);
+            for child in session_query::get_named_attmaps(read, &children)
+                .await?
+                .into_values()
+            {
+                if let Some(key) = child.get_as_string("DKEY") {
+                    let key = format!("RPRO_{key}");
+                    context.insert(key.clone(), child.get_as_string("PPRO").unwrap_or_default());
+                    context.insert(
+                        format!("{key}_default_expr"),
+                        child.get_as_string("DPRO").unwrap_or_default(),
+                    );
+                    context.insert(
+                        format!("{key}_default_type"),
+                        child.get_as_string("PTYP").unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        for (index, value) in owner_att
+            .get_f32_vec("DESP")
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            context.insert(format!("ODES{}", index + 1), value.to_string());
+        }
+        if let Some(owner_cat_ref) = owner_att.get_foreign_refno("CATR")
+            && let Ok(owner_cat) = session_query::get_named_attmap(read, owner_cat_ref).await
+        {
+            for (index, value) in owner_cat
+                .get_f32_vec("PARA")
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                context.insert(format!("OPAR{}", index + 1), value.to_string());
+            }
+        }
+        if let Some(cref) = desi_att.get_foreign_refno("CREF")
+            && let Ok(cref_att) = session_query::get_named_attmap(read, cref).await
+        {
+            for (index, value) in cref_att
+                .get_f32_vec("DESP")
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                context.insert(format!("ADES{}", index + 1), value.to_string());
+            }
+            if let Some(cref_cat_ref) = cref_att.get_foreign_refno("CATR")
+                && let Ok(cref_cat) = session_query::get_named_attmap(read, cref_cat_ref).await
+            {
+                for (index, value) in cref_cat
+                    .get_f32_vec("PARA")
+                    .unwrap_or_default()
+                    .iter()
+                    .enumerate()
+                {
+                    context.insert(format!("APAR{}", index + 1), value.to_string());
+                }
+            }
+        }
+    }
+    Ok(context)
+}
+
 ///求解design component
 pub async fn resolve_desi_comp(
+    desi_refno: RefnoEnum,
+    tubi_scom: Option<RefnoEnum>,
+    desi_att_opt: Option<&NamedAttrMap>,
+) -> anyhow::Result<CateGeomsInfo> {
+    resolve_desi_comp_inner(None, desi_refno, tubi_scom, desi_att_opt).await
+}
+
+pub async fn resolve_desi_comp_with_session(
+    read: &GenerationReadContext,
+    desi_refno: RefnoEnum,
+    tubi_scom: Option<RefnoEnum>,
+    desi_att_opt: Option<&NamedAttrMap>,
+) -> anyhow::Result<CateGeomsInfo> {
+    resolve_desi_comp_inner(Some(read), desi_refno, tubi_scom, desi_att_opt).await
+}
+
+async fn resolve_desi_comp_inner(
+    read: Option<&GenerationReadContext>,
     desi_refno: RefnoEnum,
     tubi_scom: Option<RefnoEnum>,
     desi_att_opt: Option<&NamedAttrMap>,
@@ -285,7 +755,10 @@ pub async fn resolve_desi_comp(
     let desi_att = if let Some(att) = desi_att_opt {
         att
     } else {
-        owned_att = aios_core::get_named_attmap(desi_refno).await?;
+        owned_att = match read {
+            Some(read) => session_query::get_named_attmap(read, desi_refno).await?,
+            None => aios_core::get_named_attmap(desi_refno).await?,
+        };
         &owned_att
     };
     let desi_att_fetch_time = t_desi_att.elapsed().as_millis();
@@ -296,16 +769,22 @@ pub async fn resolve_desi_comp(
     let mut scom_ref = if let Some(scom) = tubi_scom {
         scom
     } else {
-        let scom = aios_core::get_cat_refno(desi_refno)
-            .await?
-            .or_else(|| desi_att.get_foreign_refno("CATR"))
-            .ok_or(anyhow::anyhow!(format!(
-                "CAT引用不存在: {}",
-                desi_refno.to_string()
-            )))?;
+        let scom = match read {
+            Some(read) => resolve_catalog_ref_from_session(read, desi_att).await,
+            None => aios_core::get_cat_refno(desi_refno)
+                .await?
+                .or_else(|| desi_att.get_foreign_refno("CATR")),
+        }
+        .ok_or(anyhow::anyhow!(format!(
+            "CAT引用不存在: {}",
+            desi_refno.to_string()
+        )))?;
         scom
     };
-    let normalized_scom_ref = normalize_catalog_scom_ref(scom_ref).await;
+    let normalized_scom_ref = match read {
+        Some(read) => normalize_catalog_scom_ref_from_session(read, scom_ref).await,
+        None => normalize_catalog_scom_ref(scom_ref).await,
+    };
     if normalized_scom_ref != scom_ref {
         if initial_tubi_scom == Some(desi_refno) {
             is_tubi = false;
@@ -322,12 +801,19 @@ pub async fn resolve_desi_comp(
     let scom_ref_time = t_scom_ref.elapsed().as_millis();
     debug_model_trace!("scom_ref: {:?}", &scom_ref);
     let t_scom_info = Instant::now();
-    let scom_info = get_or_create_scom_info(scom_ref).await?;
+    let scom_info = match read {
+        Some(read) => get_or_create_scom_info_from_session(read, scom_ref).await?,
+        None => get_or_create_scom_info(scom_ref).await?,
+    };
     let scom_info_time = t_scom_info.elapsed().as_millis();
     debug_model_trace!("scom_info: {:?}", &scom_info);
     let t_context = Instant::now();
-    let mut context =
-        aios_core::rs_surreal::resolve::get_or_create_cata_context(desi_refno, is_tubi).await?;
+    let mut context = match read {
+        Some(read) => cata_context_from_session(read, desi_refno, desi_att, is_tubi).await?,
+        None => {
+            aios_core::rs_surreal::resolve::get_or_create_cata_context(desi_refno, is_tubi).await?
+        }
+    };
     let context_time = t_context.elapsed().as_millis();
 
     let t_bind_params = Instant::now();
@@ -460,7 +946,11 @@ pub async fn resolve_desi_comp(
             insert_iparam_kv(&mut context, idx1, "0");
         }
     } else {
-        match query_iparam_from_desi(desi_refno).await {
+        let query_result = match read {
+            Some(read) => query_iparam_from_session(read, desi_att).await,
+            None => query_iparam_from_desi(desi_refno).await,
+        };
+        match query_result {
             Ok(mut iparams) => {
                 debug_model_debug!(
                     "IPARAM query result: {:?}, with_insulation={}",

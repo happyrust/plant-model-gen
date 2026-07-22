@@ -98,6 +98,105 @@ pub struct NegGeoData {
     pub local_transform: Transform,
 }
 
+/// 对 boolean worker 的完整输入做规范化哈希，供双后端端到端语义对拍。
+/// HashMap/集合均先排序，避免并发批次到达顺序影响结果。
+pub fn semantic_hash_boolean_tasks(tasks: &[BooleanTask]) -> String {
+    let mut task_hashes = tasks
+        .iter()
+        .map(|task| {
+            let payload = match &task.task_type {
+                BooleanTaskType::CataNeg(value) => {
+                    let mut groups = value.boolean_groups.clone();
+                    for group in &mut groups {
+                        if let Some((_, negative_refnos)) = group.split_first_mut() {
+                            negative_refnos.sort_unstable();
+                        }
+                    }
+                    groups.sort_unstable();
+                    let geo_data = value
+                        .geo_data_map
+                        .iter()
+                        .map(|(refno, geo)| {
+                            (
+                                *refno,
+                                (
+                                    geo.geo_hash,
+                                    crate::generation_read::hash_serializable(&geo.param),
+                                    crate::generation_read::hash_serializable(&geo.transform),
+                                ),
+                            )
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    serde_json::json!({
+                        "kind": "cata_neg",
+                        "refno": task.refno,
+                        "noun": task.noun,
+                        "inst_info_id": value.inst_info_id,
+                        "groups": groups,
+                        "geo_data": geo_data,
+                    })
+                }
+                BooleanTaskType::InstNeg(value) => {
+                    let mut pos_geos = value
+                        .pos_geos
+                        .iter()
+                        .map(|geo| {
+                            (
+                                geo.geo_hash.clone(),
+                                crate::generation_read::hash_serializable(&geo.local_transform),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    pos_geos.sort_unstable();
+                    let mut neg_entities = value
+                        .neg_entities
+                        .iter()
+                        .map(|entity| {
+                            let mut geos = entity
+                                .neg_geos
+                                .iter()
+                                .map(|geo| {
+                                    (
+                                        geo.geo_hash.clone(),
+                                        geo.geom_refno,
+                                        geo.geo_type.clone(),
+                                        crate::generation_read::hash_serializable(
+                                            &geo.local_transform,
+                                        ),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            geos.sort_unstable();
+                            (
+                                entity.carrier_refno,
+                                entity.ngmr_geom_refno,
+                                crate::generation_read::hash_serializable(
+                                    &entity.carrier_world_transform,
+                                ),
+                                geos,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    neg_entities.sort_unstable();
+                    serde_json::json!({
+                        "kind": "inst_neg",
+                        "refno": task.refno,
+                        "noun": task.noun,
+                        "inst_world_transform": crate::generation_read::hash_serializable(
+                            &value.inst_world_transform,
+                        ),
+                        "pos_geos": pos_geos,
+                        "neg_entities": neg_entities,
+                    })
+                }
+            };
+            crate::generation_read::hash_serializable(&payload)
+        })
+        .collect::<Vec<_>>();
+    task_hashes.sort_unstable();
+    crate::generation_read::hash_serializable(&task_hashes)
+}
+
 /// 跨批次布尔任务汇总器。
 ///
 /// 在 insert_handle 收到多个 `ShapeInstancesData` 批次时，先 merge 到此汇总器，
@@ -140,6 +239,10 @@ impl BooleanTaskAccumulator {
     /// 从已汇总数据构建完整布尔任务
     pub fn build_tasks(&self) -> Vec<BooleanTask> {
         build_boolean_tasks(&self.merged)
+    }
+
+    pub fn into_merged(self) -> ShapeInstancesData {
+        self.merged
     }
 }
 
@@ -354,4 +457,35 @@ pub fn build_boolean_tasks(shape_insts: &ShapeInstancesData) -> Vec<BooleanTask>
     tasks.extend(extract_cata_neg_tasks(shape_insts));
     tasks.extend(extract_inst_neg_tasks(shape_insts));
     tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_task(refno: &str) -> BooleanTask {
+        BooleanTask {
+            refno: RefnoEnum::from(refno),
+            noun: Some("EQUI".to_string()),
+            task_type: BooleanTaskType::CataNeg(CataNegBoolTask {
+                inst_info_id: refno.to_string(),
+                boolean_groups: Vec::new(),
+                geo_data_map: HashMap::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn semantic_hash_is_order_independent_and_content_sensitive() {
+        let first = fixture_task("1/1");
+        let second = fixture_task("1/2");
+        assert_eq!(
+            semantic_hash_boolean_tasks(&[first.clone(), second.clone()]),
+            semantic_hash_boolean_tasks(&[second, first.clone()])
+        );
+        assert_ne!(
+            semantic_hash_boolean_tasks(&[first]),
+            semantic_hash_boolean_tasks(&[fixture_task("1/3")])
+        );
+    }
 }

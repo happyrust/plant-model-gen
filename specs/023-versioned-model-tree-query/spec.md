@@ -8,6 +8,11 @@
 
 **Input**: User description: "分析现在模型树的接口，加上版本后按版本显示模型树：通过指定某个 version，模型树实时地按指定版本查询出来；继续使用 pe_owner 的 edge 来实现子节点的查询；在解析时也要使用版本化的 pe_owner 来存储。"
 
+## 修订记录（2026-07-21）
+
+> GenPipeline 清理（`docs/superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md`）已退役 TreeIndex / `.tree` 运行时与生产路径。  
+> **FR-005 / 决策 #5 原「不传 sesno 走 TreeIndex」已被取代**：latest（不传 sesno）与 versioned 路径均走 pe_owner（及 pe.children 回退）。下文历史表述保留为起草时上下文，实现以 pe_owner 为准。
+
 ## 背景与决策记录（2026-07-19 会话结论）
 
 本 spec 由模型树接口分析会话产出，关键决策与已核实事实如下：
@@ -123,7 +128,7 @@
 - **FR-002**: 全量解析 MUST 继续写入 pe_owner，且对同一 versioned 库的重灌/重解析 MUST 幂等（不因已存在 id 失败、不产生重复或残留边）；边写入 MUST 在该批 `source='full'` 锚点固化之前完成
 - **FR-003**: 模型树接口（world-root / node / children / ancestors / subtree-refnos）MUST 接受可选 `sesno` 参数；带 sesno 时经锚点解析换算时间戳后**实时** VERSION 查询，不生成、不依赖任何物化的版本树产物
 - **FR-004**: 版本模式的 children MUST 保持该版本时刻的同胞顺序（以 pe_owner 边 id 序号为准；回退数据源时以 pe.children 数组顺序为准）
-- **FR-005**: 不传 sesno 时上述接口 MUST 保持现状行为与性能（TreeIndex 路径零改动零回归）
+- **FR-005**: ~~不传 sesno 时上述接口 MUST 保持现状行为与性能（TreeIndex 路径零改动零回归）~~ **（2026-07-21 修订）** 不传 sesno 时 MUST 走 pe_owner latest 路径（与带 sesno 同源图语义；无 `.tree` / TreeIndex 依赖）
 - **FR-006**: 版本入参解析 MUST 复用 specs/022 锚点体系：只接受可解析到锚点的 sesno；回退命中时响应携带 `requested_sesno / resolved_sesno / exact`；锚点缺失返回 AnchorMissing、retention 窗外返回 Expired，错误语义与 `/api/model-history/*` 一致
 - **FR-007**: 节点名称/类型/owner 等展示属性在版本模式下 MUST 来自对应版本的 PE 快照（VERSION 点查或批量点查），不得混用当前态
 - **FR-008**: 对 pe_owner 历史不可信的区间（本功能上线前的锚点、或站点尚未完成重建），children 查询 MUST 自动回退到 pe.children 的 VERSION 查询，并在响应 `version.source` 中标注实际数据源（`pe_owner` / `pe_children_fallback`）

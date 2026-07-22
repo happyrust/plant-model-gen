@@ -1,6 +1,5 @@
 use crate::fast_model::gen_model::is_e3d_debug_enabled;
-use crate::fast_model::gen_model::neg_query;
-use crate::fast_model::query_compat::query_filter_deep_children_atts;
+use crate::fast_model::gen_model::{GenerationReadContext, session_query};
 use crate::fast_model::{SEND_INST_SIZE, shared};
 use crate::options::DbOptionExt;
 use crate::{consts::*, e3d_dbg};
@@ -280,7 +279,11 @@ fn attr_refno(attr: &NamedAttrMap, key: &str) -> Option<RefnoEnum> {
     }
 }
 
-async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAttrMap) {
+async fn apply_template_primitive_orientation(
+    read: &GenerationReadContext,
+    cur_type: &str,
+    attr: &mut NamedAttrMap,
+) {
     if cur_type != "PYRA" {
         return;
     }
@@ -295,12 +298,10 @@ async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAt
         .then(|| attr.get_refno_or_default());
     let owner_refno = attr.get_owner();
     if owner_refno.is_valid() {
-        let siblings = crate::fast_model::query_provider::get_children(owner_refno)
-            .await
-            .unwrap_or_default();
+        let siblings = session_query::get_children(read, owner_refno);
         let mut same_type = Vec::new();
         for sibling in siblings {
-            let sibling_type = aios_core::get_type_name(sibling).await.unwrap_or_default();
+            let sibling_type = session_query::get_type_name(read, sibling).unwrap_or_default();
             if sibling_type == cur_type {
                 same_type.push(sibling);
             }
@@ -320,19 +321,17 @@ async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAt
     let Some(origin_refno) = attr_refno(attr, "ORRF") else {
         return;
     };
-    let origin_attr = aios_core::get_named_attmap(origin_refno)
+    let origin_attr = session_query::get_named_attmap(read, origin_refno)
         .await
         .unwrap_or_default();
     let origin_owner = origin_attr.get_owner();
     if !origin_owner.is_valid() {
         return;
     }
-    let siblings = crate::fast_model::query_provider::get_children(origin_owner)
-        .await
-        .unwrap_or_default();
+    let siblings = session_query::get_children(read, origin_owner);
     let mut same_type = Vec::new();
     for sibling in siblings {
-        let sibling_type = aios_core::get_type_name(sibling).await.unwrap_or_default();
+        let sibling_type = session_query::get_type_name(read, sibling).unwrap_or_default();
         if sibling_type == cur_type {
             same_type.push(sibling);
         }
@@ -347,7 +346,11 @@ async fn apply_template_primitive_orientation(cur_type: &str, attr: &mut NamedAt
     set_template_adjustment(attr, "_AIOS_TEMPLATE_ROT_Z", rotation_deg);
 }
 
-async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> NamedAttrMap {
+async fn resolve_template_prim_attr(
+    read: &GenerationReadContext,
+    refno: RefnoEnum,
+    attr: NamedAttrMap,
+) -> NamedAttrMap {
     let cur_type = attr.get_type_str().to_string();
     if !matches!(cur_type.as_str(), "CYLI" | "DISH" | "SNOU" | "PYRA") {
         return attr;
@@ -362,7 +365,7 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
         spec011_log(refno, "template_resolve_stop=invalid_template_owner");
         return attr;
     }
-    let tmpl_attr = aios_core::get_named_attmap(tmpl_refno)
+    let tmpl_attr = session_query::get_named_attmap(read, tmpl_refno)
         .await
         .unwrap_or_default();
     if tmpl_attr.get_type_str() != "TMPL" {
@@ -381,7 +384,7 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
         spec011_log(refno, "template_resolve_stop=invalid_design_owner");
         return attr;
     }
-    let design_attr = aios_core::get_named_attmap(design_owner)
+    let design_attr = session_query::get_named_attmap(read, design_owner)
         .await
         .unwrap_or_default();
     let Some(desp) = design_attr
@@ -399,9 +402,7 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
         return attr;
     };
 
-    let tmpl_children = crate::fast_model::query_provider::get_children(tmpl_refno)
-        .await
-        .unwrap_or_default();
+    let tmpl_children = session_query::get_children(read, tmpl_refno);
     spec011_log(
         refno,
         format!(
@@ -413,7 +414,9 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
     let mut ddat_owner_refno = None;
     let mut ddat_fallback_owner_refno = None;
     for child in tmpl_children {
-        let child_attr = aios_core::get_named_attmap(child).await.unwrap_or_default();
+        let child_attr = session_query::get_named_attmap(read, child)
+            .await
+            .unwrap_or_default();
         if child_attr.get_type_str() == "DDSE" {
             ddat_owner_refno = Some(child);
             ddat_fallback_owner_refno = attr_refno(&child_attr, "ORRF");
@@ -425,20 +428,16 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
         return attr;
     };
 
-    let mut ddat_refnos = crate::fast_model::query_provider::get_children(ddat_owner_refno)
-        .await
-        .unwrap_or_default();
+    let mut ddat_refnos = session_query::get_children(read, ddat_owner_refno);
     if ddat_refnos.is_empty() {
         if let Some(fallback_owner) = ddat_fallback_owner_refno {
             ddat_owner_refno = fallback_owner;
-            ddat_refnos = crate::fast_model::query_provider::get_children(fallback_owner)
-                .await
-                .unwrap_or_default();
+            ddat_refnos = session_query::get_children(read, fallback_owner);
         }
     }
     let mut params = HashMap::new();
     for ddat_refno in &ddat_refnos {
-        let ddat_attr = aios_core::get_named_attmap(*ddat_refno)
+        let ddat_attr = session_query::get_named_attmap(read, *ddat_refno)
             .await
             .unwrap_or_default();
         if ddat_attr.get_type_str() != "DDAT" {
@@ -469,7 +468,7 @@ async fn resolve_template_prim_attr(refno: RefnoEnum, attr: NamedAttrMap) -> Nam
 
     let mut resolved = attr;
     if apply_template_prim_params(&cur_type, &params, &mut resolved) {
-        apply_template_primitive_orientation(&cur_type, &mut resolved).await;
+        apply_template_primitive_orientation(read, &cur_type, &mut resolved).await;
         spec011_log(
             refno,
             format!(
@@ -568,18 +567,17 @@ fn build_datum_marker_geos(refno: RefnoEnum, visible: bool) -> Vec<EleInstGeo> {
         .collect()
 }
 
-/// 从 DB 查询构建多面体 CSG shape（POHE/POLYHE）。
-async fn build_polyhedron_from_db(refno: RefnoEnum) -> Option<Box<dyn BrepShapeTrait>> {
-    let pgo_refnos = crate::fast_model::query_provider::get_children(refno)
-        .await
-        .unwrap_or_default();
+/// 从固定版本读取会话构建多面体 CSG shape（POHE/POLYHE）。
+async fn build_polyhedron_from_db(
+    read: &GenerationReadContext,
+    refno: RefnoEnum,
+) -> Option<Box<dyn BrepShapeTrait>> {
+    let pgo_refnos = session_query::get_children(read, refno);
     if pgo_refnos.is_empty() {
         return None;
     }
 
-    let first_type = aios_core::get_type_name(pgo_refnos[0])
-        .await
-        .unwrap_or_default();
+    let first_type = session_query::get_type_name(read, pgo_refnos[0]).unwrap_or_default();
 
     let mut polygons = vec![];
     let mut is_polyhe = false;
@@ -587,19 +585,17 @@ async fn build_polyhedron_from_db(refno: RefnoEnum) -> Option<Box<dyn BrepShapeT
     if first_type == "POLPTL" {
         is_polyhe = true;
         let mut verts_map = HashMap::new();
-        let v_att = crate::fast_model::query_provider::query_multi_descendants_with_self(
-            &[pgo_refnos[0]],
-            &["POIN"],
-            false,
-        )
-        .await
-        .unwrap_or_default();
+        let v_att =
+            session_query::get_multi_descendants_by_types(read, &[pgo_refnos[0]], &["POIN"], false)
+                .unwrap_or_default();
         for v in v_att.into_iter() {
-            let v_attmap = aios_core::get_named_attmap(v).await.unwrap_or_default();
+            let v_attmap = session_query::get_named_attmap(read, v)
+                .await
+                .unwrap_or_default();
             let pos = v_attmap.get_position().unwrap_or_default();
             verts_map.insert(v, pos);
         }
-        let index_loops = query_filter_deep_children_atts(refno, &["LOOPTS"])
+        let index_loops = session_query::get_descendant_attmaps(read, refno, &["LOOPTS"])
             .await
             .unwrap_or_default();
         let index_map = index_loops.iter().fold(HashMap::new(), |mut map, x| {
@@ -608,7 +604,7 @@ async fn build_polyhedron_from_db(refno: RefnoEnum) -> Option<Box<dyn BrepShapeT
             map.entry(owner).or_insert_with(Vec::new).extend(vx_refnos);
             map
         });
-        let loop_atts = query_filter_deep_children_atts(refno, &["POLOOP"])
+        let loop_atts = session_query::get_descendant_attmaps(read, refno, &["POLOOP"])
             .await
             .unwrap_or_default();
         let loops_map = loop_atts.iter().fold(HashMap::new(), |mut map, x| {
@@ -634,10 +630,11 @@ async fn build_polyhedron_from_db(refno: RefnoEnum) -> Option<Box<dyn BrepShapeT
     } else {
         for pgo_refno in pgo_refnos {
             let mut verts = vec![];
-            let v_att = aios_core::collect_children_filter_attrs(pgo_refno, &[])
+            let children = session_query::get_children(read, pgo_refno);
+            let v_att = session_query::get_named_attmaps(read, &children)
                 .await
                 .unwrap_or_default();
-            for v in v_att {
+            for (_, v) in v_att {
                 verts.push(v.get_position().unwrap_or_default());
             }
             polygons.push(Polygon { loops: vec![verts] });
@@ -765,9 +762,10 @@ async fn flush_remaining(
 // 公开入口函数
 // ---------------------------------------------------------------------------
 
-/// 生成基本体的几何数据（从 SurrealDB 查询属性）
+/// 生成基本体的几何数据（从固定版本读取会话查询属性）
 pub async fn gen_prim_geos(
-    db_option: Arc<DbOptionExt>,
+    _db_option: Arc<DbOptionExt>,
+    generation_read: Arc<GenerationReadContext>,
     prim_refnos: &[RefnoEnum],
     sender: flume::Sender<ShapeInstancesData>,
 ) -> anyhow::Result<bool> {
@@ -810,7 +808,7 @@ pub async fn gen_prim_geos(
         let all_refnos = all_refnos.clone();
         let processed_cnt = processed_cnt.clone();
         let sender = sender.clone();
-        let db_option = db_option.clone();
+        let generation_read = Arc::clone(&generation_read);
 
         let handle = tokio::spawn(async move {
             let batch_start_time = Instant::now();
@@ -830,38 +828,33 @@ pub async fn gen_prim_geos(
                 batch_item_count
             );
 
-            // ── 批量预取：attmap + transform 并发，neg 走 TreeIndex ──
+            // ── 固定 snapshot 批量读取 attmap + transform ──
             let batch_refnos: Vec<RefnoEnum> = all_refnos[start_idx..end_idx].to_vec();
-            {
-                let t_prefetch = Instant::now();
-                let attmap_futs: Vec<_> = batch_refnos
-                    .iter()
-                    .map(|&r| aios_core::get_named_attmap(r))
-                    .collect();
-                let transform_fut = crate::fast_model::gen_model::transform_cache::get_world_transforms_cache_first_batch(
-                    Some(db_option.as_ref()),
-                    &batch_refnos,
-                );
-                let _ = tokio::join!(futures::future::join_all(attmap_futs), transform_fut,);
-                e3d_dbg!(
-                    "[gen_prim_geos] 批次 {} 预取 attmap+transform 完成: {} 个, 耗时 {} ms",
-                    i,
-                    batch_item_count,
-                    t_prefetch.elapsed().as_millis()
+            let t_prefetch = Instant::now();
+            let (mut attributes, transforms) = tokio::try_join!(
+                session_query::get_named_attmaps(&generation_read, &batch_refnos),
+                session_query::get_world_transforms(&generation_read, &batch_refnos),
+            )?;
+            e3d_dbg!(
+                "[gen_prim_geos] 批次 {} 读取 attmap+transform 完成: {} 个, 耗时 {} ms",
+                i,
+                batch_item_count,
+                t_prefetch.elapsed().as_millis()
+            );
+
+            let mut neg_map = HashMap::new();
+            for refno in &batch_refnos {
+                neg_map.insert(
+                    *refno,
+                    session_query::get_descendants_by_types(
+                        &generation_read,
+                        *refno,
+                        &GENRAL_NEG_NOUN_NAMES,
+                        None,
+                        false,
+                    )?,
                 );
             }
-
-            let neg_map = {
-                let tree_dir = db_option.get_scene_tree_dir();
-                neg_query::query_descendants_map_by_dbnum_dual(
-                    &tree_dir,
-                    &batch_refnos,
-                    &GENRAL_NEG_NOUN_NAMES,
-                    false,
-                )
-                .await
-                .unwrap_or_default()
-            };
 
             // ── 主循环：从缓存读取 ──
             let mut processed_in_batch = 0usize;
@@ -875,28 +868,15 @@ pub async fn gen_prim_geos(
                     *cnt -= 1;
                 }
 
-                let trans_result =
-                    crate::fast_model::gen_model::transform_cache::get_world_transform_cache_first(
-                        Some(db_option.as_ref()),
-                        refno,
-                    )
-                    .await;
-                let Ok(Some(trans_origin)) = trans_result else {
-                    skipped_in_batch += 1;
-                    spec011_log(refno, "skip=world_transform_missing");
-                    if let Err(e) = &trans_result {
-                        e3d_dbg!(
-                            "批次 {} 跳过 refno={}: 获取世界变换失败 - {:?}",
-                            i,
-                            refno,
-                            e
-                        );
-                    }
-                    continue;
-                };
+                let trans_origin = transforms
+                    .get(&refno)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("prim batch missing transform for {refno}"))?;
 
-                let attr = aios_core::get_named_attmap(refno).await.unwrap_or_default();
-                let attr = resolve_template_prim_attr(refno, attr).await;
+                let attr = attributes
+                    .remove(&refno)
+                    .ok_or_else(|| anyhow::anyhow!("prim batch missing attributes for {refno}"))?;
+                let attr = resolve_template_prim_attr(&generation_read, refno, attr).await;
                 let visible = attr.is_visible_by_level(None).unwrap_or(true);
                 let (owner_refno, owner_type) = shared::get_owner_info_from_attr(&attr).await;
                 let cur_type = attr.get_type_str();
@@ -923,7 +903,7 @@ pub async fn gen_prim_geos(
                 let csg_shape = if datum_geos.is_some() {
                     None
                 } else if cur_type == "POHE" || cur_type == "POLYHE" {
-                    build_polyhedron_from_db(refno).await
+                    build_polyhedron_from_db(&generation_read, refno).await
                 } else {
                     attr.create_csg_shape(neg_limit_size)
                 };

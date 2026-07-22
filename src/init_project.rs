@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 
 use crate::data_interface::db_meta;
-use crate::data_interface::db_meta_manager::generate_desi_indextree;
+use crate::data_interface::db_meta_manager::generate_desi_db_meta;
 use crate::options::DbOptionExt;
 use crate::pe_transform_refresh::refresh_pe_transform_for_dbnums_compat;
 
@@ -16,7 +16,7 @@ pub fn resolve_target_dbnums(
     discovered_dbnums.dedup();
 
     if discovered_dbnums.is_empty() {
-        bail!("db_meta 中没有任何 DESI dbnum（请先完成第 1 步 scene_tree / indextree 生成）");
+        bail!("db_meta 中没有任何 DESI dbnum（请先完成第 1 步 db_meta 生成）");
     }
 
     let Some(mut dbnums) = cli_dbnums else {
@@ -64,18 +64,17 @@ pub async fn run_init_project_mode(
     );
 
     println!(
-        "🌲 第 1 步：生成 scene_tree（DESI indextree：output/<项目>/scene_tree/*.tree + db_meta_info.json）"
+        "🌲 第 1 步：生成 db_meta（DESI 轻量扫描：output/<项目>/scene_tree/db_meta_info.json）"
     );
-    generate_desi_indextree(ignore_manual_dbnums)
-        .context("scene_tree / DESI indextree 生成失败")?;
+    generate_desi_db_meta(ignore_manual_dbnums).context("db_meta 生成失败")?;
 
-    println!("🔌 第 2 步：连接 SurrealDB 并从磁盘加载 db_meta（校验 scene_tree 元数据）");
+    println!("🔌 第 2 步：连接 SurrealDB 并从磁盘加载 db_meta（校验 db_meta_info.json）");
     aios_core::init_surreal()
         .await
         .context("初始化 Surreal 连接失败")?;
     db_meta()
         .try_load_default()
-        .context("加载 db_meta_info.json 失败（确认第 1 步已写出 scene_tree）")?;
+        .context("加载 db_meta_info.json 失败（确认第 1 步已写出 db_meta）")?;
 
     let discovered_dbnums = db_meta().get_all_dbnums();
     let dbnums = resolve_target_dbnums(cli_dbnums.or(configured_dbnums), discovered_dbnums)?;

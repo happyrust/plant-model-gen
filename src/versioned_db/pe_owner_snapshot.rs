@@ -62,7 +62,12 @@ struct PeSnapshotRow {
     children: Option<Vec<RefnoEnum>>,
 }
 
-fn filter_matches(filter: &TreeQueryFilter, meta: &TreeNodeMeta, has_geo: bool, is_leaf: bool) -> bool {
+fn filter_matches(
+    filter: &TreeQueryFilter,
+    meta: &TreeNodeMeta,
+    has_geo: bool,
+    is_leaf: bool,
+) -> bool {
     if let Some(f) = filter.has_geo {
         if has_geo != f {
             return false;
@@ -160,7 +165,12 @@ impl PeDbnumSnapshot {
         out
     }
 
-    fn bfs_inner(&self, root: RefU64, options: &TreeQueryOptions, mut emit: impl FnMut(RefU64, u32)) {
+    fn bfs_inner(
+        &self,
+        root: RefU64,
+        options: &TreeQueryOptions,
+        mut emit: impl FnMut(RefU64, u32),
+    ) {
         if !self.nodes.contains_key(&root) {
             return;
         }
@@ -247,7 +257,7 @@ impl PeDbnumSnapshot {
     }
 
     /// 按 noun_hash 枚举（存储序不稳定，调用侧需要稳定序时自行排序——与
-    /// TreeIndexManager::query_noun_refnos 的 arena 序同为"实现细节序"）。
+    /// arena 序同为"实现细节序"）。
     pub fn noun_refnos(&self, noun_hash: u32) -> Vec<RefU64> {
         self.nodes
             .iter()

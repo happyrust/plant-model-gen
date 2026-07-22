@@ -24,7 +24,7 @@ gen_mesh = false
 gen_model = false
 gen_model_batch_size = 16
 gen_spatial_tree = false
-gen_tree_only = false
+gen_db_meta_only = false
 # 按需最小解析集：SYST + DICT（必解析）+ DESI 7997（BRAN 所在库）
 # + CATA 5054（BRAN 闭包）+ CATA 5052（FITT 生成对比样本闭包）
 included_db_files = [
@@ -38,9 +38,9 @@ included_db_files = [
 ]
 included_projects = ["AvevaMarineSample"]
 incr_sync = false
-index_tree_batch_size = 200
-index_tree_debug_limit_per_target_type = 0
-index_tree_max_concurrent_targets = 6
+gen_pipeline_batch_size = 200
+gen_pipeline_debug_limit_per_target_type = 0
+gen_pipeline_max_concurrent = 6
 ip = "127.0.0.1"
 load_spatial_tree = false
 location = "sjz"

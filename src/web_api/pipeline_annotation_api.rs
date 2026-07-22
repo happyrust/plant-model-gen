@@ -1,6 +1,13 @@
 //! 管道标注 API 模块
 //!
 //! 提供管道分支（BRAN）的工程标注数据接口
+//!
+//! # ⚠ 已冻结（2026-07-20 审核决策）
+//!
+//! 本模块是**启发式临时预览**（段长阈值画尺寸线、端点距离判焊缝、无条件强制
+//! 落位），不是 CONTEXT.md 定义的「管道尺寸标注」——没有直段拆分、尺寸候选
+//! 与抑制契约。**禁止在其上新增功能**；rs-mbd Phase 3 宿主接入后整体删除
+//! （见 rs-mbd/docs/ROADMAP.md）。勿重演 mbd_pipe_api.rs 膨胀到 3600 行的历史。
 
 use aios_core::{RefnoEnum, rs_surreal::pipeline::PipelineQueryService};
 use axum::{Json, Router, extract::Path, response::IntoResponse, routing::get};

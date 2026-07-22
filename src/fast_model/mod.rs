@@ -173,7 +173,7 @@ pub fn get_capture_config() -> Option<CaptureConfig> {
 }
 
 // ✅ 已完成迁移：
-// - 模型生成统一入口：gen_model::gen_all_geos_data（IndexTree 单管线）
+// - 模型生成统一入口：gen_model::gen_all_geos_data（GenPipeline 单管线）
 
 // - process_meshes_by_dbnos → gen_model::mesh_processing (✅ 已完成)
 

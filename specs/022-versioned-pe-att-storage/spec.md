@@ -15,11 +15,11 @@
 | # | 决策点 | 结论 |
 |---|--------|------|
 | 1 | 启用范围 | SUL_DB（项目主库，RocksDB）实例级开启 `versioned=true`；模型高频写数据靠已有 MODEL_KV 分离机制隔离 |
-| 2 | retention | 默认 90d，做成 DbOption 可配置项，透传到 `surreal start` 启动参数 |
+| 2 | retention | 默认 **`0`（无限保留，全量历史）**，做成 DbOption 可配置项，透传到 `surreal start`；可按站点改为 `90d`/`30d` 等（磁盘风险需评估） |
 | 3 | 版本锚点 | 新建 `sesno_version_anchor` 表，每次增量落库事务完成后固化 `dbnum + sesno → 时间戳`；历史查询按 sesno 入参、内部换算时间戳 |
 | 4 | 删除语义 | 保持硬 DELETE，删除前状态由 versioned 存储层通过 `VERSION $t` 回答 |
-| 5 | 与 DuckLake 关系 | 共存（见 `specs/023`）：**022** = SUL_DB RocksDB versioned 管 PE/ATT **源行**历史（细粒度、retention）；**023** = DuckLake 只管 **导出交付单元**版本，主键 `(dbnum, refno, sesno)`，**不是** PE/ATT 行史，也**不以** `release_id` 为版本真相（`release_id` 至多作 export-batch 别名）。后续可用 022 VERSION diff 生成 affected 证据再喂 023 索引 |
-| 6 | 存量迁移 | 重新解析建库：新建 versioned 数据目录 + `sync_pdms` 全量重灌 + 写首条锚点；新站点默认开启 |
+| 5 | 与交付单元版本关系 | 正交：本 feature 只管 PE/ATT **源行**历史（细粒度、retention）。导出交付单元版本不在本 feature 范围 |
+| 6 | 存量迁移 | 重新解析建库：新建 versioned 数据目录 + `sync_pdms` 全量重灌 + 写首条锚点；`DbOption.versioned_storage` 默认 **false**（versioned 是建库属性，存量目录以 versioned=true 打开会因 comparator 不匹配启动失败），新建站点经管理端/配置显式开启（T001 偏差记录 + T022，详见 ops-notes 决策 6） |
 | 7 | 查询接口 | 仅新增 CLI 子命令（`model-version` 下的 history 类命令），暂不开 HTTP API；封装层放 rs-core `version_query` 模块 |
 
 **已核实的技术前提**：
@@ -108,7 +108,7 @@
 ### Functional Requirements
 
 - **FR-001**: 系统 MUST 支持通过 DbOption 配置项开启 SUL_DB 的版本化存储，并在所有 `surreal start` 启动点（cli_modes 自启动、managed_project_sites、web_server、systemd/nohup 脚本模板）把 `?versioned=true&retention=<配置值>` 透传到连接串
-- **FR-002**: retention MUST 默认为 90d 且可按站点配置；`retention=0`（无限保留）允许配置但文档必须警示磁盘风险
+- **FR-002**: retention MUST 默认为 `0`（无限保留，全量历史）且可按站点配置为有限窗口（如 `90d`/`30d`）；文档 MUST 警示 `retention=0` 下磁盘只增不减的风险
 - **FR-003**: 系统 MUST 提供 `sesno_version_anchor` 表（字段：dbnum、sesno、anchored_at、来源标记 full/incremental），并在增量落库全部写入完成后、以及全量重灌完成后写入锚点
 - **FR-004**: 增量落库失败时 MUST NOT 写入本次锚点
 - **FR-005**: 历史查询 MUST 以 sesno 为业务入参，内部通过锚点表换算时间戳后发起 `VERSION` 查询；锚点缺失时按"最近不大于"回退并注明
@@ -116,7 +116,7 @@
 - **FR-007**: 系统 MUST 提供 CLI 子命令（挂在 `model-version` 下）：`history snapshot`（单元素快照）、`history timeline`（元素跨锚点变更时间线）、`history diff`（refno 集合区间批量对比），全部支持 `--json` 输出
 - **FR-008**: rs-core MUST 新增 `version_query` 封装模块（sesno→时间戳换算、VERSION 查询拼接、GC 越界错误翻译），plant-model-gen 侧只做 CLI 参数层
 - **FR-009**: 存量站点切换 MUST 复用现有 sync_pdms 重灌链路，不新写一次性迁移工具；切换流程文档化到 quickstart
-- **FR-010**: 现有 DuckLake/patch_only 发布链 MUST 不受影响（本 feature 不修改 register/reconcile 逻辑）。交付单元版本身份演进见 `specs/023-ducklake-unit-version-by-sesno/`（与本 feature 正交）
+- **FR-010**: 现有 patch_only / 模型发布链 MUST 不受本 feature 影响（本 feature 不修改 register/reconcile 逻辑）。
 
 ### Key Entities
 

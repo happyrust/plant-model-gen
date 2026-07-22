@@ -30,13 +30,13 @@
 
 **Independent Test**: Run the backend against a site with `room_relate` rows and verify all `/api/room-tree/*` endpoints by HTTP.
 
-- [ ] T013 [US1] Start web_server with route logging and confirm `/api/room-tree/*` routes are mounted
-- [ ] T014 [US1] HTTP-verify `GET /api/room-tree/root`
-- [ ] T015 [US1] HTTP-verify `GET /api/room-tree/children/room-root`
+- [x] T013 [US1] Start web_server with route logging and confirm `/api/room-tree/*` routes are mounted
+- [x] T014 [US1] HTTP-verify `GET /api/room-tree/root`
+- [ ] T015 [US1] HTTP-verify `GET /api/room-tree/children/room-root`（**阻塞**：站点无 `room_panel_relate` 表；需先跑房间计算。连通性已修复，见 quickstart 附录）
 - [ ] T016 [US1] HTTP-verify one room group, one room, and one component group expansion
 - [ ] T017 [US3] HTTP-verify `GET /api/room-tree/ancestors/{component_refno}` for a known room-contained component
-- [ ] T018 [US1] HTTP-verify `POST /api/room-tree/search`
-- [ ] T019 [US4] HTTP-verify behavior when `room_relate` is empty or missing
+- [ ] T018 [US1] HTTP-verify `POST /api/room-tree/search`（同 T015：表缺失）
+- [x] T019 [US4] HTTP-verify behavior when `room_relate` is empty or missing（**2026-07-16**：children/search 快速返回 `success=false`，`error_message` 含 `table 'room_panel_relate' does not exist`）
 
 ## Phase 4: Frontend Display Validation (P1)
 

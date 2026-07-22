@@ -1,23 +1,303 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aios_core::RefnoEnum;
 use aios_core::geometry::ShapeInstancesData;
 use aios_core::options::DbOption;
+use aios_core::parsed_data::TubiInfoData;
 use dashmap::DashMap;
 use parry3d::bounding_volume::Aabb;
 use serde::Serialize;
 
-use crate::fast_model::gen_model::boolean_task::BooleanTask;
-use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks;
-use crate::fast_model::mesh_generate::{MeshResult, run_boolean_worker};
-use crate::fast_model::pdms_inst::save_instance_data_with_report;
+use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
+use crate::fast_model::gen_model::manifold_bool::run_bool_worker_from_tasks_versioned;
+use crate::fast_model::mesh_generate::MeshResult;
 use crate::fast_model::pdms_inst::{
-    build_inst_relate_aabb_rows, reconcile_missing_neg_relate, save_inst_relate_aabb_rows,
+    InstRelatePrecomputed, build_inst_relate_aabb_rows, persist_negative_relations_from_artifacts,
+    persist_tubi_relations_from_artifacts, save_inst_relate_aabb_rows,
+    save_instance_data_with_report_versioned, save_tubi_info_batch_with_replace,
 };
-use crate::fast_model::utils::{save_aabb_to_surreal, save_pts_to_surreal};
+use crate::fast_model::utils::{save_aabb_to_surreal_checked, save_pts_to_surreal_checked};
 use crate::options::{BooleanPipelineMode, ModelWriterMode};
+
+/// 单次模型生成的内存事实源。生成、mesh、关系与 boolean 阶段只在这里交接，
+/// writer 负责最终持久化，不允许为了补齐当前 run 的数据再回读模型表。
+#[derive(Debug)]
+pub struct GenerationArtifacts {
+    authoritative_snapshot_id: u64,
+    batches: Mutex<BTreeMap<u64, Arc<ShapeInstancesData>>>,
+    mesh_results: Mutex<BTreeMap<u64, HashMap<u64, MeshResult>>>,
+    boolean_accumulator: Mutex<BooleanTaskAccumulator>,
+    missing_neg_carriers: Mutex<BTreeSet<RefnoEnum>>,
+    tubi_info: DashMap<String, TubiInfoData>,
+    boolean_execution: Mutex<Option<BooleanExecutionArtifact>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BooleanExecutionArtifact {
+    task_count: usize,
+    task_semantic_hash: String,
+    success: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationArtifactsSummary {
+    pub authoritative_snapshot_id: u64,
+    pub batch_count: usize,
+    pub mesh_result_count: usize,
+    pub missing_neg_carrier_count: usize,
+    pub tubi_info_count: usize,
+    pub boolean_task_count: usize,
+    pub geometry_artifact_hash: String,
+    pub semantic_hash: String,
+    pub model_semantic_hash: String,
+}
+
+impl GenerationArtifacts {
+    pub fn new(authoritative_snapshot_id: u64) -> Self {
+        Self {
+            authoritative_snapshot_id,
+            batches: Mutex::new(BTreeMap::new()),
+            mesh_results: Mutex::new(BTreeMap::new()),
+            boolean_accumulator: Mutex::new(BooleanTaskAccumulator::default()),
+            missing_neg_carriers: Mutex::new(BTreeSet::new()),
+            tubi_info: DashMap::new(),
+            boolean_execution: Mutex::new(None),
+        }
+    }
+
+    pub fn record_base_batch(
+        &self,
+        batch_id: u64,
+        shape_insts: Arc<ShapeInstancesData>,
+    ) -> anyhow::Result<()> {
+        let mut batches = self
+            .batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch artifact mutex poisoned"))?;
+        anyhow::ensure!(
+            !batches.contains_key(&batch_id),
+            "duplicate generation batch_id={batch_id}"
+        );
+        self.boolean_accumulator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("boolean artifact mutex poisoned"))?
+            .merge_batch(&shape_insts);
+        batches.insert(batch_id, shape_insts);
+        Ok(())
+    }
+
+    pub fn record_mesh_results(
+        &self,
+        batch_id: u64,
+        mesh_results: &HashMap<u64, MeshResult>,
+    ) -> anyhow::Result<()> {
+        let mut batches = self
+            .mesh_results
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mesh artifact mutex poisoned"))?;
+        anyhow::ensure!(
+            !batches.contains_key(&batch_id),
+            "duplicate mesh artifact batch_id={batch_id}"
+        );
+        batches.insert(batch_id, mesh_results.clone());
+        Ok(())
+    }
+
+    pub fn record_missing_neg_carriers(
+        &self,
+        refnos: impl IntoIterator<Item = RefnoEnum>,
+    ) -> anyhow::Result<()> {
+        self.missing_neg_carriers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("negative relation artifact mutex poisoned"))?
+            .extend(refnos);
+        Ok(())
+    }
+
+    pub fn take_run_outputs(&self) -> anyhow::Result<(Vec<BooleanTask>, ShapeInstancesData)> {
+        let mut accumulator = self
+            .boolean_accumulator
+            .lock()
+            .map_err(|_| anyhow::anyhow!("boolean artifact mutex poisoned"))?;
+        let accumulator = std::mem::take(&mut *accumulator);
+        let tasks = accumulator.build_tasks();
+        Ok((tasks, accumulator.into_merged()))
+    }
+
+    pub fn missing_neg_carriers(&self) -> anyhow::Result<Vec<RefnoEnum>> {
+        Ok(self
+            .missing_neg_carriers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("negative relation artifact mutex poisoned"))?
+            .iter()
+            .copied()
+            .collect())
+    }
+
+    pub fn record_tubi_info(&self, values: &DashMap<String, TubiInfoData>) -> anyhow::Result<()> {
+        for entry in values {
+            match self.tubi_info.entry(entry.key().clone()) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => {
+                    anyhow::ensure!(
+                        existing.get().to_surreal_json() == entry.value().to_surreal_json(),
+                        "conflicting TUBI artifact key={}",
+                        entry.key()
+                    );
+                }
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    vacant.insert(entry.value().clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn tubi_info(&self) -> &DashMap<String, TubiInfoData> {
+        &self.tubi_info
+    }
+
+    pub fn record_boolean_execution(
+        &self,
+        task_count: usize,
+        task_semantic_hash: String,
+        report: &BooleanBridgeReport,
+    ) -> anyhow::Result<()> {
+        let mut execution = self
+            .boolean_execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("boolean execution artifact mutex poisoned"))?;
+        anyhow::ensure!(
+            execution.is_none(),
+            "boolean execution artifact already recorded"
+        );
+        *execution = Some(BooleanExecutionArtifact {
+            task_count,
+            task_semantic_hash,
+            success: report.success,
+            failed: report.failed,
+            skipped: report.skipped,
+        });
+        Ok(())
+    }
+
+    pub fn summary(&self) -> anyhow::Result<GenerationArtifactsSummary> {
+        let batches = self
+            .batches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("batch artifact mutex poisoned"))?;
+        let mut merged = BooleanTaskAccumulator::default();
+        for shape in batches.values() {
+            merged.merge_batch(shape);
+        }
+        let mut merged = merged.into_merged();
+        for refnos in merged.neg_relate_map.values_mut() {
+            refnos.sort_unstable();
+        }
+        for pairs in merged.ngmr_neg_relate_map.values_mut() {
+            pairs.sort_unstable();
+        }
+        for geos in merged.inst_geos_map.values_mut() {
+            for geo in &mut geos.insts {
+                geo.cata_neg_refnos.sort_unstable();
+                geo.cata_neg_refnos.dedup();
+            }
+            geos.insts
+                .sort_unstable_by_key(|geo| crate::generation_read::hash_serializable(geo));
+        }
+        let neg_relations = merged
+            .neg_relate_map
+            .iter()
+            .map(|(target, carriers)| (*target, carriers.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let ngmr_relations = merged
+            .ngmr_neg_relate_map
+            .iter()
+            .map(|(target, pairs)| (*target, pairs.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let merged_shape = canonical_json(serde_json::to_value(merged)?);
+        let geometry_artifact_hash = crate::generation_read::hash_serializable(&merged_shape);
+
+        let mesh_results = self
+            .mesh_results
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mesh artifact mutex poisoned"))?;
+        let mut mesh_digest = BTreeMap::new();
+        for results in mesh_results.values() {
+            for (geo_hash, result) in results {
+                let mut pts = result.pts_hashes.clone();
+                pts.sort_unstable();
+                let digest = (result.meshed, result.bad, result.aabb_hash, pts);
+                if let Some(existing) = mesh_digest.insert(*geo_hash, digest.clone()) {
+                    anyhow::ensure!(
+                        existing == digest,
+                        "conflicting mesh artifact geo_hash={geo_hash}"
+                    );
+                }
+            }
+        }
+        let mesh_result_count = mesh_digest.len();
+
+        let missing_neg_carriers = self.missing_neg_carriers()?;
+        let mut tubi_info = self
+            .tubi_info
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().to_surreal_json()))
+            .collect::<Vec<_>>();
+        tubi_info.sort_by(|left, right| left.0.cmp(&right.0));
+        let boolean_execution = self
+            .boolean_execution
+            .lock()
+            .map_err(|_| anyhow::anyhow!("boolean execution artifact mutex poisoned"))?
+            .clone();
+        let model_semantic_hash = crate::generation_read::hash_serializable(&(
+            &merged_shape,
+            &neg_relations,
+            &ngmr_relations,
+            &mesh_digest,
+            &tubi_info,
+            &boolean_execution,
+        ));
+        let semantic_hash = crate::generation_read::hash_serializable(&(
+            self.authoritative_snapshot_id,
+            &model_semantic_hash,
+            &missing_neg_carriers,
+        ));
+        Ok(GenerationArtifactsSummary {
+            authoritative_snapshot_id: self.authoritative_snapshot_id,
+            batch_count: batches.len(),
+            mesh_result_count,
+            missing_neg_carrier_count: missing_neg_carriers.len(),
+            tubi_info_count: tubi_info.len(),
+            boolean_task_count: boolean_execution
+                .as_ref()
+                .map(|execution| execution.task_count)
+                .unwrap_or_default(),
+            geometry_artifact_hash,
+            semantic_hash,
+            model_semantic_hash,
+        })
+    }
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>();
+            serde_json::to_value(sorted).expect("canonical JSON object serialization")
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -185,6 +465,24 @@ pub trait ModelWriterBackend: Send + Sync {
         batch: &ShapeInstancesData,
     ) -> anyhow::Result<ModelWriteBatchReport>;
 
+    /// 专门的 pe_transform 持久化阶段（按需生成方案）。
+    ///
+    /// 模型生成阶段已算出每个实例的 world_transform；这里把它作为一个**独立的
+    /// writer 阶段**落库 `pe_transform`，使覆盖成为生成的副产品——只覆盖本次
+    /// 生成的实例、零重算、无整库 BFS。非生成路径（导出 / transform API）继续
+    /// 按需惰性获取。默认 no-op，仅写库后端实现。
+    async fn persist_pe_transform(
+        &self,
+        shape_insts: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriterStageReport> {
+        let _ = shape_insts;
+        Ok(ModelWriterStageReport::skipped(
+            "pe_transform",
+            "backend default no-op",
+            0,
+        ))
+    }
+
     async fn persist_mesh_results(
         &self,
         mesh_results: &HashMap<u64, MeshResult>,
@@ -202,8 +500,8 @@ pub trait ModelWriterBackend: Send + Sync {
 
     async fn reconcile_missing_neg_relations(
         &self,
-        all_refnos: &[RefnoEnum],
-        missing_neg_carriers: &[RefnoEnum],
+        artifacts: &ShapeInstancesData,
+        tubi_info: &DashMap<String, TubiInfoData>,
     ) -> anyhow::Result<ModelWriterStageReport>;
 
     async fn run_boolean_bridge(
@@ -242,16 +540,19 @@ pub type ModelWriter = dyn ModelWriterBackend;
 pub struct SurrealModelWriterBackend {
     mesh_aabb_map: Arc<DashMap<String, Aabb>>,
     missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+    inst_relate_precomputed: Arc<InstRelatePrecomputed>,
 }
 
 impl SurrealModelWriterBackend {
     pub fn new(
         mesh_aabb_map: Arc<DashMap<String, Aabb>>,
         missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+        inst_relate_precomputed: Arc<InstRelatePrecomputed>,
     ) -> Self {
         Self {
             mesh_aabb_map,
             missing_neg_carriers,
+            inst_relate_precomputed,
         }
     }
 }
@@ -274,12 +575,13 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         &self,
         batch: &ShapeInstancesData,
     ) -> anyhow::Result<ModelWriteBatchReport> {
-        let save_report = save_instance_data_with_report(
+        let save_report = save_instance_data_with_report_versioned(
             batch,
             false,
             &HashMap::new(),
             &self.mesh_aabb_map,
             false,
+            &self.inst_relate_precomputed,
         )
         .await?;
         if !save_report.missing_neg_carriers.is_empty() {
@@ -292,6 +594,40 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         Ok(ModelWriteBatchReport {
             missing_neg_carriers: save_report.missing_neg_carriers,
         })
+    }
+
+    async fn persist_pe_transform(
+        &self,
+        shape_insts: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriterStageReport> {
+        use aios_core::rs_surreal::pe_transform::PeTransformEntry;
+
+        let mut entries: Vec<PeTransformEntry> =
+            Vec::with_capacity(shape_insts.inst_info_map.len());
+        for (refno, info) in &shape_insts.inst_info_map {
+            let world = info.world_transform;
+            if world.translation.is_nan() || world.rotation.is_nan() || world.scale.is_nan() {
+                continue;
+            }
+            entries.push(PeTransformEntry {
+                refno: *refno,
+                local: None,
+                world: Some(world),
+            });
+        }
+
+        if entries.is_empty() {
+            return Ok(ModelWriterStageReport::skipped(
+                "pe_transform",
+                "no instance world transforms in batch",
+                0,
+            ));
+        }
+
+        let count = entries.len();
+        let db_option = crate::options::get_db_option_ext();
+        crate::pe_transform_store::save_entries_with_backend(&db_option, &entries).await?;
+        Ok(ModelWriterStageReport::executed("pe_transform", count))
     }
 
     async fn persist_mesh_results(
@@ -337,8 +673,8 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         }
 
         // Preserve existing ordering: persist aabb/pts entities before inst_geo references them.
-        save_pts_to_surreal(&delta_pts).await;
-        save_aabb_to_surreal(&delta_aabb).await;
+        save_pts_to_surreal_checked(&delta_pts).await?;
+        save_aabb_to_surreal_checked(&delta_aabb).await?;
 
         let mut update_sql = String::new();
         for (geo_hash, mesh_result) in mesh_results {
@@ -417,8 +753,8 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
             ));
         }
 
-        save_pts_to_surreal(mesh_pts_map).await;
-        save_aabb_to_surreal(mesh_aabb_map).await;
+        save_pts_to_surreal_checked(mesh_pts_map).await?;
+        save_aabb_to_surreal_checked(mesh_aabb_map).await?;
         Ok(ModelWriterStageReport::executed(
             "final_sweep",
             mesh_aabb_map.len() + mesh_pts_map.len(),
@@ -427,21 +763,27 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
 
     async fn reconcile_missing_neg_relations(
         &self,
-        all_refnos: &[RefnoEnum],
-        missing_neg_carriers: &[RefnoEnum],
+        artifacts: &ShapeInstancesData,
+        tubi_info: &DashMap<String, TubiInfoData>,
     ) -> anyhow::Result<ModelWriterStageReport> {
-        if missing_neg_carriers.is_empty() {
+        if artifacts.neg_relate_map.is_empty()
+            && artifacts.ngmr_neg_relate_map.is_empty()
+            && artifacts.inst_tubi_map.is_empty()
+            && tubi_info.is_empty()
+        {
             return Ok(ModelWriterStageReport::skipped(
-                "missing_neg_reconcile",
-                "no missing negative relation carriers",
+                "run_relation_artifacts",
+                "no negative or tubing relation artifacts",
                 0,
             ));
         }
 
-        reconcile_missing_neg_relate(all_refnos, missing_neg_carriers).await?;
+        let submitted = persist_negative_relations_from_artifacts(artifacts).await?
+            + persist_tubi_relations_from_artifacts(artifacts).await?
+            + save_tubi_info_batch_with_replace(tubi_info, true).await?;
         Ok(ModelWriterStageReport::executed(
-            "missing_neg_reconcile",
-            missing_neg_carriers.len(),
+            "run_relation_artifacts",
+            submitted,
         ))
     }
 
@@ -450,29 +792,9 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         request: BooleanBridgeRequest,
     ) -> anyhow::Result<BooleanBridgeReport> {
         match request.mode {
-            BooleanPipelineMode::DbLegacy => {
-                if request.use_surrealdb && !request.defer_db_write {
-                    let scope_refnos = if request.scope_refnos.is_empty() {
-                        None
-                    } else {
-                        Some(request.scope_refnos.as_slice())
-                    };
-                    run_boolean_worker(request.db_option, 100, scope_refnos).await?;
-                    Ok(BooleanBridgeReport {
-                        total: 0,
-                        success: 0,
-                        failed: 0,
-                        skipped: 0,
-                        skipped_reason: None,
-                    })
-                } else {
-                    Ok(BooleanBridgeReport {
-                        skipped: request.bool_tasks.len(),
-                        skipped_reason: Some("db_legacy conditions not met"),
-                        ..BooleanBridgeReport::default()
-                    })
-                }
-            }
+            BooleanPipelineMode::DbLegacy => anyhow::bail!(
+                "DbLegacy boolean pipeline 不属于版本化双后端正式路径；请使用 memory_tasks"
+            ),
             BooleanPipelineMode::MemoryTasks => {
                 if !request.use_surrealdb {
                     return Ok(BooleanBridgeReport {
@@ -488,30 +810,18 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
                     });
                 }
 
-                let mut bool_tasks = request.bool_tasks;
                 if request.enable_db_backfill {
-                    match super::boolean_backfill::backfill_cata_tasks_from_db(
-                        &mut bool_tasks,
-                        request.use_surrealdb,
-                    )
-                    .await
-                    {
-                        Ok(count) if count > 0 => {
-                            println!(
-                                "[gen_model] DB backfill 补齐了 {} 个 cata 布尔任务，当前总数 {}",
-                                count,
-                                bool_tasks.len()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("[gen_model] DB backfill 失败（非致命，继续执行）: {}", e);
-                        }
-                        _ => {}
-                    }
+                    anyhow::bail!(
+                        "enable_db_backfill 与版本化双后端正式路径不兼容；boolean task 必须完全来自 GenerationArtifacts"
+                    );
                 }
 
-                let report =
-                    run_bool_worker_from_tasks(bool_tasks, request.db_option, None).await?;
+                let report = run_bool_worker_from_tasks_versioned(
+                    request.bool_tasks,
+                    request.db_option,
+                    None,
+                )
+                .await?;
                 Ok(BooleanBridgeReport {
                     total: report.total,
                     success: report.success,
@@ -627,6 +937,17 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
         Ok(ModelWriteBatchReport::default())
     }
 
+    async fn persist_pe_transform(
+        &self,
+        shape_insts: &ShapeInstancesData,
+    ) -> anyhow::Result<ModelWriterStageReport> {
+        self.record_skipped(
+            "pe_transform",
+            "drain-only does not persist pe_transform",
+            shape_insts.inst_info_map.len(),
+        )
+    }
+
     async fn persist_mesh_results(
         &self,
         mesh_results: &HashMap<u64, MeshResult>,
@@ -656,13 +977,16 @@ impl ModelWriterBackend for DrainOnlyModelWriterBackend {
 
     async fn reconcile_missing_neg_relations(
         &self,
-        _all_refnos: &[RefnoEnum],
-        missing_neg_carriers: &[RefnoEnum],
+        artifacts: &ShapeInstancesData,
+        tubi_info: &DashMap<String, TubiInfoData>,
     ) -> anyhow::Result<ModelWriterStageReport> {
         self.record_skipped(
-            "missing_neg_reconcile",
-            "drain-only does not reconcile SurrealDB relations",
-            missing_neg_carriers.len(),
+            "run_relation_artifacts",
+            "drain-only does not persist relation artifacts",
+            artifacts.neg_relate_map.len()
+                + artifacts.ngmr_neg_relate_map.len()
+                + artifacts.inst_tubi_map.len()
+                + tubi_info.len(),
         )
     }
 
@@ -707,34 +1031,17 @@ pub fn create_model_writer(
     mode: ModelWriterMode,
     mesh_aabb_map: Arc<DashMap<String, Aabb>>,
     missing_neg_carriers: Arc<Mutex<HashSet<RefnoEnum>>>,
+    inst_relate_precomputed: Option<Arc<InstRelatePrecomputed>>,
 ) -> Arc<dyn ModelWriterBackend> {
     match mode {
         ModelWriterMode::Surreal => Arc::new(SurrealModelWriterBackend::new(
             mesh_aabb_map,
             missing_neg_carriers,
+            inst_relate_precomputed
+                .expect("Surreal model writer requires versioned precomputed metadata"),
         )),
         ModelWriterMode::DrainOnly => Arc::new(DrainOnlyModelWriterBackend::new()),
     }
-}
-
-pub async fn run_model_writer_sink(
-    receiver: flume::Receiver<ShapeInstancesData>,
-    writer: Arc<dyn ModelWriterBackend>,
-) -> anyhow::Result<ModelWriterFinishReport> {
-    writer.cleanup().await?;
-    writer.init().await?;
-    while let Ok(batch) = receiver.recv_async().await {
-        writer.write_base_batch(&batch).await?;
-    }
-    writer.finalize().await
-}
-
-pub async fn run_drain_only_sink(
-    receiver: flume::Receiver<ShapeInstancesData>,
-) -> anyhow::Result<DrainOnlyStats> {
-    let report =
-        run_model_writer_sink(receiver, Arc::new(DrainOnlyModelWriterBackend::new())).await?;
-    Ok(report.drain_only_stats.unwrap_or_default())
 }
 
 pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContractEvidence {
@@ -752,6 +1059,7 @@ pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContr
         "init",
         "cleanup",
         "base_batch",
+        "pe_transform",
         "mesh_persist",
         "inst_relate_aabb",
         "missing_neg_reconcile",
@@ -774,5 +1082,115 @@ pub fn model_writer_contract_evidence(mode: ModelWriterMode) -> ModelWriterContr
         runs_downstream_pipeline,
         stages,
         known_gap_tables: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_semantic_hash_is_snapshot_bound_and_deterministic() {
+        fn build(snapshot_id: u64) -> GenerationArtifactsSummary {
+            let artifacts = GenerationArtifacts::new(snapshot_id);
+            artifacts
+                .record_base_batch(1, Arc::new(ShapeInstancesData::default()))
+                .expect("record batch");
+            artifacts
+                .record_mesh_results(1, &HashMap::new())
+                .expect("record mesh");
+            artifacts.summary().expect("summary")
+        }
+
+        let first = build(42);
+        let repeated = build(42);
+        let another_snapshot = build(43);
+        assert_eq!(first.semantic_hash, repeated.semantic_hash);
+        assert_ne!(first.semantic_hash, another_snapshot.semantic_hash);
+        assert_eq!(
+            first.model_semantic_hash,
+            another_snapshot.model_semantic_hash
+        );
+    }
+
+    #[test]
+    fn duplicate_artifact_batch_fails_closed() {
+        let artifacts = GenerationArtifacts::new(42);
+        artifacts
+            .record_base_batch(1, Arc::new(ShapeInstancesData::default()))
+            .expect("first batch");
+        assert!(
+            artifacts
+                .record_base_batch(1, Arc::new(ShapeInstancesData::default()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_hash_ignores_batch_ids_and_arrival_order() {
+        fn neg_batch(target: RefnoEnum, negative: RefnoEnum) -> ShapeInstancesData {
+            let mut batch = ShapeInstancesData::default();
+            batch.neg_relate_map.insert(target, vec![negative]);
+            batch
+        }
+
+        let target = RefnoEnum::from("1/1");
+        let first_neg = RefnoEnum::from("1/2");
+        let second_neg = RefnoEnum::from("1/3");
+
+        let left = GenerationArtifacts::new(42);
+        left.record_base_batch(1, Arc::new(neg_batch(target, first_neg)))
+            .expect("left first");
+        left.record_base_batch(2, Arc::new(neg_batch(target, second_neg)))
+            .expect("left second");
+
+        let right = GenerationArtifacts::new(42);
+        right
+            .record_base_batch(90, Arc::new(neg_batch(target, second_neg)))
+            .expect("right second");
+        right
+            .record_base_batch(80, Arc::new(neg_batch(target, first_neg)))
+            .expect("right first");
+
+        assert_eq!(
+            left.summary().expect("left summary").semantic_hash,
+            right.summary().expect("right summary").semantic_hash
+        );
+    }
+
+    #[test]
+    fn geometry_artifact_hash_is_independent_of_downstream_execution() {
+        let batch = Arc::new(ShapeInstancesData::default());
+        let producer_only = GenerationArtifacts::new(42);
+        producer_only
+            .record_base_batch(1, Arc::clone(&batch))
+            .expect("record producer batch");
+
+        let downstream = GenerationArtifacts::new(42);
+        downstream
+            .record_base_batch(9, batch)
+            .expect("record downstream batch");
+        downstream
+            .record_boolean_execution(
+                1,
+                "downstream-task".to_string(),
+                &BooleanBridgeReport {
+                    total: 1,
+                    success: 1,
+                    ..BooleanBridgeReport::default()
+                },
+            )
+            .expect("record downstream execution");
+
+        let producer_summary = producer_only.summary().expect("producer summary");
+        let downstream_summary = downstream.summary().expect("downstream summary");
+        assert_eq!(
+            producer_summary.geometry_artifact_hash,
+            downstream_summary.geometry_artifact_hash
+        );
+        assert_ne!(
+            producer_summary.model_semantic_hash,
+            downstream_summary.model_semantic_hash
+        );
     }
 }

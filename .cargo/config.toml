@@ -1,27 +1,27 @@
 [build]
 # 默认禁用 OCC 功能避免 glam 版本冲突
 rustflags = []
+# sccache 跨项目编译缓存：本仓库所有 rustc 调用经由 sccache。
+# 适用场景：频繁切换分支、clean build、surrealdb-core 等大依赖反复重编。
+# 命中率查看：sccache --show-stats
+# CI 不受影响：各 workflow 已显式设 RUSTC_WRAPPER=""（环境变量优先于本配置，
+# 空串=禁用 wrapper，见 .github/workflows/*.yml）。
+rustc-wrapper = "sccache"
+# 关闭增量编译（覆盖所有 profile）：sccache 与 incremental 互斥，
+# 增量产物 sccache 无法缓存；缓存复用统一交给 sccache。
+incremental = false
 # ─── 为何有时感觉“每次都重编”？───────────────────────────────────────────────
 # 1. Feature 组合不同：每种 --features 对应独立产物。跑 room_demo 用 gen_model+sqlite-index，
 #    若平时只 build 默认 features，首次跑该 example 会触发该组合的完整构建。
 # 2. 首次跑某个 example：example 与 main/bin 的依赖可能不同，首次需完整构建该 example。
 # 3. 建议：固定用同一套 features 跑回归，如总是 `--features "gen_model,sqlite-index"`，
-#    第二次起即为增量。
+#    第二次起即可命中 sccache 缓存。
 # 4. [patch] aios_core = { path = "../rs-core" }：rs-core 任一文件改动会触发 aios-database 重编。
-# 5. sccache 跨项目编译缓存（可选）
-# 适用场景：频繁切换分支、clean build、surrealdb-core 等大依赖反复重编
-# 安装：brew install sccache
-# 注意：sccache 与 incremental 互斥，必须设置环境变量：
-#   export CARGO_INCREMENTAL=0
-#
-# CI 侧不保证安装 sccache，因此 **不要**在仓库级 `.cargo/config.toml` 里强制启用。
-# 如需启用请在本机通过环境变量设置：
-#   export RUSTC_WRAPPER=sccache
 
 [env]
-# 固定本仓库的本地迭代编译环境，避免不同 shell 中 CARGO_INCREMENTAL
-# 状态不同导致大依赖反复重建。
-CARGO_INCREMENTAL = { value = "1", force = true }
+# sccache 与增量编译互斥：全仓库强制关闭增量（force=true 覆盖 shell/脚本里的残留
+# CARGO_INCREMENTAL 设置），缓存复用统一交给 sccache。
+CARGO_INCREMENTAL = { value = "0", force = true }
 
 # 增大主线程栈大小，避免 debug 模式下 async 函数状态机导致的栈溢出
 # 16MB 栈大小足以应对深度 async 调用链
@@ -35,7 +35,7 @@ rustflags = [
     "-C", "link-args=/STACK:16777216",
     "-C", "linker=rust-lld",
     "-C", "linker-flavor=lld-link",
-    "-Zthreads=8",
+    "-Zthreads=2",
 ]
 
 [target.i686-pc-windows-msvc]
@@ -51,30 +51,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
 
-# 启用 per-profile codegen-backend（nightly 不稳定特性）
-[unstable]
-codegen-backend = true
 
-[profile.dev]
-# 根 crate(aios-database) 用 cranelift：debug 迭代编译显著加快（codegen -20%~-30%）
-# 依赖仍走 LLVM（见下方 package."*"），避免个别 crate 在 cranelift 下不兼容。
-codegen-backend = "cranelift"
-debug = 1              # 仅行号表，加快编译和链接
-incremental = true     # 显式开启增量编译（dev 默认已开，防止被环境变量覆盖）
-split-debuginfo = "unpacked"  # macOS 关键优化：调试信息不打包，大幅缩短链接时间
-                               # Linux 下此选项为默认行为，无负面影响
-                               # 注：Windows MSVC 上此项为 no-op（调试信息走 PDB）
-
-# 快赢 #6: 让 build script 与 proc-macro（serde/rkyv/strum derive、cc）在 opt-level=3
-# 下运行，加快每次构建的宏展开/脚本执行。只影响编译期工具代码，不影响产物运行性能。
-[profile.dev.build-override]
-opt-level = 3
-
-[profile.dev.package."*"]
-# 所有依赖固定用 LLVM：依赖只编译一次（已缓存），且避免 cranelift 对个别
-# 含 inline asm / 特殊 intrinsic 的 crate 不兼容。仅根 crate 走 cranelift。
-codegen-backend = "llvm"
-#opt-level = 1  # 依赖项轻度优化，减小产物体积加速链接
 
 [profile.test]
 # 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；
@@ -89,8 +66,8 @@ codegen-backend = "llvm"
 # 以下配置在"编译速度"与"运行性能"之间取折中：
 [profile.release]
 opt-level = 2              # 比 3 少几个重量级 pass（如 vectorization aggressive），编译快 20-40%
-codegen-units = 16         # 并行代码生成，充分利用多核；代价：跨 codegen-unit 内联机会减少
-incremental = true         # 开启增量，迭代改动无需全量重编
+codegen-units = 4          # 降并行以降低 release 编译峰值内存（aios-database 大 crate）
+incremental = false        # 关闭增量（与 sccache 互斥），缓存复用交给 sccache
 split-debuginfo = "unpacked"  # macOS 链接加速，同 dev 配置
 
 [profile.release.package."*"]

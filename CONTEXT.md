@@ -13,8 +13,12 @@ _Avoid_: 版本号、session id
 _Avoid_: 数据快照、源版本
 
 **输入版本清单（Input Version Manifest）**:
-一次模型生成实际读取的全部数据版本集合，是 `dbnum → sesno` 的不可变映射，也是跨库依赖可重现的完整业务坐标；它是模型提交的来源证明，不取代模型提交身份。
-_Avoid_: 目标 sesno、最新版本、单库版本号
+一次模型生成运行打开读取时观测到的各 dbnum 已提交水位记录（`dbnum → sesno`），写入运行结果用于解释与复现来源；它是观测记录，不是绑定契约，不参与失败关闭或覆盖校验。
+_Avoid_: 绑定契约、fail-closed 清单、目标 sesno、最新版本
+
+**生成读取时刻（Generation Read Instant）**:
+一次增量模型生成绑定的单一 MVCC as-of 时刻（取本次数据提交锚点的存储时间戳）；运行内所有数据读取都看到该时刻的一致切面。全量生成不绑定时刻，活读当前态。
+_Avoid_: 版本读取会话、动态快照、每次查询取最新
 
 **生成契约（Generation Contract）**:
 决定同一输入版本清单如何生成模型结果的规则集合，涵盖会影响结果的算法与配置；它用于解释和重现结果，不取代 sesno 模型历史。
@@ -31,26 +35,6 @@ _Avoid_: model_version_id、release、发布版本、content_hash
 **模型删除提交（Tombstone Model Commit）**:
 最小交付单元在指定 sesno 已不存在的模型提交；它保留删除事实，但不引用模型导出物。
 _Avoid_: 空模型、缺失导出物、加载失败
-
-**权威版本库（Authoritative Version Store）**:
-唯一有权判定某个数据版本是否正式存在并推进已提交水位的版本库。
-_Avoid_: 主库、默认后端
-
-**版本化读副本（Versioned Read Replica）**:
-复制权威版本库已发布的数据版本并保留历史查询能力的只读版本库；它可以落后但不得领先权威版本库，也不能自行发布新版本。
-_Avoid_: 第二真相源、双主版本库、当前态缓存
-
-**版本读取会话（Versioned Read Session）**:
-一次业务运行绑定到固定输入版本清单和单一读取后端后的只读视图；会话存续期间即使有新版本发布，所有查询仍必须看到同一组数据版本。会话内禁止按 dbnum 或单次查询在权威版本库与版本化读副本之间回退。
-_Avoid_: 每次查询取最新、动态快照、混合后端会话
-
-**权威 snapshot 绑定（Authoritative Snapshot Binding）**:
-输入版本清单在权威版本库中的物理定位信息。当前实现绑定一个 DuckLake 全局 `snapshot_id`；它只用于重现清单对应的存储状态，不取代任何 `(dbnum, sesno)` 数据版本身份。
-_Avoid_: 用 snapshot_id 代替数据版本、任意历史版本拼接
-
-**副本 snapshot 绑定（Replica Snapshot Binding）**:
-权威 `snapshot_id` 在版本化读副本中的已验证复制提交点。只有连续复制水位已覆盖该 snapshot 且绑定校验成功时，副本才可为对应版本读取会话提供数据。
-_Avoid_: 版本锚点、读取副本 latest、缺水位时静默回退
 
 **版本提交（Version Commit）**:
 一个 dbnum 在目标 sesno 上完整、已验证且已发布、可供历史读取的 PE/ATT 数据版本。
@@ -98,8 +82,26 @@ _Avoid_: mem 沙箱、内存副本库、缓存 surrealdb
 生成缓存库中一个 db 副本灌入时对应的已提交水位，是该副本数据新鲜度的唯一判据；副本落后于持久库已提交水位时即视为过期。
 _Avoid_: 缓存版本号、快照 sesno
 
+**依赖闭包清单（Dependency Closure Manifest）**:
+一个 DESI dbnum 进行模型生成所需的外部依赖 refno 集合（元件库及模板 DESI 库），按依赖 dbnum 分组；解析期计算，生成期仅作预灌范围提示，允许滞后，漂移由生成期兜底链自愈。
+_Avoid_: 工程级 union 闭包清单、输入版本清单、cata manifest
+
+**模型生成水位（Model Generation Watermark）**:
+一个 dbnum 已发布 model_gen 锚点的最高 sesno，表示模型产物已完整覆盖到的数据版本；它只在该 dbnum 的模型生成及其后处理全部成功后推进。
+_Avoid_: 生成进度、最后生成时间
+
+**模型生成欠账（Model Generation Debt）**:
+增量数据提交时留存、尚未被成功模型生成消费的变更种子记录；追赶只认欠账记录，欠账不阻断后续数据版本提交。
+_Avoid_: 生成失败列表、重试队列、历史全量补偿
+
+**未跟踪历史（Untracked History）**:
+欠账跟踪启用之前发生的数据版本与模型状态差距；默认忽略、不告警、不自动重建，仅显式整库重生成可追平。
+_Avoid_: 历史欠账、存量洞
+
 ## 已废除术语（历史文档中出现时一律按废除理解）
 
+- **权威版本库 / 版本化读副本**：DuckLake 权威 + Surreal 读副本的双库分工（ADR-0002 时期）；版本真相已收敛为 Surreal MVCC + sesno 锚点单源（ADR-0007），不存在第二个版本库
+- **版本读取会话 / 权威 snapshot 绑定 / 副本 snapshot 绑定**：绑定 DuckLake snapshot 的固定版本读取机制（ADR-0003 时期）；由「生成读取时刻」取代（ADR-0008），不再有 snapshot_id 或后端绑定
 - **版本锚点 / 旧式锚点**：旧 SurrealDB 历史方案中从 `(dbnum, sesno, source)` 映射存储时间戳的桥梁，不再承担版本身份或一致性证明
 - **release / release_id / model_version_id**：人为发布批次或额外代理版本号；模型变化直接以最小交付单元的 sesno 提交表达
 - **历史重放 / 物理基线**：用源文件重放历史的机制，被存储层时间旅行取代

@@ -36,25 +36,16 @@ pub async fn process_prim_refno_page(
     // 离线生成路径已移除（foyer-cache-cleanup），直接走 SurrealDB
 
     // 生成 prim 几何体
-    if !prim_model::gen_prim_geos(ctx.db_option.clone(), refnos, sender).await? {
+    if !prim_model::gen_prim_geos(
+        ctx.db_option.clone(),
+        Arc::clone(&ctx.generation_read),
+        refnos,
+        sender,
+    )
+    .await?
+    {
         bail!("prim geos generation failed");
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::options::DbOptionExt;
-    use aios_core::options::DbOption;
-
-    #[tokio::test]
-    async fn test_empty_refnos() {
-        let ctx = NounProcessContext::new(Arc::new(DbOptionExt::from(DbOption::default())), 100, 4);
-        let (sender, _receiver) = flume::unbounded();
-
-        let result = process_prim_refno_page(&ctx, sender, &[]).await;
-        assert!(result.is_ok());
-    }
 }

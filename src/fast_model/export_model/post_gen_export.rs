@@ -145,14 +145,20 @@ async fn export_parquet_after_generation_impl(
         0,
     );
 
+    // 生成阶段的专门 persist_pe_transform 已按实例落库 pe_transform，因此这里改用
+    // **实例级覆盖探测**：命中即跳过整库 BFS 刷新。整库 refresh 仅在未覆盖（旧库/
+    // 未按新阶段生成的数据）时作为兜底运行，不再是常规路径。
     let mut uncovered_dbnums = Vec::new();
     for dbnum in &dbnums {
-        match crate::pe_transform_refresh::pe_transform_covers_dbnum(*dbnum).await {
-            Ok(true) => log::info!("✅ Parquet 导出前 pe_transform 已覆盖 dbnum={}", dbnum),
+        match crate::pe_transform_refresh::pe_transform_covers_instances_for_dbnum(*dbnum).await {
+            Ok(true) => log::info!(
+                "✅ Parquet 导出前 pe_transform 实例覆盖完好（生成阶段已就地落库），dbnum={}",
+                dbnum
+            ),
             Ok(false) => uncovered_dbnums.push(*dbnum),
             Err(err) => {
                 log::warn!(
-                    "⚠️ Parquet 导出前探测 pe_transform 覆盖失败，按未覆盖处理: dbnum={} err={}",
+                    "⚠️ Parquet 导出前探测 pe_transform 实例覆盖失败，按未覆盖处理: dbnum={} err={}",
                     dbnum,
                     err
                 );
@@ -163,12 +169,12 @@ async fn export_parquet_after_generation_impl(
 
     if uncovered_dbnums.is_empty() {
         log::info!(
-            "✅ Parquet 导出前 pe_transform 覆盖完好，跳过重复刷新: dbnums={:?}",
+            "✅ Parquet 导出前 pe_transform 实例覆盖完好，跳过整库刷新: dbnums={:?}",
             dbnums
         );
     } else {
         log::info!(
-            "🔄 Parquet 导出前刷新未覆盖的 pe_transform: dbnums={:?}",
+            "🔄 Parquet 导出前兜底刷新未覆盖 dbnum 的 pe_transform（旧库/未按新阶段生成）: dbnums={:?}",
             uncovered_dbnums
         );
         let refreshed = crate::pe_transform_refresh::refresh_pe_transform_for_dbnums(
@@ -178,7 +184,7 @@ async fn export_parquet_after_generation_impl(
         .await
         .map_err(|e| anyhow::anyhow!("Parquet 导出前刷新 pe_transform 失败: {}", e))?;
         log::info!(
-            "✅ Parquet 导出前 pe_transform 刷新完成: {} 个节点",
+            "✅ Parquet 导出前 pe_transform 兜底刷新完成: {} 个节点",
             refreshed
         );
     }

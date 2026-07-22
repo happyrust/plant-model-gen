@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use aios_core::rs_surreal::pe_transform::PeTransformEntry;
+use aios_core::rs_surreal::pe_transform::{PeTransformEntry, save_pe_transform_entries};
 use aios_core::{RefnoEnum, Transform};
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
@@ -12,6 +12,35 @@ use crate::data_interface::db_meta_manager::db_meta;
 use crate::options::{DbOptionExt, TransformReadBackend};
 
 use super::transform_rkyv_cache::{self, LoadedTransformDbnum};
+
+/// cache-first miss 回退后，按需把计算结果写回 pe_transform（best-effort）。
+/// 失败只打日志，不阻断生成读路径。
+async fn persist_lazy_pe_transform_entries(
+    db_option: Option<&DbOptionExt>,
+    entries: &[PeTransformEntry],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let result = match db_option {
+        Some(option) => crate::pe_transform_store::save_entries_with_backend(option, entries).await,
+        None => save_pe_transform_entries(entries).await,
+    };
+    match result {
+        Ok(()) => {
+            log::debug!(
+                "[transform_cache] lazy pe_transform persisted entries={}",
+                entries.len()
+            );
+        }
+        Err(err) => {
+            log::warn!(
+                "[transform_cache] lazy pe_transform persist failed entries={}: {err}",
+                entries.len()
+            );
+        }
+    }
+}
 
 /// 模型生成阶段的 transform 缓存：
 /// - world/local 均放在内存 DashMap 中，按 (dbnum, refno) 索引；
@@ -477,9 +506,18 @@ pub async fn get_world_transform_cache_first(
     if let Some(world) = computed.clone() {
         if let (true, Some(dbnum)) = (use_cache, dbnum) {
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                cache.insert_world_transform(dbnum, refno, world);
+                cache.insert_world_transform(dbnum, refno, world.clone());
             }
         }
+        persist_lazy_pe_transform_entries(
+            db_option,
+            &[PeTransformEntry {
+                refno,
+                local: None,
+                world: Some(world),
+            }],
+        )
+        .await;
     }
     Ok(computed)
 }
@@ -514,9 +552,18 @@ pub async fn get_local_transform_cache_first(
     if let Some(local) = computed.clone() {
         if let (true, Some(dbnum)) = (use_cache, dbnum) {
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
-                cache.insert_local_transform(dbnum, refno, local);
+                cache.insert_local_transform(dbnum, refno, local.clone());
             }
         }
+        persist_lazy_pe_transform_entries(
+            db_option,
+            &[PeTransformEntry {
+                refno,
+                local: Some(local),
+                world: None,
+            }],
+        )
+        .await;
     }
     Ok(computed)
 }
@@ -678,7 +725,8 @@ pub async fn ensure_local_transforms_present(
 /// - 先尝试按 dbnum 从 rkyv 文件加载到内存；
 /// - 再读内存 transform_cache；
 /// - miss 的 refno 再通过 SurrealDB pe_transform 批量查询；
-/// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform）。
+/// - 仍 miss 的少量 refno 兜底走旧计算路径（aios_core::get_world_transform），
+///   并 **lazy upsert** 回 pe_transform，避免下次再整库预刷。
 pub async fn get_world_transforms_cache_first_batch(
     db_option: Option<&DbOptionExt>,
     refnos: &[RefnoEnum],
@@ -730,6 +778,7 @@ pub async fn get_world_transforms_cache_first_batch(
 
     if !still_missing.is_empty() {
         let still_missing_vec: Vec<RefnoEnum> = still_missing.into_iter().collect();
+        let mut lazy_entries = Vec::with_capacity(still_missing_vec.len());
         let mut stream =
             futures::stream::iter(still_missing_vec.into_iter().map(|refno| async move {
                 let world = aios_core::get_world_transform(refno).await.ok().flatten();
@@ -742,11 +791,17 @@ pub async fn get_world_transforms_cache_first_batch(
                 out.insert(refno, world.clone());
                 if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
                     if let Some(&dbnum) = dbnum_map.get(&refno) {
-                        cache.insert_world_transform(dbnum, refno, world);
+                        cache.insert_world_transform(dbnum, refno, world.clone());
                     }
                 }
+                lazy_entries.push(PeTransformEntry {
+                    refno,
+                    local: None,
+                    world: Some(world),
+                });
             }
         }
+        persist_lazy_pe_transform_entries(db_option, &lazy_entries).await;
     }
 
     Ok(out)
@@ -810,6 +865,7 @@ pub async fn get_local_transforms_cache_first_batch(
         .filter(|refno| !local_store_hits.contains(refno))
         .collect::<Vec<_>>();
 
+    let mut lazy_entries = Vec::with_capacity(compute_misses.len());
     let mut stream =
         futures::stream::iter(compute_misses.iter().copied().map(|refno| async move {
             let local = aios_core::transform::get_local_mat4(refno)
@@ -826,11 +882,17 @@ pub async fn get_local_transforms_cache_first_batch(
             out.insert(refno, local.clone());
             if let Some(cache) = GLOBAL_TRANSFORM_CACHE.get() {
                 if let Some(&dbnum) = dbnum_map.get(&refno) {
-                    cache.insert_local_transform(dbnum, refno, local);
+                    cache.insert_local_transform(dbnum, refno, local.clone());
                 }
             }
+            lazy_entries.push(PeTransformEntry {
+                refno,
+                local: Some(local),
+                world: None,
+            });
         }
     }
+    persist_lazy_pe_transform_entries(db_option, &lazy_entries).await;
 
     Ok(out)
 }

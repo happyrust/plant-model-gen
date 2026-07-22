@@ -1,221 +1,51 @@
-# 迁移指南：Index Tree 优化版本
+# 迁移指南：GenPipeline 配置硬切换（2026-07-21）
 
-## 🎯 概述
+> 完整设计见 [`docs/superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md`](../superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md)。
 
-本指南帮助您从旧版本的 Index Tree 实现迁移到优化版本。
+## 概述
 
----
+模型生成统一管线已从「IndexTree / `.tree`」命名与双源回退迁移为 **GenPipeline + pe_owner / GenerationRead**。配置键硬切换，**无兼容读**。
 
-## 📋 必需的配置更改
+## DbOption.toml 迁移
 
-### 1. 添加 Index Tree 配置字段到 DbOption
-
-需要在 `aios-core/src/options.rs` 的 `DbOption` 结构体中添加以下字段：
-
-```rust
-// 在 DbOption 结构体中添加
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DbOption {
-    // ... 现有字段 ...
-
-    // Index Tree 模式配置
-    #[serde(default)]
-    pub index_tree_mode: bool,
-
-    #[serde(default = "default_index_tree_concurrency")]
-    pub index_tree_max_concurrent_nouns: usize,
-
-    #[serde(default = "default_index_tree_batch_size")]
-    pub index_tree_batch_size: usize,
-
-    // ... 其他字段 ...
-}
-
-fn default_index_tree_concurrency() -> usize {
-    4
-}
-
-fn default_index_tree_batch_size() -> usize {
-    100
-}
-```
-
-### 2. 更新 DbOption.toml 配置文件
+删除旧键，改用新键：
 
 ```toml
-# Index Tree 模式配置
-index_tree_mode = true                    # 是否启用 Index Tree 模式
-index_tree_max_concurrent_nouns = 6       # 并发处理的 Noun 数量 (2-8)
-index_tree_batch_size = 200               # 每批次处理的 refno 数量
+# 删除
+# index_tree_max_concurrent_targets = 6
+# index_tree_batch_size = 200
+# index_tree_enabled_target_types = ["BRAN"]
+# index_tree_excluded_target_types = ["BOX"]
+# index_tree_debug_limit_per_target_type = 0
+
+# 使用
+gen_pipeline_max_concurrent = 6
+gen_pipeline_batch_size = 200
+# gen_pipeline_enabled_target_types = ["BRAN"]
+# gen_pipeline_excluded_target_types = ["BOX"]
+gen_pipeline_debug_limit_per_target_type = 0
 ```
 
----
+若仍保留任一旧 `index_tree_*` 键，配置加载会失败并打印 `旧键 -> 新键` 对照。
 
-## 🔄 API 迁移
+## 环境变量
 
-### 方案 A: 使用兼容层（推荐用于快速迁移）
+删除 `AIOS_TREE_QUERY_SOURCE`（含 `=tree` / `=pe_owner`）。若仍设置，配置加载失败。层级查询仅 pe_owner / GenerationRead。
 
-**优点**: 无需修改现有代码
-**缺点**: 未使用全部优化特性
+## 代码符号（开发者）
 
-```rust
-// 现有代码保持不变
-use crate::fast_model::gen_model::gen_all_geos_data;
+| 旧 | 新 |
+|---|---|
+| `index_tree_mode.rs` | `gen_pipeline.rs` |
+| `process_index_tree_generation` | `process_gen_pipeline` |
+| `gen_index_tree_geos_optimized` | `gen_pipeline_geos` |
+| `IndexTreeConfig` / `IndexTreeError` | `GenPipelineConfig` / `GenPipelineError` |
+| `get_index_tree_concurrency` | `get_gen_pipeline_concurrency` |
 
-let result = gen_all_geos_data(
-    manual_refnos,
-    &db_option,
-    incr_updates,
-    target_sesno,
-).await?;
-```
+入口仍为 `gen_all_geos_data` / `gen_all_geos_data_with_session`。
 
-内部自动调用优化版本（如果启用 `index_tree_mode`）。
+## 故障排查
 
-### 方案 B: 直接使用优化版本（推荐用于新代码）
-
-**优点**: 完全利用优化特性
-**缺点**: 需要修改代码
-
-```rust
-use crate::fast_model::gen_model::{
-    IndexTreeConfig,
-    gen_index_tree_geos_optimized,
-};
-
-// 1. 创建配置
-let config = IndexTreeConfig::from_db_option(&db_option)?;
-
-// 2. 可选：自定义配置
-let config = config
-    .with_strict_validation(true)  // 启用严格验证
-    .with_concurrency(Concurrency::new(6)?);
-
-// 3. 创建数据通道
-let (sender, receiver) = flume::unbounded();
-
-// 4. 启动接收器
-let receiver_handle = tokio::spawn(async move {
-    while let Ok(data) = receiver.recv_async().await {
-        // 处理 ShapeInstancesData
-    }
-});
-
-// 5. 运行生成
-let categorized = gen_index_tree_geos_optimized(
-    Arc::new(db_option.clone()),
-    &config,
-    sender,
-).await?;
-
-// 6. 查看结果
-categorized.print_statistics();
-
-// 7. 按类别获取 refno
-let cate_refnos = categorized.get_by_category(NounCategory::Cate);
-let loop_refnos = categorized.get_by_category(NounCategory::LoopOwner);
-let prim_refnos = categorized.get_by_category(NounCategory::Prim);
-```
-
----
-
-## ⚠️ 已知限制
-
-### 当前版本限制
-
-1. **环境变量移除**: 不再支持 `FULL_NOUN_MODE` 环境变量，请使用配置文件
-2. **兼容层功能**: legacy.rs 中的 `gen_all_geos_data` 只实现了 Index Tree 模式
-3. **非 Index Tree 模式**: 旧代码的非 Index Tree 模式需要手动从 `gen_model_old.rs` 迁移
-
-### 临时解决方案
-
-如果您需要非 Index Tree 模式的功能，目前有两个选项：
-
-**选项 1: 使用旧文件（临时）**
-```rust
-// 在 src/fast_model/mod.rs 中
-#[path = "gen_model_old.rs"]
-pub mod gen_model_legacy;
-
-// 使用
-use crate::fast_model::gen_model_legacy;
-```
-
-**选项 2: 迁移到优化版本**
-参考 `gen_model_old.rs` 中的逻辑，将非 Index Tree 模式迁移到新模块。
-
----
-
-## 🚀 性能对比
-
-### 预期性能提升
-
-| 指标 | 旧版本 | 优化版本 | 提升 |
-|-----|-------|---------|-----|
-| 执行时间 | ~30秒 | ~12秒 | **60%** ⚡ |
-| 内存使用 | 高 | 低 | **-33%** 💾 |
-| 并发性 | 伪并发 | 真并发 | ✅ |
-
-### 实际测试建议
-
-```rust
-use std::time::Instant;
-
-let start = Instant::now();
-
-// 运行 Index Tree 生成
-let config = IndexTreeConfig::from_db_option(&db_option)?;
-let result = gen_index_tree_geos_optimized(...).await?;
-
-let duration = start.elapsed();
-println!("Index Tree 生成耗时: {:?}", duration);
-println!("处理 refno 数量: {}", result.total_count());
-```
-
----
-
-## 🔍 故障排查
-
-### 问题 1: 编译错误 - 字段不存在
-
-**错误**: `error[E0609]: no field 'index_tree_mode' on type '&DbOption'`
-
-**解决**: 确保在 `aios-core` 的 `DbOption` 中添加了必需字段
-
-### 问题 2: 警告 - SJUS map 为空
-
-**警告**: `⚠️ SJUS map 为空，几何体生成可能产生不正确的结果`
-
-**解决**:
-- 这是预期行为，如果您确定不需要 SJUS map，可以忽略
-- 禁用警告：`config.with_strict_validation(false)`
-
-### 问题 3: 性能未提升
-
-**检查点**:
-1. 确认并发数配置：`index_tree_max_concurrent_nouns` 应该 > 1
-2. 检查数据库性能：可能是 I/O 瓶颈
-3. 查看 CPU 使用率：应该接近 N 个核心（N = 并发数）
-
----
-
-## 📚 更多资源
-
-- [完整优化方案](./FULL_NOUN_OPTIMIZATION_PLAN.md)
-- [优化总结](./OPTIMIZATION_SUMMARY.md)
-- [架构对比](./ARCHITECTURE_COMPARISON.md)
-- 模块文档: `cargo doc --open`
-
----
-
-## 🆘 获取帮助
-
-如有问题：
-1. 查看编译错误并参考本指南
-2. 检查配置文件是否正确
-3. 提交 Issue 并附上错误信息
-
----
-
-**版本**: 2.0.0-optimized
-**更新日期**: 2025-01-15
+1. **旧键加载失败**：按上方对照改 toml。
+2. **AIOS_TREE_QUERY_SOURCE 报错**：从环境/脚本中删除该变量。
+3. **层级缺边**：跑 `scripts/smoke/pe_owner_children_audit.ps1`，必要时 `model-version rebuild-pe-owner`。

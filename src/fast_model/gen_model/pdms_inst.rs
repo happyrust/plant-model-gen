@@ -1,10 +1,11 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 use aios_core::Transform;
 use aios_core::geometry::{EleGeosInfo, EleInstGeo, EleInstGeosData, ShapeInstancesData};
 use aios_core::parsed_data::TubiInfoData;
 use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
 use aios_core::pdms_types::*;
+use aios_core::shape::pdms_shape::RsVec3;
 use aios_core::types::*;
 use aios_core::{
     SurrealQueryExt, gen_aabb_hash, gen_plant_transform_hash, gen_string_hash, get_db_option,
@@ -28,7 +29,7 @@ use parry3d::math::Point;
 use super::mesh_generate::MeshResult;
 use super::model_record_id::{
     geo_relate_id, geo_relate_id_for_inst, model_refno_id, model_refno_range, neg_relate_id,
-    ngmr_relate_id,
+    ngmr_relate_id, tubi_relate_id,
 };
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
@@ -241,6 +242,125 @@ pub(crate) async fn delete_tubi_relate_by_branch_refnos(
         project_primary_db().query_response(&sql).await?.check()?;
     }
     Ok(())
+}
+
+/// 从本次运行合并后的 `ShapeInstancesData` 一次性持久化 TUBI 关系。
+/// 生成阶段只产出 `inst_tubi_map`，不得提前写 Surreal 再由后续阶段回读。
+pub async fn persist_tubi_relations_from_artifacts(
+    artifacts: &ShapeInstancesData,
+) -> anyhow::Result<usize> {
+    if artifacts.inst_tubi_map.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows = artifacts.inst_tubi_map.values().collect::<Vec<_>>();
+    rows.sort_by_key(|info| {
+        (
+            info.owner_refno,
+            info.tubi
+                .as_ref()
+                .and_then(|tubi| tubi.index)
+                .unwrap_or_default(),
+            info.refno,
+        )
+    });
+    let branch_refnos = rows
+        .iter()
+        .map(|info| info.owner_refno)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    delete_tubi_relate_by_branch_refnos(&branch_refnos, 100).await?;
+
+    let mut transforms = HashMap::new();
+    let aabbs = DashMap::new();
+    let points = DashMap::new();
+    let mut statements = Vec::with_capacity(rows.len());
+    for info in rows {
+        let tubi = info
+            .tubi
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 tubi payload: {}", info.refno))?;
+        let arrive_refno = tubi
+            .arrive_refno
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 arrive_refno: {}", info.refno))?;
+        let index = tubi
+            .index
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 index: {}", info.refno))?;
+        let start = tubi
+            .start_pt
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 start_pt: {}", info.refno))?;
+        let end = tubi
+            .end_pt
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 end_pt: {}", info.refno))?;
+        let arrive_axis = tubi
+            .arrive_axis_pt
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 arrive_axis: {}", info.refno))?;
+        let leave_axis = tubi
+            .leave_axis_pt
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 leave_axis: {}", info.refno))?;
+        let aabb = info
+            .aabb
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 aabb: {}", info.refno))?;
+        let geo_hash = info
+            .cata_hash
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("TUBI artifact 缺少 geo hash: {}", info.refno))?;
+
+        let trans_hash = gen_plant_transform_hash(&info.world_transform);
+        transforms
+            .entry(trans_hash)
+            .or_insert(serde_json::to_string(&info.world_transform)?);
+        let aabb_hash = gen_aabb_hash(&aabb);
+        aabbs.entry(aabb_hash.to_string()).or_insert(aabb);
+
+        let start = RsVec3(start);
+        let end = RsVec3(end);
+        let arrive_axis = RsVec3(arrive_axis.into());
+        let leave_axis = RsVec3(leave_axis.into());
+        let start_hash = start.gen_hash();
+        let end_hash = end.gen_hash();
+        let arrive_hash = arrive_axis.gen_hash();
+        let leave_hash = leave_axis.gen_hash();
+        points
+            .entry(start_hash)
+            .or_insert(serde_json::to_string(&start)?);
+        points
+            .entry(end_hash)
+            .or_insert(serde_json::to_string(&end)?);
+        points
+            .entry(arrive_hash)
+            .or_insert(serde_json::to_string(&arrive_axis)?);
+        points
+            .entry(leave_hash)
+            .or_insert(serde_json::to_string(&leave_axis)?);
+
+        let relation_id = tubi_relate_id(info.owner_refno, index as usize);
+        let bore_size = serde_json::to_string(tubi.bore_size.as_deref().unwrap_or_default())?;
+        statements.push(format!(
+            "RELATE {}->{}->{} SET geo=inst_geo:⟨{geo_hash}⟩, \
+             aabb=aabb:⟨{aabb_hash}⟩, world_trans=trans:⟨{trans_hash}⟩, \
+             start_pt=vec3:⟨{start_hash}⟩, end_pt=vec3:⟨{end_hash}⟩, \
+             arrive_axis=vec3:⟨{arrive_hash}⟩, leave_axis=vec3:⟨{leave_hash}⟩, \
+             bore_size={bore_size}, bad=false, system={}, dt=fn::ses_date({});",
+            info.refno.to_pe_key(),
+            relation_id,
+            arrive_refno.to_pe_key(),
+            info.owner_refno.to_pe_key(),
+            info.refno.to_pe_key(),
+        ));
+    }
+
+    crate::fast_model::utils::save_transforms_to_surreal(&transforms).await?;
+    crate::fast_model::utils::save_aabb_to_surreal(&aabbs).await;
+    crate::fast_model::utils::save_pts_to_surreal(&points).await;
+    let mut batcher = TransactionBatcher::new(4, 2);
+    for statement in &statements {
+        batcher.push(statement.clone()).await?;
+    }
+    batcher.finish().await?;
+    Ok(statements.len())
 }
 
 fn build_delete_inst_relate_bool_records_sql(
@@ -619,15 +739,53 @@ async fn query_cleanup_bran_hang_or_seed(seed_refnos: &[RefnoEnum]) -> Vec<Refno
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
 pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
+    pre_cleanup_for_regen_inner(seed_refnos, None).await
+}
+
+pub async fn pre_cleanup_for_regen_versioned(
+    seed_refnos: &[RefnoEnum],
+    read: &super::context::GenerationReadContext,
+) -> anyhow::Result<()> {
+    pre_cleanup_for_regen_inner(seed_refnos, Some(read)).await
+}
+
+async fn pre_cleanup_for_regen_inner(
+    seed_refnos: &[RefnoEnum],
+    read: Option<&super::context::GenerationReadContext>,
+) -> anyhow::Result<()> {
     if seed_refnos.is_empty() {
         return Ok(());
     }
 
     const CHUNK_SIZE: usize = 200;
 
-    // 展开 seed_refnos 到所有后代（包含自身），不过滤 noun 类型
-    let all_refnos = query_cleanup_refnos_or_seed(seed_refnos).await;
-    let bran_refnos = query_cleanup_bran_hang_or_seed(seed_refnos).await;
+    // 版本化正式路径严格使用会话 hierarchy；legacy 调用保留旧查询入口。
+    let (all_refnos, bran_refnos) = if let Some(read) = read {
+        let all_refnos = read.hierarchy.descendants(
+            seed_refnos,
+            &crate::generation_read::HierarchyQuery {
+                include_self: true,
+                nouns: BTreeSet::new(),
+                max_depth: None,
+                prune_on_match: false,
+            },
+        )?;
+        let bran_refnos = all_refnos
+            .iter()
+            .copied()
+            .filter(|refno| {
+                read.hierarchy
+                    .node(*refno)
+                    .is_some_and(|node| matches!(node.noun.as_str(), "BRAN" | "HANG"))
+            })
+            .collect();
+        (all_refnos, bran_refnos)
+    } else {
+        (
+            query_cleanup_refnos_or_seed(seed_refnos).await,
+            query_cleanup_bran_hang_or_seed(seed_refnos).await,
+        )
+    };
 
     println!(
         "[pre_cleanup_for_regen] seed_refnos={}, 展开后 all_refnos={}, bran_or_hang={}",
@@ -837,6 +995,44 @@ pub async fn save_instance_data_with_report(
     mesh_aabb_map: &DashMap<String, Aabb>,
     write_inst_relate_aabb: bool,
 ) -> anyhow::Result<SaveInstanceDataReport> {
+    save_instance_data_with_report_inner(
+        inst_mgr,
+        replace_exist,
+        mesh_results,
+        mesh_aabb_map,
+        write_inst_relate_aabb,
+        None,
+    )
+    .await
+}
+
+pub async fn save_instance_data_with_report_versioned(
+    inst_mgr: &ShapeInstancesData,
+    replace_exist: bool,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+    write_inst_relate_aabb: bool,
+    precomputed: &InstRelatePrecomputed,
+) -> anyhow::Result<SaveInstanceDataReport> {
+    save_instance_data_with_report_inner(
+        inst_mgr,
+        replace_exist,
+        mesh_results,
+        mesh_aabb_map,
+        write_inst_relate_aabb,
+        Some(precomputed),
+    )
+    .await
+}
+
+async fn save_instance_data_with_report_inner(
+    inst_mgr: &ShapeInstancesData,
+    replace_exist: bool,
+    mesh_results: &HashMap<u64, MeshResult>,
+    mesh_aabb_map: &DashMap<String, Aabb>,
+    write_inst_relate_aabb: bool,
+    versioned_precomputed: Option<&InstRelatePrecomputed>,
+) -> anyhow::Result<SaveInstanceDataReport> {
     debug_model_debug!(
         "save_instance_data_optimize start: inst_info={}, inst_geo_keys={}, tubi_keys={}, replace_exist={}, write_inst_relate_aabb={}",
         inst_mgr.inst_info_map.len(),
@@ -895,8 +1091,22 @@ pub async fn save_instance_data_with_report(
     // 写入前不再逐批扫描删除 inst_relate：首次部署为空库，重生成场景的旧
     // 关系清理统一由入口 pre_cleanup_for_regen 完成（写入用 INSERT RELATION
     // IGNORE 幂等），避免空库部署时每批 refnos 白跑一次图遍历 DELETE。
-    let inst_dbnum_map = query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await;
-    let inst_relate_precomputed = InstRelatePrecomputed::build(&inst_refnos).await;
+    let legacy_precomputed = if versioned_precomputed.is_none() {
+        Some(InstRelatePrecomputed::build(&inst_refnos).await)
+    } else {
+        None
+    };
+    let inst_relate_precomputed = versioned_precomputed
+        .or(legacy_precomputed.as_ref())
+        .expect("versioned or legacy precomputed metadata must exist");
+    let inst_dbnum_map = if versioned_precomputed.is_some() {
+        inst_refnos
+            .iter()
+            .map(|refno| (*refno, inst_relate_precomputed.dbnum(refno)))
+            .collect()
+    } else {
+        query_refno_dbnum_map(&inst_refnos, CHUNK_SIZE).await
+    };
     if let Entry::Vacant(entry) = transform_map.entry(0) {
         entry.insert(serde_json::to_string(&Transform::IDENTITY)?);
     }
@@ -1065,8 +1275,8 @@ pub async fn save_instance_data_with_report(
             debug_model_debug!("  目标: {}, 负实体数量: {}", target, refnos.len());
         }
 
-        // 跨 batch 兜底：若负载体的 Neg/CataNeg 几何不在当前 inst_mgr 中，
-        // 则从 DB 回查 geo_relate，避免“负实体与被减实体分批写入”导致 neg_relate 丢失。
+        // 跨 batch 缺口仅上报给 GenerationArtifacts；禁止从刚写入的模型表回查。
+        // 所有 batch 汇总完成后，writer 会从完整内存事实重建确定性的 relation ID。
         let mut missing_carriers: HashSet<RefnoEnum> = HashSet::new();
         for neg_refnos in inst_mgr.neg_relate_map.values() {
             for neg_refno in neg_refnos.iter() {
@@ -1075,53 +1285,9 @@ pub async fn save_instance_data_with_report(
                 }
             }
         }
-        if !missing_carriers.is_empty() {
-            const NEG_RECONCILE_RANGE_QUERY_CHUNK: usize = 16;
-            let mut missing_carriers_vec = missing_carriers.iter().copied().collect::<Vec<_>>();
-            missing_carriers_vec.sort_unstable();
-            let mut loaded = 0usize;
-
-            for carrier_chunk in missing_carriers_vec.chunks(NEG_RECONCILE_RANGE_QUERY_CHUNK) {
-                let sql = carrier_chunk
-                    .iter()
-                    .map(|carrier_refno| {
-                        let range = model_refno_range("geo_relate", *carrier_refno);
-                        format!(
-                            "SELECT id AS gr_id FROM {range} WHERE geo_type IN ['Neg', 'CataNeg'];"
-                        )
-                    })
-                    .join("\n");
-                let mut resp = project_primary_db().query_response(&sql).await?;
-                for (query_idx, carrier_refno) in carrier_chunk.iter().enumerate() {
-                    let rows: Vec<serde_json::Value> = resp.take(query_idx).unwrap_or_default();
-                    for row in rows {
-                        let gr_id = row
-                            .get("gr_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        if gr_id.is_empty() {
-                            continue;
-                        }
-                        neg_geo_by_carrier
-                            .entry(*carrier_refno)
-                            .or_insert_with(Vec::new)
-                            .push((0, gr_id.to_string()));
-                        loaded += 1;
-                    }
-                }
-            }
-            debug_model_debug!(
-                "neg_relate DB回查: missing_carriers={}, loaded_geo_relate_ids={}",
-                missing_carriers.len(),
-                loaded
-            );
-        }
-        report.missing_neg_carriers.extend(
-            missing_carriers
-                .iter()
-                .filter(|neg_refno| !neg_geo_by_carrier.contains_key(neg_refno))
-                .copied(),
-        );
+        report
+            .missing_neg_carriers
+            .extend(missing_carriers.iter().copied());
 
         let mut neg_batcher = TransactionBatcher::new(MAX_TX_STATEMENTS, MAX_CONCURRENT_TX);
         let mut neg_buffer: Vec<String> = Vec::with_capacity(CHUNK_SIZE);
@@ -1130,10 +1296,8 @@ pub async fn save_instance_data_with_report(
             for neg_refno in neg_refnos.iter() {
                 // 首先尝试从当前 batch 的 neg_geo_by_carrier 查找
                 if let Some(geo_relate_ids) = neg_geo_by_carrier.get(neg_refno) {
-                    for (relation_index, (geo_index, geo_relate_id)) in
-                        geo_relate_ids.iter().enumerate()
-                    {
-                        let neg_id = neg_relate_id(*target, *neg_refno, *geo_index, relation_index);
+                    for (geo_index, geo_relate_id) in geo_relate_ids {
+                        let neg_id = neg_relate_id(*target, *neg_refno, *geo_index, 0);
                         neg_buffer.push(format!(
                             "{{ in: {0}, id: {3}, out: {2}, pe: {1} }}",
                             geo_relate_id,         // 切割几何
@@ -1187,27 +1351,10 @@ pub async fn save_instance_data_with_report(
         if !debug_neg_pairs.is_empty() {
             debug_neg_pairs.sort_unstable();
             debug_neg_pairs.dedup();
-            for (target, carrier) in debug_neg_pairs {
-                let sql = format!(
-                    "SELECT id, record::id(in) AS in_id, record::id(out) AS out_id, record::id(pe) AS pe_id \
-FROM neg_relate WHERE out = {} AND pe = {}",
-                    target.to_pe_key(),
-                    carrier.to_pe_key()
-                );
-                let rows: Vec<serde_json::Value> = project_primary_db()
-                    .query_take(&sql, 0)
-                    .await
-                    .unwrap_or_default();
-                println!(
-                    "[neg-write-debug] post-finish target={} carrier={} rows={}",
-                    target,
-                    carrier,
-                    rows.len()
-                );
-                for row in rows {
-                    println!("[neg-write-debug] row={}", row);
-                }
-            }
+            println!(
+                "[neg-write-debug] queued relation pairs={}（禁止写后读，未执行 DB 验证查询）",
+                debug_neg_pairs.len()
+            );
         }
     }
 
@@ -1231,14 +1378,11 @@ FROM neg_relate WHERE out = {} AND pe = {}",
                 // 查找该 (负载体, ngmr_geom_refno) 的 CataCrossNeg geo_relate
                 let key = (*ele_refno, *ngmr_geom_refno);
                 if let Some(geo_relate_ids) = cata_cross_neg_geo_map.get(&key) {
-                    for (relation_index, (geo_index, geo_relate_id)) in
-                        geo_relate_ids.iter().enumerate()
-                    {
+                    for (geo_index, geo_relate_id) in geo_relate_ids {
                         let ele_pe = ele_refno.to_pe_key();
                         let target_pe = target_k.to_pe_key();
                         let ngmr_pe = ngmr_geom_refno.to_pe_key();
-                        let ngmr_id =
-                            ngmr_relate_id(*target_k, *ele_refno, *geo_index, relation_index);
+                        let ngmr_id = ngmr_relate_id(*target_k, *ele_refno, *geo_index, 0);
                         ngmr_buffer.push(format!(
                             "{{ in: {0}, id: {4}, out: {2}, pe: {1}, ngmr: {3} }}",
                             geo_relate_id, // 切割几何
@@ -2206,6 +2350,119 @@ pub async fn save_tubi_info_batch(
     Ok(submitted)
 }
 
+/// 仅使用本次 run 汇总的内存事实补写跨 batch 负关系。
+///
+/// `geo_relate` ID 与逐批 writer 使用相同的内容寻址规则，因此这里无需查询
+/// SurrealDB；`INSERT RELATION IGNORE` 只负责幂等持久化。
+pub async fn persist_negative_relations_from_artifacts(
+    artifacts: &ShapeInstancesData,
+) -> anyhow::Result<usize> {
+    use aios_core::geometry::GeoBasicType;
+
+    let inst_key_carriers = build_inst_key_carrier_map(artifacts);
+    let mut neg_geo_by_carrier: HashMap<RefnoEnum, Vec<(usize, String)>> = HashMap::new();
+    let mut cata_cross_neg_geo_map: HashMap<(RefnoEnum, RefnoEnum), Vec<(usize, String)>> =
+        HashMap::new();
+
+    for inst_geo_data in artifacts.inst_geos_map.values() {
+        let carriers = inst_key_carriers
+            .get(&inst_geo_data.id())
+            .cloned()
+            .unwrap_or_else(|| vec![(inst_geo_data.refno, inst_geo_data.id())]);
+        for (geo_index, inst) in inst_geo_data.insts.iter().enumerate() {
+            for (carrier_refno, inst_info_id) in &carriers {
+                let relation_id =
+                    geo_relate_id_for_inst(*carrier_refno, geo_index, inst_info_id.as_str());
+                match inst.geo_type {
+                    GeoBasicType::Neg => neg_geo_by_carrier
+                        .entry(*carrier_refno)
+                        .or_default()
+                        .push((geo_index, relation_id)),
+                    GeoBasicType::CataCrossNeg => cata_cross_neg_geo_map
+                        .entry((*carrier_refno, inst.refno))
+                        .or_default()
+                        .push((geo_index, relation_id)),
+                    _ => {}
+                }
+            }
+        }
+    }
+    for rows in neg_geo_by_carrier.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
+    }
+    for rows in cata_cross_neg_geo_map.values_mut() {
+        rows.sort_unstable();
+        rows.dedup();
+    }
+
+    let mut relation_records = Vec::new();
+    let mut neg_targets = artifacts.neg_relate_map.iter().collect::<Vec<_>>();
+    neg_targets.sort_unstable_by_key(|(target, _)| **target);
+    for (target, carriers) in neg_targets {
+        let mut carriers = carriers.clone();
+        carriers.sort_unstable();
+        carriers.dedup();
+        for carrier in carriers {
+            if let Some(geometries) = neg_geo_by_carrier.get(&carrier) {
+                for (geo_index, geo_relate_id) in geometries {
+                    relation_records.push((
+                        "neg_relate",
+                        format!(
+                            "{{ in: {geo_relate_id}, id: {}, out: {}, pe: {} }}",
+                            neg_relate_id(*target, carrier, *geo_index, 0),
+                            target.to_pe_key(),
+                            carrier.to_pe_key(),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut ngmr_targets = artifacts.ngmr_neg_relate_map.iter().collect::<Vec<_>>();
+    ngmr_targets.sort_unstable_by_key(|(target, _)| **target);
+    for (target, pairs) in ngmr_targets {
+        let mut pairs = pairs.clone();
+        pairs.sort_unstable();
+        pairs.dedup();
+        for (carrier, ngmr_geom_refno) in pairs {
+            if let Some(geometries) = cata_cross_neg_geo_map.get(&(carrier, ngmr_geom_refno)) {
+                for (geo_index, geo_relate_id) in geometries {
+                    relation_records.push((
+                        "ngmr_relate",
+                        format!(
+                            "{{ in: {geo_relate_id}, id: {}, out: {}, pe: {}, ngmr: {} }}",
+                            ngmr_relate_id(*target, carrier, *geo_index, 0),
+                            target.to_pe_key(),
+                            carrier.to_pe_key(),
+                            ngmr_geom_refno.to_pe_key(),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    const INSERT_CHUNK_SIZE: usize = 200;
+    let mut submitted = 0usize;
+    for table in ["neg_relate", "ngmr_relate"] {
+        let records = relation_records
+            .iter()
+            .filter_map(|(record_table, record)| (*record_table == table).then_some(record))
+            .collect::<Vec<_>>();
+        for chunk in records.chunks(INSERT_CHUNK_SIZE) {
+            let sql = format!(
+                "INSERT RELATION IGNORE INTO {table} [{}];",
+                chunk.iter().map(|record| record.as_str()).join(",")
+            );
+            project_primary_db().query_response(&sql).await?.check()?;
+            submitted += chunk.len();
+        }
+    }
+    Ok(submitted)
+}
+
 /// 补建跨阶段缺失的 neg_relate
 ///
 /// 当 LOOP 阶段的 LoopOwner（如 GWALL）发现负实体子孙（如 NPYR）时，会在
@@ -2579,8 +2836,6 @@ pub async fn reconcile_missing_neg_relate(
 // ============================================================================
 
 use super::sql_file_writer::SqlFileWriter;
-use super::tree_index_manager::TreeIndexManager;
-
 /// inst_relate 中 fn::* 的预计算结果缓存
 pub struct InstRelatePrecomputed {
     /// refno → zone PE key (e.g. "pe:⟨17496_8517⟩")，None 表示未找到 ZONE 祖先
@@ -2594,6 +2849,36 @@ pub struct InstRelatePrecomputed {
 }
 
 impl InstRelatePrecomputed {
+    pub fn from_generation_read(
+        read: &super::context::GenerationReadContext,
+    ) -> anyhow::Result<Self> {
+        let mut zone_map = HashMap::new();
+        let mut spec_map = HashMap::new();
+        let mut dt_map = HashMap::new();
+        let mut dbnum_map = HashMap::new();
+        for refno in read.hierarchy.all_refnos() {
+            let node = read
+                .hierarchy
+                .node(refno)
+                .ok_or_else(|| anyhow::anyhow!("hierarchy missing refno={refno}"))?;
+            anyhow::ensure!(
+                read.session.manifest().versions.contains_key(&node.dbnum),
+                "refno={refno} dbnum={} 不在输入版本清单中",
+                node.dbnum
+            );
+            zone_map.insert(refno, None);
+            spec_map.insert(refno, 0);
+            dt_map.insert(refno, None);
+            dbnum_map.insert(refno, node.dbnum);
+        }
+        Ok(Self {
+            zone_map,
+            spec_map,
+            dt_map,
+            dbnum_map,
+        })
+    }
+
     /// 从 TreeIndex 本地缓存 + 批量 DB 读取构建预计算缓存。
     ///
     /// - zone_refno: 使用默认值 NONE（已禁用 TreeIndex 查询）

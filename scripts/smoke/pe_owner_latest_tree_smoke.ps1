@@ -1,4 +1,4 @@
-# specs/023 M0/T1：latest pe_owner 图查询原语 smoke
+# specs/023 M0/T1：latest pe_owner 图查询原语 smoke（单源；TreeIndex 双源 diff 已退役）
 # 执行 db-data/smoke_023_pe_owner_latest.surql，验证 PeOwnerTreeStore 依赖的全部 SQL 形态：
 #   L1  children 同胞有序（<owner><-pe_owner ORDER BY id）
 #   L2  递归全子孙（.{..256+collect}<-pe_owner<-pe，SurrealDB 3.1 递归 idiom）

@@ -2245,33 +2245,6 @@ mod tests {
 
     #[cfg(feature = "sqlite-index")]
     #[test]
-    fn filter_design_outbound_keeps_all_sources_when_manual_targets_empty() {
-        let outbound = vec![(250160, vec![250193]), (250161, vec![250194])];
-
-        let filtered = filter_design_outbound_for_manual_dbnums(outbound.clone(), &[]);
-
-        assert_eq!(filtered, outbound);
-    }
-
-    #[cfg(feature = "sqlite-index")]
-    #[test]
-    fn filter_design_outbound_keeps_only_manual_target_sources() {
-        let outbound = vec![
-            (250160, vec![7015, 250193]),
-            (250161, vec![250194]),
-            (250162, vec![250195]),
-        ];
-
-        let filtered = filter_design_outbound_for_manual_dbnums(outbound, &[250160, 250162]);
-
-        assert_eq!(
-            filtered,
-            vec![(250160, vec![7015, 250193]), (250162, vec![250195])]
-        );
-    }
-
-    #[cfg(feature = "sqlite-index")]
-    #[test]
     fn append_related_cata_from_db_index_adds_only_cata_dependencies() {
         let dir = tempfile::tempdir().expect("tempdir");
         let index_path = dir

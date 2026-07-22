@@ -540,13 +540,13 @@ pub async fn export_instanced_bundle_for_refnos(
     // specs/023 M2：过滤逻辑走双源层级视图（pe_owner 快照默认 / .tree 回退）。
     let mut bran_roots: Vec<RefnoEnum> = Vec::new();
     if !all_refnos.is_empty() {
+        use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
         use crate::fast_model::gen_model::hier_view::HierView;
-        use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
         use std::collections::HashMap;
 
         let mut views: HashMap<u32, HierView> = HashMap::new();
         for &refno in &all_refnos {
-            let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(refno) else {
+            let Ok(dbnum) = resolve_dbnum_for_refno(refno) else {
                 continue;
             };
             if !views.contains_key(&dbnum) {

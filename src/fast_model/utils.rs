@@ -76,6 +76,12 @@ pub async fn ensure_inst_relate_relation_schema() {
 }
 
 pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
+    if let Err(error) = save_aabb_to_surreal_checked(aabb_map).await {
+        log::error!("save_aabb_to_surreal 失败: {error}");
+    }
+}
+
+pub async fn save_aabb_to_surreal_checked(aabb_map: &DashMap<String, Aabb>) -> anyhow::Result<()> {
     if !aabb_map.is_empty() {
         let keys = aabb_map
             .iter()
@@ -84,8 +90,10 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
         for chunk in keys.chunks(300) {
             let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
             for k in chunk {
-                let v = aabb_map.get(k).unwrap();
-                let d = serde_json::to_string(v.value()).unwrap();
+                let v = aabb_map
+                    .get(k)
+                    .ok_or_else(|| anyhow::anyhow!("AABB entry disappeared during save: {k}"))?;
+                let d = serde_json::to_string(v.value())?;
                 let id_key = if k.starts_with("aabb:") {
                     k.to_string()
                 } else {
@@ -94,14 +102,13 @@ pub async fn save_aabb_to_surreal(aabb_map: &DashMap<String, Aabb>) {
                 rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
             }
             let sql = format!("INSERT IGNORE INTO aabb [{}];", rows.join(","));
-            match project_primary_db().query(&sql).await {
-                Ok(_) => {}
-                Err(_) => {
-                    init_save_database_error(&sql, &std::panic::Location::caller().to_string());
-                }
+            if let Err(error) = project_primary_db().query(&sql).await {
+                init_save_database_error(&sql, &std::panic::Location::caller().to_string());
+                anyhow::bail!("写入 aabb 失败: {error}");
             }
         }
     }
+    Ok(())
 }
 
 /// 保存布尔结果状态
@@ -236,23 +243,30 @@ pub async fn save_inst_relate_booled_aabb(
 }
 
 pub async fn save_pts_to_surreal(vec3_map: &DashMap<u64, String>) {
+    if let Err(error) = save_pts_to_surreal_checked(vec3_map).await {
+        log::error!("save_pts_to_surreal 失败: {error}");
+    }
+}
+
+pub async fn save_pts_to_surreal_checked(vec3_map: &DashMap<u64, String>) -> anyhow::Result<()> {
     if !vec3_map.is_empty() {
         let keys = vec3_map.iter().map(|kv| *kv.key()).collect::<Vec<_>>();
         for chunk in keys.chunks(100) {
             let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
             for &k in chunk {
-                let v = vec3_map.get(&k).unwrap();
+                let v = vec3_map
+                    .get(&k)
+                    .ok_or_else(|| anyhow::anyhow!("vec3 entry disappeared during save: {k}"))?;
                 rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
             }
             let sql = format!("INSERT IGNORE INTO vec3 [{}];", rows.join(","));
-            match project_primary_db().query(&sql).await {
-                Ok(_) => {}
-                Err(_e) => {
-                    init_save_database_error(&sql, &std::panic::Location::caller().to_string());
-                }
-            };
+            if let Err(error) = project_primary_db().query(&sql).await {
+                init_save_database_error(&sql, &std::panic::Location::caller().to_string());
+                anyhow::bail!("写入 vec3 失败: {error}");
+            }
         }
     }
+    Ok(())
 }
 
 pub async fn save_transforms_to_surreal(trans_map: &HashMap<u64, String>) -> anyhow::Result<()> {

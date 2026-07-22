@@ -24,12 +24,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use surrealdb::types::SurrealValue;
 
-use crate::fast_model::gen_model::model_record_id::model_refno_range;
-use crate::fast_model::gen_model::tree_index_manager::{
-    TreeIndexManager, load_index_with_large_stack,
-};
-
 use super::InstRelateRow;
+use crate::fast_model::gen_model::model_record_id::model_refno_range;
 
 // =============================================================================
 // 公共返回类型
@@ -401,21 +397,10 @@ pub async fn export_dbnum_instances_web(
         }
         list.sort_by_key(|r| r.to_string());
         list
-    } else if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
+    } else {
         crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum)
             .await
-            .with_context(|| format!("加载 pe 快照失败: dbnum={}", dbnum))?
-            .all_refnos()
-            .into_iter()
-            .map(RefnoEnum::from)
-            .collect()
-    } else {
-        let tree_dir = TreeIndexManager::with_default_dir(vec![dbnum])
-            .tree_dir()
-            .to_path_buf();
-        let tree_index = load_index_with_large_stack(&tree_dir, dbnum)
-            .with_context(|| format!("加载 TreeIndex 失败: dbnum={}", dbnum))?;
-        tree_index
+            .with_context(|| format!("加载 pe 快照 dbnum={} 失败", dbnum))?
             .all_refnos()
             .into_iter()
             .map(RefnoEnum::from)

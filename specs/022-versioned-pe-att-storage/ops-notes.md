@@ -69,3 +69,9 @@
 - **审计方法**：`powershell -File scripts/smoke/anchor_continuity_audit.ps1 -Ns <surreal_ns> -Db <project>`（连接默认 `127.0.0.1:8030` root/root，可参数/环境变量覆盖）执行 `db-data/audit_anchor_continuity.surql`：第一段输出按 `(dbnum, sesno)` 升序的全量锚点链，第二段列出断链可疑项——`from_sesno` 存在、`source != 'full'` 且 `from_sesno != 前一锚点 sesno + 1`（无 `from_sesno` 的 Legacy Anchor 与 full 基线重置锚点不参与判定）。结果落 `db-data/audit_anchor_continuity.out.md`，存在可疑项时退出码 1。
 - **写侧门禁（增量防新洞）**：`commit_version` 对 `source=incremental` 且非 recover 的提交检查区间衔接——`from_sesno > committed_watermark + 1` 返回 `ContinuityGap` 显式失败，不再静默锚定带洞的链；full（基线重置）豁免，recover 路径由 pending fingerprint 匹配把关。
 - **历史断链修复口径**：审计发现的历史洞**只能对该 dbnum 全量重灌**（重建锚点链基线），**不做"补洞"式回填**——原因：锚点是 create-once 不可变发布记录，补写过去区间必须伪造/改写既有锚点链的时间与指纹语义，会摧毁"锚点 = 已验证 Version Commit 的唯一可信入口"这一审计基础。
+
+### scene_tree / GenPipeline（2026-07-21）
+
+- **`.tree` 已退役**：解析与 CLI 不再写出 TreeIndex；`scene_tree/` 仅需 `db_meta_info.json`。站点上遗留的 `*.tree` 可删。
+- **层级数据**：latest 与 versioned 树查询均走 pe_owner（缺边时 pe.children 回退）。切换/增量前用 `scripts/smoke/pe_owner_children_audit.ps1`；不绿则 `model-version rebuild-pe-owner`。
+- **CLI**：`--gen-indextree` 已移除，改用 `--gen-db-meta`；配置 `gen_tree_only` → `gen_db_meta_only`，`index_tree_*` → `gen_pipeline_*`（见 `docs/guides/MIGRATION_GUIDE.md`）。

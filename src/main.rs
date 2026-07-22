@@ -85,23 +85,27 @@ async fn promote_generation_refnos_to_bran_hang_roots(
     refnos: &[String],
     verbose: bool,
 ) -> anyhow::Result<Vec<String>> {
+    use aios_database::data_interface::db_meta_manager::resolve_dbnum_for_refno;
+    use aios_database::fast_model::gen_model::hier_view::HierView;
     use aios_database::fast_model::gen_model::query_compat::query_filter_ancestors;
-    use aios_database::fast_model::gen_model::tree_index_manager::TreeIndexManager;
     use std::collections::{BTreeSet, HashMap};
 
     const BRAN_HANG_NOUNS: &[&str] = &["BRAN", "HANG"];
 
     let mut promoted_refnos = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut tree_managers: HashMap<u32, TreeIndexManager> = HashMap::new();
+    let mut hier_views: HashMap<u32, HierView> = HashMap::new();
 
     for input_refno in refnos {
         let parsed_refno = parse_cli_refno(input_refno)?;
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(parsed_refno)?;
-        let manager = tree_managers
-            .entry(dbnum)
-            .or_insert_with(|| TreeIndexManager::with_default_dir(vec![dbnum]));
-        let self_noun = manager
+        let dbnum = resolve_dbnum_for_refno(parsed_refno)?;
+        let hier = match hier_views.entry(dbnum) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(HierView::load(vec![dbnum]).await?)
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        };
+        let self_noun = hier
             .get_noun(parsed_refno)
             .unwrap_or_default()
             .trim()
@@ -423,17 +427,11 @@ async fn main() -> anyhow::Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
-            Arg::new("gen-indextree")
-                .long("gen-indextree")
-                .help("生成 indextree 文件。可选指定 dbnum，不指定则生成所有 DESI 类型")
+            Arg::new("gen-db-meta")
+                .long("gen-db-meta")
+                .help("Regenerate db_meta_info.json only (optional DBNUM; default: all DESI types)")
                 .value_name("DBNUM")
                 .num_args(0..=1),
-        )
-        .arg(
-            Arg::new("gen-all-desi-indextree")
-                .long("gen-all-desi-indextree")
-                .help("强制生成所有 DESI 类型的 indextree 文件（绕过配置文件中的 manual_db_nums 限制）")
-                .action(clap::ArgAction::SetTrue),
         )
         .arg(
             Arg::new("capture")
@@ -647,7 +645,7 @@ async fn main() -> anyhow::Result<()> {
         .arg(
             Arg::new("gen-nouns")
                 .long("gen-nouns")
-                .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides index_tree_enabled_target_types in DbOption")
+                .help("Only generate specified noun types (comma-separated, e.g. BRAN,PANE). Overrides gen_pipeline_enabled_target_types in DbOption")
                 .value_name("NOUNS")
                 .value_delimiter(',')
                 .num_args(1..),
@@ -1003,9 +1001,9 @@ async fn main() -> anyhow::Result<()> {
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
-                    Arg::new("require-tree-index")
-                        .long("require-tree-index")
-                        .help("增量模型生成前要求 scene_tree/<dbnum>.tree 已存在；缺失时快速失败，不进入模型生成")
+                    Arg::new("require-pe-owner-ready")
+                        .long("require-pe-owner-ready")
+                        .help("增量模型生成前要求 pe_owner 完整性证据就绪（pe_owner_version_meta 存在 + 抽查一致）；不就绪时快速失败，不进入模型生成。修复指引：model-version rebuild-pe-owner")
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
@@ -1054,9 +1052,9 @@ async fn main() -> anyhow::Result<()> {
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
-                    Arg::new("require-tree-index")
-                        .long("require-tree-index")
-                        .help("watcher 触发增量模型生成前要求 scene_tree/<dbnum>.tree 已存在；缺失时快速失败，不进入模型生成")
+                    Arg::new("require-pe-owner-ready")
+                        .long("require-pe-owner-ready")
+                        .help("watcher 触发增量模型生成前要求 pe_owner 完整性证据就绪；不就绪时该 dbnum 快速失败，不进入模型生成。修复指引：model-version rebuild-pe-owner")
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
@@ -1391,7 +1389,9 @@ async fn main() -> anyhow::Result<()> {
         if mv.subcommand_matches("history").is_some()
             || mv.subcommand_matches("export").is_some()
             || mv.subcommand_matches("resolve-anchor").is_some()
+            || mv.subcommand_matches("bootstrap-generation-read").is_some()
             || mv.subcommand_matches("backfill-pe-cata-hash").is_some()
+            || mv.subcommand_matches("rebuild-pe-owner").is_some()
         {
             crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         }
@@ -1471,19 +1471,19 @@ async fn main() -> anyhow::Result<()> {
         let v: Vec<String> = nouns.map(|s| s.to_uppercase()).collect();
         if !v.is_empty() {
             println!(
-                "🔧 CLI 覆盖 index_tree_enabled_target_types: {:?} -> {:?}",
-                db_option_ext.index_tree_enabled_target_types, v
+                "🔧 CLI 覆盖 gen_pipeline_enabled_target_types: {:?} -> {:?}",
+                db_option_ext.gen_pipeline_enabled_target_types, v
             );
-            db_option_ext.index_tree_enabled_target_types = v;
+            db_option_ext.gen_pipeline_enabled_target_types = v;
         }
     }
     if let Some(limit) = matches.get_one::<usize>("gen-limit-per-noun").copied() {
         let override_limit = if limit == 0 { None } else { Some(limit) };
         println!(
-            "🔧 CLI 覆盖 index_tree_debug_limit_per_target_type: {:?} -> {:?}",
-            db_option_ext.index_tree_debug_limit_per_target_type, override_limit
+            "🔧 CLI 覆盖 gen_pipeline_debug_limit_per_target_type: {:?} -> {:?}",
+            db_option_ext.gen_pipeline_debug_limit_per_target_type, override_limit
         );
-        db_option_ext.index_tree_debug_limit_per_target_type = override_limit;
+        db_option_ext.gen_pipeline_debug_limit_per_target_type = override_limit;
     }
     if matches.get_flag("gen-dry-run") {
         db_option_ext.gen_model_dry_run = true;
@@ -1584,15 +1584,15 @@ async fn main() -> anyhow::Result<()> {
     println!("🔧 配置加载完成:");
     println!("   - 配置文件路径: {}", config_path);
     println!(
-        "   - index_tree_enabled_target_types: {:?}",
-        db_option_ext.index_tree_enabled_target_types
+        "   - gen_pipeline_enabled_target_types: {:?}",
+        db_option_ext.gen_pipeline_enabled_target_types
     );
     println!(
-        "   - index_tree_excluded_target_types: {:?}",
-        db_option_ext.index_tree_excluded_target_types
+        "   - gen_pipeline_excluded_target_types: {:?}",
+        db_option_ext.gen_pipeline_excluded_target_types
     );
 
-    println!("✅ IndexTree 默认生成管线已启用（无模式开关）");
+    println!("✅ GenPipeline 默认生成管线已启用（无模式开关）");
     let config_debug_refnos: Option<Vec<String>> = db_option_ext.inner.debug_model_refnos.clone();
     let log_model_error = matches.get_flag("log-model-error");
     let debug_model_requested = matches.contains_id("debug-model") || log_model_error;
@@ -1795,28 +1795,20 @@ async fn main() -> anyhow::Result<()> {
         return aios_database::init_project::run_init_project_mode(db_option_ext, cli_dbnums).await;
     }
 
-    // ========== 处理 --gen-all-desi-indextree 参数 ==========
-    if matches.get_flag("gen-all-desi-indextree") {
-        println!("🔄 生成所有 DESI 类型的 indextree (忽略 manual_db_nums)...");
-        aios_database::data_interface::db_meta_manager::generate_desi_indextree(true)?;
-        println!("✅ indextree 生成完成");
-        return Ok(());
-    }
-
-    // ========== 处理 --gen-indextree 参数 ==========
-    if matches.contains_id("gen-indextree") {
+    // ========== 处理 --gen-db-meta 参数 ==========
+    if matches.contains_id("gen-db-meta") {
         let dbnum: Option<u32> = matches
-            .get_one::<String>("gen-indextree")
+            .get_one::<String>("gen-db-meta")
             .and_then(|s| s.parse().ok());
 
         if let Some(dbnum) = dbnum {
-            println!("🔄 生成指定 dbnum={} 的 indextree...", dbnum);
-            aios_database::data_interface::db_meta_manager::generate_single_indextree(dbnum)?;
+            println!("🔄 生成指定 dbnum={} 的 db_meta...", dbnum);
+            aios_database::data_interface::db_meta_manager::generate_single_db_meta(dbnum)?;
         } else {
-            println!("🔄 生成所有 DESI 类型的 indextree...");
-            aios_database::data_interface::db_meta_manager::generate_desi_indextree(false)?;
+            println!("🔄 生成所有 DESI 类型的 db_meta...");
+            aios_database::data_interface::db_meta_manager::generate_desi_db_meta(false)?;
         }
-        println!("✅ indextree 生成完成");
+        println!("✅ db_meta 生成完成");
         return Ok(());
     }
 
@@ -1871,6 +1863,8 @@ async fn main() -> anyhow::Result<()> {
     // --debug-model: 直接增量生成（不清理，补充缺失的 inst_geo/mesh/布尔结果）
     let should_generate = regen_model_requested || any_model_requested;
     if should_generate {
+        // debug-model / regen-model 在 promote roots / HierView 前必须已连接 Surreal。
+        crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         // 确定生成的目标 refnos：优先 debug-model 指定的 refnos，其次 CLI 独立 refno 参数，
         // 再次 dbnum（查询所有 SITE），最后全库模式。
         let gen_refnos_vec: Vec<String> = if let Some(ref refnos) = debug_model_refnos {
@@ -2444,14 +2438,22 @@ async fn main() -> anyhow::Result<()> {
         let dbnum = matches.get_one::<u32>("dbnum").copied();
         let export_bundle_dir = matches.get_one::<String>("output").map(PathBuf::from);
 
-        // 解析 --debug-model / --root-model 参数作为 root_refno
+        // 解析作用域：优先 --root-refno，其次 --debug-model / --root-model
         let root_refno: Option<RefnoEnum> = matches
-            .get_many::<String>("debug-model")
-            .or_else(|| matches.get_many::<String>("root-model"))
-            .and_then(|values| values.into_iter().next())
+            .get_one::<String>("root-refno")
             .and_then(|s| {
                 let refno_str = s.replace('_', "/");
                 RefnoEnum::from_str(&refno_str).ok()
+            })
+            .or_else(|| {
+                matches
+                    .get_many::<String>("debug-model")
+                    .or_else(|| matches.get_many::<String>("root-model"))
+                    .and_then(|values| values.into_iter().next())
+                    .and_then(|s| {
+                        let refno_str = s.replace('_', "/");
+                        RefnoEnum::from_str(&refno_str).ok()
+                    })
             });
 
         // 必须提供 dbnum 参数
@@ -2954,7 +2956,7 @@ async fn main() -> anyhow::Result<()> {
             persist_data: !incr_matches.get_flag("no-persist"),
             recover_pending: incr_matches.get_flag("recover-pending"),
             generate_model: incr_matches.get_flag("generate-model"),
-            require_tree_index: incr_matches.get_flag("require-tree-index"),
+            require_pe_owner_ready: incr_matches.get_flag("require-pe-owner-ready"),
             verbose,
         };
         let result = match run_incremental_sesno_once(&db_option_ext, options).await {
@@ -2994,7 +2996,7 @@ async fn main() -> anyhow::Result<()> {
                 once: watch_matches.get_flag("once"),
                 force_initial_scan: watch_matches.get_flag("force-initial-scan"),
                 generate_model: watch_matches.get_flag("generate-model"),
-                require_tree_index: watch_matches.get_flag("require-tree-index"),
+                require_pe_owner_ready: watch_matches.get_flag("require-pe-owner-ready"),
                 json_output: watch_matches.get_flag("json"),
                 verbose,
             },

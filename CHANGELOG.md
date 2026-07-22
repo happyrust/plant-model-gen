@@ -1,6 +1,45 @@
 # Changelog
 
+## 2026-07-21
+
+### Changed — GenPipeline：配置硬切 + 运行时仅 pe_owner（PR-1）
+
+> 依据 `docs/superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md`。消除 IndexTree/`.tree` 歧义的第一阶段：配置与运行时层级源不再提供 TreeIndex 回退。
+
+- **Breaking（配置）**：`index_tree_*` 键硬切换为 `gen_pipeline_*`（见下表）；检出旧键时配置加载失败并打印迁移提示，无兼容读。
+  | 旧键 | 新键 |
+  |---|---|
+  | `index_tree_max_concurrent_targets` | `gen_pipeline_max_concurrent` |
+  | `index_tree_batch_size` | `gen_pipeline_batch_size` |
+  | `index_tree_enabled_target_types` | `gen_pipeline_enabled_target_types` |
+  | `index_tree_excluded_target_types` | `gen_pipeline_excluded_target_types` |
+  | `index_tree_debug_limit_per_target_type` | `gen_pipeline_debug_limit_per_target_type` |
+- **Breaking（环境变量）**：`AIOS_TREE_QUERY_SOURCE` 已退役；若仍设置则配置加载失败。层级查询仅 pe_owner / GenerationRead / pe 快照。
+- 运行时删除 `HierView::Tree`、`TreeIndexQueryProvider` 与 Web/导出/precheck 的 tree 回退分支；`.tree` 写出与 `--gen-indextree` 仍保留至后续 PR（生产侧退役）。
+
+### Changed — GenPipeline：模块与符号改名（PR-2）
+
+- `index_tree_mode.rs` → `gen_pipeline.rs`；`process_index_tree_generation` → `process_gen_pipeline`；`gen_index_tree_geos_*` → `gen_pipeline_geos*`；`IndexTreeConfig`/`IndexTreeError`/`IndexTreeTargetCollection` → `GenPipeline*`。
+- 日志前缀与进度标记统一为 `gen_pipeline` / `[gen_pipeline]`。
+
+### Changed — GenPipeline：停产 `.tree` / TreeIndexManager（PR-3）
+
+- **Breaking**：解析路径不再写出 `.tree`；删除 `tree_export` 与 `TreeIndexManager`。
+- **Breaking（CLI）**：移除 `--gen-indextree` / `--gen-all-desi-indextree`；新增 `--gen-db-meta`（仅维护 `db_meta_info.json`）。
+- **Breaking（配置）**：`gen_tree_only` → `gen_db_meta_only`（轻量扫描只更新 db_meta，不写 tree）。
+- `resolve_dbnum_for_refno` 迁至 `db_meta_manager`；BRAN 子元件收集迁至 `hier_view`（pe 快照）。
+- 运维：`scene_tree/` 仅需保留 `db_meta_info.json`；站点上旧 `.tree` 文件可删。
+
 ## 2026-07-20
+
+### Changed — 树查询迁移 M3：增量域证据换源 + rebuild-pe-owner 去 tree 依赖
+
+> 依据 `docs/plans/2026-07-20-pe-owner-tree-query-migration-dev-plan.md` M3（T8）。增量模型生成前的"层级数据可用"判据从 `.tree` 文件存在性换成 **pe_owner 完整性证据**；`model-version rebuild-pe-owner` 重建为 pe 表 cursor 分页枚举，无 `.tree` 的站点也能重建边。
+
+- **Breaking（CLI）**：`incremental-sesno` / `watch-incremental` 的 `--require-tree-index` 移除，改为 `--require-pe-owner-ready`（增量生成前要求 `pe_owner_version_meta` 存在 + 抽查一致，不就绪快速失败；不加 flag 保持 degraded_allowed 咨询语义）。summary JSON 字段 `tree_index` → `pe_owner_evidence`（`incremental_pe_owner_evidence:v1`：per-dbnum maintained_since_sesno + 抽样 200 个有子 parent 的边/字段计数对比 + not_ready 修复指引）。
+- `model-version rebuild-pe-owner`：候选枚举从 TreeIndex（要求 tree 与库内同源新鲜，增量常态化后不成立）改为 pe 表 cursor 分页（`WHERE dbnum AND id > <last> ORDER BY id`）；verify-and-skip / 删插分批 / 幂等冲突慢路径 / 幽灵 owner 清理等 T021 实测行为保留，幽灵清理增加 dbnum 归属过滤；成功后 UPSERT `pe_owner_version_meta`（source=rebuild_cli）语义不变。
+- `backfill-pe-cata-hash` 枚举分页同步改 cursor 形态（无序 START/LIMIT 页序不稳定可能漏读/重读）。
+- 8030 fixture 闭环验证：缺边库审计 FAIL → rebuild 语句序列修复 → 审计 PASS；三面 cargo check（lib / web_server / sync-cli）全绿。
 
 ### Changed — 树查询迁移 M2：模型生成管线与导出路径切 pe_owner 快照
 

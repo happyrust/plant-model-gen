@@ -1,0 +1,180 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 640" width="1100" height="640" role="img" aria-labelledby="diagram-title diagram-desc">
+  <title id="diagram-title">PE/ATT 版本时间线与 retention 窗口</title>
+  <desc id="diagram-desc">展示元素 E 在三个 sesno 锚点间的 v1、v2 与硬删除历史，以及 retention 水位线、HistoryExpired 和历史查询入口约束。</desc>
+  <style>
+    text {
+      font-family: "Helvetica Neue", Helvetica, Arial, "PingFang SC", "Microsoft YaHei", "Microsoft JhengHei", "SimHei", sans-serif;
+      fill: #111827;
+    }
+    .title { font-size: 22px; font-weight: 700; }
+    .subtitle { font-size: 13px; fill: #6b7280; }
+    .section { font-size: 14px; font-weight: 700; }
+    .label { font-size: 13px; font-weight: 600; }
+    .small { font-size: 12px; }
+    .tiny { font-size: 11px; }
+    .muted { fill: #6b7280; }
+    .mono { font-family: Consolas, "Cascadia Mono", "Courier New", monospace; }
+  </style>
+  <defs>
+    <marker id="arrow-axis" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#374151"/></marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#2563eb"/></marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#059669"/></marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#dc2626"/></marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#7c3aed"/></marker>
+    <pattern id="deleted-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#f9fafb"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#d1d5db" stroke-width="3"/>
+    </pattern>
+  </defs>
+
+  <rect width="1100" height="640" fill="#ffffff"/>
+
+  <g id="header">
+    <text x="50" y="38" class="title">版本时间线与 retention 窗口</text>
+    <text x="50" y="61" class="subtitle">业务 sesno 通过锚点映射到 RocksDB versioned 的 HLC 时间戳；删除保持硬 DELETE</text>
+  </g>
+
+  <g id="plot-frame">
+    <rect x="50" y="78" width="1000" height="402" rx="12" fill="#ffffff" stroke="#e5e7eb" stroke-width="1.5"/>
+    <rect x="100" y="86" width="200" height="382" fill="#f3f4f6"/>
+    <line x1="300" y1="86" x2="300" y2="468" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 5"/>
+    <text x="114" y="108" class="section" fill="#4b5563">retention=90d 窗口外</text>
+    <text x="114" y="128" class="small muted">timestamp &lt; full_history_ts_low</text>
+    <rect x="110" y="140" width="178" height="36" rx="7" fill="#faf5ff" stroke="#ddd6fe"/>
+    <text x="121" y="156" class="tiny" fill="#7c3aed">GC 每 60s 粒度推进 →</text>
+    <text x="121" y="170" class="tiny mono" fill="#7c3aed">full_history_ts_low 水位线</text>
+  </g>
+
+  <g id="anchor-cards">
+    <rect x="315" y="88" width="220" height="72" rx="8" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <text x="425" y="111" text-anchor="middle" class="small mono" font-weight="700">anchor(sesno=N, source=full)</text>
+    <text x="425" y="133" text-anchor="middle" class="tiny" fill="#2563eb">全量写入全部完成后固化</text>
+    <text x="425" y="150" text-anchor="middle" class="tiny muted">anchored_at 晚于本批写入</text>
+
+    <rect x="545" y="88" width="225" height="72" rx="8" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <text x="657.5" y="109" text-anchor="middle" class="small mono" font-weight="700">anchor(sesno=N+1,</text>
+    <text x="657.5" y="126" text-anchor="middle" class="small mono" font-weight="700">source=incremental)</text>
+    <text x="657.5" y="149" text-anchor="middle" class="tiny muted">增量事务完成后固化 · 晚于全部写入</text>
+
+    <rect x="780" y="88" width="225" height="72" rx="8" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <text x="892.5" y="109" text-anchor="middle" class="small mono" font-weight="700">anchor(sesno=N+2,</text>
+    <text x="892.5" y="126" text-anchor="middle" class="small mono" font-weight="700">source=incremental)</text>
+    <text x="892.5" y="149" text-anchor="middle" class="tiny muted">DELETE 完成后固化 · 晚于本批写入</text>
+  </g>
+
+  <g id="time-axis">
+    <text x="69" y="191" class="section">存储 HLC</text>
+    <text x="69" y="208" class="small muted">时间戳</text>
+    <line x1="100" y1="200" x2="1032" y2="200" stroke="#374151" stroke-width="2" marker-end="url(#arrow-axis)"/>
+    <text x="100" y="226" class="tiny muted">过去</text>
+    <text x="1038" y="226" class="tiny muted" text-anchor="end">墙钟前进 → 当前</text>
+
+    <polygon points="210,192 218,200 210,208 202,200" fill="#9ca3af" stroke="#6b7280"/>
+    <text x="210" y="181" class="tiny muted" text-anchor="middle">过期 anchor</text>
+
+    <rect x="375" y="195" width="10" height="10" rx="2" fill="#ea580c"/>
+    <path d="M 389 184 L 416 184" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)"/>
+    <polygon points="425,190 435,200 425,210 415,200" fill="#2563eb" stroke="#1d4ed8"/>
+    <text x="380" y="225" class="tiny" text-anchor="middle" fill="#c2410c">v1 写入</text>
+
+    <rect x="615" y="195" width="10" height="10" rx="2" fill="#ea580c"/>
+    <path d="M 629 184 L 648 184" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)"/>
+    <polygon points="657,190 667,200 657,210 647,200" fill="#2563eb" stroke="#1d4ed8"/>
+    <text x="620" y="225" class="tiny" text-anchor="middle" fill="#c2410c">v2 修改</text>
+
+    <circle cx="760" cy="200" r="7" fill="#ffffff" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="3 2"/>
+    <path d="M 756 196 L 764 204 M 764 196 L 756 204" stroke="#9ca3af" stroke-width="1.5"/>
+    <text x="760" y="225" class="tiny muted" text-anchor="middle">失败半成品 · 无锚点</text>
+
+    <circle cx="850" cy="200" r="8" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/>
+    <path d="M 846 196 L 854 204 M 854 196 L 846 204" stroke="#dc2626" stroke-width="2"/>
+    <path d="M 862 184 L 883 184" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#arrow-blue)"/>
+    <polygon points="892,190 902,200 892,210 882,200" fill="#2563eb" stroke="#1d4ed8"/>
+    <text x="850" y="225" class="tiny" text-anchor="middle" fill="#dc2626">硬 DELETE</text>
+
+    <line x1="425" y1="211" x2="425" y2="275" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <line x1="657" y1="211" x2="657" y2="275" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <line x1="892" y1="211" x2="892" y2="275" stroke="#60a5fa" stroke-width="1.5" stroke-dasharray="5 4"/>
+  </g>
+
+  <g id="element-lane">
+    <text x="69" y="282" class="section">元素 E</text>
+    <text x="69" y="300" class="small muted">版本泳道</text>
+
+    <rect x="380" y="275" width="240" height="68" rx="8" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+    <text x="500" y="301" text-anchor="middle" class="label" fill="#166534">v1 · BORE=150</text>
+    <text x="500" y="322" text-anchor="middle" class="small" fill="#166534">随 sesno=N 写入</text>
+    <text x="500" y="338" text-anchor="middle" class="tiny muted">有效区间：v1 写入 ≤ t &lt; v2 写入</text>
+
+    <rect x="620" y="275" width="230" height="68" rx="8" fill="#dbeafe" stroke="#93c5fd" stroke-width="1.5"/>
+    <text x="735" y="301" text-anchor="middle" class="label" fill="#1e40af">v2 · BORE=200</text>
+    <text x="735" y="322" text-anchor="middle" class="small" fill="#1e40af">随 sesno=N+1 修改</text>
+    <text x="735" y="338" text-anchor="middle" class="tiny muted">有效区间：v2 写入 ≤ t &lt; DELETE</text>
+
+    <rect x="850" y="275" width="180" height="68" rx="8" fill="url(#deleted-hatch)" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="5 3"/>
+    <text x="940" y="301" text-anchor="middle" class="label" fill="#4b5563">记录不存在</text>
+    <text x="940" y="322" text-anchor="middle" class="small muted">随 sesno=N+2 硬删除</text>
+    <text x="940" y="338" text-anchor="middle" class="tiny muted">当前态无软删除标记</text>
+    <line x1="850" y1="262" x2="850" y2="352" stroke="#dc2626" stroke-width="2"/>
+  </g>
+
+  <g id="expired-query">
+    <path d="M 210 253 L 210 212" stroke="#dc2626" stroke-width="1.8" stroke-dasharray="5 3" fill="none" marker-end="url(#arrow-red)"/>
+    <rect x="110" y="253" width="180" height="84" rx="8" fill="#fef2f2" stroke="#fecaca" stroke-width="1.5"/>
+    <text x="200" y="278" text-anchor="middle" class="small mono">VERSION $t(old anchor)</text>
+    <text x="200" y="302" text-anchor="middle" class="label" fill="#dc2626">HistoryExpired</text>
+    <text x="200" y="322" text-anchor="middle" class="tiny muted">明确报错 · 不以空结果冒充</text>
+
+    <rect x="110" y="352" width="180" height="96" rx="8" fill="#ffffff" stroke="#d1d5db" stroke-width="1.5"/>
+    <text x="200" y="378" text-anchor="middle" class="label">窗口外兜底</text>
+    <text x="200" y="401" text-anchor="middle" class="small" fill="#4b5563">PDMS 源文件重扫</text>
+    <text x="200" y="420" text-anchor="middle" class="small muted">或 DuckLake 存档</text>
+    <path d="M 145 432 L 255 432" stroke="#9ca3af" stroke-width="1" stroke-dasharray="4 3"/>
+  </g>
+
+  <g id="queries">
+    <path d="M 425 392 L 425 348" stroke="#059669" stroke-width="2" fill="none" marker-end="url(#arrow-green)"/>
+    <rect x="320" y="392" width="210" height="62" rx="8" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+    <text x="425" y="417" text-anchor="middle" class="small mono">VERSION $t(anchor N)</text>
+    <text x="425" y="439" text-anchor="middle" class="label" fill="#047857">命中 v1 → BORE=150</text>
+
+    <path d="M 657 392 L 657 348" stroke="#059669" stroke-width="2" fill="none" marker-end="url(#arrow-green)"/>
+    <rect x="545" y="392" width="225" height="62" rx="8" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+    <text x="657.5" y="417" text-anchor="middle" class="small mono">VERSION $t(anchor N+1)</text>
+    <text x="657.5" y="439" text-anchor="middle" class="label" fill="#047857">命中 v2 → BORE=200</text>
+
+    <path d="M 940 392 L 940 348" stroke="#dc2626" stroke-width="2" fill="none" marker-end="url(#arrow-red)"/>
+    <rect x="805" y="392" width="240" height="62" rx="8" fill="#fef2f2" stroke="#fecaca" stroke-width="1.5"/>
+    <text x="925" y="417" text-anchor="middle" class="small mono">当前读（无 VERSION）</text>
+    <text x="925" y="439" text-anchor="middle" class="label" fill="#b91c1c">记录不存在（已删除）</text>
+  </g>
+
+  <g id="business-entry-note">
+    <rect x="50" y="498" width="1000" height="70" rx="10" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1.5"/>
+    <circle cx="82" cy="533" r="16" fill="#2563eb"/>
+    <path d="M 75 533 L 80 538 L 90 527" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="110" y="520" class="label" fill="#1e3a8a">锚点是历史查询唯一业务入口</text>
+    <text x="110" y="541" class="small mono" fill="#334155">sesno → sesno_version_anchor → VERSION $t(anchor)</text>
+    <text x="110" y="558" class="tiny muted">不直接接受任意 HLC 时间戳。</text>
+    <text x="660" y="520" class="label" fill="#4b5563">失败安全边界</text>
+    <text x="660" y="541" class="small muted">无锚点中间态（如失败半成品）</text>
+    <text x="660" y="558" class="tiny muted">不对外暴露。</text>
+  </g>
+
+  <g id="legend" transform="translate(50 590)">
+    <text x="0" y="13" class="small" font-weight="700">图例</text>
+    <rect x="46" y="4" width="10" height="10" rx="2" fill="#ea580c"/>
+    <text x="63" y="13" class="tiny muted">批内写入完成点</text>
+    <polygon points="183,2 193,12 183,22 173,12" fill="#2563eb"/>
+    <text x="201" y="16" class="tiny muted">固化锚点（晚于写入）</text>
+    <line x1="365" y1="12" x2="399" y2="12" stroke="#059669" stroke-width="2" marker-end="url(#arrow-green)"/>
+    <text x="407" y="16" class="tiny muted">历史读取命中</text>
+    <line x1="520" y1="12" x2="554" y2="12" stroke="#dc2626" stroke-width="2" marker-end="url(#arrow-red)"/>
+    <text x="562" y="16" class="tiny muted">删除 / 过期结果</text>
+    <rect x="688" y="3" width="28" height="18" fill="#f3f4f6" stroke="#d1d5db"/>
+    <text x="724" y="16" class="tiny muted">低于 GC 水位线</text>
+    <circle cx="873" cy="12" r="7" fill="#ffffff" stroke="#9ca3af" stroke-dasharray="3 2"/>
+    <path d="M 869 8 L 877 16 M 877 8 L 869 16" stroke="#9ca3af"/>
+    <text x="888" y="16" class="tiny muted">无锚点，不可见</text>
+  </g>
+</svg>

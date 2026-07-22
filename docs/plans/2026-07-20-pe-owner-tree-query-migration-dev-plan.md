@@ -1,5 +1,7 @@
 # 树查询统一 pe_owner / indextree 退役开发计划（2026-07-20）
 
+> **M4/M5 已由** [`docs/superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md`](../superpowers/specs/2026-07-21-gen-pipeline-cleanup-rename-design.md) **与 GenPipeline 清理开发计划承接**（配置硬切 `gen_pipeline_*`、运行时仅 pe_owner、模块改名、生产侧停产 `.tree`）。本文件 M0–M3 仍为历史落地记录；勿再按下方 M4/M5 任务表重复开工。
+
 > 依据：2026-07-20 对「增量更新下 indextree 适配性」的代码审核。
 > 审核结论：`.tree`（TreeIndex）只在全量解析 / 手工 `--gen-indextree` 时产出，
 > 增量路径（`incremental-sesno` / `watch-incremental` / web `/api/incremental/*`）**从不重建它**，
@@ -216,7 +218,7 @@ SurrealQL 断言走 `db-data/*.surql` + `scripts/smoke/*.ps1`；瘦构建 `scrip
 
 ## M3（P1）：版本管理 / 增量域清理
 
-### T8 增量入口证据与门禁改造
+### T8 增量入口证据与门禁改造 ✅（2026-07-20）
 - `increment_run.rs`：删除 `TreeIndexEvidence` 与 `require_tree_index`（含 `main.rs` watch
   `--require-tree-index` flag），替换为 **pe_owner 完整性证据**：`pe_owner_version_meta.maintained_since_sesno`
   存在 + T3 审计抽查通过；degraded 语义（patch_only/quarantined）保留但判据换源。
@@ -225,6 +227,40 @@ SurrealQL 断言走 `db-data/*.surql` + `scripts/smoke/*.ps1`；瘦构建 `scrip
   退役（保留 `db_meta_info.json` 的快照/恢复子集）；`publish-history` / `physical_baseline_snapshot` /
   `history_replay_plan` 的 scene_tree 证据项同步降级为 db_meta_info.json 检查。
 - 验收：`incremental-sesno --json` / `watch-incremental --once --json` 回归；rebuild 在无 `.tree` 站点可运行。
+  > **落地（2026-07-20）**：
+  > - **证据换源**：`TreeIndexEvidence` → `PeOwnerEvidence`（`increment_run.rs::build_pe_owner_evidence`，
+  >   async）：per-dbnum 读 `pe_owner_version_meta.maintained_since_sesno` + 在线抽查（≤200 个有子
+  >   parent 对比 `count(<-pe_owner)` vs `len(children)`，口径对齐 audit surql [2] 段，LET+RETURN 一次
+  >   请求完成，8030 实测形态 OK）；证据本身咨询性——单库探测失败记 not_ready 带 error 不终止运行，
+  >   仅 strict flag 升级为快速失败。summary 字段 `tree_index` → `pe_owner_evidence`
+  >   （manifest_version=`incremental_pe_owner_evidence:v1`，ready/mode[strict_required|ready|degraded_allowed]/
+  >   required/sample_limit/checked_dbnums/not_ready_dbnums/dbnums[]/recommendation，recommendation 指向
+  >   rebuild-pe-owner + 审计脚本）。
+  > - **flag 更名**：`--require-tree-index` → `--require-pe-owner-ready`（incremental-sesno 与
+  >   watch-incremental 两处，直接删除不留别名）；`IncrementRunOptions.require_tree_index` →
+  >   `require_pe_owner_ready`；`WatchIncrementalOptions` 同步；watch summary 打印行改
+  >   `pe_owner_evidence: ready/mode/not_ready_dbnums`；web `incremental_update_handlers` 构造点同步。
+  > - **rebuild-pe-owner 重建**（并发会话瘦身 cli.rs 时被整体删除，自 stash `pre-sync-20260720-145423`
+  >   找回并按 T8 改造）：候选枚举改 **pe 表 cursor 分页**（`WHERE dbnum AND id > <last> ORDER BY id
+  >   LIMIT 500`，与 pe_owner_snapshot 同形态；弃 START 偏移——无序 START/LIMIT 页序不稳会漏读/重读），
+  >   彻底去掉 `.tree` 依赖（修 §0-4，无 `.tree` 站点可运行）；T021 实测教训全部保留（verify-and-skip
+  >   只重写不一致 owner、删段/插段分批请求、慢路径幂等冲突判定、幽灵 owner 清理）；幽灵清理加
+  >   dbnum 归属过滤（候选集只含本 dbnum，非本库 owner 不算幽灵，经 db_meta ref0→dbnum 判定）；
+  >   `dbnum_info_table` 无 sesno 拒绝写 meta 语义不变；main.rs ensure_surreal_connected 门已含。
+  > - **顺带修正**：M0 `backfill-pe-cata-hash` 的枚举分页同步从 START 偏移改为 cursor 分页（同一
+  >   稳定性理由）。
+  > - **退役目标核实**：`restore-scene-tree`/`scene_tree_artifact.rs`/`physical_baseline_snapshot.rs`/
+  >   `history_replay_plan.rs`/`model_release`/`ducklake_store` 已由 **spec 024 批次**（并发会话，
+  >   CHANGELOG 2026-07-20 Spec 024 条目）整体退役——文件仍在磁盘但已无 mod 声明、无编译引用，
+  >   本批只核实无残留（rg 确认），文件删除归 024 批次收尾。
+  > **验证（2026-07-20）**：三面 `cargo check`（--lib / --features web_server / sync-cli 瘦特性）全绿；
+  > 8030 fixture 实测 rebuild 全语句序列（cursor 首页+续页终止、边 bulk 读投影、children 批查、
+  > 先删后插修复 pe:f 缺边、meta UPSERT、evidence 抽查 probe sampled=4/mismatched=0）；
+  > `pe_owner_children_audit.ps1` 修复前 FAIL(1) → 修复后 PASS(0) 闭环；
+  > `pe_owner_latest_tree_smoke.ps1` 复跑全绿。
+  > **未验证项（留站点环境）**：真实站点 `incremental-sesno --json` / `watch-incremental --once --json`
+  > 端到端回归（本地无完整工程配置）；大库 rebuild 耗时（cursor 分页 + verify-and-skip 的写放大为零，
+  > 预期优于旧实现）。
 
 ## M4（P1→P2）：生产侧退役与代码删除
 

@@ -1,0 +1,43 @@
+﻿🔎 SurrealDB 启动诊断:
+   - 当前进程复现命令: 'D:\work\plant-code\plant-model-gen\target\debug\aios-database.exe' '--config' 'db_options/DbOption-t012-e2e' 'model-version' 'rebuild-pe-owner' '--dbnum' '1112' '--json'
+   - 连接模式: Ws
+   - [surrealdb].path: db-data/t012-e2e-versioned.rdb
+   - [surrealdb].ws: 127.0.0.1:8033
+   - [web_server].surreal_data_path: db-data/t012-e2e-versioned.rdb
+   - [web_server].surreal_bind: 0.0.0.0:8020
+   - WS 连接目标: 127.0.0.1:8033
+   - 手动启动测试命令: 'surreal' start --user 'root' --pass 'root' --bind '0.0.0.0:8020' 'rocksdb://db-data/t012-e2e-versioned.rdb?versioned=true&retention=0'
+
+📡 SurrealDB 已在 127.0.0.1:8033 运行，直接连接...
+🔧 正在初始化数据库连接...
+📄 使用配置文件: db_options/DbOption-t012-e2e.toml
+🏷️  命名空间: 1516
+💾 数据库名: AvevaMarineSample
+🌐 后端: WebSocket 远程
+🌐 连接服务器: ws://127.0.0.1:8033
+👤 用户名: root
+✅ 数据库连接成功！
+载入surreal attr_metadata.surql
+载入surreal common.surql
+载入surreal fn_query_room_code.surql
+载入surreal fn_query_room_code_hh.surql
+载入surreal get_room_nodes.surql
+载入surreal gy_common.surql
+载入surreal init_status.surql
+载入surreal material_common.surql
+载入surreal review_workflow.surql
+载入surreal type_hierarchy_schema.surql
+✅ 数据库连接成功
+{
+  "dbnum": 1112,
+  "dry_run": false,
+  "duration_ms": 27991,
+  "edges_inserted": 191,
+  "ghost_edges_deleted": 39,
+  "maintained_since_sesno": 897,
+  "meta_source": "rebuild_cli",
+  "nodes_processed": 258241,
+  "owners_rewritten": 18,
+  "owners_skipped": 258223,
+  "owners_with_children": 89806
+}

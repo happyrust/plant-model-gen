@@ -1,0 +1,1 @@
+2026/07/17-23:51:04.231041 7444 [WARN] [db/db_impl/db_impl_open.cc:2705] DB::Open() failed: IO error: Failed to create lock file: D:\work\plant-code\plant-model-gen\db-data\t012-release-bench.rdb/LOCK: 另一个程序正在使用此文件，进程无法访问。

@@ -134,8 +134,8 @@ impl DbMetaManager {
         }
 
         // 文件不存在时，自动触发解析生成（不再兼容旧目录结构 output/scene_tree）
-        println!("📂 检测到 indextree 文件缺失，正在自动生成...");
-        self.auto_generate_indextree()?;
+        println!("📂 检测到 db_meta_info.json 缺失，正在自动生成...");
+        self.auto_generate_db_meta()?;
 
         // 重新尝试加载
         for path in &project_paths {
@@ -165,8 +165,8 @@ impl DbMetaManager {
         paths
     }
 
-    /// 自动生成 indextree 文件（使用解析方式，只处理 DESI 类型）
-    fn auto_generate_indextree(&self) -> Result<()> {
+    /// 自动生成 db_meta_info.json（使用解析方式，只处理 DESI 类型）
+    fn auto_generate_db_meta(&self) -> Result<()> {
         use crate::versioned_db::database::sync_total_async_threaded;
         use aios_core::options::DbOption;
         use dashmap::DashSet;
@@ -184,8 +184,8 @@ impl DbMetaManager {
         let mut db_option: DbOption = toml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
-        // 设置为仅生成树结构模式
-        db_option.gen_tree_only = true;
+        // 设置为仅维护 db_meta 模式
+        db_option.gen_db_meta_only = true;
         db_option.total_sync = true;
         db_option.save_db = Some(false);
 
@@ -207,14 +207,14 @@ impl DbMetaManager {
         }
         if source_projects.is_empty() {
             anyhow::bail!(
-                "无法生成 indextree：输出项目 {} 未映射到源工程路径，included_projects={:?}",
+                "无法生成 db_meta：输出项目 {} 未映射到源工程路径，included_projects={:?}",
                 output_project_name,
                 db_option.included_projects
             );
         }
 
         println!(
-            "🔄 正在通过 PDMS 解析生成 indextree (gen_tree_only 模式, 输出项目: {}, 源工程: {:?}, 类型: DESI)...",
+            "🔄 正在通过 PDMS 解析生成 db_meta (gen_db_meta_only 模式, 输出项目: {}, 源工程: {:?}, 类型: DESI)...",
             output_project_name, source_projects
         );
 
@@ -261,11 +261,11 @@ impl DbMetaManager {
 
         match result {
             Ok(_) => {
-                println!("✅ indextree 生成完成");
+                println!("✅ db_meta 生成完成");
                 Ok(())
             }
             Err(e) => {
-                anyhow::bail!("indextree 生成失败: {}", e)
+                anyhow::bail!("db_meta 生成失败: {}", e)
             }
         }
     }
@@ -450,27 +450,42 @@ pub(crate) fn indextree_project_dir_candidates(
     candidates
 }
 
-/// 生成所有 DESI 类型的 indextree 文件
-pub fn generate_desi_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
-    generate_indextree_for_types(&["DESI"], ignore_manual_dbnum)
+/// 从 refno 解析 dbnum（cache-only，依赖 db_meta_info.json，不回退 SurrealDB）。
+pub fn resolve_dbnum_for_refno(refno: aios_core::RefnoEnum) -> anyhow::Result<u32> {
+    let _ = db_meta().ensure_loaded();
+    if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
+        return Ok(dbnum);
+    }
+    if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
+        return Ok(dbnum);
+    }
+    anyhow::bail!(
+        "无法从缓存推导 refno 的 dbnum（cache-only 不回退 SurrealDB）：refno={}\n\
+         处理建议：\n\
+         - 先生成当前 DB_OPTION_FILE 对应的 <output_root>/<project>/scene_tree/db_meta_info.json\n\
+         - 或确认当前运行目录/配置指向了正确的输出目录（output/scene_tree 仅为旧路径 fallback）",
+        refno
+    )
 }
 
-/// 生成全部库类型（DESI/CATA/DICT/SYST/GLB/GLOB）的 indextree。
+/// 生成所有 DESI 类型的 db_meta_info.json
+pub fn generate_desi_db_meta(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_db_meta_for_types(&["DESI"], ignore_manual_dbnum)
+}
+
+/// 生成全部库类型（DESI/CATA/DICT/SYST/GLB/GLOB）的 db_meta_info.json。
 ///
 /// 用于全量预扫描 ref0↔dbnum 映射：只有覆盖全部库类型，才能把"外部引用 ref0"
 /// 正确反查到所属 dbnum（仅 DESI 时外部库 ref0 缺失）。这是关联库精确解析的基础。
-pub fn generate_all_types_indextree(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
-    generate_indextree_for_types(
+pub fn generate_all_types_db_meta(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_db_meta_for_types(
         &["DESI", "CATA", "DICT", "SYST", "GLB", "GLOB"],
         ignore_manual_dbnum,
     )
 }
 
-/// 按给定 db 类型集合做 gen_tree_only 轻量解析并写出 `db_meta_info.json`。
-fn generate_indextree_for_types(
-    db_types: &[&str],
-    ignore_manual_dbnum: bool,
-) -> anyhow::Result<()> {
+/// 按给定 db 类型集合做 gen_db_meta_only 轻量解析并写出 `db_meta_info.json`。
+fn generate_db_meta_for_types(db_types: &[&str], ignore_manual_dbnum: bool) -> anyhow::Result<()> {
     use crate::versioned_db::database::sync_total_async_threaded;
     use aios_core::options::DbOption;
     use dashmap::DashSet;
@@ -489,7 +504,7 @@ fn generate_indextree_for_types(
         .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
 
     // 设置为仅生成树结构模式
-    db_option.gen_tree_only = true;
+    db_option.gen_db_meta_only = true;
     db_option.total_sync = true;
     db_option.save_db = Some(false);
 
@@ -499,7 +514,7 @@ fn generate_indextree_for_types(
 
     let project_name = db_option.project_name.clone();
     println!(
-        "🔄 正在生成 indextree (项目: {}, 类型: {:?})...",
+        "🔄 正在生成 db_meta (项目: {}, 类型: {:?})...",
         project_name, db_types
     );
 
@@ -522,11 +537,11 @@ fn generate_indextree_for_types(
         }
     };
 
-    result.map_err(|e| anyhow::anyhow!("indextree 生成失败: {}", e))
+    result.map_err(|e| anyhow::anyhow!("db_meta 生成失败: {}", e))
 }
 
-/// 生成指定 dbnum 的 indextree 文件
-pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
+/// 生成指定 dbnum 的 db_meta_info.json
+pub fn generate_single_db_meta(target_dbnum: u32) -> anyhow::Result<()> {
     use aios_core::options::DbOption;
     use parse_pdms_db::parse::parse_file_basic_info;
     use std::fs;
@@ -602,7 +617,7 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
     let file_path = found_file
         .ok_or_else(|| anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum))?;
 
-    println!("🔄 正在生成 dbnum={} 的 indextree...", target_dbnum);
+    println!("🔄 正在生成 dbnum={} 的 db_meta...", target_dbnum);
 
     // 调用单文件解析函数
     let result = match tokio::runtime::Handle::try_current() {
@@ -631,5 +646,5 @@ pub fn generate_single_indextree(target_dbnum: u32) -> anyhow::Result<()> {
         }
     };
 
-    result.map_err(|e| anyhow::anyhow!("indextree 生成失败: {}", e))
+    result.map_err(|e| anyhow::anyhow!("db_meta 生成失败: {}", e))
 }

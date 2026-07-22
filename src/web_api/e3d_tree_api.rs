@@ -16,12 +16,8 @@ use surrealdb::types::SurrealValue;
 use tokio::time::{Duration, timeout};
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::{
-    TreeIndexManager, load_index_with_large_stack,
-};
-// specs/023 M1：latest（不带 sesno）层级查询主路径切 pe_owner 图查询；
-// `AIOS_TREE_QUERY_SOURCE=tree` 可一键回退旧 TreeIndex 路径（M4 删除开关）。
-use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
+use crate::versioned_db::pe_owner_tree::PeOwnerTreeStore;
 
 #[derive(Clone)]
 pub struct E3dTreeApiState {
@@ -312,7 +308,7 @@ pub async fn resolve_tree_version_for_refno(
     refno: RefnoEnum,
     sesno: u32,
 ) -> Result<ResolvedTreeVersion, TreeVersionError> {
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).map_err(|e| {
+    let dbnum = resolve_dbnum_for_refno(refno).map_err(|e| {
         TreeVersionError::QueryFailed(format!("resolve_dbnum_for_refno failed: {e}"))
     })?;
     resolve_tree_version(dbnum, sesno).await
@@ -617,8 +613,7 @@ async fn get_world_root_versioned(sesno: u32) -> Response {
         )
         .into_response();
     };
-    let dbnum = TreeIndexManager::resolve_dbnum_for_refno(world)
-        .unwrap_or_else(|_| (world.refno().0 >> 32) as u32);
+    let dbnum = resolve_dbnum_for_refno(world).unwrap_or_else(|_| (world.refno().0 >> 32) as u32);
     let ver = match resolve_tree_version(dbnum, sesno).await {
         Ok(v) => v,
         Err(e) => return e.into_response(),
@@ -819,43 +814,10 @@ async fn get_children(
                 };
             hydrate_tree_node_names(&mut children).await;
             children
-        } else if latest_tree_source_is_pe_owner() {
-            // specs/023 M1：pe_owner 边有序 children + 批量 meta/计数（增量后实时可见）
+        } else {
             query_children_dtos_pe_owner(parent_refno)
                 .await
                 .unwrap_or_default()
-        } else {
-            match TreeIndexManager::resolve_dbnum_for_refno(parent_refno) {
-                Ok(dbnum) => {
-                    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                    let child_refnos = manager.query_children(parent_refno);
-
-                    let mut out: Vec<TreeNodeDto> = Vec::with_capacity(child_refnos.len());
-                    for (idx, r) in child_refnos.iter().enumerate() {
-                        let noun = manager.get_noun(*r).unwrap_or_default();
-                        let mut name = crate::fast_model::query_provider::get_pe(*r)
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|pe| pe.name)
-                            .unwrap_or_default();
-                        // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
-                        if name.trim().is_empty() {
-                            name = format!("{} {}", noun, idx + 1);
-                        }
-                        let children_count = manager.query_children(*r).len() as i32;
-                        out.push(TreeNodeDto {
-                            refno: *r,
-                            name,
-                            noun,
-                            owner: Some(parent_refno),
-                            children_count: Some(children_count),
-                        });
-                    }
-                    out
-                }
-                Err(_) => Vec::new(),
-            }
         };
 
     let truncated = (children.len() as i32) > limit;
@@ -876,9 +838,7 @@ async fn get_children(
 
 /// specs/023 M1：latest children 的 pe_owner 主路径——
 /// 同胞顺序 = 边序（`ORDER BY id`），noun/children_count 批量查询（不逐子回环）。
-async fn query_children_dtos_pe_owner(
-    parent_refno: RefnoEnum,
-) -> anyhow::Result<Vec<TreeNodeDto>> {
+async fn query_children_dtos_pe_owner(parent_refno: RefnoEnum) -> anyhow::Result<Vec<TreeNodeDto>> {
     let child_refnos = PeOwnerTreeStore::query_children(parent_refno).await?;
     if child_refnos.is_empty() {
         return Ok(Vec::new());
@@ -965,33 +925,9 @@ async fn try_offline_world_children_count(world_refno: RefnoEnum) -> Option<i32>
 }
 
 async fn offline_world_children(parent_refno: RefnoEnum) -> Vec<TreeNodeDto> {
-    // specs/023 M1（D4）：pe_owner 主路径改查 DB（pe WHERE noun='WORL' + db_meta dbnum 清单），
-    // 不再依赖 .tree 文件；`AIOS_TREE_QUERY_SOURCE=tree` 回退旧文件路径。
-    if latest_tree_source_is_pe_owner() {
-        return offline_world_children_pe_owner(parent_refno)
-            .await
-            .unwrap_or_default();
-    }
-
-    let tree_dir = TreeIndexManager::with_default_dir(vec![])
-        .tree_dir()
-        .to_path_buf();
-    let mut out = offline_world_children_from_index(parent_refno, &tree_dir);
-    if !out.is_empty() {
-        return out;
-    }
-
-    if is_offline_world_refno(parent_refno) {
-        out = offline_top_level_children_from_index(parent_refno, &tree_dir);
-        if !out.is_empty() {
-            out.sort_by_key(|node| node.refno.refno().0);
-            return out;
-        }
-    }
-
-    out = offline_world_children_by_scan(parent_refno, &tree_dir);
-    out.sort_by_key(|node| node.refno.refno().0);
-    out
+    offline_world_children_pe_owner(parent_refno)
+        .await
+        .unwrap_or_default()
 }
 
 /// D4：offline world 子节点的 DB 主路径。
@@ -1054,212 +990,6 @@ async fn offline_world_children_pe_owner(
             children_count: Some(counts.get(&r).copied().unwrap_or(0) as i32),
         })
         .collect())
-}
-
-fn offline_world_children_from_index(
-    parent_refno: RefnoEnum,
-    tree_dir: &std::path::Path,
-) -> Vec<TreeNodeDto> {
-    let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno) else {
-        return Vec::new();
-    };
-    let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
-        return Vec::new();
-    };
-    if !index.contains_refno(parent_refno.refno()) {
-        return Vec::new();
-    }
-
-    let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
-    for refno in index.all_refnos() {
-        if let Some(meta) = index.node_meta(refno) {
-            if meta.owner.0 != 0 {
-                *child_counts.entry(meta.owner).or_insert(0) += 1;
-            }
-        }
-    }
-
-    index
-        .all_refnos()
-        .into_iter()
-        .filter_map(|child| {
-            let meta = index.node_meta(child)?;
-            if meta.owner != parent_refno.refno() {
-                return None;
-            }
-            let noun = db1_dehash(meta.noun);
-            Some(TreeNodeDto {
-                refno: RefnoEnum::from(child),
-                name: RefnoEnum::from(child).to_string(),
-                noun: noun.to_string(),
-                owner: Some(parent_refno),
-                children_count: Some(*child_counts.get(&child).unwrap_or(&0)),
-            })
-        })
-        .collect()
-}
-
-fn offline_top_level_children_from_index(
-    synthetic_world_refno: RefnoEnum,
-    tree_dir: &std::path::Path,
-) -> Vec<TreeNodeDto> {
-    let mut dbnums = aios_core::get_db_option()
-        .manual_db_nums
-        .clone()
-        .unwrap_or_default();
-    if dbnums.is_empty() {
-        if let Ok(entries) = fs::read_dir(tree_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let Some(stem) = name.strip_suffix(".tree") else {
-                    continue;
-                };
-                if let Ok(dbnum) = stem.parse::<u32>() {
-                    dbnums.push(dbnum);
-                }
-            }
-        }
-    }
-    dbnums.sort_unstable();
-    dbnums.dedup();
-
-    let mut roots = Vec::new();
-    for dbnum in dbnums {
-        let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
-            continue;
-        };
-
-        let refnos = index.all_refnos();
-        let refno_set: HashSet<RefU64> = refnos.iter().copied().collect();
-        let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
-        for refno in &refnos {
-            if let Some(meta) = index.node_meta(*refno) {
-                if meta.owner.0 != 0 {
-                    *child_counts.entry(meta.owner).or_insert(0) += 1;
-                }
-            }
-        }
-
-        let mut db_roots = Vec::new();
-        for refno in refnos {
-            let Some(meta) = index.node_meta(refno) else {
-                continue;
-            };
-            let owner_missing = meta.owner.0 == 0 || !refno_set.contains(&meta.owner);
-            if !owner_missing {
-                continue;
-            }
-
-            let noun = db1_dehash(meta.noun).to_string();
-            db_roots.push(TreeNodeDto {
-                refno: RefnoEnum::from(meta.refno),
-                name: RefnoEnum::from(meta.refno).to_string(),
-                noun,
-                owner: Some(synthetic_world_refno),
-                children_count: Some(*child_counts.get(&meta.refno).unwrap_or(&0)),
-            });
-        }
-
-        if let Some(best_rank) = db_roots
-            .iter()
-            .map(|node| offline_root_noun_rank(&node.noun))
-            .min()
-        {
-            db_roots.retain(|node| offline_root_noun_rank(&node.noun) == best_rank);
-        }
-        roots.extend(db_roots);
-    }
-
-    roots
-}
-
-fn offline_root_noun_rank(noun: &str) -> u8 {
-    match noun.trim().to_ascii_uppercase().as_str() {
-        "SITE" => 0,
-        "ZONE" => 1,
-        "PIPE" | "EQUI" | "STRU" | "FRMW" => 2,
-        "BRAN" | "HANG" => 3,
-        _ => 4,
-    }
-}
-
-fn offline_world_children_by_scan(
-    parent_refno: RefnoEnum,
-    tree_dir: &std::path::Path,
-) -> Vec<TreeNodeDto> {
-    let wanted_dbnum = TreeIndexManager::resolve_dbnum_for_refno(parent_refno).ok();
-    let mut dbnums: Vec<u32> = Vec::new();
-    if let Ok(entries) = fs::read_dir(tree_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some(stem) = name.strip_suffix(".tree") else {
-                continue;
-            };
-            let Ok(dbnum) = stem.parse::<u32>() else {
-                continue;
-            };
-            if wanted_dbnum.is_none() || wanted_dbnum == Some(dbnum) {
-                dbnums.push(dbnum);
-            }
-        }
-    }
-    dbnums.sort_unstable();
-    dbnums.dedup();
-
-    let mut out = Vec::new();
-    for dbnum in dbnums {
-        let Ok(index) = load_index_with_large_stack(tree_dir, dbnum) else {
-            continue;
-        };
-
-        let mut child_counts: HashMap<RefU64, i32> = HashMap::new();
-        for refno in index.all_refnos() {
-            if let Some(meta) = index.node_meta(refno) {
-                if meta.owner.0 != 0 {
-                    *child_counts.entry(meta.owner).or_insert(0) += 1;
-                }
-            }
-        }
-
-        for refno in index.all_refnos() {
-            let Some(meta) = index.node_meta(refno) else {
-                continue;
-            };
-            let noun = db1_dehash(meta.noun);
-            if noun != "SITE" {
-                continue;
-            }
-            let owner_noun = index
-                .node_meta(meta.owner)
-                .map(|owner| db1_dehash(owner.noun))
-                .unwrap_or_default();
-            if owner_noun != "WORL" {
-                continue;
-            }
-
-            out.push(TreeNodeDto {
-                refno: RefnoEnum::from(meta.refno),
-                name: RefnoEnum::from(meta.refno).to_string(),
-                noun: noun.to_string(),
-                owner: Some(parent_refno),
-                children_count: Some(*child_counts.get(&meta.refno).unwrap_or(&0)),
-            });
-        }
-    }
-
-    out
 }
 
 fn configured_project_output_root() -> std::path::PathBuf {
@@ -1378,12 +1108,7 @@ async fn get_ancestors(
     if let Some(sesno) = query.sesno {
         return get_ancestors_versioned(refno, sesno).await;
     }
-    // specs/023 M1：pe_owner 主路径（owner 链接递归 idiom）；`tree` 开关回退 TreeIndex
-    let ancestors_result = if latest_tree_source_is_pe_owner() {
-        PeOwnerTreeStore::query_ancestors(refno).await
-    } else {
-        crate::fast_model::query_provider::get_ancestors(refno).await
-    };
+    let ancestors_result = PeOwnerTreeStore::query_ancestors(refno).await;
     let ancestors = match ancestors_result {
         Ok(v) => v,
         Err(e) => {
@@ -1425,10 +1150,9 @@ async fn get_subtree_refnos(
             .await;
     }
 
-    // specs/023 M1：pe_owner 主路径（递归图 idiom）；`tree` 开关回退 TreeIndex
     let mut out: Vec<RefnoEnum> = if max_depth <= 0 {
         Vec::new()
-    } else if latest_tree_source_is_pe_owner() {
+    } else {
         match PeOwnerTreeStore::query_descendants(root_refno, Some(max_depth as usize)).await {
             Ok(v) => v,
             Err(e) => {
@@ -1442,19 +1166,6 @@ async fn get_subtree_refnos(
                 .into_response();
             }
         }
-    } else {
-        let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(root_refno) else {
-            return Json(SubtreeRefnosResponse {
-                success: false,
-                refnos: vec![],
-                truncated: false,
-                error_message: Some("resolve_dbnum_for_refno failed".to_string()),
-                version: None,
-            })
-            .into_response();
-        };
-        let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-        manager.query_descendants(root_refno, Some(max_depth as usize))
     };
 
     if include_self {
@@ -1546,8 +1257,7 @@ async fn get_visible_insts_inner(
     }
     let candidates_count = candidates.len();
 
-    let bran_hang_load_roots: HashSet<RefnoEnum> = if latest_tree_source_is_pe_owner() {
-        // specs/023 M1：批量 meta 点查判 BRAN/HANG（不再依赖 .tree）
+    let bran_hang_load_roots: HashSet<RefnoEnum> =
         match PeOwnerTreeStore::fetch_node_metas(&candidates).await {
             Ok(metas) => candidates
                 .iter()
@@ -1563,47 +1273,21 @@ async fn get_visible_insts_inner(
                 })
                 .collect(),
             Err(_) => HashSet::new(),
-        }
-    } else if let Ok(dbnum) =
-        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
-            refno,
-        ) {
-        let manager =
-            crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::with_default_dir(
-                vec![dbnum],
-            );
-        candidates
-            .iter()
-            .copied()
-            .filter(|candidate| {
-                manager
-                    .get_noun(*candidate)
-                    .map(|noun| {
-                        let noun = noun.trim().to_ascii_uppercase();
-                        noun == "BRAN" || noun == "HANG"
-                    })
-                    .unwrap_or(false)
-            })
-            .collect()
-    } else {
-        HashSet::new()
-    };
+        };
 
     // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
     //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
     fn parse_dbno(r: RefnoEnum) -> Option<u32> {
-        crate::fast_model::gen_model::tree_index_manager::TreeIndexManager::resolve_dbnum_for_refno(
-            r,
-        )
-        .ok()
-        .or_else(|| {
-            if is_offline_world_refno(r) {
-                Some((r.refno().0 >> 32) as u32)
-            } else {
-                None
-            }
-        })
+        crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(r)
+            .ok()
+            .or_else(|| {
+                if is_offline_world_refno(r) {
+                    Some((r.refno().0 >> 32) as u32)
+                } else {
+                    None
+                }
+            })
     }
 
     fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
@@ -1849,24 +1533,11 @@ async fn query_node(refno: RefnoEnum) -> anyhow::Result<Option<TreeNodeDto>> {
     let mut name = pe.name;
     // 与 fn::default_name 一致：name 为空时生成 "{noun} {order+1}"
     if name.trim().is_empty() {
-        let order = if latest_tree_source_is_pe_owner() {
-            // specs/023 M1：order 来自 pe_owner 边序（ORDER BY id），与 fn::default_name 同源
-            PeOwnerTreeStore::query_children(pe.owner)
-                .await
-                .ok()
-                .and_then(|siblings| siblings.iter().position(|r| *r == refno))
-                .unwrap_or(0)
-        } else {
-            use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-            match TreeIndexManager::resolve_dbnum_for_refno(refno) {
-                Ok(dbnum) => {
-                    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-                    let siblings = manager.query_children(pe.owner);
-                    siblings.iter().position(|r| *r == refno).unwrap_or(0)
-                }
-                Err(_) => 0,
-            }
-        };
+        let order = PeOwnerTreeStore::query_children(pe.owner)
+            .await
+            .ok()
+            .and_then(|siblings| siblings.iter().position(|r| *r == refno))
+            .unwrap_or(0);
         name = format!("{} {}", pe.noun, order + 1);
     }
 

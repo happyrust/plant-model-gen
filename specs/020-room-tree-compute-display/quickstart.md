@@ -144,3 +144,45 @@ Expected:
 - Backend response is empty or `success=false` with clear `error_message`.
 - Frontend room tab does not corrupt PDMS tree state.
 - Operator knows to run room compute explicitly before expecting populated room tree contents.
+
+## Appendix: 2026-07-16 HTTP smoke on `:8080`
+
+Base: `http://127.0.0.1:8080`
+
+| Step | Result |
+|------|--------|
+| `GET /api/room-tree/root` | **Pass** — `success=true`, `node.id=room-root`, `noun=ROOM_ROOT` |
+| `GET /api/room-tree/children/room-root` | **Fail** — `success=false` after ~30s; `error_message`: `query_arch_room_groups failed: query timeout after 30s at D:\work\plant-code\rs-core\src\room\algorithm.rs:64:51` |
+| `POST /api/room-tree/search` (`keyword=301`) | **Fail** — same 30s timeout via `query_arch_room_groups` |
+| `GET /api/room-tree/ancestors/1_1` | **Inconclusive** — client canceled at 10s (likely same slow path) |
+
+**Implication (updated)**: Route mounting and root contract are healthy. The 30s error is **not** a slow SurrealQL scan — it is the `SUL_DB` query-timeout wrapper converting a **TCP hang** into an observable error.
+
+**Root cause (2026-07-16)**:
+
+| Check | Result |
+|-------|--------|
+| Running `web_server` | `plant-model-gen-cata-closure` · `--config runtime/admin_sites/avevamarinesample/quicktest-7997-8080/DbOption` · `:8080` |
+| Configured Surreal | `surreal_ip=198.18.0.1` · `surreal_port=8021` · user `siteadmin7997` |
+| Surreal process | Listening on `198.18.0.1:8021` (rocksdb site data path) |
+| Local TCP to `198.18.0.1:8021` | **TIMEOUT** (SYN_SENT); `127.0.0.1:8021` refused (not bound there) |
+| `web_server` sockets | Multiple `SYN_SENT` to `198.18.0.1:8021` |
+
+So `/api/room-tree/root` works (no SUL_DB), while children/search/ancestors hang until the 30s `query_ext` timeout.
+
+**Fix applied (2026-07-16, local ops)**:
+
+1. Patched site `DbOption.toml`: `surreal_ip` / `surreal_bind` → `127.0.0.1:8021`
+2. Restarted Surreal bound to `127.0.0.1:8021` (same rocksdb path)
+3. Restarted `web_server` with the same config
+
+**After reconnect**:
+
+| Step | Result |
+|------|--------|
+| `GET .../children/room-root` | Fast fail (~15ms): `table 'room_panel_relate' does not exist` |
+| `POST .../search` | Fast fail (~9ms): same |
+| Surreal CLI `SELECT count() FROM pe` | **174194** rows — model data present |
+| `room_relate` / `room_panel_relate` | **tables absent** — room compute not run on this site |
+
+**Next for T015–T018**: run room compute for `AvevaMarineSample` / dbnum `7997` on this site, then re-smoke children/search/ancestors.

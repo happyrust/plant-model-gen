@@ -7,9 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-// specs/023 M1：latest 层级触点主路径切 pe_owner；`AIOS_TREE_QUERY_SOURCE=tree` 回退
-use crate::versioned_db::pe_owner_tree::{PeOwnerTreeStore, latest_tree_source_is_pe_owner};
+use crate::versioned_db::pe_owner_tree::PeOwnerTreeStore;
 use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
 use std::collections::{BTreeMap, HashSet};
 use surrealdb::types::SurrealValue;
@@ -279,28 +277,18 @@ async fn query_room_components(room_refno: &RefnoEnum) -> anyhow::Result<Vec<Roo
 }
 
 async fn model_children(parent_refno: RefnoEnum) -> Vec<RefnoEnum> {
-    // specs/023 M1：pe_owner 边有序 children 主路径；`tree` 开关回退 TreeIndex
-    if latest_tree_source_is_pe_owner() {
-        return PeOwnerTreeStore::query_children(parent_refno)
-            .await
-            .unwrap_or_default();
-    }
-    let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno) else {
-        return Vec::new();
-    };
-    TreeIndexManager::with_default_dir(vec![dbnum]).query_children(parent_refno)
+    PeOwnerTreeStore::query_children(parent_refno)
+        .await
+        .unwrap_or_default()
 }
 
 async fn model_children_count(parent_refno: RefnoEnum) -> i32 {
-    if latest_tree_source_is_pe_owner() {
-        return PeOwnerTreeStore::query_children_counts(&[parent_refno])
-            .await
-            .ok()
-            .and_then(|counts| counts.get(&parent_refno).copied())
-            .unwrap_or(0)
-            .min(i32::MAX as usize) as i32;
-    }
-    model_children(parent_refno).await.len().min(i32::MAX as usize) as i32
+    PeOwnerTreeStore::query_children_counts(&[parent_refno])
+        .await
+        .ok()
+        .and_then(|counts| counts.get(&parent_refno).copied())
+        .unwrap_or(0)
+        .min(i32::MAX as usize) as i32
 }
 
 async fn query_room_item_children(
@@ -308,55 +296,18 @@ async fn query_room_item_children(
     parent_refno: RefnoEnum,
     parent_id: &str,
 ) -> anyhow::Result<Vec<RoomTreeNodeDto>> {
-    // specs/023 M1：pe_owner 主路径——边序 children + 批量 meta/计数；`tree` 开关回退 TreeIndex
-    if latest_tree_source_is_pe_owner() {
-        let child_refnos = PeOwnerTreeStore::query_children(parent_refno).await?;
-        if child_refnos.is_empty() {
-            return Ok(Vec::new());
-        }
-        let metas = PeOwnerTreeStore::fetch_node_metas(&child_refnos).await?;
-        let counts = PeOwnerTreeStore::query_children_counts(&child_refnos).await?;
-        let mut out = Vec::with_capacity(child_refnos.len());
-        for (idx, child_refno) in child_refnos.into_iter().enumerate() {
-            let noun = metas
-                .get(&child_refno)
-                .map(|m| m.noun.clone())
-                .unwrap_or_default();
-            let mut name = crate::fast_model::query_provider::get_pe(child_refno)
-                .await
-                .ok()
-                .flatten()
-                .map(|pe| pe.name)
-                .unwrap_or_default();
-            if name.trim().is_empty() {
-                name = format!("{} {}", noun, idx + 1);
-            }
-            out.push(RoomTreeNodeDto {
-                id: RoomTreeNodeId::Str(room_item_node_id(&room_refno, &child_refno)),
-                name,
-                noun,
-                owner: Some(RoomTreeNodeId::Str(parent_id.to_string())),
-                children_count: Some(
-                    counts
-                        .get(&child_refno)
-                        .copied()
-                        .unwrap_or(0)
-                        .min(i32::MAX as usize) as i32,
-                ),
-            });
-        }
-        return Ok(out);
-    }
-
-    let Ok(dbnum) = TreeIndexManager::resolve_dbnum_for_refno(parent_refno) else {
+    let child_refnos = PeOwnerTreeStore::query_children(parent_refno).await?;
+    if child_refnos.is_empty() {
         return Ok(Vec::new());
-    };
-    let manager = TreeIndexManager::with_default_dir(vec![dbnum]);
-    let child_refnos = manager.query_children(parent_refno);
+    }
+    let metas = PeOwnerTreeStore::fetch_node_metas(&child_refnos).await?;
+    let counts = PeOwnerTreeStore::query_children_counts(&child_refnos).await?;
     let mut out = Vec::with_capacity(child_refnos.len());
-
     for (idx, child_refno) in child_refnos.into_iter().enumerate() {
-        let noun = manager.get_noun(child_refno).unwrap_or_default();
+        let noun = metas
+            .get(&child_refno)
+            .map(|m| m.noun.clone())
+            .unwrap_or_default();
         let mut name = crate::fast_model::query_provider::get_pe(child_refno)
             .await
             .ok()
@@ -366,21 +317,20 @@ async fn query_room_item_children(
         if name.trim().is_empty() {
             name = format!("{} {}", noun, idx + 1);
         }
-
         out.push(RoomTreeNodeDto {
             id: RoomTreeNodeId::Str(room_item_node_id(&room_refno, &child_refno)),
             name,
             noun,
             owner: Some(RoomTreeNodeId::Str(parent_id.to_string())),
             children_count: Some(
-                manager
-                    .query_children(child_refno)
-                    .len()
+                counts
+                    .get(&child_refno)
+                    .copied()
+                    .unwrap_or(0)
                     .min(i32::MAX as usize) as i32,
             ),
         });
     }
-
     Ok(out)
 }
 

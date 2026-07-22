@@ -1,0 +1,13 @@
+# code-review-graph ignore rules (gitignore-style globs)
+# Goal: keep the knowledge graph focused on first-party source,
+# excluding vendored / minified / generated bundles that bloat the graph.
+
+# Vendored front-end SDK bundle (166K+ lines, dominates the graph)
+src/web_server/static/xeokit-sdk.es.js
+
+# Minified / vendored front-end libraries
+**/*.min.js
+**/*.min.css
+
+# Build / packaging output
+dist/**

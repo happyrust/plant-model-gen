@@ -22,7 +22,7 @@ use surrealdb::types::SurrealValue;
 use tracing::{error, info, warn};
 
 use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
 
 use super::AppState;
 
@@ -739,7 +739,7 @@ pub async fn api_stream_generate(
                             dbnos.push(dbnum);
                             continue;
                         }
-                        match TreeIndexManager::resolve_dbnum_for_refno(*r) {
+                        match resolve_dbnum_for_refno(*r) {
                             Ok(dbnum) => dbnos.push(dbnum),
                             Err(e) => {
                                 warn!("[StreamGenerate] 无法解析 dbnum: refno={}, err={}", r, e);

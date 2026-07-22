@@ -3,6 +3,8 @@
 // 从 cata_model.rs 提取的 gen_cata_single_geoms 函数及其依赖
 
 use crate::data_interface::structs::PlantAxisMap;
+use crate::fast_model::gen_model::resolve::resolve_desi_comp_with_session;
+use crate::fast_model::gen_model::{GenerationReadContext, session_query};
 use crate::fast_model::{debug_model, debug_model_debug, resolve_desi_comp};
 use aios_core::parsed_data::CateGeomsInfo;
 use aios_core::prim_geo::category::{CateCsgShape, try_convert_cate_geo_to_csg_shape};
@@ -52,12 +54,33 @@ pub async fn gen_cata_single_geoms(
     csg_shape_map: &CateCsgShapeMap,
     design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
 ) -> anyhow::Result<bool> {
+    gen_cata_single_geoms_inner(None, design_refno, csg_shape_map, design_axis_map).await
+}
+
+pub async fn gen_cata_single_geoms_with_session(
+    read: &GenerationReadContext,
+    design_refno: RefnoEnum,
+    csg_shape_map: &CateCsgShapeMap,
+    design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
+) -> anyhow::Result<bool> {
+    gen_cata_single_geoms_inner(Some(read), design_refno, csg_shape_map, design_axis_map).await
+}
+
+async fn gen_cata_single_geoms_inner(
+    read: Option<&GenerationReadContext>,
+    design_refno: RefnoEnum,
+    csg_shape_map: &CateCsgShapeMap,
+    design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
+) -> anyhow::Result<bool> {
     let total_start = std::time::Instant::now();
     let trace_this = should_trace_cata_p1(design_refno);
 
     // Timing for get_named_attmap
     let t_get_attmap = std::time::Instant::now();
-    let desi_att = aios_core::get_named_attmap(design_refno).await?;
+    let desi_att = match read {
+        Some(read) => session_query::get_named_attmap(read, design_refno).await?,
+        None => aios_core::get_named_attmap(design_refno).await?,
+    };
     let get_attmap_time = t_get_attmap.elapsed().as_millis();
 
     let type_name = desi_att.get_type_str();
@@ -80,7 +103,13 @@ pub async fn gen_cata_single_geoms(
 
     // Timing for resolve_desi_comp
     let t_resolve = std::time::Instant::now();
-    let geoms_info = match resolve_desi_comp(design_refno, None, Some(&desi_att)).await {
+    let resolve_result = match read {
+        Some(read) => {
+            resolve_desi_comp_with_session(read, design_refno, None, Some(&desi_att)).await
+        }
+        None => resolve_desi_comp(design_refno, None, Some(&desi_att)).await,
+    };
+    let geoms_info = match resolve_result {
         Ok(info) => info,
         Err(e) => {
             // 无 CAT 引用时，按 cata_model 的设计应走“子原语直解”路径。
@@ -91,7 +120,20 @@ pub async fn gen_cata_single_geoms(
                     "[fallback] design_refno={} 无CAT，改用 design_refno 作为 scom_ref 重试 resolve_desi_comp",
                     design_refno
                 );
-                resolve_desi_comp(design_refno, Some(design_refno), Some(&desi_att)).await?
+                match read {
+                    Some(read) => {
+                        resolve_desi_comp_with_session(
+                            read,
+                            design_refno,
+                            Some(design_refno),
+                            Some(&desi_att),
+                        )
+                        .await?
+                    }
+                    None => {
+                        resolve_desi_comp(design_refno, Some(design_refno), Some(&desi_att)).await?
+                    }
+                }
             } else {
                 return Err(e);
             }
@@ -119,9 +161,13 @@ pub async fn gen_cata_single_geoms(
     if let Some(desc) = desi_att.get_as_string("DESC") {
         debug_model_debug!("   DESC: {}", desc);
     }
-    if let Some(cat_refno) = aios_core::get_cat_refno(design_refno).await.ok().flatten() {
+    if let Some(cat_refno) = desi_att.get_foreign_refno("CATR") {
         debug_model_debug!("   元件库参考号: {}", cat_refno);
-        if let Ok(cat_att) = aios_core::get_named_attmap(cat_refno).await {
+        let cat_att = match read {
+            Some(read) => session_query::get_named_attmap(read, cat_refno).await,
+            None => aios_core::get_named_attmap(cat_refno).await,
+        };
+        if let Ok(cat_att) = cat_att {
             if let Some(cat_name) = cat_att.get_as_string("NAME") {
                 debug_model_debug!("   元件库名称: {}", cat_name);
             }

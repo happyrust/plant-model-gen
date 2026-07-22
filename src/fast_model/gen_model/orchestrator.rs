@@ -1,203 +1,39 @@
 //! 模型生成编排器
 //!
 //! 负责协调整个模型生成流程：
-//! - IndexTree 单管线路由（Full / Manual / Debug / Incremental）
+//! - GenPipeline 单管线路由（Full / Manual / Debug / Incremental）
 //! - 几何体生成、Mesh 生成、布尔运算的编排
 //! - 增量更新、手动 refno、调试模式的处理
 //! - 空间索引和截图捕获的触发
+use crate::data_interface::db_meta_manager::db_meta;
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_dbnos;
 use crate::fast_model::export_model::export_prepack_lod::export_instances_json_for_refnos_grouped_by_dbno;
 use crate::fast_model::export_model::export_prepack_lod::export_prepack_lod_for_refnos;
+use crate::fast_model::gen_model::model_writer::{
+    BooleanBridgeReport, BooleanBridgeRequest, GenerationArtifacts, GenerationArtifactsSummary,
+    create_model_writer,
+};
 use crate::fast_model::unit_converter::LengthUnit;
+use crate::generation_read::SessionMetricsSnapshot;
+use crate::options::{DbOptionExt, MeshFormat};
 use aios_core::RefnoEnum;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use dashmap::DashMap;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-// use crate::fast_model::capture::capture_refnos_if_enabled; // removed on foyer-cache-cleanup
-use crate::data_interface::db_meta_manager::db_meta;
-use crate::fast_model::gen_model::boolean_task::{BooleanTask, BooleanTaskAccumulator};
-use crate::fast_model::gen_model::model_writer::{
-    BooleanBridgeRequest, ModelWriterBackend, ModelWriterFinishReport, create_model_writer,
-    run_model_writer_sink,
-};
-use crate::fast_model::mesh_generate::{MeshResult, query_existing_meshed_inst_geo_ids};
-use crate::options::{DbOptionExt, MeshFormat, ModelWriterMode};
-use dashmap::DashMap;
-use flume::{Receiver, Sender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-#[cfg(feature = "parquet-export")]
-use crate::fast_model::export_model::ParquetStreamWriter;
 
 use super::cache_miss_report;
-use super::config::IndexTreeConfig;
-use super::errors::{IndexTreeError, Result};
-use super::index_tree_mode::{
-    gen_index_tree_geos_for_incremental_log, gen_index_tree_geos_optimized,
+use super::config::{ExecutionTuning, GenPipelineConfig, GenerationContract};
+use super::context::GenerationReadContext;
+use super::errors::{GenPipelineError, Result};
+use super::gen_pipeline::{
+    execute_generation_targets, resolve_full_generation_targets,
+    resolve_incremental_generation_targets, resolve_root_generation_targets,
 };
 use super::models::NounCategory;
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
-use aios_core::tool::db_tool::db1_hash;
-
-/// 按 dbnum 拆分一个 batch，保证写入 InstanceCache 时“一个 batch 只落到一个 dbnum 分桶”。
-///
-/// 说明：
-/// - 这里不尝试“从 ref0 推 dbnum”，必须通过 TreeIndexManager 映射。
-/// - 若某个 refno 无法映射 dbnum：直接返回 Err（避免悄然写错桶）。
-pub(crate) fn split_shape_instances_by_dbnum(
-    shape_insts: &aios_core::geometry::ShapeInstancesData,
-) -> anyhow::Result<HashMap<u32, aios_core::geometry::ShapeInstancesData>> {
-    use aios_core::geometry::ShapeInstancesData;
-    let mut out: HashMap<u32, ShapeInstancesData> = HashMap::new();
-    let mut cache: HashMap<RefnoEnum, u32> = HashMap::new();
-    let mut missing_by_source: HashMap<&'static str, usize> = HashMap::new();
-    let mut missing_refnos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-    /// 同步查询 dbnum，内部无 async 操作，无需 async 标记以减少 Future 开销
-    fn get_dbnum_cached(
-        refno: RefnoEnum,
-        source: &'static str,
-        cache: &mut HashMap<RefnoEnum, u32>,
-        missing_by_source: &mut HashMap<&'static str, usize>,
-        missing_refnos: &mut std::collections::BTreeSet<String>,
-    ) -> Option<u32> {
-        if let Some(v) = cache.get(&refno) {
-            return Some(*v);
-        }
-        let dbnum = TreeIndexManager::resolve_dbnum_for_refno(refno).ok();
-        if let Some(dbnum) = dbnum {
-            cache.insert(refno, dbnum);
-            return Some(dbnum);
-        }
-        *missing_by_source.entry(source).or_insert(0) += 1;
-        missing_refnos.insert(refno.to_string());
-        None
-    }
-
-    fn summarize_missing_sources(missing_by_source: &HashMap<&'static str, usize>) -> String {
-        let mut parts: Vec<String> = missing_by_source
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect();
-        parts.sort();
-        parts.join(", ")
-    }
-
-    fn summarize_missing_samples(
-        missing_refnos: &std::collections::BTreeSet<String>,
-        max_n: usize,
-    ) -> String {
-        missing_refnos
-            .iter()
-            .take(max_n)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
-    // inst_info
-    for (refno, info) in shape_insts.inst_info_map.iter() {
-        let refno = *refno;
-        let Some(dbnum) = get_dbnum_cached(
-            refno,
-            "inst_info.key",
-            &mut cache,
-            &mut missing_by_source,
-            &mut missing_refnos,
-        ) else {
-            continue;
-        };
-        out.entry(dbnum)
-            .or_insert_with(ShapeInstancesData::default)
-            .inst_info_map
-            .insert(refno, info.clone());
-    }
-
-    // inst_tubi
-    for (refno, tubi) in shape_insts.inst_tubi_map.iter() {
-        let refno = *refno;
-        let Some(dbnum) = get_dbnum_cached(
-            refno,
-            "inst_tubi.key",
-            &mut cache,
-            &mut missing_by_source,
-            &mut missing_refnos,
-        ) else {
-            continue;
-        };
-        out.entry(dbnum)
-            .or_insert_with(ShapeInstancesData::default)
-            .inst_tubi_map
-            .insert(refno, tubi.clone());
-    }
-
-    // inst_geos：每条 geos_data 都绑定一个 refno（元素），直接按 geos_data.refno 分桶。
-    for (inst_key, geos_data) in shape_insts.inst_geos_map.iter() {
-        let inst_key = inst_key.clone();
-        let geos_data = geos_data.clone();
-        let Some(dbnum) = get_dbnum_cached(
-            geos_data.refno,
-            "inst_geos.refno",
-            &mut cache,
-            &mut missing_by_source,
-            &mut missing_refnos,
-        ) else {
-            continue;
-        };
-        out.entry(dbnum)
-            .or_insert_with(ShapeInstancesData::default)
-            .inst_geos_map
-            .insert(inst_key, geos_data);
-    }
-
-    // neg_relate / ngmr_neg_relate：按 key(refno) 分桶
-    for (refno, v) in &shape_insts.neg_relate_map {
-        let Some(dbnum) = get_dbnum_cached(
-            *refno,
-            "neg_relate.key",
-            &mut cache,
-            &mut missing_by_source,
-            &mut missing_refnos,
-        ) else {
-            continue;
-        };
-        out.entry(dbnum)
-            .or_insert_with(ShapeInstancesData::default)
-            .neg_relate_map
-            .insert(*refno, v.clone());
-    }
-    for (refno, v) in &shape_insts.ngmr_neg_relate_map {
-        let Some(dbnum) = get_dbnum_cached(
-            *refno,
-            "ngmr_neg_relate.key",
-            &mut cache,
-            &mut missing_by_source,
-            &mut missing_refnos,
-        ) else {
-            continue;
-        };
-        out.entry(dbnum)
-            .or_insert_with(ShapeInstancesData::default)
-            .ngmr_neg_relate_map
-            .insert(*refno, v.clone());
-    }
-
-    if !missing_refnos.is_empty() {
-        let source_summary = summarize_missing_sources(&missing_by_source);
-        let sample = summarize_missing_samples(&missing_refnos, 8);
-        return Err(anyhow::anyhow!(
-            "缺少 ref0->dbnum 映射: unique_refnos={}, sources=[{}], sample=[{}]",
-            missing_refnos.len(),
-            source_summary,
-            sample
-        ));
-    }
-
-    Ok(out)
-}
-
+use super::write_pipeline::{ModelWritePipeline, WritePipelineStart};
 #[derive(Debug, Clone)]
 enum GenerationScope {
     Full,
@@ -246,592 +82,96 @@ fn decide_generation_scope(
     GenerationScope::Full
 }
 
-async fn collect_db_write_failures(db_write_handles: Vec<tokio::task::JoinHandle<bool>>) -> usize {
-    let mut db_write_failures = 0usize;
-    for h in db_write_handles {
-        match h.await {
-            Ok(true) => {}
-            Ok(false) => db_write_failures += 1,
-            Err(e) => {
-                eprintln!("等待写库任务失败: {}", e);
-                db_write_failures += 1;
-            }
-        }
-    }
-    db_write_failures
-}
-
-fn ensure_no_db_write_failures(db_write_failures: usize) -> anyhow::Result<()> {
-    if db_write_failures > 0 {
-        return Err(anyhow::anyhow!(
-            "SurrealDB 批量写入存在失败任务: {}",
-            db_write_failures
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Debug, Default)]
-struct InsertHandleReport {
-    batch_cnt: u64,
-    bool_tasks: Vec<BooleanTask>,
-}
-
-#[derive(Debug, Clone)]
-struct PipelineBatch {
-    batch_id: u64,
-    shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
-    batch_started_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct BatchMeshOutput {
-    batch_id: u64,
-    shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
-    mesh_results: HashMap<u64, MeshResult>,
-    mesh_task_count: usize,
-    mesh_cache_hits: usize,
-    mesh_new_generated: usize,
-    mesh_ms: u128,
-    mesh_wait_ms: u128,
-    batch_started_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BaseWriteMetrics {
-    base_wait_ms: u128,
-    base_write_ms: u128,
-}
-
-#[derive(Debug, Clone)]
-struct JoinedBatchOutput {
-    batch_id: u64,
-    shape_insts: Arc<aios_core::geometry::ShapeInstancesData>,
-    mesh_results: HashMap<u64, MeshResult>,
-    mesh_task_count: usize,
-    mesh_cache_hits: usize,
-    mesh_new_generated: usize,
-    base_write_ms: u128,
-    base_wait_ms: u128,
-    mesh_ms: u128,
-    mesh_wait_ms: u128,
-    batch_started_at: Instant,
-}
-
-#[derive(Debug, Default)]
-struct BatchStageJoiner {
-    pending_mesh_outputs: HashMap<u64, BatchMeshOutput>,
-    pending_base_metrics: HashMap<u64, BaseWriteMetrics>,
-}
-
-impl BatchStageJoiner {
-    fn push_mesh_output(&mut self, batch: BatchMeshOutput) -> Option<JoinedBatchOutput> {
-        let batch_id = batch.batch_id;
-        if let Some(base_metrics) = self.pending_base_metrics.remove(&batch_id) {
-            return Some(Self::join_batch(batch, base_metrics));
-        }
-        self.pending_mesh_outputs.insert(batch_id, batch);
-        None
-    }
-
-    fn push_base_metrics(
-        &mut self,
-        batch_id: u64,
-        base_wait_ms: u128,
-        base_write_ms: u128,
-    ) -> Option<JoinedBatchOutput> {
-        let base_metrics = BaseWriteMetrics {
-            base_wait_ms,
-            base_write_ms,
-        };
-        if let Some(batch) = self.pending_mesh_outputs.remove(&batch_id) {
-            return Some(Self::join_batch(batch, base_metrics));
-        }
-        self.pending_base_metrics.insert(batch_id, base_metrics);
-        None
-    }
-
-    fn join_batch(batch: BatchMeshOutput, base_metrics: BaseWriteMetrics) -> JoinedBatchOutput {
-        JoinedBatchOutput {
-            batch_id: batch.batch_id,
-            shape_insts: batch.shape_insts,
-            mesh_results: batch.mesh_results,
-            mesh_task_count: batch.mesh_task_count,
-            mesh_cache_hits: batch.mesh_cache_hits,
-            mesh_new_generated: batch.mesh_new_generated,
-            base_write_ms: base_metrics.base_write_ms,
-            base_wait_ms: base_metrics.base_wait_ms,
-            mesh_ms: batch.mesh_ms,
-            mesh_wait_ms: batch.mesh_wait_ms,
-            batch_started_at: batch.batch_started_at,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.pending_mesh_outputs.is_empty() && self.pending_base_metrics.is_empty()
-    }
-
-    fn pending_counts(&self) -> (usize, usize) {
-        (
-            self.pending_mesh_outputs.len(),
-            self.pending_base_metrics.len(),
-        )
-    }
-}
-
-#[derive(Debug)]
-struct BatchCompletion {
-    batch_id: u64,
-    mesh_task_count: usize,
-    mesh_cache_hits: usize,
-    mesh_new_generated: usize,
-    base_write_ms: u128,
-    base_wait_ms: u128,
-    mesh_ms: u128,
-    mesh_wait_ms: u128,
-    inst_aabb_ms: u128,
-    inst_aabb_wait_ms: u128,
-    total_ms: u128,
-}
-
-async fn acquire_with_wait(
-    semaphore: Arc<Semaphore>,
-) -> anyhow::Result<(OwnedSemaphorePermit, u128)> {
-    let wait_start = Instant::now();
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .map_err(|e| anyhow::anyhow!("获取 semaphore 失败: {}", e))?;
-    Ok((permit, wait_start.elapsed().as_millis()))
-}
-
-async fn run_batch_sink(
-    receiver: Receiver<aios_core::geometry::ShapeInstancesData>,
-    base_writer_sender: Sender<PipelineBatch>,
-    mesh_stage_sender: Sender<PipelineBatch>,
-    touched_refnos: Arc<std::sync::Mutex<HashSet<RefnoEnum>>>,
-) -> anyhow::Result<InsertHandleReport> {
-    let mut batch_cnt: u64 = 0;
-    let mut bool_accumulator = BooleanTaskAccumulator::default();
-
-    while let Ok(shape_insts) = receiver.recv_async().await {
-        batch_cnt += 1;
-        let batch = PipelineBatch {
-            batch_id: batch_cnt,
-            shape_insts: Arc::new(shape_insts),
-            batch_started_at: Instant::now(),
-        };
-
-        {
-            let mut guard = touched_refnos.lock().unwrap();
-            for r in batch.shape_insts.inst_info_map.keys() {
-                guard.insert(*r);
-            }
-            for r in batch.shape_insts.inst_tubi_map.keys() {
-                guard.insert(*r);
-            }
-        }
-
-        bool_accumulator.merge_batch(&batch.shape_insts);
-        let base_send_start = Instant::now();
-        base_writer_sender.send_async(batch.clone()).await?;
-        let base_send_wait_ms = base_send_start.elapsed().as_millis();
-        if base_send_wait_ms > 0 {
-            println!(
-                "[batch_stage] batch={} stage=sink target=base_writer send_wait_ms={} inst_cnt={}",
-                batch.batch_id,
-                base_send_wait_ms,
-                batch.shape_insts.inst_cnt()
-            );
-        }
-
-        let mesh_send_start = Instant::now();
-        mesh_stage_sender.send_async(batch.clone()).await?;
-        let mesh_send_wait_ms = mesh_send_start.elapsed().as_millis();
-        if mesh_send_wait_ms > 0 {
-            println!(
-                "[batch_stage] batch={} stage=sink target=mesh_stage send_wait_ms={} inst_cnt={}",
-                batch.batch_id,
-                mesh_send_wait_ms,
-                batch.shape_insts.inst_cnt()
-            );
-        }
-    }
-
-    drop(base_writer_sender);
-    drop(mesh_stage_sender);
-
-    Ok(InsertHandleReport {
-        batch_cnt,
-        bool_tasks: bool_accumulator.build_tasks(),
-    })
-}
-
-async fn run_base_writer(
-    receiver: Receiver<PipelineBatch>,
-    result_sender: Sender<(u64, u128, u128)>,
-    base_write_semaphore: Arc<Semaphore>,
-    worker_count: usize,
-    model_writer: Arc<dyn ModelWriterBackend>,
-) -> anyhow::Result<ModelWriterFinishReport> {
-    let mut handles = Vec::new();
-    let worker_count = worker_count.max(1);
-    println!("[batch_stage] stage=base worker_pool={}", worker_count);
-    let cleanup_report = model_writer.cleanup().await?;
-    println!(
-        "[model-writer:{}] stage={} status={:?} skipped_reason={:?}",
-        model_writer.name(),
-        cleanup_report.stage,
-        cleanup_report.status,
-        cleanup_report.skipped_reason
-    );
-    let init_report = model_writer.init().await?;
-    println!(
-        "[model-writer:{}] stage={} status={:?}",
-        model_writer.name(),
-        init_report.stage,
-        init_report.status
-    );
-    for worker_id in 0..worker_count {
-        let receiver = receiver.clone();
-        let semaphore = base_write_semaphore.clone();
-        let result_sender = result_sender.clone();
-        let model_writer = model_writer.clone();
-        handles.push(tokio::spawn(async move {
-            while let Ok(batch) = receiver.recv_async().await {
-                let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
-                let base_start = Instant::now();
-                let write_report = model_writer.write_base_batch(&batch.shape_insts).await?;
-                let base_ms = base_start.elapsed().as_millis();
-                drop(permit);
-                println!(
-                    "[batch_stage] batch={} stage=base worker={} wait_ms={} base_write_ms={} missing_neg_candidates={}",
-                    batch.batch_id,
-                    worker_id,
-                    wait_ms,
-                    base_ms,
-                    write_report.missing_neg_carriers.len()
-                );
-                result_sender
-                    .send_async((batch.batch_id, wait_ms, base_ms))
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
-
-    for handle in handles {
-        handle.await.map_err(|e| anyhow::anyhow!(e))??;
-    }
-    let finish_report = model_writer.finalize().await?;
-    drop(result_sender);
-    Ok(finish_report)
-}
-
-async fn run_mesh_stage(
-    receiver: Receiver<PipelineBatch>,
-    output_sender: Sender<BatchMeshOutput>,
-    mesh_compute_semaphore: Arc<Semaphore>,
-    worker_count: usize,
-    db_option: DbOptionExt,
-    gen_mesh: bool,
-    mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
-    mesh_pts_map: Arc<DashMap<u64, String>>,
-) -> anyhow::Result<()> {
-    let deduper = Arc::new(crate::fast_model::mesh_generate::RecentGeoDeduper::new(
-        200_000,
-    ));
-    if gen_mesh {
-        crate::fast_model::preload_mesh_cache();
-        let ids = query_existing_meshed_inst_geo_ids();
-        let count = ids.len();
-        deduper.preload(ids);
-        println!(
-            "[mesh_pipeline] 预加载 {} 个已 meshed inst_geo ID 到去重器 (size={})",
-            count,
-            deduper.len()
-        );
-    } else if !gen_mesh {
-        println!("[mesh_pipeline] gen_mesh 未开启，跳过 mesh 阶段");
-    }
-
-    let mut handles = Vec::new();
-    let worker_count = worker_count.max(1);
-    println!("[batch_stage] stage=mesh worker_pool={}", worker_count);
-    for worker_id in 0..worker_count {
-        let receiver = receiver.clone();
-        let semaphore = mesh_compute_semaphore.clone();
-        let deduper = deduper.clone();
-        let mesh_aabb_map = mesh_aabb_map.clone();
-        let mesh_pts_map = mesh_pts_map.clone();
-        let output_sender = output_sender.clone();
-        let db_option_inner = db_option.inner.clone();
-        handles.push(tokio::spawn(async move {
-            while let Ok(batch) = receiver.recv_async().await {
-                let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
-                let mesh_start = Instant::now();
-                let tasks = crate::fast_model::mesh_generate::extract_mesh_tasks(&batch.shape_insts);
-                let mesh_task_count = tasks.len();
-
-                let mut mesh_results = HashMap::new();
-                let mut mesh_cache_hits = 0usize;
-                let mut mesh_new_generated = 0usize;
-
-                if gen_mesh && !tasks.is_empty() {
-                    mesh_results = crate::fast_model::mesh_generate::generate_meshes_for_batch(
-                        &tasks,
-                        &db_option_inner,
-                        &deduper,
-                        &mesh_aabb_map,
-                        &mesh_pts_map,
-                    )
-                    .await;
-                    mesh_cache_hits = mesh_results
-                        .values()
-                        .filter(|mr| mr.meshed && !mr.bad && mr.pts_hashes.is_empty())
-                        .count();
-                    mesh_new_generated = mesh_results.len().saturating_sub(mesh_cache_hits);
-                }
-
-                let mesh_ms = mesh_start.elapsed().as_millis();
-                drop(permit);
-                println!(
-                    "[batch_stage] batch={} stage=mesh worker={} wait_ms={} mesh_ms={} mesh_tasks={} mesh_cache_hit={} mesh_new_generated={}",
-                    batch.batch_id, worker_id, wait_ms, mesh_ms, mesh_task_count, mesh_cache_hits, mesh_new_generated
-                );
-
-                let output_send_start = Instant::now();
-                output_sender
-                    .send_async(BatchMeshOutput {
-                        batch_id: batch.batch_id,
-                        shape_insts: batch.shape_insts,
-                        mesh_results,
-                        mesh_task_count,
-                        mesh_cache_hits,
-                        mesh_new_generated,
-                        mesh_ms,
-                        mesh_wait_ms: wait_ms,
-                        batch_started_at: batch.batch_started_at,
-                    })
-                    .await?;
-                let output_send_wait_ms = output_send_start.elapsed().as_millis();
-                if output_send_wait_ms > 0 {
-                    println!(
-                        "[batch_stage] batch={} stage=mesh_output worker={} send_wait_ms={}",
-                        batch.batch_id, worker_id, output_send_wait_ms
-                    );
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
-
-    for handle in handles {
-        handle.await.map_err(|e| anyhow::anyhow!(e))??;
-    }
-    drop(output_sender);
-    Ok(())
-}
-
-async fn process_inst_aabb_batch(
-    batch: JoinedBatchOutput,
-    inst_aabb_semaphore: Arc<Semaphore>,
-    mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
-    mesh_pts_map: Arc<DashMap<u64, String>>,
-    completion_sender: Sender<BatchCompletion>,
-    model_writer: Arc<dyn ModelWriterBackend>,
-    skip_inst_relate_aabb: bool,
-    worker_id: usize,
-) -> anyhow::Result<()> {
-    let (aabb_permit, inst_aabb_wait_ms) = acquire_with_wait(inst_aabb_semaphore).await?;
-    let inst_aabb_start = Instant::now();
-    let mesh_report = model_writer
-        .persist_mesh_results(&batch.mesh_results, &mesh_aabb_map, &mesh_pts_map)
-        .await?;
-    let inst_report = model_writer
-        .persist_inst_relate_aabb(
-            &batch.shape_insts,
-            &batch.mesh_results,
-            &mesh_aabb_map,
-            skip_inst_relate_aabb,
-        )
-        .await?;
-    println!(
-        "[batch_stage] batch={} stage=writer_backend worker={} mesh_persist={:?}/{} inst_relate_aabb={:?}/{}",
-        batch.batch_id,
-        worker_id,
-        mesh_report.status,
-        mesh_report.item_count,
-        inst_report.status,
-        inst_report.item_count
-    );
-    let inst_aabb_ms = inst_aabb_start.elapsed().as_millis();
-    drop(aabb_permit);
-
-    let total_ms = batch.batch_started_at.elapsed().as_millis();
-    println!(
-        "[batch_perf] batch={} worker={} base_wait_ms={} base_write_ms={} mesh_wait_ms={} mesh_ms={} inst_aabb_wait_ms={} inst_aabb_ms={} total_ms={} mesh_cache_hit={} mesh_new_generated={} mesh_tasks={}",
-        batch.batch_id,
-        worker_id,
-        batch.base_wait_ms,
-        batch.base_write_ms,
-        batch.mesh_wait_ms,
-        batch.mesh_ms,
-        inst_aabb_wait_ms,
-        inst_aabb_ms,
-        total_ms,
-        batch.mesh_cache_hits,
-        batch.mesh_new_generated,
-        batch.mesh_task_count
-    );
-
-    completion_sender
-        .send_async(BatchCompletion {
-            batch_id: batch.batch_id,
-            mesh_task_count: batch.mesh_task_count,
-            mesh_cache_hits: batch.mesh_cache_hits,
-            mesh_new_generated: batch.mesh_new_generated,
-            base_write_ms: batch.base_write_ms,
-            base_wait_ms: batch.base_wait_ms,
-            mesh_ms: batch.mesh_ms,
-            mesh_wait_ms: batch.mesh_wait_ms,
-            inst_aabb_ms,
-            inst_aabb_wait_ms,
-            total_ms,
-        })
-        .await?;
-    Ok(())
-}
-
-async fn run_inst_aabb_writer(
-    receiver: Receiver<BatchMeshOutput>,
-    base_result_receiver: Receiver<(u64, u128, u128)>,
-    completion_sender: Sender<BatchCompletion>,
-    inst_aabb_semaphore: Arc<Semaphore>,
-    worker_count: usize,
-    mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>>,
-    mesh_pts_map: Arc<DashMap<u64, String>>,
-    model_writer: Arc<dyn ModelWriterBackend>,
-) -> anyhow::Result<()> {
-    let skip_inst_relate_aabb = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
-    let worker_count = worker_count.max(1);
-    let (joined_sender, joined_receiver) = flume::unbounded::<JoinedBatchOutput>();
-    let mut handles = Vec::new();
-    println!(
-        "[batch_stage] stage=inst_aabb worker_pool={} skip_inst_relate_aabb={}",
-        worker_count, skip_inst_relate_aabb
-    );
-    for worker_id in 0..worker_count {
-        let joined_receiver = joined_receiver.clone();
-        let inst_aabb_semaphore = inst_aabb_semaphore.clone();
-        let mesh_aabb_map = mesh_aabb_map.clone();
-        let mesh_pts_map = mesh_pts_map.clone();
-        let completion_sender = completion_sender.clone();
-        let model_writer = model_writer.clone();
-        handles.push(tokio::spawn(async move {
-            while let Ok(batch) = joined_receiver.recv_async().await {
-                process_inst_aabb_batch(
-                    batch,
-                    inst_aabb_semaphore.clone(),
-                    mesh_aabb_map.clone(),
-                    mesh_pts_map.clone(),
-                    completion_sender.clone(),
-                    model_writer.clone(),
-                    skip_inst_relate_aabb,
-                    worker_id,
-                )
-                .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }));
-    }
-
-    let mut joiner = BatchStageJoiner::default();
-    let mut mesh_closed = false;
-    let mut base_closed = false;
-
-    while !mesh_closed || !base_closed {
-        tokio::select! {
-            mesh_result = receiver.recv_async(), if !mesh_closed => {
-                match mesh_result {
-                    Ok(batch) => {
-                        let batch_id = batch.batch_id;
-                        if let Some(batch) = joiner.push_mesh_output(batch) {
-                            joined_sender.send_async(batch).await?;
-                        } else {
-                            let (pending_mesh, pending_base) = joiner.pending_counts();
-                            println!(
-                                "[batch_stage] batch={} stage=join waiting=base_result pending_mesh_outputs={} pending_base_metrics={}",
-                                batch_id, pending_mesh, pending_base
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        mesh_closed = true;
-                    }
-                }
-            }
-            base_result = base_result_receiver.recv_async(), if !base_closed => {
-                match base_result {
-                    Ok((batch_id, base_wait_ms, base_write_ms)) => {
-                        if let Some(batch) = joiner.push_base_metrics(batch_id, base_wait_ms, base_write_ms) {
-                            joined_sender.send_async(batch).await?;
-                        } else {
-                            let (pending_mesh, pending_base) = joiner.pending_counts();
-                            println!(
-                                "[batch_stage] batch={} stage=join waiting=mesh_output pending_mesh_outputs={} pending_base_metrics={}",
-                                batch_id, pending_mesh, pending_base
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        base_closed = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if !joiner.is_empty() {
-        let (pending_mesh, pending_base) = joiner.pending_counts();
-        return Err(anyhow::anyhow!(
-            "batch stage join 未收敛: pending_mesh_outputs={}, pending_base_metrics={}",
-            pending_mesh,
-            pending_base
-        ));
-    }
-
-    drop(joined_sender);
-    for handle in handles {
-        handle.await.map_err(|e| anyhow::anyhow!(e))??;
-    }
-    drop(completion_sender);
-    Ok(())
+fn should_start_write_pipeline(contract: &GenerationContract) -> bool {
+    !contract.dry_run()
 }
 
 #[derive(Debug, Clone)]
 pub struct GenModelResult {
     pub success: bool,
+    pub authoritative_snapshot_id: u64,
+    pub artifacts: Option<GenerationArtifactsSummary>,
+    pub read_metrics: SessionMetricsSnapshot,
+    pub provenance: GenerationRunProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRunProvenance {
+    input_manifest_hash: String,
+    contract_hash: String,
+    target_hash: String,
+}
+
+impl GenerationRunProvenance {
+    fn new(input_manifest_hash: String, contract_hash: String, target_hash: String) -> Self {
+        Self {
+            input_manifest_hash,
+            contract_hash,
+            target_hash,
+        }
+    }
+
+    pub fn input_manifest_hash(&self) -> &str {
+        &self.input_manifest_hash
+    }
+
+    pub fn contract_hash(&self) -> &str {
+        &self.contract_hash
+    }
+
+    pub fn target_hash(&self) -> &str {
+        &self.target_hash
+    }
+}
+
+fn validated_read_metrics(
+    generation_read: &GenerationReadContext,
+) -> anyhow::Result<SessionMetricsSnapshot> {
+    let metrics = generation_read.session.metrics();
+    metrics.assert_batch_first_hot_path()?;
+    Ok(metrics)
 }
 
 /// 主入口函数：生成所有几何体数据
 ///
-/// 这是主要的公共 API，统一收敛到 IndexTree 生成管线：
-/// - Full：按 `index_tree_enabled_target_types` 从 TreeIndex 提取入口 roots
+/// 这是主要的公共 API，统一收敛到 GenPipeline 生成管线：
+/// - Full：按 `gen_pipeline_enabled_target_types` 从 TreeIndex 提取入口 roots
 /// - Manual / Debug / Incremental：构造 roots 并集后以 seed_roots 直入
 ///
 /// # Arguments
 /// * `manual_refnos` - 手动指定的 refno 列表
 /// * `db_option` - 数据库配置
 /// * `incr_updates` - 增量更新日志
-#[cfg_attr(
-    feature = "profile",
-    tracing::instrument(skip_all, name = "gen_all_geos_data")
-)]
 pub async fn gen_all_geos_data(
     manual_refnos: Vec<RefnoEnum>,
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
+) -> Result<GenModelResult> {
+    let session = crate::generation_read::open_generation_read_session(db_option)
+        .await
+        .map_err(anyhow::Error::new)?;
+    gen_all_geos_data_with_session(manual_refnos, db_option, incr_updates, session).await
+}
+
+pub async fn gen_all_geos_data_with_session(
+    manual_refnos: Vec<RefnoEnum>,
+    db_option: &DbOptionExt,
+    incr_updates: Option<IncrGeoUpdateLog>,
+    session: Arc<dyn crate::generation_read::VersionedReadSession>,
+) -> Result<GenModelResult> {
+    let generation_read = GenerationReadContext::load(session).await?;
+    gen_all_geos_data_inner(manual_refnos, db_option, incr_updates, generation_read).await
+}
+
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "gen_all_geos_data")
+)]
+async fn gen_all_geos_data_inner(
+    manual_refnos: Vec<RefnoEnum>,
+    db_option: &DbOptionExt,
+    incr_updates: Option<IncrGeoUpdateLog>,
+    generation_read: Arc<GenerationReadContext>,
 ) -> Result<GenModelResult> {
     let time = Instant::now();
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
@@ -853,11 +193,9 @@ pub async fn gen_all_geos_data(
     if db_option.use_surrealdb {
         crate::fast_model::utils::ensure_surreal_init()
             .await
-            .map_err(IndexTreeError::Other)?;
+            .map_err(GenPipelineError::Other)?;
     }
 
-    // cache-first 缺失报告：生成过程中按需补充记录，结束时输出到 output/<project>/cache_miss_report.json
-    // cache-first 模式已移除（foyer-cache-cleanup），使用 Direct 模式
     cache_miss_report::init_global_cache_miss_report(db_option, "Direct");
     // 按 sesno 的增量生成只走 IncrementRun 采集后直传的 update_log。
     let final_incr_updates = incr_updates;
@@ -872,19 +210,72 @@ pub async fn gen_all_geos_data(
         incr_count,
     );
 
+    // 增量：先失效受影响子树的 pe_transform / 内存 cache，再进 precheck/生成。
+    // 避免 owner/POS 变更后 lazy miss 命中陈旧 world；禁止整库 clear。
+    if db_option.use_surrealdb
+        && let Some(log) = final_incr_updates.as_ref().filter(|l| l.count() > 0)
+    {
+        let change_roots: Vec<RefnoEnum> = log.get_all_visible_refnos().into_iter().collect();
+        if !change_roots.is_empty() {
+            match crate::pe_transform_refresh::invalidate_pe_transform_for_root_refnos(
+                &change_roots,
+            )
+            .await
+            {
+                Ok(n) => {
+                    println!(
+                        "[gen_model] pe_transform 增量子树已失效: roots={} affected={}",
+                        change_roots.len(),
+                        n
+                    );
+                }
+                Err(e) => {
+                    log::warn!("[gen_model] pe_transform 增量子树失效失败（继续生成）: {e}");
+                }
+            }
+        }
+        let deleted: Vec<RefnoEnum> = log.delete_refnos.iter().copied().collect();
+        if !deleted.is_empty() {
+            match crate::pe_transform_store::clear_pe_transform_for_refnos(&deleted).await {
+                Ok(n) => {
+                    let _ = crate::fast_model::gen_model::transform_cache::clear_global_transform_cache_for_refnos(
+                        &deleted,
+                    );
+                    println!("[gen_model] pe_transform 已清理删除节点: keys={}", n);
+                }
+                Err(e) => {
+                    log::warn!("[gen_model] pe_transform 删除节点清理失败（继续生成）: {e}");
+                }
+            }
+        }
+    }
+
     // 性能剖析：尽量在最上层启用 tracing，覆盖 precheck -> gen_model -> mesh -> room 计算全链路。
 
     #[cfg(feature = "profile")]
     let _ = crate::profiling::init_chrome_tracing_for_db_option(db_option, "full_flow_room");
     perf.mark("precheck");
 
-    // ✨ 执行预检查：确保 Tree 文件、pe_transform、db_meta_info 就绪
+    // ✨ 执行预检查：确保 Tree / db_meta 就绪；pe_transform 按需 L0/L1/L2
     if db_option.use_surrealdb {
-        use crate::fast_model::gen_model::precheck_coordinator::{PrecheckConfig, run_precheck};
+        use crate::fast_model::gen_model::precheck_coordinator::{
+            PeTransformPrecheckMode, PrecheckConfig, run_precheck,
+        };
+        use crate::options::GenerationReadBackendMode;
+
+        // GenPipeline 已通过 VersionedReadSession 预加载 transforms → L0。
+        // L1（子树）/ L2（整库）仅在显式配置 pe_transform_mode 时使用；
+        // debug-model 入口仍会在 gen 前自行 refresh_pe_transform_for_root_refnos。
+        let pe_transform_mode = match db_option.generation_read_backend {
+            GenerationReadBackendMode::Surreal
+            | GenerationReadBackendMode::DuckLake
+            | GenerationReadBackendMode::Compare => PeTransformPrecheckMode::Skip,
+        };
         let precheck_config = PrecheckConfig {
             enabled: true,
             check_tree: true,
-            check_pe_transform: true,
+            pe_transform_mode,
+            pe_transform_roots: Vec::new(),
             check_db_meta: true,
             tree_output_dir: db_option
                 .get_project_output_dir()
@@ -892,6 +283,11 @@ pub async fn gen_all_geos_data(
                 .to_string_lossy()
                 .to_string(),
         };
+        println!(
+            "[gen_model] pe_transform precheck mode={:?} (generation_read_backend={})",
+            pe_transform_mode,
+            db_option.generation_read_backend.as_str()
+        );
         match run_precheck(db_option, Some(precheck_config)).await {
             Ok(stats) => {
                 log::info!("[gen_model] 预检查完成: {:?}", stats);
@@ -904,19 +300,19 @@ pub async fn gen_all_geos_data(
             }
         }
     } else {
-        // cache-only 模式：仅检查 db_meta_info
+        // 非 Surreal 运行仍需要 refno -> dbnum 元数据。
         let _ = db_meta().ensure_loaded();
     }
 
-    // 调试：打印 IndexTree 模式配置
+    // 调试：打印 GenPipeline配置
     println!(
-        "[gen_model] IndexTree 默认管线配置: concurrency={}, batch_size={}",
-        db_option.get_index_tree_concurrency(),
-        db_option.get_index_tree_batch_size()
+        "[gen_model] GenPipeline 默认管线配置: concurrency={}, batch_size={}",
+        db_option.get_gen_pipeline_concurrency(),
+        db_option.get_gen_pipeline_batch_size()
     );
     db_option
         .validate_model_writer_features()
-        .map_err(IndexTreeError::Other)?;
+        .map_err(GenPipelineError::Other)?;
     println!(
         "[gen_model] 模型写入后端: {}",
         db_option.model_writer_mode.as_str()
@@ -931,32 +327,22 @@ pub async fn gen_all_geos_data(
             eprintln!("[gen_model] ❌ 初始化 inst_relate 表结构失败: {}", e);
 
             // 严重错误，建议直接中断，否则后续写入必挂
-            return Err(IndexTreeError::Other(e));
+            return Err(GenPipelineError::Other(e));
         }
     }
 
     // =========================
-    // LOOP/PRIM 输入缓存初始化（按环境变量启用）
+    // GenPipeline：新管线
 
     // =========================
-    // geom_input_cache 已移除（foyer-cache-cleanup），跳过缓存初始化
-    println!("[gen_model] geom_input_cache: Direct 模式（cache 已移除）");
-
-    // =========================
-    // IndexTree 模式：新管线
-
-    // =========================
-    // 统一入口：manual/debug/incr/full 全部收敛到 IndexTree 生成管线
+    // 统一入口：manual/debug/incr/full 全部收敛到 GenPipeline 生成管线
     perf.mark("route_decision");
     let debug_roots = db_option.inner.get_all_debug_refnos().await;
     let incr_visible_roots: Vec<RefnoEnum> = final_incr_updates
         .as_ref()
         .map(|log| log.get_all_visible_refnos().into_iter().collect())
         .unwrap_or_default();
-    let has_incr_log = final_incr_updates
-        .as_ref()
-        .map(|log| log.count() > 0)
-        .unwrap_or(false);
+    let has_incr_log = final_incr_updates.is_some();
     let has_incr_visible_roots = !incr_visible_roots.is_empty();
     let scope = decide_generation_scope(
         &manual_refnos,
@@ -982,8 +368,8 @@ pub async fn gen_all_geos_data(
         }
     }
 
-    perf.mark("index_tree_generation");
-    let result = process_index_tree_generation(scope, db_option, time).await;
+    perf.mark("gen_pipeline_generation");
+    let result = process_gen_pipeline(scope, db_option, time, generation_read).await;
     perf.print_summary();
 
     // 输出 cache miss 报告（覆盖写）。
@@ -1007,106 +393,115 @@ pub async fn gen_all_geos_data(
     result
 }
 
-async fn filter_bran_hang_refnos(refnos: &[RefnoEnum]) -> Vec<RefnoEnum> {
-    let bran_hash = db1_hash("BRAN");
-    let hang_hash = db1_hash("HANG");
-    let mut out = Vec::new();
-    // specs/023 M2：按 refno 出现的 dbnum 一次性加载层级视图（pe_owner 快照默认 /
-    // .tree 回退）；meta 查不到不再静默 continue，记入 cache_miss_report（修 §0-3 可观测性）。
-    let mut view_cache: HashMap<u32, super::hier_view::HierView> = HashMap::new();
-    for &r in refnos {
-        if !r.is_valid() {
-            continue;
-        }
-
-        let dbnum = match TreeIndexManager::resolve_dbnum_for_refno(r) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !view_cache.contains_key(&dbnum) {
-            match super::hier_view::HierView::load(vec![dbnum]).await {
-                Ok(view) => {
-                    view_cache.insert(dbnum, view);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[gen_model] filter_bran_hang: 加载层级视图失败 dbnum={} err={}",
-                        dbnum, e
-                    );
-                    continue;
-                }
-            }
-        }
-        let Some(view) = view_cache.get(&dbnum) else {
-            continue;
-        };
-        let Some(meta) = view.get_node_meta(r) else {
-            super::cache_miss_report::with_global_report(|report| {
-                report.record_refno_miss(
-                    "filter_bran_hang",
-                    "hier_meta_missing",
-                    r,
-                    Some("层级视图中查不到节点 meta（增量新增未入库或 dbnum 映射错误）"),
-                );
-            });
-            continue;
-        };
-        if meta.noun == bran_hash || meta.noun == hang_hash {
-            out.push(r);
-        }
-    }
-
-    out
-}
-
-/// 处理 IndexTree 模式的生成流程
-async fn process_index_tree_generation(
+/// 处理 GenPipeline的生成流程
+async fn process_gen_pipeline(
     scope: GenerationScope,
     db_option: &DbOptionExt,
     time: Instant,
+    generation_read: Arc<GenerationReadContext>,
 ) -> Result<GenModelResult> {
-    let mut perf = crate::perf_timer::PerfTimer::new("index_tree_generation");
+    let authoritative_snapshot_id = generation_read.session.manifest().authoritative_snapshot_id;
+    let mut perf = crate::perf_timer::PerfTimer::new("gen_pipeline_generation");
     perf.mark("init");
-    println!("[gen_model] 进入 IndexTree 生成模式（统一管线）");
+    println!("[gen_model] 进入 GenPipeline 生成模式（统一管线）");
     if db_option.manual_db_nums.is_some() || db_option.exclude_db_nums.is_some() {
         println!(
-            "[gen_model] 提示: IndexTree 新管线已支持 manual_db_nums / exclude_db_nums 过滤，当前仍按配置执行"
+            "[gen_model] 提示: GenPipeline已支持 manual_db_nums / exclude_db_nums 过滤，当前仍按配置执行"
         );
     }
 
-    let seed_roots = match &scope {
+    let config = GenPipelineConfig::from_db_option_ext(db_option)
+        .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
+    let generation_contract = Arc::new(GenerationContract::from_db_option(db_option, &config));
+    let execution_tuning = ExecutionTuning::from_db_option(db_option);
+    let targets = match &scope {
         GenerationScope::Full => {
-            println!("[gen_model] 当前 scope: Full（按 target_type 入口查询 roots）");
-            None
+            println!("[gen_model] 当前 scope: Full");
+            resolve_full_generation_targets(db_option, &generation_read.hierarchy, &config).await?
         }
         GenerationScope::Manual { roots } => {
             println!("[gen_model] 当前 scope: Manual roots={}", roots.len());
-            Some(roots.clone())
+            resolve_root_generation_targets(&generation_read.hierarchy, &config, roots)?
         }
         GenerationScope::Debug { roots } => {
             println!("[gen_model] 当前 scope: Debug roots={}", roots.len());
-            Some(roots.clone())
+            resolve_root_generation_targets(&generation_read.hierarchy, &config, roots)?
         }
         GenerationScope::Incremental { log } => {
-            let roots: Vec<RefnoEnum> = log.get_all_visible_refnos().into_iter().collect();
             println!(
-                "[gen_model] 当前 scope: Incremental roots={} deletes={}",
-                roots.len(),
+                "[gen_model] 当前 scope: Incremental visible={} deletes={}",
+                log.get_all_visible_refnos().len(),
                 log.delete_refnos.len()
             );
-            Some(roots)
+            resolve_incremental_generation_targets(&generation_read.hierarchy, &config, log)?
         }
     };
+    println!(
+        "[gen_model] GenerationTargets hash={} generation={} deletes={}",
+        targets.target_hash(),
+        targets.bran_hang_refnos().len()
+            + targets.loop_refnos().len()
+            + targets.cate_refnos().len()
+            + targets.prim_refnos().len(),
+        targets.delete_refnos().len()
+    );
+    let provenance = GenerationRunProvenance::new(
+        generation_read.session.manifest().manifest_hash.clone(),
+        generation_contract.contract_hash(),
+        targets.target_hash().to_string(),
+    );
+    println!(
+        "[gen_model] provenance manifest_hash={} contract_hash={} target_hash={}",
+        provenance.input_manifest_hash(),
+        provenance.contract_hash(),
+        provenance.target_hash()
+    );
+    println!(
+        "[gen_model] execution tuning noun_concurrency={} noun_batch={} channel={} base_write={} mesh_compute={} inst_aabb={} read_backend={} writer_backend={} output_root={:?} export_formats={:?} export_instances={} export_parquet={} parquet_stream={} perf_disabled={}",
+        execution_tuning.noun_concurrency,
+        execution_tuning.noun_batch_size,
+        execution_tuning.channel_capacity,
+        execution_tuning.base_write_concurrency,
+        execution_tuning.mesh_compute_concurrency,
+        execution_tuning.inst_aabb_write_concurrency,
+        execution_tuning.read_backend,
+        execution_tuning.writer_backend,
+        execution_tuning.output_root,
+        execution_tuning.export_formats,
+        execution_tuning.export_instances,
+        execution_tuning.export_parquet_after_gen,
+        execution_tuning.parquet_stream_writer_enabled,
+        execution_tuning.perf_report_disabled,
+    );
+    if !should_start_write_pipeline(&generation_contract) {
+        println!(
+            "[gen_model] dry-run：targets 与 provenance 已解析，跳过 cleanup、writer lifecycle、几何生成及全部后处理"
+        );
+        perf.mark("dry_run_complete");
+        perf.end_current();
+        return Ok(GenModelResult {
+            success: true,
+            authoritative_snapshot_id,
+            artifacts: None,
+            read_metrics: validated_read_metrics(&generation_read)
+                .map_err(GenPipelineError::Other)?,
+            provenance,
+        });
+    }
     let incremental_cleanup_roots = match &scope {
-        GenerationScope::Incremental { log } => {
-            let mut roots = log.get_all_visible_refnos();
-            roots.extend(log.delete_refnos.iter().copied());
-            roots.into_iter().collect::<Vec<_>>()
-        }
+        GenerationScope::Incremental { .. } => targets
+            .bran_hang_refnos()
+            .iter()
+            .chain(targets.loop_refnos())
+            .chain(targets.cate_refnos())
+            .chain(targets.prim_refnos())
+            .chain(targets.delete_refnos())
+            .copied()
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     let is_boolean_scoped_generation = matches!(
-        scope,
+        &scope,
         GenerationScope::Debug { .. } | GenerationScope::Incremental { .. }
     ) || db_option
         .inner
@@ -1114,215 +509,41 @@ async fn process_index_tree_generation(
         .as_ref()
         .map(|refnos| !refnos.is_empty())
         .unwrap_or(false);
-    if seed_roots.is_some() && !is_boolean_scoped_generation {
-        println!(
-            "[gen_model] boolean scope disabled: seed roots come from dbnum/full generation, not explicit refno scope"
-        );
-    }
     let full_start = Instant::now();
-    crate::perf_metrics::record_generate_progress("index_tree_init", None, 0);
+    crate::perf_metrics::record_generate_progress("gen_pipeline_init", None, 0);
     perf.mark("categorize_and_inst_relate");
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
-    let config = IndexTreeConfig::from_db_option_ext(db_option)
-        .map_err(|e| anyhow::anyhow!("配置错误: {}", e))?;
-    let (sender, receiver) = flume::bounded::<aios_core::geometry::ShapeInstancesData>(
-        db_option.get_batch_channel_capacity(),
-    );
-    let _replace_exist_deprecated = false; // replace_exist 已废弃，由 pre_cleanup_for_regen 替代
     let use_surrealdb = db_option.use_surrealdb;
     let defer_db_write = false;
 
-    if matches!(scope, GenerationScope::Incremental { .. }) {
-        let cleanup_enabled = use_surrealdb
-            && !defer_db_write
-            && !db_option.gen_model_dry_run
-            && db_option.model_writer_mode.writes_to_surreal();
-        if incremental_cleanup_roots.is_empty() {
-            println!("[gen_model] 增量模型清理跳过：无清理 roots");
-        } else if cleanup_enabled {
-            println!(
-                "[gen_model] 增量模型清理开始: cleanup_roots={}",
-                incremental_cleanup_roots.len()
-            );
-            crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(
-                &incremental_cleanup_roots,
-            )
-            .await
-            .map_err(IndexTreeError::Other)?;
-            println!("[gen_model] 增量模型清理完成");
-        } else {
-            println!(
-                "[gen_model] 增量模型清理跳过: use_surrealdb={} defer_db_write={} gen_model_dry_run={} writer={}",
-                use_surrealdb,
-                defer_db_write,
-                db_option.gen_model_dry_run,
-                db_option.model_writer_mode.as_str()
-            );
-        }
-
-        if seed_roots
-            .as_ref()
-            .map(|roots| roots.is_empty())
-            .unwrap_or(false)
-        {
-            println!("[gen_model] 增量日志没有可见生成 roots，仅执行清理路径后结束");
-            perf.mark("incremental_no_visible_roots");
-            perf.end_current();
-            return Ok(GenModelResult { success: true });
-        }
+    if matches!(&scope, GenerationScope::Incremental { .. }) && !targets.has_generation_targets() {
+        println!(
+            "[gen_model] 增量日志没有生成目标，进入统一空 producer/write pipeline 路径 (delete_only={})",
+            targets.is_delete_only()
+        );
     }
 
-    if db_option.model_writer_mode == ModelWriterMode::DrainOnly {
-        println!(
-            "[model-writer:drain-only] 启动压测消费端：生成 batch 真实运行，但跳过 SurrealDB 写入、mesh stage、AABB 回写和 boolean"
-        );
-        let drain_writer = create_model_writer(
-            db_option.model_writer_mode,
-            Arc::new(DashMap::new()),
-            Arc::new(std::sync::Mutex::new(HashSet::new())),
-        );
-        println!(
-            "[gen_model] ModelWriter={} writes_to_surreal={} runs_downstream_pipeline={}",
-            drain_writer.name(),
-            drain_writer.writes_to_surreal(),
-            drain_writer.runs_downstream_pipeline()
-        );
-        if drain_writer.runs_downstream_pipeline() {
-            return Err(IndexTreeError::Other(anyhow::anyhow!(
-                "drain-only 快速路径要求 backend.runs_downstream_pipeline=false"
-            )));
-        }
-        let drain_handle = tokio::spawn(run_model_writer_sink(receiver, drain_writer));
-        println!("⏳ [1/2] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
-        let _categorized = match &scope {
-            GenerationScope::Incremental { log } => {
-                gen_index_tree_geos_for_incremental_log(
-                    Arc::new(db_option.clone()),
-                    &config,
-                    sender.clone(),
-                    log,
-                )
-                .await
-            }
-            _ => {
-                gen_index_tree_geos_optimized(
-                    Arc::new(db_option.clone()),
-                    &config,
-                    sender.clone(),
-                    seed_roots,
-                )
-                .await
-            }
-        }
-        .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
-        println!(
-            "✅ [1/2] 几何体生成完成, 用时 {}ms",
-            full_start.elapsed().as_millis()
-        );
-        println!("⏳ [2/2] drain-only 消费剩余 batch...");
-        drop(sender);
-        let drain_stats = drain_handle
-            .await
-            .map_err(|e| anyhow::anyhow!("drain-only sink 任务异常退出: {}", e))?
-            .map_err(IndexTreeError::Other)?
-            .drain_only_stats
-            .unwrap_or_default();
-        drain_stats.print_summary();
-        println!(
-            "✅ [2/2] drain-only 完成, 总用时 {}ms",
-            full_start.elapsed().as_millis()
-        );
-        perf.mark("drain_only_complete");
-        perf.end_current();
-        return Ok(GenModelResult { success: true });
-    }
-
-    // Mesh 生成：生产端只产出 inst batch，mesh/持久化在下游并行阶段完成
     let gen_mesh = db_option.inner.gen_mesh;
-
-    // 初始化 Parquet 写入器（默认关闭，通过环境变量显式开启）。
-    //
-    // 开关：AIOS_ENABLE_PARQUET_STREAM_WRITER=1|true|yes|on
-    // 说明：此前该路径固定为 None，容易造成“看似支持但实际未启用”的误解；
-    // 这里改为显式开关，默认行为保持不变（关闭）。
-    let enable_parquet_stream_writer = std::env::var("AIOS_ENABLE_PARQUET_STREAM_WRITER")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    // ParquetStreamWriter 需要 parquet-export feature
-
-    #[cfg(feature = "parquet-export")]
-    let parquet_writer = if enable_parquet_stream_writer {
-        let output_dir = db_option
-            .inner
-            .meshes_path
-            .as_deref()
-            .unwrap_or("assets/meshes");
-        let parquet_dir = std::path::Path::new(output_dir)
-            .parent()
-            .unwrap_or(std::path::Path::new("output"));
-        match ParquetStreamWriter::new(parquet_dir) {
-            Ok(writer) => {
-                println!(
-                    "[Parquet] 已启用流式写入（AIOS_ENABLE_PARQUET_STREAM_WRITER=1），输出目录: {}",
-                    parquet_dir.display()
-                );
-                Some(std::sync::Arc::new(writer))
-            }
-            Err(e) => {
-                eprintln!("[Parquet] 初始化写入器失败: {}, 回退为禁用", e);
-                None
-            }
-        }
-    } else {
-        println!("[Parquet] 流式写入已禁用（可设置 AIOS_ENABLE_PARQUET_STREAM_WRITER=1 显式开启）");
-        None
-    };
-
-    #[cfg(not(feature = "parquet-export"))]
-    let parquet_writer: Option<std::sync::Arc<()>> = None;
-
-    //
-    #[allow(unused_variables)]
-    let parquet_writer_clone = parquet_writer.clone();
-
-    // model cache-only 已移除（foyer-cache-cleanup）
-    let model_cache_ctx: Option<()> = None;
-    #[allow(unused_variables)]
-    let cache_manager_for_insert: Option<()> = None;
-
-    let touched_dbnums: Arc<std::sync::Mutex<BTreeSet<u32>>> =
-        Arc::new(std::sync::Mutex::new(BTreeSet::new()));
-
-    // IndexTree 下用于 inst_relate_aabb 写入的 refno 集合：只收集“本次生成触达”的实例，
-    // 避免通过 pe_transform 全库扫描导致卡死/耗时失真。
-    let touched_refnos: Arc<std::sync::Mutex<std::collections::HashSet<RefnoEnum>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-    let touched_refnos_for_insert = touched_refnos.clone();
-
-    // 当 manual_db_nums 只有一个值时，直接使用该 dbnum，无需从 refno 反推
-    let known_dbnum: Option<u32> = db_option
-        .inner
-        .manual_db_nums
-        .as_ref()
-        .filter(|nums| nums.len() == 1)
-        .and_then(|nums| nums.first().copied());
     let mesh_aabb_map: Arc<DashMap<String, parry3d::bounding_volume::Aabb>> =
         Arc::new(DashMap::new());
     let mesh_pts_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
-    let missing_neg_carriers_for_reconcile: Arc<std::sync::Mutex<HashSet<RefnoEnum>>> =
-        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let missing_neg_carriers_for_reconcile = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let artifacts = Arc::new(GenerationArtifacts::new(authoritative_snapshot_id));
+    let inst_relate_precomputed = if db_option.model_writer_mode.writes_to_surreal() {
+        Some(Arc::new(
+            crate::fast_model::pdms_inst::InstRelatePrecomputed::from_generation_read(
+                &generation_read,
+            )?,
+        ))
+    } else {
+        None
+    };
     let base_model_writer = create_model_writer(
         db_option.model_writer_mode,
-        mesh_aabb_map.clone(),
-        missing_neg_carriers_for_reconcile.clone(),
+        Arc::clone(&mesh_aabb_map),
+        missing_neg_carriers_for_reconcile,
+        inst_relate_precomputed,
     );
     println!(
         "[gen_model] ModelWriter={} writes_to_surreal={} runs_downstream_pipeline={}",
@@ -1330,88 +551,64 @@ async fn process_index_tree_generation(
         base_model_writer.writes_to_surreal(),
         base_model_writer.runs_downstream_pipeline()
     );
-    if !base_model_writer.runs_downstream_pipeline() {
-        return Err(IndexTreeError::Other(anyhow::anyhow!(
-            "ModelWriter={} 不支持完整下游模型后处理路径；请使用 drain-only 专用路径或实现对应后处理",
-            base_model_writer.name()
-        )));
-    }
-    let base_write_semaphore = Arc::new(Semaphore::new(db_option.get_base_write_concurrency()));
-    let mesh_compute_semaphore = Arc::new(Semaphore::new(db_option.get_mesh_compute_concurrency()));
-    let inst_aabb_semaphore = Arc::new(Semaphore::new(db_option.get_inst_aabb_write_concurrency()));
-    let (base_writer_sender, base_writer_receiver) =
-        flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
-    let (base_result_sender, base_result_receiver) =
-        flume::bounded::<(u64, u128, u128)>(db_option.get_batch_channel_capacity());
-    let (mesh_stage_sender, mesh_stage_receiver) =
-        flume::bounded::<PipelineBatch>(db_option.get_batch_channel_capacity());
-    let (mesh_output_sender, mesh_output_receiver) =
-        flume::bounded::<BatchMeshOutput>(db_option.get_batch_channel_capacity());
-    // completion 仅用于主线程汇总 batch 统计，不参与生产侧背压。
-    // 若这里使用有界通道，run_inst_aabb_writer 内部任务会在 send_async(completion)
-    // 上卡住，而主线程又要等 inst_aabb_handle 退出后才开始 recv，形成尾部自锁。
-    let (completion_sender, completion_receiver) = flume::unbounded::<BatchCompletion>();
 
-    let sink_handle = tokio::spawn(run_batch_sink(
-        receiver,
-        base_writer_sender,
-        mesh_stage_sender,
-        touched_refnos_for_insert,
-    ));
-    let base_writer_handle = tokio::spawn(run_base_writer(
-        base_writer_receiver,
-        base_result_sender,
-        base_write_semaphore.clone(),
-        db_option.get_base_write_concurrency(),
-        base_model_writer.clone(),
-    ));
-    let mesh_stage_handle = tokio::spawn(run_mesh_stage(
-        mesh_stage_receiver,
-        mesh_output_sender,
-        mesh_compute_semaphore,
-        db_option.get_mesh_compute_concurrency(),
-        db_option.clone(),
-        gen_mesh,
-        mesh_aabb_map.clone(),
-        mesh_pts_map.clone(),
-    ));
-    let inst_aabb_handle = tokio::spawn(run_inst_aabb_writer(
-        mesh_output_receiver,
-        base_result_receiver,
-        completion_sender,
-        inst_aabb_semaphore,
-        db_option.get_inst_aabb_write_concurrency(),
-        mesh_aabb_map.clone(),
-        mesh_pts_map.clone(),
-        base_model_writer.clone(),
-    ));
+    let (sender, write_pipeline) = ModelWritePipeline::start(WritePipelineStart {
+        db_option: db_option.clone(),
+        generation_read: Arc::clone(&generation_read),
+        incremental_cleanup_roots,
+        model_writer: Arc::clone(&base_model_writer),
+        artifacts: Arc::clone(&artifacts),
+        mesh_aabb_map,
+        mesh_pts_map,
+        channel_capacity: execution_tuning.channel_capacity,
+        base_write_concurrency: execution_tuning.base_write_concurrency,
+        mesh_compute_concurrency: execution_tuning.mesh_compute_concurrency,
+        inst_aabb_write_concurrency: execution_tuning.inst_aabb_write_concurrency,
+        skip_inst_relate_aabb: generation_contract.skip_inst_relate_aabb(),
+        skip_final_aabb_sweep: generation_contract.skip_final_aabb_sweep(),
+        use_surrealdb,
+    })
+    .await
+    .map_err(GenPipelineError::Other)?;
     println!("⏳ [1/5] 几何体生成 (BRAN/HANG + LOOP/CATE/PRIM)...");
     crate::perf_metrics::record_generate_progress(
         "geometry_generation",
         None,
         full_start.elapsed().as_millis() as u64,
     );
-    let categorized = match &scope {
-        GenerationScope::Incremental { log } => {
-            gen_index_tree_geos_for_incremental_log(
-                Arc::new(db_option.clone()),
-                &config,
-                sender.clone(),
-                log,
-            )
-            .await
+    let generation_result = execute_generation_targets(
+        Arc::new(db_option.clone()),
+        Arc::clone(&generation_read),
+        &config,
+        Arc::clone(&generation_contract),
+        sender.clone(),
+        &targets,
+        Some(Arc::clone(&artifacts)),
+    )
+    .await;
+
+    println!("⏳ [2/5] write pipeline barrier...");
+    crate::perf_metrics::record_generate_progress(
+        "instance_data_write",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
+    drop(sender);
+    let write_result = write_pipeline.finish().await;
+    let (categorized, write_report) = match (generation_result, write_result) {
+        (Ok(categorized), Ok(write_report)) => (categorized, write_report),
+        (Err(generation_error), Ok(_)) => {
+            return Err(GenPipelineError::Other(anyhow::anyhow!(
+                "GenPipeline 生成失败: {generation_error}"
+            )));
         }
-        _ => {
-            gen_index_tree_geos_optimized(
-                Arc::new(db_option.clone()),
-                &config,
-                sender.clone(),
-                seed_roots,
-            )
-            .await
+        (Ok(_), Err(write_error)) => return Err(GenPipelineError::Other(write_error)),
+        (Err(generation_error), Err(write_error)) => {
+            return Err(GenPipelineError::Other(anyhow::anyhow!(
+                "GenPipeline 生成失败: {generation_error}; write pipeline 收敛失败: {write_error}"
+            )));
         }
-    }
-    .map_err(|e| anyhow::anyhow!("IndexTree 生成失败: {}", e))?;
+    };
     println!(
         "✅ [1/5] 几何体生成完成, 用时 {}ms",
         full_start.elapsed().as_millis()
@@ -1421,92 +618,49 @@ async fn process_index_tree_generation(
         None,
         full_start.elapsed().as_millis() as u64,
     );
-
-    // 🔥 显式 drop sender，让 receiver 的循环能够正常结束
-    // 否则 insert_handle.await 会永久阻塞
-    println!("⏳ [2/5] 实例数据入库...");
-    crate::perf_metrics::record_generate_progress(
-        "instance_data_write",
-        None,
-        full_start.elapsed().as_millis() as u64,
-    );
-    drop(sender);
-    let insert_report = sink_handle
-        .await
-        .map_err(|e| anyhow::anyhow!("batch sink 任务异常退出: {}", e))?
-        .map_err(IndexTreeError::Other)?;
-    let base_writer_report = base_writer_handle
-        .await
-        .map_err(|e| anyhow::anyhow!("base writer 任务异常退出: {}", e))?
-        .map_err(IndexTreeError::Other)?;
     println!(
-        "[gen_model] ModelWriter finish: writer={} drain_only_stats={}",
-        base_writer_report.writer_name,
-        base_writer_report.drain_only_stats.is_some()
+        "[gen_model] write pipeline finish: writer={} batches={} completed={} barrier_wait_ms={} mesh_cache_hit={} mesh_new={} missing_neg={}",
+        write_report.writer_finish.writer_name,
+        write_report.batch_count,
+        write_report.completed_batches,
+        write_report.barrier_wait_ms,
+        write_report.mesh_cache_hits,
+        write_report.mesh_new_generated,
+        write_report.missing_neg_carrier_count,
     );
-    mesh_stage_handle
-        .await
-        .map_err(|e| anyhow::anyhow!("mesh stage 任务异常退出: {}", e))?
-        .map_err(IndexTreeError::Other)?;
-    let barrier_wait_start = Instant::now();
-    inst_aabb_handle
-        .await
-        .map_err(|e| anyhow::anyhow!("inst aabb writer 任务异常退出: {}", e))?
-        .map_err(IndexTreeError::Other)?;
-    let mut completed_batches = 0usize;
-    let mut total_mesh_cache_hits = 0usize;
-    let mut total_mesh_new_generated = 0usize;
-    while let Ok(completion) = completion_receiver.recv_async().await {
-        completed_batches += 1;
-        total_mesh_cache_hits += completion.mesh_cache_hits;
-        total_mesh_new_generated += completion.mesh_new_generated;
+
+    if write_report.is_drain_only() {
+        if let Some(stats) = &write_report.writer_finish.drain_only_stats {
+            stats.print_summary();
+        }
+        perf.mark("drain_only_complete");
+        perf.end_current();
+        let artifact_summary = artifacts.summary().map_err(GenPipelineError::Other)?;
+        return Ok(GenModelResult {
+            success: true,
+            authoritative_snapshot_id,
+            artifacts: Some(artifact_summary),
+            read_metrics: validated_read_metrics(&generation_read)
+                .map_err(GenPipelineError::Other)?,
+            provenance,
+        });
     }
-    let missing_neg_carriers = {
-        let guard = missing_neg_carriers_for_reconcile.lock().unwrap();
-        let mut carriers = guard.iter().copied().collect::<Vec<_>>();
-        carriers.sort_unstable();
-        carriers
-    };
-    let barrier_wait_ms = barrier_wait_start.elapsed().as_millis();
-    // spec 004：生成阶段 mesh 计数（批量屏障汇总点，一次性记录）。
-    crate::perf_metrics::add_generate_counters(total_mesh_new_generated, total_mesh_cache_hits);
+
     crate::perf_metrics::record_generate_progress(
         "batch_barrier_done",
         Some(&format!(
             "batches={} mesh_cache_hit={} mesh_new_generated={}",
-            completed_batches, total_mesh_cache_hits, total_mesh_new_generated
+            write_report.completed_batches,
+            write_report.mesh_cache_hits,
+            write_report.mesh_new_generated
         )),
         full_start.elapsed().as_millis() as u64,
     );
-    println!(
-        "[gen_model] batch barrier complete: batches={} barrier_wait_ms={} mesh_cache_hit={} mesh_new_generated={} missing_neg_candidates={}",
-        completed_batches,
-        barrier_wait_ms,
-        total_mesh_cache_hits,
-        total_mesh_new_generated,
-        missing_neg_carriers.len()
-    );
-    // spec 006 T302：收尾安全网——所有 writer 退出后全量 INSERT IGNORE 补写 aabb/vec3，
-    // 兜住增量写（T301）覆盖不到的跨运行状态漂移；失败只告警不阻断流程。
-    if std::env::var_os("AIOS_SKIP_FINAL_AABB_SWEEP").is_some() {
-        println!("[gen_model] final_sweep skipped: AIOS_SKIP_FINAL_AABB_SWEEP 已设置");
-    } else {
-        let sweep_start = Instant::now();
-        match base_model_writer
-            .finalize_mesh_entities(&mesh_aabb_map, &mesh_pts_map)
-            .await
-        {
-            Ok(report) => println!(
-                "[gen_model] final_sweep aabb={} pts={} status={:?} elapsed_ms={}",
-                mesh_aabb_map.len(),
-                mesh_pts_map.len(),
-                report.status,
-                sweep_start.elapsed().as_millis()
-            ),
-            Err(err) => log::error!("[gen_model] final_sweep 失败（不阻断流程）: {err}"),
-        }
-    }
-    let mut bool_tasks = insert_report.bool_tasks;
+    let insert_batch_count = write_report.batch_count;
+    let mut bool_tasks = write_report.bool_tasks;
+    let boolean_task_count = bool_tasks.len();
+    let boolean_task_semantic_hash = super::boolean_task::semantic_hash_boolean_tasks(&bool_tasks);
+    let mut boolean_execution_report: Option<BooleanBridgeReport> = None;
     println!(
         "✅ [2/5] 实例数据入库完成, 用时 {}ms",
         full_start.elapsed().as_millis()
@@ -1530,7 +684,7 @@ async fn process_index_tree_generation(
         ran_primary = gen_mesh;
         if gen_mesh {
             println!(
-                "[gen_model] IndexTree 模式 mesh 并行阶段完成，用时 {} ms",
+                "[gen_model] GenPipeline mesh 并行阶段完成，用时 {} ms",
                 mesh_start.elapsed().as_millis()
             );
         }
@@ -1540,13 +694,13 @@ async fn process_index_tree_generation(
 
         // 3️⃣ batch barrier 之后，inst_relate_aabb 已按 batch 写入完成
         if use_surrealdb {
-            let skip_aabb_write = std::env::var_os("AIOS_SKIP_INST_RELATE_AABB").is_some();
+            let skip_aabb_write = generation_contract.skip_inst_relate_aabb();
             if skip_aabb_write {
                 println!(
-                    "[gen_model] IndexTree 模式已跳过 batch inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
+                    "[gen_model] GenPipeline已跳过 batch inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
                 );
             } else {
-                println!("[gen_model] IndexTree 模式 batch inst_relate_aabb 写入已完成");
+                println!("[gen_model] GenPipeline batch inst_relate_aabb 写入已完成");
             }
         }
 
@@ -1558,28 +712,10 @@ async fn process_index_tree_generation(
             full_start.elapsed().as_millis() as u64,
         );
 
-        // 3.5️⃣ barrier 后补建跨阶段缺失的 neg_relate（LOOP 阶段发现负实体但 PRIM 阶段才创建 geo_relate）
-        if use_surrealdb {
-            match base_model_writer
-                .reconcile_missing_neg_relations(&all_refnos, &missing_neg_carriers)
-                .await
-            {
-                Ok(report) => {
-                    println!(
-                        "[gen_model] ModelWriter missing_neg_reconcile: status={:?} item_count={} skipped_reason={:?}",
-                        report.status, report.item_count, report.skipped_reason
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[gen_model] missing_neg_reconcile 失败: {}", e);
-                }
-            }
-        }
-
         // 4️⃣ 可选执行布尔运算
         if db_option.inner.apply_boolean_operation {
             let bool_start = Instant::now();
-            println!("[gen_model] IndexTree 模式开始布尔运算（boolean worker）");
+            println!("[gen_model] GenPipeline开始布尔运算（boolean worker）");
             println!(
                 "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
                 db_option.boolean_pipeline_mode,
@@ -1590,10 +726,10 @@ async fn process_index_tree_generation(
             println!(
                 "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
                 bool_tasks.len(),
-                insert_report.batch_cnt
+                insert_batch_count
             );
 
-            match base_model_writer
+            let report = base_model_writer
                 .run_boolean_bridge(BooleanBridgeRequest {
                     mode: db_option.boolean_pipeline_mode.clone(),
                     db_option: Arc::new(db_option.inner.clone()),
@@ -1607,27 +743,23 @@ async fn process_index_tree_generation(
                     },
                     bool_tasks: std::mem::take(&mut bool_tasks),
                 })
-                .await
-            {
-                Ok(report) => {
-                    println!(
-                        "[gen_model] ModelWriter boolean_bridge 完成: total={} success={} failed={} skipped={} skipped_reason={:?}",
-                        report.total,
-                        report.success,
-                        report.failed,
-                        report.skipped,
-                        report.skipped_reason
-                    );
-                    // spec 004：生成阶段布尔任务计数。
-                    crate::perf_metrics::add_boolean_counters(report.success, report.failed);
-                }
-                Err(e) => {
-                    eprintln!("[gen_model] IndexTree 布尔运算失败: {}", e);
-                }
+                .await?;
+            println!(
+                "[gen_model] ModelWriter boolean_bridge 完成: total={} success={} failed={} skipped={} skipped_reason={:?}",
+                report.total, report.success, report.failed, report.skipped, report.skipped_reason
+            );
+            crate::perf_metrics::add_boolean_counters(report.success, report.failed);
+            if report.failed > 0 {
+                return Err(GenPipelineError::Other(anyhow::anyhow!(
+                    "boolean worker failed tasks: total={} failed={}",
+                    report.total,
+                    report.failed
+                )));
             }
+            boolean_execution_report = Some(report);
 
             println!(
-                "[gen_model] IndexTree 模式布尔运算完成，用时 {} ms",
+                "[gen_model] GenPipeline布尔运算完成，用时 {} ms",
                 bool_start.elapsed().as_millis()
             );
         }
@@ -1678,6 +810,20 @@ async fn process_index_tree_generation(
             }
         }
     }
+    let boolean_execution_report =
+        boolean_execution_report.unwrap_or_else(|| BooleanBridgeReport {
+            total: boolean_task_count,
+            skipped: boolean_task_count,
+            skipped_reason: Some("boolean operation disabled"),
+            ..BooleanBridgeReport::default()
+        });
+    artifacts
+        .record_boolean_execution(
+            boolean_task_count,
+            boolean_task_semantic_hash,
+            &boolean_execution_report,
+        )
+        .map_err(GenPipelineError::Other)?;
 
     perf.mark("sqlite_spatial_index");
     crate::perf_metrics::record_generate_progress(
@@ -1686,7 +832,7 @@ async fn process_index_tree_generation(
         full_start.elapsed().as_millis() as u64,
     );
     println!(
-        "[gen_model] IndexTree 模式全部完成，总用时 {} ms",
+        "[gen_model] GenPipeline全部完成，总用时 {} ms",
         full_start.elapsed().as_millis()
     );
     println!(
@@ -1750,7 +896,7 @@ async fn process_index_tree_generation(
             )
             .await
             {
-                eprintln!("[instances] IndexTree 导出失败: {}", e);
+                eprintln!("[instances] GenPipeline 导出失败: {}", e);
             }
         }
     }
@@ -1814,10 +960,9 @@ async fn process_index_tree_generation(
         }
     }
 
-    // model_cache close 已移除（foyer-cache-cleanup）
     perf.end_current();
     crate::perf_metrics::record_generate_progress(
-        "index_tree_finished",
+        "gen_pipeline_finished",
         None,
         full_start.elapsed().as_millis() as u64,
     );
@@ -1841,17 +986,11 @@ async fn process_index_tree_generation(
 
     // 输出性能摘要到控制台
     perf.print_summary();
+    let artifact_summary = artifacts.summary().map_err(GenPipelineError::Other)?;
+    let read_metrics = validated_read_metrics(&generation_read).map_err(GenPipelineError::Other)?;
 
     // 保存性能报告为 JSON 和 CSV（可通过 AIOS_DISABLE_PERF_REPORT=1 禁用）
-    let perf_report_disabled = std::env::var("AIOS_DISABLE_PERF_REPORT")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
+    let perf_report_disabled = execution_tuning.perf_report_disabled;
 
     if !perf_report_disabled {
         let project_name = if !db_option.inner.project_name.is_empty() {
@@ -1872,7 +1011,7 @@ async fn process_index_tree_generation(
             .and_then(|nums| nums.first().copied())
             .map(|n| n.to_string())
             .unwrap_or_else(|| "all".to_string());
-        let enabled_nouns = db_option.index_tree_enabled_target_types.clone();
+        let enabled_nouns = db_option.gen_pipeline_enabled_target_types.clone();
         let metadata = serde_json::json!({
             "mode": "index_tree",
             "project_name": project_name,
@@ -1882,15 +1021,24 @@ async fn process_index_tree_generation(
             "model_cache_write": true,
             "apply_boolean": db_option.inner.apply_boolean_operation,
             "gen_mesh": db_option.inner.gen_mesh,
-            "concurrency": db_option.get_index_tree_concurrency(),
-            "batch_size": db_option.get_index_tree_batch_size(),
+            "concurrency": db_option.get_gen_pipeline_concurrency(),
+            "batch_size": db_option.get_gen_pipeline_batch_size(),
+            "generation_read_backend": generation_read.session.backend_kind().as_str(),
+            "authoritative_snapshot_id": authoritative_snapshot_id,
+            "generation_read_metrics": read_metrics.clone(),
+            "geometry_artifact_hash": artifact_summary.geometry_artifact_hash.clone(),
+            "generation_artifacts_semantic_hash": artifact_summary.semantic_hash.clone(),
+            "final_model_semantic_hash": artifact_summary.model_semantic_hash.clone(),
+            "input_manifest_hash": provenance.input_manifest_hash(),
+            "generation_contract_hash": provenance.contract_hash(),
+            "generation_target_hash": provenance.target_hash(),
         });
         let json_path = profile_dir.join(format!(
-            "perf_gen_model_index_tree_dbnum_{}_{}.json",
+            "perf_gen_model_gen_pipeline_dbnum_{}_{}.json",
             dbnum_tag, timestamp
         ));
         let csv_path = profile_dir.join(format!(
-            "perf_gen_model_index_tree_dbnum_{}_{}.csv",
+            "perf_gen_model_gen_pipeline_dbnum_{}_{}.csv",
             dbnum_tag, timestamp
         ));
         if let Err(e) = perf.save_json(&json_path, metadata.clone()) {
@@ -1902,7 +1050,21 @@ async fn process_index_tree_generation(
         }
     }
 
-    Ok(GenModelResult { success: true })
+    println!(
+        "[gen_model] GenerationArtifacts snapshot={} batches={} mesh_results={} geometry_hash={} semantic_hash={}",
+        artifact_summary.authoritative_snapshot_id,
+        artifact_summary.batch_count,
+        artifact_summary.mesh_result_count,
+        artifact_summary.geometry_artifact_hash,
+        artifact_summary.semantic_hash
+    );
+    Ok(GenModelResult {
+        success: true,
+        authoritative_snapshot_id,
+        artifacts: Some(artifact_summary),
+        read_metrics,
+        provenance,
+    })
 }
 
 // ============================================================================
@@ -2018,75 +1180,62 @@ fn initialize_spatial_index() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     #[test]
-    fn test_route_incremental_when_visible_roots_empty() {
-        let manual_refnos: Vec<RefnoEnum> = Vec::new();
-        let debug_roots: Vec<RefnoEnum> = Vec::new();
-        let mut incr_log = IncrGeoUpdateLog::default();
-        incr_log.prim_refnos.insert("17496_171666".into());
-        let scope =
-            decide_generation_scope(&manual_refnos, &debug_roots, true, &[], Some(&incr_log));
+    fn generation_scope_priority_is_stable() {
+        let manual = RefnoEnum::from("1/1");
+        let debug = RefnoEnum::from("1/2");
+        let incremental = RefnoEnum::from("1/3");
+        let mut log = IncrGeoUpdateLog::default();
+        log.prim_refnos.insert(incremental);
+
+        assert!(matches!(
+            decide_generation_scope(&[], &[], false, &[], None),
+            GenerationScope::Full
+        ));
+        assert!(matches!(
+            decide_generation_scope(&[manual], &[], false, &[], None),
+            GenerationScope::Manual { roots } if roots == vec![manual]
+        ));
+        assert!(matches!(
+            decide_generation_scope(&[], &[debug], false, &[], None),
+            GenerationScope::Debug { roots } if roots == vec![debug]
+        ));
+        assert!(matches!(
+            decide_generation_scope(&[], &[], true, &[incremental], Some(&log)),
+            GenerationScope::Incremental { .. }
+        ));
+
+        let mixed = decide_generation_scope(&[manual], &[debug], true, &[incremental], Some(&log));
+        let GenerationScope::Manual { roots } = mixed else {
+            panic!("mixed scope must normalize to Manual roots");
+        };
+        let roots: HashSet<_> = roots.into_iter().collect();
+        assert_eq!(roots, HashSet::from([manual, debug, incremental]));
+    }
+
+    #[test]
+    fn delete_only_incremental_scope_does_not_fall_back_to_full() {
+        let mut log = IncrGeoUpdateLog::default();
+        log.delete_refnos.insert(RefnoEnum::from("1/9"));
+
+        let scope = decide_generation_scope(&[], &[], true, &[], Some(&log));
         assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 
-    #[tokio::test]
-    async fn test_db_write_failures_are_not_silenced() {
-        let handles = vec![tokio::spawn(async { true }), tokio::spawn(async { false })];
-        let failures = collect_db_write_failures(handles).await;
-        let result = ensure_no_db_write_failures(failures);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("SurrealDB 批量写入存在失败任务")
-        );
-    }
-
-    fn sample_mesh_output(batch_id: u64) -> BatchMeshOutput {
-        BatchMeshOutput {
-            batch_id,
-            shape_insts: Arc::new(aios_core::geometry::ShapeInstancesData::default()),
-            mesh_results: HashMap::new(),
-            mesh_task_count: 0,
-            mesh_cache_hits: 0,
-            mesh_new_generated: 0,
-            mesh_ms: 17,
-            mesh_wait_ms: 5,
-            batch_started_at: Instant::now(),
-        }
+    #[test]
+    fn empty_incremental_scope_does_not_fall_back_to_full() {
+        let log = IncrGeoUpdateLog::default();
+        let scope = decide_generation_scope(&[], &[], true, &[], Some(&log));
+        assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 
     #[test]
-    fn test_batch_stage_joiner_waits_for_base_after_mesh() {
-        let mut joiner = BatchStageJoiner::default();
-        assert!(joiner.push_mesh_output(sample_mesh_output(7)).is_none());
-
-        let ready = joiner
-            .push_base_metrics(7, 11, 13)
-            .expect("base 到达后应完成汇合");
-
-        assert_eq!(ready.batch_id, 7);
-        assert_eq!(ready.base_wait_ms, 11);
-        assert_eq!(ready.base_write_ms, 13);
-        assert_eq!(ready.mesh_ms, 17);
-        assert_eq!(ready.mesh_wait_ms, 5);
-    }
-
-    #[test]
-    fn test_batch_stage_joiner_waits_for_mesh_after_base() {
-        let mut joiner = BatchStageJoiner::default();
-        assert!(joiner.push_base_metrics(9, 3, 4).is_none());
-
-        let ready = joiner
-            .push_mesh_output(sample_mesh_output(9))
-            .expect("mesh 到达后应完成汇合");
-
-        assert_eq!(ready.batch_id, 9);
-        assert_eq!(ready.base_wait_ms, 3);
-        assert_eq!(ready.base_write_ms, 4);
-        assert_eq!(ready.mesh_ms, 17);
+    fn dry_run_never_starts_write_pipeline() {
+        let mut opt = DbOptionExt::from(aios_core::options::DbOption::default());
+        opt.gen_model_dry_run = true;
+        let config = GenPipelineConfig::from_db_option_ext(&opt).expect("config");
+        let contract = GenerationContract::from_db_option(&opt, &config);
+        assert!(!should_start_write_pipeline(&contract));
     }
 }

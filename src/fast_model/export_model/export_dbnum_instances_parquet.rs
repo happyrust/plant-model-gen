@@ -31,21 +31,20 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use chrono::{SecondsFormat, Utc};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde_json::json;
 use std::str::FromStr;
 
 // 注: trans/aabb 查询在本模块内自行实现（避免跨模块耦合）
 // specs/023 M2：层级/元信息读取统一走 HierView（pe_owner 快照默认 / .tree 回退）
+use crate::data_interface::db_meta_manager::resolve_dbnum_for_refno;
 use crate::fast_model::gen_model::hier_view::HierView;
 use crate::fast_model::gen_model::model_record_id::{model_refno_id, model_refno_range};
-use crate::fast_model::gen_model::tree_index_manager::TreeIndexManager;
 use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
-
-// =============================================================================
+use crate::versioned_db::db_meta_info;
 
 pub fn publish_dbnum_latest_manifest(
     artifact_dir: &Path,
@@ -165,6 +164,8 @@ pub fn publish_dbnum_latest_manifest(
     temp.persist(&pointer_path).map_err(|error| error.error)?;
     Ok(pointer_path)
 }
+
+// =============================================================================
 // Parquet 行结构体
 // =============================================================================
 
@@ -1555,7 +1556,7 @@ async fn query_inst_relate_by_refno_dbnum_fallback(
         offset += page_rows.len();
         let page_len = page_rows.len();
         rows.extend(page_rows.into_iter().filter(|row| {
-            TreeIndexManager::resolve_dbnum_for_refno(row.refno)
+            resolve_dbnum_for_refno(row.refno)
                 .map(|resolved| resolved == dbnum)
                 .unwrap_or(false)
         }));
@@ -2427,9 +2428,8 @@ pub async fn export_dbnum_instances_parquet(
     // 构建/加载 spec_info（BRAN/HANG/EQUI/WALL/FLOOR 专业信息），用于 spec_value=0 时回填
     // specs/023 M2：层级/元信息读取走 HierView（pe_owner 快照默认 / .tree 回退）
     let tree_manager = HierView::load(vec![dbnum]).await?;
-    let tree_dir_buf = TreeIndexManager::with_default_dir(vec![dbnum])
-        .tree_dir()
-        .to_path_buf();
+    let tree_dir_buf = db_meta_info::get_current_project_tree_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("output/scene_tree"));
     let tree_dir = tree_dir_buf.as_path();
     let spec_info_map = match crate::fast_model::export_model::spec_info::load_or_build_spec_info(
         dbnum, tree_dir, output_dir, verbose,
@@ -3160,12 +3160,37 @@ pub async fn export_dbnum_instances_parquet(
     // 8. 写入 manifest.json
     // =========================================================================
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let source_to_design_scale = LengthUnit::Millimeter.to_meter_factor() as f64;
+    let source_to_design = [
+        source_to_design_scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        source_to_design_scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        source_to_design_scale,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let coordinate_transform = json!({
+        "source_space": "source_mm",
+        "design_space": "design_m",
+        "source_to_design": source_to_design,
+    });
     let manifest = json!({
         "version": 1,
         "format": "parquet",
         "generated_at": generated_at,
         "dbnum": dbnum,
         "root_refno": root_refno.map(|r| r.to_string()),
+        "coordinate_transform": coordinate_transform.clone(),
         "tables": {
             "instances": {
                 "file": "instances.parquet",
@@ -3273,9 +3298,6 @@ pub async fn export_dbnum_instances_parquet(
     })
 }
 
-// =============================================================================
-// Cache → Parquet 导出
-// =============================================================================
 pub async fn export_dbnum_instances_parquet_latest(
     dbnum: u32,
     latest_root: &Path,
@@ -3428,3 +3450,7 @@ mod latest_manifest_tests {
         );
     }
 }
+
+// =============================================================================
+// Cache → Parquet 导出
+// =============================================================================

@@ -1,4 +1,4 @@
-//! spec_info 表：按 IndexTree SITE 层级遍历，导出 SITE 与 BRAN/HANG/EQUI/WALL/FLOOR 的专业信息
+//! spec_info 表：按 hierarchy SITE 层级遍历，导出 SITE 与 BRAN/HANG/EQUI/WALL/FLOOR 的专业信息
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,7 +14,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::fast_model::gen_model::tree_index_manager::load_index_with_large_stack;
+use crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot;
 
 /// 最小交付单元 noun 类型
 const DELIVERY_UNIT_NOUNS: &[&str] = &["BRAN", "HANG", "EQUI", "WALL", "FLOOR"];
@@ -39,25 +39,16 @@ fn site_name_to_spec_value(name: &str) -> i64 {
     }
 }
 
-/// 层级数据源（specs/023 M2 双源）：pe_owner 快照（默认）或 `.tree`（回退）。
-enum SpecHierSource {
-    Snapshot(std::sync::Arc<crate::versioned_db::pe_owner_snapshot::PeDbnumSnapshot>),
-    Tree(std::sync::Arc<aios_core::tree_query::TreeIndex>),
-}
+/// 层级数据源：pe_owner 快照。
+struct SpecHierSource(Arc<PeDbnumSnapshot>);
 
 impl SpecHierSource {
     fn all_refnos(&self) -> Vec<RefU64> {
-        match self {
-            Self::Snapshot(s) => s.all_refnos(),
-            Self::Tree(t) => t.all_refnos(),
-        }
+        self.0.all_refnos()
     }
 
     fn node_meta(&self, r: RefU64) -> Option<aios_core::tree_query::TreeNodeMeta> {
-        match self {
-            Self::Snapshot(s) => s.node_meta(r),
-            Self::Tree(t) => t.node_meta(r),
-        }
+        self.0.node_meta(r)
     }
 
     fn collect_descendants_bfs_grouped(
@@ -65,10 +56,7 @@ impl SpecHierSource {
         root: RefU64,
         options: &TreeQueryOptions,
     ) -> std::collections::HashMap<u32, Vec<RefU64>> {
-        match self {
-            Self::Snapshot(s) => s.collect_descendants_bfs_grouped(root, options),
-            Self::Tree(t) => t.collect_descendants_bfs_grouped(root, options),
-        }
+        self.0.collect_descendants_bfs_grouped(root, options)
     }
 }
 
@@ -79,19 +67,11 @@ pub async fn build_spec_info_parquet(
     output_path: &Path,
     verbose: bool,
 ) -> Result<HashMap<u64, i64>> {
-    // specs/023 M2 双源：pe_owner（默认）→ pe 快照（tree_dir 入参仅回退路径使用）
-    let index = if crate::versioned_db::pe_owner_tree::latest_tree_source_is_pe_owner() {
-        SpecHierSource::Snapshot(
-            crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum)
-                .await
-                .with_context(|| format!("加载 pe 快照 dbnum={} 失败", dbnum))?,
-        )
-    } else {
-        SpecHierSource::Tree(
-            load_index_with_large_stack(tree_dir, dbnum)
-                .with_context(|| format!("加载 TreeIndex dbnum={} 失败", dbnum))?,
-        )
-    };
+    let index = SpecHierSource(
+        crate::versioned_db::pe_owner_snapshot::get_or_load_pe_snapshot(dbnum)
+            .await
+            .with_context(|| format!("加载 pe 快照 dbnum={} 失败", dbnum))?,
+    );
 
     let all_count = index.all_refnos().len();
     let site_refnos: Vec<RefU64> = index

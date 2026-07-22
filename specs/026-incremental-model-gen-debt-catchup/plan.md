@@ -7,14 +7,14 @@
 3. 从 `run_increment` 提炼可复用的追赶核心：合并欠账五桶 → pe_owner 证据检查 → Incremental scope 生成 → 后处理 → 发锚点 → 标记消费；本轮增量路径与 watch 追赶路径共用同一函数。
 4. watch 循环接入：数据步之后对每个候选 dbnum 执行水位比对与追赶；失败隔离沿用加固计划 T2 语义（per-dbnum continue，不退进程）。
 5. `generate_model` 默认翻转 + `--no-generate-model` 逃生口；`incremental-sesno` 与 web 增量入口对齐同一默认。
-6. `model-version catch-up` 子命令：`--dbnum`（可选，缺省全部）、`--dry-run`、`--json`、`--allow-full-regen`（洞兜底的唯一入口）。
+6. `model-version catch-up` 子命令：`--dbnum`（可选，缺省全部）、`--dry-run`、`--json`；覆盖洞需要 specs/027 定义的受控模式，显式绑定既有数据锚点、持项目锁并写 `model_generation_run`，`--allow-full-regen` 单独出现不得授权执行。
 7. 属性级过滤：采集分类点接 `model_impact::attribute_affects_model` 的生成链路包装（未知属性 → 触发），`model_neutral_changes` 观测字段 + `--no-model-impact-filter` 逃生口。
 8. smoke 脚本与文档对齐（CHANGELOG / ops-notes / AGENTS.md）。
 
 ## Rollout
 
 - 行为变化集中在 `generate_model` 默认翻转：CHANGELOG 与 ops-notes 标注；纯数据同步站点升级前改用 `--no-generate-model`。
-- 升级后第一轮 watch 对存量断更站点只告警（洞语义），不自动重建；运维按告警清单分批执行 `catch-up --allow-full-regen`。
+- 升级后第一轮 watch 对存量断更站点只告警（洞语义），不自动重建；运维按告警清单分批执行绑定数据锚点的受控 catch-up/repair。
 - 验证遵循 AGENTS.md 约束：CLI `--json` 断言 + `db-data/*.surql` + `scripts/smoke/*.ps1`，不使用 `cargo test`。
 
 ## Dependencies

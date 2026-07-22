@@ -8,8 +8,6 @@ use log::{debug, error, info, warn};
 #[allow(unused_imports)]
 use aios_core::SUL_MEM_DB;
 
-#[cfg(feature = "generation-read-ducklake")]
-use aios_core::db::DbBasicData;
 #[cfg(feature = "sql")]
 use aios_core::db_pool::get_global_pool;
 use aios_core::get_default_pdms_db_info;
@@ -57,13 +55,6 @@ use crate::consts::*;
 use crate::data_interface::tidb_manager::AiosDBManager;
 // use crate::graph_db::pdms_arango::*;
 use crate::tables::*;
-#[cfg(feature = "generation-read-ducklake")]
-use crate::version_store::replica::{ReplicaDbCatalogEntry, ReplicaElement};
-#[cfg(feature = "generation-read-ducklake")]
-use crate::version_store::{
-    DbCatalogEntry, DuckLakeAuthority, DuckLakeConfig, DuckLakeParseStager, ParseStageVersion,
-    ParsedFactBatch, ReplicaApplyBatch, SealedParseStage, SurrealReplicaStore, VersionStoreElement,
-};
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
 use crate::versioned_db::version_commit::{
@@ -893,24 +884,6 @@ where
     if db_option.included_projects.is_empty() {
         return Err(anyhow::anyhow!("没有包含的项目"));
     }
-    #[cfg(feature = "generation-read-ducklake")]
-    {
-        let options = crate::options::get_db_option_ext();
-        if options.parse_storage_backend.uses_ducklake() {
-            options.validate_parse_storage_features()?;
-            let callback = progress_callback
-                .as_mut()
-                .map(|callback| callback as &mut SyncProgressCallback<'_>);
-            return sync_pdms_to_ducklake(
-                db_option,
-                options.parse_storage_config(),
-                options.ducklake_config(),
-                callback,
-            )
-            .await;
-        }
-    }
-
     // 开始同步pdms/E3D项目的数据
     info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);
     let mut time = tokio::time::Instant::now();
@@ -1084,20 +1057,6 @@ where
 pub async fn sync_pdms(db_option: &DbOption) -> anyhow::Result<()> {
     if db_option.included_projects.is_empty() {
         return Err(anyhow::anyhow!("没有包含的项目"));
-    }
-    #[cfg(feature = "generation-read-ducklake")]
-    {
-        let options = crate::options::get_db_option_ext();
-        if options.parse_storage_backend.uses_ducklake() {
-            options.validate_parse_storage_features()?;
-            return sync_pdms_to_ducklake(
-                db_option,
-                options.parse_storage_config(),
-                options.ducklake_config(),
-                None,
-            )
-            .await;
-        }
     }
     // 开始同步pdms/E3D项目的数据
     info!("开始同步pdms/E3D: {} 的数据", &db_option.project_name);

@@ -75,3 +75,11 @@
 - **`.tree` 已退役**：解析与 CLI 不再写出 TreeIndex；`scene_tree/` 仅需 `db_meta_info.json`。站点上遗留的 `*.tree` 可删。
 - **层级数据**：latest 与 versioned 树查询均走 pe_owner（缺边时 pe.children 回退）。切换/增量前用 `scripts/smoke/pe_owner_children_audit.ps1`；不绿则 `model-version rebuild-pe-owner`。
 - **CLI**：`--gen-indextree` 已移除，改用 `--gen-db-meta`；配置 `gen_tree_only` → `gen_db_meta_only`，`index_tree_*` → `gen_pipeline_*`（见 `docs/guides/MIGRATION_GUIDE.md`）。
+
+### 模型生成欠账与属性门控（2026-07-23）
+
+- 数据提交成功后写 `model_gen_debt:[dbnum,to_sesno]`；模型失败不回滚数据锚点，欠账保留给后续 watch 重试。
+- watch 每轮都会比较数据水位与 model_gen 水位，即使源文件 sesno 没增长也会消费连续欠账；单库失败不阻断其他库。
+- `NAME/DESC/PURP/FUNCTION` 等确认元数据修改不进生成桶；未知属性与 UDA 默认触发。怀疑门控误判时使用 `--no-model-impact-filter`。
+- 欠账区间有洞时只报告 `needs_full_regen`，禁止 watch 自动整库重建；先用 `model-version catch-up --dbnum N --dry-run --json` 审计，再显式加 `--allow-full-regen`。
+- 模型生成现为默认行为；纯数据同步必须显式传 `--no-generate-model`。旧 `--generate-model` 只保留一版兼容。

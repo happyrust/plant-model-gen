@@ -121,7 +121,8 @@ impl ExecutionTuning {
             base_write_concurrency: opt.get_base_write_concurrency(),
             mesh_compute_concurrency: opt.get_mesh_compute_concurrency(),
             inst_aabb_write_concurrency: opt.get_inst_aabb_write_concurrency(),
-            read_backend: opt.generation_read_backend.as_str().to_string(),
+            // specs/027（ADR-0008）：generation_read_backend 退役后统一 Surreal 主表直读。
+            read_backend: "surreal".to_string(),
             writer_backend: opt.model_writer_mode.as_str().to_string(),
             output_root: opt.output_root.clone(),
             export_formats: opt.mesh_formats.clone(),
@@ -601,7 +602,6 @@ mod tests {
         right.base_write_concurrency = 7;
         right.mesh_compute_concurrency = 6;
         right.inst_aabb_write_concurrency = 5;
-        right.generation_read_backend = crate::options::GenerationReadBackendMode::DuckLake;
         right.model_writer_mode = crate::options::ModelWriterMode::DrainOnly;
         right.output_root = Some("somewhere-else".into());
         right.mesh_formats = vec![MeshFormat::Obj, MeshFormat::Glb];

@@ -1,8 +1,9 @@
 # 解析零版本重构方案：版本仅由增量产生，单源 Surreal MVCC + 锚点
 
-> grill-with-docs 定案产物（2026-07-22）。决策记录：ADR-0007（supersede ADR-0002）、ADR-0008（supersede ADR-0003）；术语变更已入根 `CONTEXT.md`。
+> grill-with-docs 第一轮定案产物（2026-07-22）。决策记录：ADR-0007（supersede ADR-0002）、ADR-0008（supersede ADR-0003）；2026-07-23 的 ADR-0010 已修订初始化 staging、首次增量 baseline、多库 barrier、no-op 与 repair 边界。
 > **实施规格已转 speckit：`specs/027-version-single-source-refactor/`（spec/plan/tasks 三件套，为实施口径之准）；本文保留定案过程与 M6 伴生加固轨道。**
-> 原则一句话：**全量解析不写任何版本痕迹；数据版本与模型版本都只由增量链路以增量生成的方式产生；版本真相单源 = SurrealDB(RocksDB) MVCC + `sesno_version_anchor`。**
+> 原则一句话：**初始化解析不写数据版本；初始化全量生成只发布模型基线，数据历史从首次增量 baseline 起版；版本真相单源 = SurrealDB(RocksDB) MVCC + `sesno_version_anchor`。**
+> 下文 M1/M6 和旧验证剧本保留第一轮推导现场；与 ADR-0010 不一致之处一律以 specs/027 当前三件套为准。
 
 ## 定案汇总（Q1–Q6）
 
@@ -48,8 +49,8 @@
 - specs/024（unified-rocksdb-versioning）、specs/025（versioned-generation-read-session）加状态注记指向 ADR-0007/0008；specs/022 ops-notes 与 AGENTS.md 的增量说明段核对措辞（Committed Watermark 语义未变）。
 - ADR-0006 不动（水位/欠账闭环不受影响，其 depends_on 是历史记录）。
 
-### M6 伴生加固（独立可执行，来自 2026-07-22 brooks-review）
-- **锁进 seam**：`run_increment` 在 `persist_data || generate_model` 时自持 `ProjectMutationLock`（支持调用方声明已持有），封死 HTTP 生成路径（`incremental_update_handlers.rs`、`stream_generate.rs`）绕锁并发窗口。
+### M6 伴生加固（来自 2026-07-22 brooks-review）
+- **已升格为 specs/027 核心要求**：`run_increment`、初始化、catch-up/repair 深层 seam 自持 `ProjectMutationLock`，以不可伪造的持锁令牌支持组合调用；不再属于可并行跳过的伴生轨道。
 - **活动 db 文件解析收敛**：删 `sesno_increment.rs` 中 `inactive_db_path`/`db_candidate_rank`/`discover_active_db_file_for_dbnum` 三份拷贝，统一走 db_index（discover 仅作索引 miss 显式回退且与预扫描同规则）。
 - 其余 findings（错误子串匹配→结构化 kind、pe 行 builder 收敛、水位查询去重、unclassified 计数）按 review 报告顺序择机处理；其中"committed_watermark ducklake fork"与"状态端点水位二次实现"两条随 M2 自然消灭。
 
@@ -58,8 +59,8 @@
 2. 冒烟：`scripts/smoke/unified_versioning_e2e.ps1`、`anchor_continuity_audit.ps1`、`pe_owner_incr_shapes_smoke.ps1`。
 3. web_server 起服务后 HTTP 实测：`/api/incremental/*` 状态与 sync/detect、`execute_incremental_update`（ParseOnly 与 ParseAndModel 各一次）。
 4. 配置检测手测：带 `generation_read_backend=compare` 的 toml 启动必须硬错误且指引明确；带惰性 `ducklake_*` 键启动必须仅警告。
-5. 新站剧本：全量解析 → 确认零版本痕迹（无 full 锚点）→ 全量生成 → 确认 model_gen 起点锚点 → 首次增量 → watermark 从 dbnum_info 基线衔接、欠账闭环不误报。
+5. 新站剧本：versioned staging 初始化解析 → 确认无数据锚点 → 全量生成并发布 model_gen 基线 → 原子启用 → 首次增量发布 incremental_baseline + incremental → 前后 diff 与欠账闭环均可断言。
 
 ## 风险与顺序
 - **当前工作区未检测到 git 仓库**：M2 删除面动工前先初始化版本控制或做目录快照，这是本方案唯一的回滚保障。
-- 顺序建议：盘点清单 → M2（删除面，编译门通过）→ M1 → M3 → M4 → M5 收尾 → M6 随时插队。M2 先行是因为删除面最大、编译器会把 M1/M3 的遗漏点暴露出来。
+- 当前实施顺序已由 `specs/027-version-single-source-refactor/plan.md` 重排；尤其主表 adapter/Surreal unit ledger 必须先可用，再删除 replica/DuckLake 调用方，避免出现不可构建中间态。

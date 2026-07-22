@@ -6,7 +6,7 @@ use aios_core::pdms_types::{
     BRAN_COMPONENT_NOUN_NAMES, GNERAL_LOOP_OWNER_NOUN_NAMES, GNERAL_PRIM_NOUN_NAMES,
     TOTAL_CATA_GEO_NOUN_NAMES, TOTAL_LOOP_NOUN_NAMES, TOTAL_VERT_NOUN_NAMES, USE_CATE_NOUN_NAMES,
 };
-use aios_core::{RefU64, RefnoEnum, project_primary_db};
+use aios_core::{NamedAttrValue, RefU64, RefnoEnum, project_primary_db};
 use anyhow::Context;
 use once_cell::sync::Lazy;
 use parse_pdms_db::parse::EleData;
@@ -179,6 +179,10 @@ pub struct PdmsSesnoElementChange {
     pub operation: String,
     pub noun: String,
     pub owner_refno: Option<RefnoEnum>,
+    #[serde(default)]
+    pub changed_attributes: Vec<String>,
+    pub impact_decision: String,
+    pub impact_reason: String,
     pub classified: bool,
     pub model_category: Option<String>,
     pub model_refno: Option<RefnoEnum>,
@@ -195,6 +199,7 @@ pub struct PdmsSesnoIncrementOutcome {
 pub struct PdmsSesnoCollectedFile {
     pub report: PdmsSesnoIncrementFileReport,
     pub grouped_operations: BTreeMap<u32, Vec<EleOperationData>>,
+    pub update_log: IncrGeoUpdateLog,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -310,6 +315,7 @@ fn collected_outcome_for_file(
     update_log: IncrGeoUpdateLog,
     element_changes: Vec<PdmsSesnoElementChange>,
 ) -> PdmsSesnoCollectedOutcome {
+    let file_update_log = update_log.clone();
     PdmsSesnoCollectedOutcome {
         outcome: PdmsSesnoIncrementOutcome {
             files: vec![report.clone()],
@@ -319,6 +325,7 @@ fn collected_outcome_for_file(
         files: vec![PdmsSesnoCollectedFile {
             report,
             grouped_operations,
+            update_log: file_update_log,
         }],
     }
 }
@@ -515,11 +522,21 @@ fn operation_kind(operation: &EleOperationData) -> &'static str {
     }
 }
 
-fn modified_element_affects_model(modified: &pdms_io::io::ModifiedElement) -> bool {
-    if modified.children_changed.is_some() {
-        return true;
+#[derive(Debug, Clone)]
+struct OperationModelImpact {
+    decision: &'static str,
+    reason: &'static str,
+    changed_attributes: Vec<String>,
+}
+
+impl OperationModelImpact {
+    fn triggers_model(&self) -> bool {
+        self.decision != "neutral"
     }
-    modified
+}
+
+fn collect_modified_attribute_names(modified: &pdms_io::io::ModifiedElement) -> Vec<String> {
+    let mut names = modified
         .added_attrs
         .keys()
         .chain(modified.deleted_attrs.keys())
@@ -527,33 +544,134 @@ fn modified_element_affects_model(modified: &pdms_io::io::ModifiedElement) -> bo
         .chain(modified.added_explicit_attrs.keys())
         .chain(modified.deleted_explicit_attrs.keys())
         .chain(modified.modified_explicit_attrs.keys())
-        .any(|name| crate::version_management::model_impact::attribute_affects_model(name))
+        .map(|name| crate::version_management::model_impact::normalize_attribute_name(name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    names.extend(
+        modified
+            .added_uda_attrs
+            .keys()
+            .chain(modified.deleted_uda_attrs.keys())
+            .chain(modified.modified_uda_attrs.keys())
+            .map(|id| format!("UDA:{id}")),
+    );
+    names.sort();
+    names.dedup();
+    names
 }
 
-fn operation_is_known_model_noop(operation: &EleOperationData) -> bool {
-    matches!(
-        &operation.detail,
-        EleOperationDetail::Modified(modified) if !modified_element_affects_model(modified)
-    )
+fn classify_modified_element(
+    modified: &pdms_io::io::ModifiedElement,
+    model_impact_filter: bool,
+) -> OperationModelImpact {
+    use crate::version_management::model_impact::{
+        AttributeModelImpact, classify_attribute_model_impact,
+    };
+
+    let changed_attributes = collect_modified_attribute_names(modified);
+    if modified.children_changed.is_some() {
+        return OperationModelImpact {
+            decision: "trigger",
+            reason: "children_changed",
+            changed_attributes,
+        };
+    }
+    if changed_attributes
+        .iter()
+        .any(|name| matches!(name.as_str(), "OWNER"))
+    {
+        return OperationModelImpact {
+            decision: "trigger",
+            reason: "owner_changed",
+            changed_attributes,
+        };
+    }
+    if changed_attributes
+        .iter()
+        .any(|name| matches!(name.as_str(), "NOUN" | "TYPE"))
+    {
+        return OperationModelImpact {
+            decision: "trigger",
+            reason: "noun_changed",
+            changed_attributes,
+        };
+    }
+    if !model_impact_filter {
+        return OperationModelImpact {
+            decision: "trigger",
+            reason: "model_impact_filter_disabled",
+            changed_attributes,
+        };
+    }
+    if changed_attributes.iter().any(|name| name.starts_with("UDA:")) {
+        return OperationModelImpact {
+            decision: "unknown_fallback",
+            reason: "unknown_uda",
+            changed_attributes,
+        };
+    }
+
+    let mut has_model_input = false;
+    let mut has_unknown = changed_attributes.is_empty();
+    for name in &changed_attributes {
+        match classify_attribute_model_impact(name) {
+            AttributeModelImpact::AffectsModel => has_model_input = true,
+            AttributeModelImpact::KnownNeutral => {}
+            AttributeModelImpact::Unknown => has_unknown = true,
+        }
+    }
+    let (decision, reason) = if has_model_input {
+        ("trigger", "geometry_attribute")
+    } else if has_unknown {
+        ("unknown_fallback", "unknown_attribute")
+    } else {
+        ("neutral", "known_neutral")
+    };
+    OperationModelImpact {
+        decision,
+        reason,
+        changed_attributes,
+    }
+}
+
+fn classify_operation(
+    operation: &EleOperationData,
+    model_impact_filter: bool,
+) -> OperationModelImpact {
+    match &operation.detail {
+        EleOperationDetail::Add(_) => OperationModelImpact {
+            decision: "trigger",
+            reason: "added",
+            changed_attributes: Vec::new(),
+        },
+        EleOperationDetail::Deleted => OperationModelImpact {
+            decision: "trigger",
+            reason: "deleted",
+            changed_attributes: Vec::new(),
+        },
+        EleOperationDetail::Modified(modified) => {
+            classify_modified_element(modified, model_impact_filter)
+        }
+        EleOperationDetail::None => OperationModelImpact {
+            decision: "neutral",
+            reason: "none_operation",
+            changed_attributes: Vec::new(),
+        },
+    }
 }
 
 fn apply_pdms_operation(
     io: &mut PdmsIO,
     update_log: &mut IncrGeoUpdateLog,
     operation: &EleOperationData,
+    impact: &OperationModelImpact,
 ) -> Option<PdmsModelChangeTarget> {
     let refno = RefnoEnum::from(operation.refno);
     match &operation.detail {
         EleOperationDetail::Deleted => insert_change_by_noun(update_log, refno, "DELETED", true)
             .map(|category| PdmsModelChangeTarget { refno, category }),
-        EleOperationDetail::None => {
-            remove_refno_from_log(update_log, refno);
-            None
-        }
-        EleOperationDetail::Modified(modified) if !modified_element_affects_model(modified) => {
-            remove_refno_from_log(update_log, refno);
-            None
-        }
+        EleOperationDetail::None => None,
+        EleOperationDetail::Modified(_) if !impact.triggers_model() => None,
         _ => {
             let noun = operation.get_noun_type();
             if is_loop_container_noun(&noun) {
@@ -578,8 +696,128 @@ fn apply_pdms_operation(
                 }
                 return None;
             }
-            insert_change_by_noun(update_log, refno, &noun, false)
-                .map(|category| PdmsModelChangeTarget { refno, category })
+            match insert_change_by_noun(update_log, refno, &noun, false) {
+                Some(category) => Some(PdmsModelChangeTarget { refno, category }),
+                None
+                    if impact
+                        .changed_attributes
+                        .iter()
+                        .any(|name| matches!(name.as_str(), "NOUN" | "TYPE")) =>
+                {
+                    insert_change_by_noun(update_log, refno, "DELETED", true)
+                        .map(|category| PdmsModelChangeTarget { refno, category })
+                }
+                None => None,
+            }
+        }
+    }
+}
+
+fn named_attr_refno(value: &NamedAttrValue) -> Option<RefnoEnum> {
+    match value {
+        NamedAttrValue::RefU64Type(value) => Some(RefnoEnum::from(*value)),
+        NamedAttrValue::RefnoEnumType(value) => Some(*value),
+        _ => None,
+    }
+    .filter(RefnoEnum::is_valid)
+}
+
+fn insert_existing_model_target(
+    io: &mut PdmsIO,
+    update_log: &mut IncrGeoUpdateLog,
+    refno: RefnoEnum,
+    sesno: u32,
+) {
+    let Some((_, offset)) = io.search_latest_refno(refno.refno(), Some(sesno)) else {
+        return;
+    };
+    let Ok(ele) = io.parse_raw_element(offset) else {
+        return;
+    };
+    let noun = ele.att_map().get_type();
+    if is_loop_container_noun(&noun) {
+        if let Some((owner_refno, owner_noun)) =
+            resolve_non_container_owner(io, element_owner_refno(&ele), sesno)
+        {
+            if owner_noun.is_empty() {
+                update_log.loop_owner_refnos.insert(owner_refno);
+            } else {
+                insert_change_by_noun(update_log, owner_refno, &owner_noun, false);
+            }
+        }
+    } else {
+        insert_change_by_noun(update_log, refno, &noun, false);
+    }
+}
+
+fn apply_critical_model_expansion(
+    io: &mut PdmsIO,
+    update_log: &mut IncrGeoUpdateLog,
+    operation: &EleOperationData,
+    impact: &OperationModelImpact,
+) {
+    let EleOperationDetail::Modified(modified) = &operation.detail else {
+        return;
+    };
+    if !impact.triggers_model() {
+        return;
+    }
+
+    if impact
+        .changed_attributes
+        .iter()
+        .any(|name| name == "OWNER")
+    {
+        for (name, (old, new)) in &modified.modified_attrs {
+            if crate::version_management::model_impact::normalize_attribute_name(name) == "OWNER" {
+                if let Some(old_owner) = named_attr_refno(old) {
+                    insert_existing_model_target(
+                        io,
+                        update_log,
+                        old_owner,
+                        operation.sesno.saturating_sub(1),
+                    );
+                }
+                if let Some(new_owner) = named_attr_refno(new) {
+                    insert_existing_model_target(io, update_log, new_owner, operation.sesno);
+                }
+            }
+        }
+        for (name, value) in &modified.deleted_attrs {
+            if crate::version_management::model_impact::normalize_attribute_name(name) == "OWNER"
+                && let Some(old_owner) = named_attr_refno(value)
+            {
+                insert_existing_model_target(
+                    io,
+                    update_log,
+                    old_owner,
+                    operation.sesno.saturating_sub(1),
+                );
+            }
+        }
+        if let Some(new_owner) = operation_owner_refno(operation) {
+            insert_existing_model_target(io, update_log, new_owner, operation.sesno);
+        }
+    }
+
+    if let Some((old_children, new_children)) = &modified.children_changed {
+        let old = old_children.0.iter().copied().collect::<HashSet<_>>();
+        let new = new_children.0.iter().copied().collect::<HashSet<_>>();
+        for child in old.difference(&new) {
+            insert_existing_model_target(
+                io,
+                update_log,
+                RefnoEnum::from(*child),
+                operation.sesno.saturating_sub(1),
+            );
+        }
+        for child in new.difference(&old) {
+            insert_existing_model_target(
+                io,
+                update_log,
+                RefnoEnum::from(*child),
+                operation.sesno,
+            );
         }
     }
 }
@@ -953,12 +1191,13 @@ pub async fn persist_collected_pdms_increment_files(
 /// `cached_sesno` 表示当前系统已解析/缓存到的版本；实际读取范围从
 /// `cached_sesno + 1` 到 `to_sesno`（省略则使用文件最新 sesno）。
 /// 该函数只读源文件并构造模型增量日志，不写 SurrealDB/SQLite。
-pub fn collect_pdms_increment_for_file_with_operations(
+pub fn collect_pdms_increment_for_file_with_operations_options(
     project: &str,
     file_path: impl AsRef<Path>,
     cached_sesno: u32,
     to_sesno: Option<u32>,
     detail: bool,
+    model_impact_filter: bool,
 ) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
     let file_path = file_path.as_ref();
     let source_sha256_before = crate::version_management::hashing::sha256_file(file_path)
@@ -1127,10 +1366,17 @@ pub fn collect_pdms_increment_for_file_with_operations(
                 EleOperationDetail::None => none_count += 1,
             }
 
-            let model_change = apply_pdms_operation(&mut io, &mut update_log, operation);
+            let impact = classify_operation(operation, model_impact_filter);
+            let model_change =
+                apply_pdms_operation(&mut io, &mut update_log, operation, &impact);
+            apply_critical_model_expansion(&mut io, &mut update_log, operation, &impact);
             let classified = model_change.is_some()
                 || is_none_operation
-                || operation_is_known_model_noop(operation);
+                || !impact.triggers_model()
+                || matches!(
+                    impact.reason,
+                    "owner_changed" | "children_changed" | "noun_changed"
+                );
             if !classified {
                 println!(
                     "警告：未知 PDMS noun/type {} 对于 refno {}",
@@ -1147,6 +1393,9 @@ pub fn collect_pdms_increment_for_file_with_operations(
                 operation: operation_kind(operation).to_string(),
                 noun: operation.get_noun_type(),
                 owner_refno: operation_owner_refno(operation),
+                changed_attributes: impact.changed_attributes,
+                impact_decision: impact.decision.to_string(),
+                impact_reason: impact.reason.to_string(),
                 classified,
                 model_category: model_change.map(|change| change.category.to_string()),
                 model_refno: model_change.map(|change| change.refno),
@@ -1180,6 +1429,23 @@ pub fn collect_pdms_increment_for_file_with_operations(
     ))
 }
 
+pub fn collect_pdms_increment_for_file_with_operations(
+    project: &str,
+    file_path: impl AsRef<Path>,
+    cached_sesno: u32,
+    to_sesno: Option<u32>,
+    detail: bool,
+) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
+    collect_pdms_increment_for_file_with_operations_options(
+        project,
+        file_path,
+        cached_sesno,
+        to_sesno,
+        detail,
+        true,
+    )
+}
+
 pub fn collect_pdms_increment_for_file(
     project: &str,
     file_path: impl AsRef<Path>,
@@ -1199,13 +1465,14 @@ pub fn collect_pdms_increment_for_file(
 
 /// 通过 db_index.sqlite 将 dbnum 定位到实际 db 文件，再按 sesno 收集增量。
 #[cfg(feature = "sqlite-index")]
-pub fn collect_pdms_increment_for_dbnums_from_index_with_operations(
+pub fn collect_pdms_increment_for_dbnums_from_index_with_operations_options(
     project: &str,
     index_path: impl AsRef<Path>,
     dbnums: &[u32],
     cached_sesno: u32,
     to_sesno: Option<u32>,
     detail: bool,
+    model_impact_filter: bool,
 ) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
     let store = crate::data_interface::db_index::DbIndexStore::open(index_path)?;
     let mut outcome = PdmsSesnoCollectedOutcome::default();
@@ -1225,18 +1492,39 @@ pub fn collect_pdms_increment_for_dbnums_from_index_with_operations(
             };
             (record_project, PathBuf::from(record.file_path))
         };
-        let file_outcome = collect_pdms_increment_for_file_with_operations(
+        let file_outcome = collect_pdms_increment_for_file_with_operations_options(
             &record_project,
             &record_path,
             cached_sesno,
             to_sesno,
             detail,
+            model_impact_filter,
         )
         .with_context(|| format!("dbnum={} 增量收集失败", dbnum))?;
         outcome.merge(file_outcome);
     }
 
     Ok(outcome)
+}
+
+#[cfg(feature = "sqlite-index")]
+pub fn collect_pdms_increment_for_dbnums_from_index_with_operations(
+    project: &str,
+    index_path: impl AsRef<Path>,
+    dbnums: &[u32],
+    cached_sesno: u32,
+    to_sesno: Option<u32>,
+    detail: bool,
+) -> anyhow::Result<PdmsSesnoCollectedOutcome> {
+    collect_pdms_increment_for_dbnums_from_index_with_operations_options(
+        project,
+        index_path,
+        dbnums,
+        cached_sesno,
+        to_sesno,
+        detail,
+        true,
+    )
 }
 
 #[cfg(feature = "sqlite-index")]

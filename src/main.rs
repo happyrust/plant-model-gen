@@ -997,7 +997,20 @@ async fn main() -> anyhow::Result<()> {
                 .arg(
                     Arg::new("generate-model")
                         .long("generate-model")
-                        .help("收集增量后调用 gen_all_geos_data(..., Some(update_log))")
+                        .help("兼容参数：模型生成现已默认开启；后续版本将移除")
+                        .conflicts_with("no-generate-model")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-generate-model")
+                        .long("no-generate-model")
+                        .help("仅提交 PE/ATT 与模型欠账，不消费欠账、不发布 model_gen 锚点")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-model-impact-filter")
+                        .long("no-model-impact-filter")
+                        .help("关闭属性影响过滤，让所有 Modified 元素进入模型更新桶")
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
@@ -1048,7 +1061,20 @@ async fn main() -> anyhow::Result<()> {
                 .arg(
                     Arg::new("generate-model")
                         .long("generate-model")
-                        .help("发现增量后同步触发模型增量生成")
+                        .help("兼容参数：模型生成现已默认开启；后续版本将移除")
+                        .conflicts_with("no-generate-model")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-generate-model")
+                        .long("no-generate-model")
+                        .help("仅提交数据与模型欠账，不消费模型欠账")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no-model-impact-filter")
+                        .long("no-model-impact-filter")
+                        .help("关闭属性影响过滤，让所有 Modified 元素进入模型更新桶")
                         .action(clap::ArgAction::SetTrue),
                 )
                 .arg(
@@ -1391,6 +1417,7 @@ async fn main() -> anyhow::Result<()> {
             || mv.subcommand_matches("resolve-anchor").is_some()
             || mv.subcommand_matches("bootstrap-generation-read").is_some()
             || mv.subcommand_matches("backfill-pe-cata-hash").is_some()
+            || mv.subcommand_matches("catch-up").is_some()
             || mv.subcommand_matches("rebuild-pe-owner").is_some()
         {
             crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
@@ -2944,6 +2971,9 @@ async fn main() -> anyhow::Result<()> {
             .copied()
             .expect("required by clap");
         let json_output = incr_matches.get_flag("json");
+        if incr_matches.get_flag("generate-model") {
+            eprintln!("⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭");
+        }
         let options = IncrementRunOptions {
             file: incr_matches.get_one::<String>("file").map(PathBuf::from),
             dbnums: incr_matches
@@ -2955,7 +2985,8 @@ async fn main() -> anyhow::Result<()> {
             rescan_index: incr_matches.get_flag("rescan-index"),
             persist_data: !incr_matches.get_flag("no-persist"),
             recover_pending: incr_matches.get_flag("recover-pending"),
-            generate_model: incr_matches.get_flag("generate-model"),
+            generate_model: !incr_matches.get_flag("no-generate-model"),
+            model_impact_filter: !incr_matches.get_flag("no-model-impact-filter"),
             require_pe_owner_ready: incr_matches.get_flag("require-pe-owner-ready"),
             verbose,
         };
@@ -2975,12 +3006,19 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        if !result.failures.is_empty() {
+            aios_database::perf_metrics::finalize_task_metrics(false);
+            anyhow::bail!("incremental-sesno completed with failures: {}", result.failures.join("; "));
+        }
         aios_database::perf_metrics::finalize_task_metrics(true);
         return Ok(());
     }
 
     // ========== 处理 watch-incremental 子命令 ==========
     if let Some(watch_matches) = matches.subcommand_matches("watch-incremental") {
+        if watch_matches.get_flag("generate-model") {
+            eprintln!("⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭");
+        }
         crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         aios_database::version_management::watch_incremental::run_watch_incremental(
             &db_option_ext,
@@ -2995,7 +3033,8 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(30),
                 once: watch_matches.get_flag("once"),
                 force_initial_scan: watch_matches.get_flag("force-initial-scan"),
-                generate_model: watch_matches.get_flag("generate-model"),
+                generate_model: !watch_matches.get_flag("no-generate-model"),
+                model_impact_filter: !watch_matches.get_flag("no-model-impact-filter"),
                 require_pe_owner_ready: watch_matches.get_flag("require-pe-owner-ready"),
                 json_output: watch_matches.get_flag("json"),
                 verbose,

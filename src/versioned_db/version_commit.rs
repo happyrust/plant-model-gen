@@ -343,23 +343,8 @@ where
     })
 }
 
-#[cfg(feature = "generation-read-ducklake")]
-async fn publish_authority_after_apply(request: &VersionCommitRequest) -> anyhow::Result<()> {
-    crate::version_store::publish_legacy_applied_state(
-        crate::version_store::LegacyAuthorityPublishRequest {
-            dbnum: request.dbnum,
-            from_sesno: request.from_sesno,
-            to_sesno: request.to_sesno,
-            source: request.source.as_str().to_string(),
-            commit_fingerprint: request.fingerprint.clone(),
-            source_hash: request.source_hash.clone(),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-#[cfg(not(feature = "generation-read-ducklake"))]
+// specs/027（ADR-0007）：DuckLake 权威链退役后，apply 后不再向外部权威发布，
+// Surreal MVCC + sesno 锚点即版本单源。
 async fn publish_authority_after_apply(_request: &VersionCommitRequest) -> anyhow::Result<()> {
     Ok(())
 }
@@ -873,17 +858,6 @@ fn next_owner() -> String {
     format!("{}-{millis}-{sequence}", std::process::id())
 }
 
-/// 正式版本化路径的唯一权威提交水位。
-#[cfg(feature = "generation-read-ducklake")]
-pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
-    let config = crate::options::get_db_option_ext().ducklake_config();
-    tokio::task::spawn_blocking(move || {
-        crate::version_store::DuckLakeAuthority::open(config)?.committed_watermark(dbnum)
-    })
-    .await
-    .map_err(|error| anyhow!("DuckLake committed watermark task join failed: {error}"))?
-}
-
 /// specs/022 Committed Watermark：某 dbnum 已发布 Version Anchor 的最高 sesno。
 ///
 /// 增量采集的唯一合法起点（见 CONTEXT.md）：优先读 `sesno_version_anchor`；
@@ -896,7 +870,6 @@ pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
 ///
 /// 它同时是 `commit_while_leased` 连续性门禁（`ContinuityGap`）的基准水位，
 /// 增量提交的 `from_sesno` 必须与该值衔接（`<= watermark + 1`）。
-#[cfg(not(feature = "generation-read-ducklake"))]
 pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
     let sql = format!(
         "math::max(array::flatten([SELECT VALUE sesno FROM sesno_version_anchor \

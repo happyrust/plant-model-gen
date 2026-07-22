@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-23
+
+### Changed — 增量模型生成默认开启并支持欠账自愈
+
+- `incremental-sesno`、`watch-incremental` 与 Web sync 默认在数据提交后生成模型；新增 `--no-generate-model`，旧 `--generate-model` 暂留一版兼容提示。
+- Modified 元素按属性三态判定：确认的元数据修改不生成，未知属性和 UDA 保守触发；新增 `--no-model-impact-filter` 逃生口。
+- 数据锚点成功后幂等写入 `model_gen_debt`；生成失败不回滚数据，watch 后续轮次自动追赶连续欠账。
+- 新增 `model-version catch-up --dbnum ... [--dry-run] [--json] [--allow-full-regen]`；欠账有洞时 watch 只告警，整库追平必须显式授权。
+
 ## 2026-07-21
 
 ### Changed — GenPipeline：配置硬切 + 运行时仅 pe_owner（PR-1）

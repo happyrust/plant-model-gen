@@ -19,6 +19,7 @@ pub struct WatchIncrementalOptions {
     pub once: bool,
     pub force_initial_scan: bool,
     pub generate_model: bool,
+    pub model_impact_filter: bool,
     /// specs/023 M3/T8：触发增量模型生成前要求 pe_owner 完整性证据就绪。
     pub require_pe_owner_ready: bool,
     pub json_output: bool,
@@ -32,7 +33,8 @@ impl Default for WatchIncrementalOptions {
             interval_secs: 30,
             once: false,
             force_initial_scan: false,
-            generate_model: false,
+            generate_model: true,
+            model_impact_filter: true,
             require_pe_owner_ready: false,
             json_output: false,
             verbose: false,
@@ -147,6 +149,49 @@ async fn run_with_sqlite_index(
                 continue;
             }
             if record.latest_sesno <= watermark {
+                if options.generate_model {
+                    match super::model_gen_catchup::catch_up_model_generation(
+                        db_option_ext,
+                        record.dbnum,
+                        super::model_gen_catchup::ModelGenCatchUpOptions {
+                            require_pe_owner_ready: options.require_pe_owner_ready,
+                            allow_full_regen: false,
+                            dry_run: db_option_ext.gen_model_dry_run,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(result) if result.coverage.needs_full_regen => {
+                            eprintln!(
+                                "⚠️ dbnum={} 模型欠账存在区间洞，需要显式 model-version catch-up --allow-full-regen",
+                                record.dbnum
+                            );
+                            if options.json_output {
+                                cycle_summaries.push(serde_json::to_value(result)?);
+                            }
+                        }
+                        Ok(result) => {
+                            if let Some(anchor) = &result.model_gen_anchor {
+                                update_count += 1;
+                                println!(
+                                    "✅ dbnum={} 模型欠账已追平到 sesno={}",
+                                    anchor.dbnum, anchor.sesno
+                                );
+                            }
+                            if options.json_output
+                                && (result.generation_success.is_some()
+                                    || !result.coverage.coverage_complete)
+                            {
+                                cycle_summaries.push(serde_json::to_value(result)?);
+                            }
+                        }
+                        Err(error) => {
+                            let message = format!("模型欠账追赶失败: {error:#}");
+                            eprintln!("❌ dbnum={} {}", record.dbnum, message);
+                            cycle_failures.push((record.dbnum, message));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -165,6 +210,7 @@ async fn run_with_sqlite_index(
                     persist_data: true,
                     recover_pending: false,
                     generate_model: options.generate_model,
+                    model_impact_filter: options.model_impact_filter,
                     require_pe_owner_ready: options.require_pe_owner_ready,
                     verbose: options.verbose,
                 },
@@ -184,6 +230,9 @@ async fn run_with_sqlite_index(
                             "dbnum={} 已提交，但 MQTT 源文件发布失败: {error:#}",
                             record.dbnum
                         );
+                    }
+                    if !result.failures.is_empty() {
+                        cycle_failures.push((record.dbnum, result.failures.join("; ")));
                     }
                     if options.json_output {
                         cycle_summaries.push(result.summary);

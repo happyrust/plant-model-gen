@@ -307,6 +307,35 @@ pub fn model_version_command() -> Command {
                 .arg(json_arg()),
         )
         .subcommand(
+            Command::new("catch-up")
+                .about("Inspect or consume model generation debt up to the committed data watermark")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .action(clap::ArgAction::Append)
+                        .num_args(1..)
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("allow-full-regen")
+                        .long("allow-full-regen")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Allow an explicit full regeneration when the debt interval has a gap"),
+                )
+                .arg(
+                    Arg::new("require-pe-owner-ready")
+                        .long("require-pe-owner-ready")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
             Command::new("rebuild-pe-owner")
                 .about(
                     "specs/023: rebuild pe_owner edges for a dbnum from current pe.children, then mark pe_owner_version_meta (source=rebuild_cli)",
@@ -403,10 +432,85 @@ pub async fn handle_model_version_command(
             handle_generation_read_bootstrap_command(sub, db_option_ext).await?
         }
         Some(("backfill-pe-cata-hash", sub)) => handle_backfill_pe_cata_hash_command(sub).await?,
+        Some(("catch-up", sub)) => handle_model_gen_catch_up_command(sub, db_option_ext).await?,
         Some(("rebuild-pe-owner", sub)) => handle_rebuild_pe_owner_command(sub).await?,
         _ => unreachable!("subcommand_required by clap"),
     }
     Ok(true)
+}
+
+async fn handle_model_gen_catch_up_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    let _mutation_lock = super::project_mutation_lock::ProjectMutationLock::acquire_for_current_command(
+        db_option_ext,
+    )?;
+    let dbnums = sub
+        .get_many::<u32>("dbnum")
+        .expect("required by clap")
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let dry_run = sub.get_flag("dry-run");
+    let allow_full_regen = sub.get_flag("allow-full-regen");
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    for dbnum in dbnums {
+        match super::model_gen_catchup::catch_up_model_generation(
+            db_option_ext,
+            dbnum,
+            super::model_gen_catchup::ModelGenCatchUpOptions {
+                require_pe_owner_ready: sub.get_flag("require-pe-owner-ready"),
+                allow_full_regen,
+                dry_run,
+            },
+        )
+        .await
+        {
+            Ok(result) => {
+                if result.coverage.needs_full_regen && !allow_full_regen && !dry_run {
+                    failures.push(format!(
+                        "dbnum={dbnum} needs --allow-full-regen because debt coverage has a gap"
+                    ));
+                }
+                results.push(result);
+            }
+            Err(error) => failures.push(format!("dbnum={dbnum}: {error:#}")),
+        }
+    }
+    if sub.get_flag("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "results": results,
+                "failures": failures,
+            }))?
+        );
+    } else {
+        for result in &results {
+            println!(
+                "model catch-up dbnum={} data={} model={} coverage_complete={} needs_full_regen={} generated={:?} anchor={}",
+                result.dbnum,
+                result.coverage.data_watermark,
+                result.coverage.model_generation_watermark,
+                result.coverage.coverage_complete,
+                result.coverage.needs_full_regen,
+                result.generation_success,
+                result
+                    .model_gen_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.sesno.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+        for failure in &failures {
+            eprintln!("❌ {failure}");
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("model catch-up failed for {} dbnum(s)", failures.len());
+    }
+    Ok(())
 }
 
 #[cfg(all(

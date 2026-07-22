@@ -7,7 +7,7 @@
 //! `version_management::increment_run`（同一 IncrementRun seam），而非旁路实现。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
 };
@@ -65,6 +65,7 @@ async fn run_increment_once(
     to_sesno: Option<u32>,
     persist: bool,
     generate_model: bool,
+    model_impact_filter: bool,
 ) -> anyhow::Result<crate::version_management::increment_run::IncrementRunResult> {
     let db_option_ext = crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
     let options = crate::version_management::increment_run::IncrementRunOptions {
@@ -76,6 +77,7 @@ async fn run_increment_once(
         persist_data: persist,
         recover_pending: false,
         generate_model,
+        model_impact_filter,
         require_pe_owner_ready: false,
         verbose: false,
     };
@@ -99,7 +101,12 @@ fn record_run_result(
         entry.finished_at = Some(chrono::Utc::now().to_rfc3339());
         match result {
             Ok(run) => {
-                entry.state = "succeeded".to_string();
+                if run.failures.is_empty() {
+                    entry.state = "succeeded".to_string();
+                } else {
+                    entry.state = "failed".to_string();
+                    entry.error = Some(run.failures.join("; "));
+                }
                 entry.summary = Some(run.summary);
             }
             Err(err) => {
@@ -129,7 +136,12 @@ async fn set_dbnum_updating(dbnum: u32, updating: bool, result: Option<&str>) {
 }
 
 /// 后台跑一次 IncrementRun 并把结果写回注册表。persist=false 即 detect 试跑。
-async fn spawn_increment_run(dbnum: u32, persist: bool) -> Result<IncrementRunStatus, String> {
+async fn spawn_increment_run(
+    dbnum: u32,
+    persist: bool,
+    generate_model: bool,
+    model_impact_filter: bool,
+) -> Result<IncrementRunStatus, String> {
     let watermark = committed_watermark(dbnum)
         .await
         .map_err(|e| format!("查询 Committed Watermark 失败 dbnum={dbnum}: {e}"))?;
@@ -139,7 +151,13 @@ async fn spawn_increment_run(dbnum: u32, persist: bool) -> Result<IncrementRunSt
         ));
     }
 
-    let kind = if persist { "sync" } else { "detect" };
+    let kind = if generate_model {
+        "sync+generate"
+    } else if persist {
+        "sync"
+    } else {
+        "detect"
+    };
     let run_id = new_run_id(kind, dbnum);
     let status = IncrementRunStatus {
         run_id: run_id.clone(),
@@ -156,7 +174,15 @@ async fn spawn_increment_run(dbnum: u32, persist: bool) -> Result<IncrementRunSt
 
     let run_id_task = run_id.clone();
     tokio::spawn(async move {
-        let result = run_increment_once(dbnum, watermark, None, persist, false).await;
+        let result = run_increment_once(
+            dbnum,
+            watermark,
+            None,
+            persist,
+            generate_model,
+            model_impact_filter,
+        )
+        .await;
         record_run_result(&run_id_task, result);
     });
 
@@ -178,6 +204,7 @@ pub async fn execute_incremental_update(
     Json(request): Json<IncrementalUpdateRequest>,
 ) -> impl IntoResponse {
     let generate_model = !matches!(request.update_type, UpdateType::ParseOnly);
+    let model_impact_filter = !request.no_model_impact_filter;
     if generate_model && !cfg!(feature = "gen_model") {
         return (
             StatusCode::BAD_REQUEST,
@@ -262,7 +289,15 @@ pub async fn execute_incremental_update(
                 entry.started_at = chrono::Utc::now().to_rfc3339();
             }
             set_dbnum_updating(dbnum, true, None).await;
-            let result = run_increment_once(dbnum, watermark, to_sesno, true, generate_model).await;
+            let result = run_increment_once(
+                dbnum,
+                watermark,
+                to_sesno,
+                true,
+                generate_model,
+                model_impact_filter,
+            )
+            .await;
             let result_tag = if result.is_ok() { "Success" } else { "Failed" };
             record_run_result(&run_id, result);
             set_dbnum_updating(dbnum, false, Some(result_tag)).await;
@@ -699,7 +734,7 @@ pub async fn start_incremental_detection(
         Ok(dbnum) => dbnum,
         Err(resp) => return resp,
     };
-    match spawn_increment_run(dbnum, false).await {
+    match spawn_increment_run(dbnum, false, false, true).await {
         Ok(status) => (
             StatusCode::ACCEPTED,
             Json(json!({
@@ -720,24 +755,31 @@ pub async fn start_incremental_detection(
 
 /// 触发增量同步（真实落库，persist）：后台跑 IncrementRun，经 commit_version
 /// 固化 Version Anchor。persist-only，不触发模型生成（与 watch 语义一致）。
+#[derive(Debug, Deserialize, Default)]
+pub struct IncrementalSyncQuery {
+    #[serde(default)]
+    pub no_model_impact_filter: bool,
+}
+
 pub async fn start_incremental_sync(
     _state: State<AppState>,
     Path(site_id): Path<String>,
+    Query(query): Query<IncrementalSyncQuery>,
 ) -> impl IntoResponse {
     let dbnum = match parse_dbnum_path(&site_id) {
         Ok(dbnum) => dbnum,
         Err(resp) => return resp,
     };
-    match spawn_increment_run(dbnum, true).await {
+    match spawn_increment_run(dbnum, true, true, !query.no_model_impact_filter).await {
         Ok(status) => (
             StatusCode::ACCEPTED,
             Json(json!({
                 "success": true,
                 "run_id": status.run_id,
                 "dbnum": dbnum,
-                "kind": "sync",
+                "kind": "sync+generate",
                 "from_sesno": status.from_sesno,
-                "message": "增量同步已启动（persist-only，走 Version Commit seam），用 /api/incremental/task/{run_id} 查询",
+                "message": "增量同步与模型生成已启动（IncrementRun / Version Commit seam），用 /api/incremental/task/{run_id} 查询",
             })),
         ),
         Err(err) => (

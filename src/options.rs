@@ -18,46 +18,6 @@ fn default_boolean_pipeline_mode() -> BooleanPipelineMode {
     BooleanPipelineMode::MemoryTasks
 }
 
-fn default_generation_read_backend() -> GenerationReadBackendMode {
-    GenerationReadBackendMode::Surreal
-}
-
-fn default_parse_storage_backend() -> ParseStorageBackend {
-    ParseStorageBackend::SurrealLegacy
-}
-
-fn default_ducklake_metadata_catalog() -> String {
-    "runtime/ducklake/metadata/generation.sqlite".to_string()
-}
-
-fn default_ducklake_data_path() -> String {
-    "runtime/ducklake/data".to_string()
-}
-
-fn default_ducklake_temp_directory() -> String {
-    "runtime/ducklake/temp".to_string()
-}
-
-fn default_ducklake_extension_directory() -> String {
-    "runtime/ducklake/extensions".to_string()
-}
-
-fn default_ducklake_staging_directory() -> String {
-    "runtime/ducklake/staging".to_string()
-}
-
-fn default_duckdb_memory_limit() -> String {
-    "4GB".to_string()
-}
-
-fn default_duckdb_threads() -> usize {
-    num_cpus::get().clamp(1, 8)
-}
-
-fn default_duckdb_pool_size() -> usize {
-    2
-}
-
 fn default_version_retention() -> String {
     // specs/022：用户决策默认无限保留（"0"）；磁盘只增不减，站点需评估盘余量。
     "0".to_string()
@@ -202,102 +162,50 @@ impl Default for MeshFormat {
     }
 }
 
-/// 模型生成输入读取后端。选择在会话打开前完成，会话内禁止自动回退。
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum GenerationReadBackendMode {
-    Surreal,
-    DuckLake,
-    Compare,
-}
+/// specs/027（ADR-0007）：DuckLake 退役后的配置分级检测。
+///
+/// - **行为键**残留（站点显式声明过的存储语义）→ 硬错误 + 修复指引：
+///   `parse_storage_backend = "ducklake"`、`generation_read_backend = "ducklake"|"compare"`；
+/// - **惰性键**残留（代码已不读取）→ 仅警告：
+///   `ducklake_*`、`duckdb_*`、`generation_input_manifest`。
+pub fn check_retired_ducklake_keys(raw_toml: &toml::Value) -> anyhow::Result<()> {
+    let Some(table) = raw_toml.as_table() else {
+        return Ok(());
+    };
 
-impl Default for GenerationReadBackendMode {
-    fn default() -> Self {
-        Self::Surreal
-    }
-}
-
-impl GenerationReadBackendMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Surreal => "surreal",
-            Self::DuckLake => "ducklake",
-            Self::Compare => "compare",
-        }
-    }
-
-    pub fn needs_ducklake(self) -> bool {
-        matches!(self, Self::DuckLake | Self::Compare)
-    }
-}
-
-pub fn parse_generation_read_backend(
-    raw: Option<&str>,
-) -> anyhow::Result<GenerationReadBackendMode> {
-    match raw.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if value == "surreal" => Ok(GenerationReadBackendMode::Surreal),
-        Some(value) if value == "ducklake" => Ok(GenerationReadBackendMode::DuckLake),
-        Some(value) if value == "compare" => Ok(GenerationReadBackendMode::Compare),
-        Some(value) if value == "auto" => {
+    if let Some(value) = table.get("parse_storage_backend").and_then(|v| v.as_str()) {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == "ducklake" {
             anyhow::bail!(
-                "generation_read_backend 不支持 auto；请显式选择 surreal|ducklake|compare"
-            )
-        }
-        Some(value) => {
-            anyhow::bail!("未知 generation_read_backend={value}；仅支持 surreal|ducklake|compare")
-        }
-        None => Ok(GenerationReadBackendMode::Surreal),
-    }
-}
-
-/// 解析阶段的权威存储后端。DuckLake 模式会在权威提交后复制到 Surreal；
-/// `surreal_legacy` 仅用于显式兼容回退，两者不会在一次解析中独立双写。
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ParseStorageBackend {
-    DuckLake,
-    SurrealLegacy,
-}
-
-impl Default for ParseStorageBackend {
-    fn default() -> Self {
-        Self::SurrealLegacy
-    }
-}
-
-impl ParseStorageBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DuckLake => "ducklake",
-            Self::SurrealLegacy => "surreal_legacy",
+                "parse_storage_backend=ducklake 已退役（ADR-0007：版本单源 = Surreal MVCC + sesno 锚点）。\
+                 请删除该配置行（解析固定写 Surreal 主库）后重启。"
+            );
         }
     }
-
-    pub fn uses_ducklake(self) -> bool {
-        matches!(self, Self::DuckLake)
-    }
-}
-
-pub fn parse_parse_storage_backend(raw: Option<&str>) -> anyhow::Result<ParseStorageBackend> {
-    match raw.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if value == "ducklake" => Ok(ParseStorageBackend::DuckLake),
-        Some(value) if value == "surreal_legacy" => Ok(ParseStorageBackend::SurrealLegacy),
-        Some(value) if value == "auto" || value == "dual" => {
+    if let Some(value) = table.get("generation_read_backend").and_then(|v| v.as_str()) {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == "ducklake" || normalized == "compare" {
             anyhow::bail!(
-                "parse_storage_backend 不支持 {value}；请显式选择 ducklake|surreal_legacy"
-            )
+                "generation_read_backend={normalized} 已退役（ADR-0008：模型生成主表直读）。\
+                 请删除该配置行后重启；双后端对比能力已随 DuckLake 退役移除。"
+            );
         }
-        Some(value) => {
-            anyhow::bail!("未知 parse_storage_backend={value}；仅支持 ducklake|surreal_legacy")
-        }
-        None => Ok(ParseStorageBackend::SurrealLegacy),
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseStorageConfig {
-    pub backend: ParseStorageBackend,
-    pub staging_directory: std::path::PathBuf,
+    for key in table.keys() {
+        let lower = key.to_ascii_lowercase();
+        if lower.starts_with("ducklake_")
+            || lower.starts_with("duckdb_")
+            || lower == "generation_input_manifest"
+            || lower == "generation_read_backend"
+            || lower == "parse_storage_backend"
+        {
+            log::warn!(
+                "配置键 `{key}` 已随 DuckLake 退役失效（ADR-0007/0008），当前被忽略；建议从配置文件删除"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// 模型生成结果写入后端。
@@ -492,43 +400,6 @@ pub struct DbOptionExt {
     /// 旧配置：是否启用 SurrealDB 进程。它不再表达模型生成输入后端。
     #[serde(default = "default_true")]
     pub use_surrealdb: bool,
-
-    /// 模型生成输入后端；无 auto/fallback。
-    #[serde(default = "default_generation_read_backend")]
-    pub generation_read_backend: GenerationReadBackendMode,
-
-    /// 解析结果的权威存储后端；无 auto/dual。
-    #[serde(default = "default_parse_storage_backend")]
-    pub parse_storage_backend: ParseStorageBackend,
-
-    /// 可选的固定输入版本清单 JSON。未提供时从所选权威 DuckLake 最新 snapshot 解析。
-    #[serde(default)]
-    pub generation_input_manifest: Option<String>,
-
-    #[serde(default = "default_ducklake_metadata_catalog")]
-    pub ducklake_metadata_catalog: String,
-
-    #[serde(default = "default_ducklake_data_path")]
-    pub ducklake_data_path: String,
-
-    #[serde(default = "default_ducklake_temp_directory")]
-    pub ducklake_temp_directory: String,
-
-    #[serde(default = "default_ducklake_extension_directory")]
-    pub ducklake_extension_directory: String,
-
-    /// 解析 chunk 的按 run_id/dbnum 隔离暂存目录。
-    #[serde(default = "default_ducklake_staging_directory")]
-    pub ducklake_staging_directory: String,
-
-    #[serde(default = "default_duckdb_memory_limit")]
-    pub duckdb_memory_limit: String,
-
-    #[serde(default = "default_duckdb_threads")]
-    pub duckdb_threads: usize,
-
-    #[serde(default = "default_duckdb_pool_size")]
-    pub duckdb_pool_size: usize,
 
     /// model 缓存目录（默认 output/instance_cache）
     #[serde(default)]
@@ -770,81 +641,12 @@ impl DbOptionExt {
         }
     }
 
+    /// specs/027（ADR-0008）：生成读取固定为 Surreal 主库；唯一前置是 SurrealDB 可用。
     pub fn validate_generation_read_features(&self) -> anyhow::Result<()> {
-        if self.generation_input_manifest.is_none() && !cfg!(feature = "generation-read-ducklake") {
-            anyhow::bail!(
-                "未提供 generation_input_manifest 时必须编译 feature `generation-read-ducklake`，因为 DuckLake 是唯一权威 snapshot 来源"
-            );
-        }
-        if self.generation_read_backend.needs_ducklake()
-            && !cfg!(feature = "generation-read-ducklake")
-        {
-            anyhow::bail!(
-                "generation_read_backend={} 需要编译 feature `generation-read-ducklake`",
-                self.generation_read_backend.as_str()
-            );
-        }
-        if matches!(
-            self.generation_read_backend,
-            GenerationReadBackendMode::Surreal | GenerationReadBackendMode::Compare
-        ) && !self.use_surrealdb
-        {
-            anyhow::bail!(
-                "generation_read_backend={} 需要可用的 SurrealDB 版本化读副本",
-                self.generation_read_backend.as_str()
-            );
-        }
-        anyhow::ensure!(self.duckdb_threads > 0, "duckdb_threads 必须大于 0");
-        anyhow::ensure!(self.duckdb_pool_size > 0, "duckdb_pool_size 必须大于 0");
-        anyhow::ensure!(
-            !self.duckdb_memory_limit.trim().is_empty(),
-            "duckdb_memory_limit 不能为空"
-        );
-        Ok(())
-    }
-
-    pub fn parse_storage_config(&self) -> ParseStorageConfig {
-        ParseStorageConfig {
-            backend: self.parse_storage_backend,
-            staging_directory: std::path::PathBuf::from(&self.ducklake_staging_directory),
-        }
-    }
-
-    pub fn validate_parse_storage_features(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.ducklake_staging_directory.trim().is_empty(),
-            "ducklake_staging_directory 不能为空"
-        );
-        if self.parse_storage_backend.uses_ducklake() && !cfg!(feature = "generation-read-ducklake")
-        {
-            anyhow::bail!(
-                "parse_storage_backend=ducklake 需要编译 feature `generation-read-ducklake`"
-            );
-        }
-        if self.parse_storage_backend.uses_ducklake() && !self.use_surrealdb {
-            anyhow::bail!(
-                "parse_storage_backend=ducklake 需要可用的 SurrealDB 版本副本；权威提交后必须完成 snapshot binding"
-            );
+        if !self.use_surrealdb {
+            anyhow::bail!("模型生成需要可用的 SurrealDB（use_surrealdb=true）");
         }
         Ok(())
-    }
-
-    #[cfg(feature = "generation-read-ducklake")]
-    pub fn ducklake_config(&self) -> crate::version_store::DuckLakeConfig {
-        let extension_dir = std::path::PathBuf::from(&self.ducklake_extension_directory);
-        crate::version_store::DuckLakeConfig {
-            metadata_catalog: std::path::PathBuf::from(&self.ducklake_metadata_catalog),
-            data_path: std::path::PathBuf::from(&self.ducklake_data_path),
-            temp_directory: std::path::PathBuf::from(&self.ducklake_temp_directory),
-            memory_limit: self.duckdb_memory_limit.clone(),
-            threads: self.duckdb_threads,
-            extensions: crate::version_store::DuckLakeExtensionConfig {
-                ducklake_extension: extension_dir.join("ducklake.duckdb_extension"),
-                // DuckDB 官方扩展名为 sqlite_scanner；LOAD 路径的 stem 必须与
-                // 扩展 entrypoint 一致（sqlite_scanner_duckdb_cpp_init）。
-                sqlite_extension: extension_dir.join("sqlite_scanner.duckdb_extension"),
-            },
-        }
     }
 
     pub fn validate_transform_store_features(&self) -> anyhow::Result<()> {
@@ -891,17 +693,6 @@ impl From<DbOption> for DbOptionExt {
             gen_pipeline_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
             use_surrealdb: true,
-            generation_read_backend: GenerationReadBackendMode::Surreal,
-            parse_storage_backend: ParseStorageBackend::SurrealLegacy,
-            generation_input_manifest: None,
-            ducklake_metadata_catalog: default_ducklake_metadata_catalog(),
-            ducklake_data_path: default_ducklake_data_path(),
-            ducklake_temp_directory: default_ducklake_temp_directory(),
-            ducklake_extension_directory: default_ducklake_extension_directory(),
-            ducklake_staging_directory: default_ducklake_staging_directory(),
-            duckdb_memory_limit: default_duckdb_memory_limit(),
-            duckdb_threads: default_duckdb_threads(),
-            duckdb_pool_size: default_duckdb_pool_size(),
             model_cache_dir: None,
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::MemoryTasks,
@@ -1107,60 +898,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .get("use_surrealdb")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let generation_read_backend = parse_generation_read_backend(
-        toml_value
-            .get("generation_read_backend")
-            .and_then(|v| v.as_str()),
-    )?;
-    let parse_storage_backend = parse_parse_storage_backend(
-        toml_value
-            .get("parse_storage_backend")
-            .and_then(|v| v.as_str()),
-    )?;
-    let generation_input_manifest = toml_value
-        .get("generation_input_manifest")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let ducklake_metadata_catalog = toml_value
-        .get("ducklake_metadata_catalog")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_ducklake_metadata_catalog);
-    let ducklake_data_path = toml_value
-        .get("ducklake_data_path")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_ducklake_data_path);
-    let ducklake_temp_directory = toml_value
-        .get("ducklake_temp_directory")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_ducklake_temp_directory);
-    let ducklake_extension_directory = toml_value
-        .get("ducklake_extension_directory")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_ducklake_extension_directory);
-    let ducklake_staging_directory = toml_value
-        .get("ducklake_staging_directory")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_ducklake_staging_directory);
-    let duckdb_memory_limit = toml_value
-        .get("duckdb_memory_limit")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(default_duckdb_memory_limit);
-    let duckdb_threads = toml_value
-        .get("duckdb_threads")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.max(1) as usize)
-        .unwrap_or_else(default_duckdb_threads);
-    let duckdb_pool_size = toml_value
-        .get("duckdb_pool_size")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.max(1) as usize)
-        .unwrap_or_else(default_duckdb_pool_size);
+
+    // specs/027（ADR-0007）：DuckLake 配置键分级检测（行为键硬错误、惰性键警告）。
+    check_retired_ducklake_keys(&toml_value)?;
 
     let model_cache_dir = toml_value
         .get("model_cache_dir")
@@ -1301,17 +1041,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         gen_pipeline_debug_limit_per_target_type,
         mesh_formats,
         use_surrealdb,
-        generation_read_backend,
-        parse_storage_backend,
-        generation_input_manifest,
-        ducklake_metadata_catalog,
-        ducklake_data_path,
-        ducklake_temp_directory,
-        ducklake_extension_directory,
-        ducklake_staging_directory,
-        duckdb_memory_limit,
-        duckdb_threads,
-        duckdb_pool_size,
         model_cache_dir,
         defer_db_write,
         boolean_pipeline_mode,
@@ -1334,24 +1063,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
     validate_data_source_mode(db_option_ext.use_surrealdb)
         .map_err(|e| anyhow::anyhow!("配置文件 {} 数据源模式非法: {}", config_file, e))?;
     db_option_ext
-        .validate_generation_read_features()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "配置文件 {} generation read backend 配置非法: {}",
-                config_file,
-                e
-            )
-        })?;
-    db_option_ext
-        .validate_parse_storage_features()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "配置文件 {} parse storage backend 配置非法: {}",
-                config_file,
-                e
-            )
-        })?;
-    db_option_ext
         .validate_transform_store_features()
         .map_err(|e| {
             anyhow::anyhow!("配置文件 {} transform backend 配置非法: {}", config_file, e)
@@ -1371,14 +1082,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         println!(
             "   - model_writer: {}",
             db_option_ext.model_writer_mode.as_str()
-        );
-        println!(
-            "   - generation_read_backend: {}",
-            db_option_ext.generation_read_backend.as_str()
-        );
-        println!(
-            "   - parse_storage_backend: {}",
-            db_option_ext.parse_storage_backend.as_str()
         );
         println!(
             "   - transform_write_backend: {}",
@@ -1417,10 +1120,7 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BooleanPipelineMode, DbOptionExt, GenerationReadBackendMode, ParseStorageBackend,
-        parse_generation_read_backend, parse_parse_storage_backend, validate_data_source_mode,
-    };
+    use super::{BooleanPipelineMode, DbOptionExt, validate_data_source_mode};
     use aios_core::options::DbOption;
     use std::path::PathBuf;
 
@@ -1430,57 +1130,15 @@ mod tests {
         assert!(validate_data_source_mode(false).is_ok());
     }
 
-    #[test]
-    fn generation_read_backend_is_explicit_and_has_no_auto_mode() {
-        assert_eq!(
-            parse_generation_read_backend(Some(" surreal ")).expect("surreal"),
-            GenerationReadBackendMode::Surreal
-        );
-        assert_eq!(
-            parse_generation_read_backend(Some("DUCKLAKE")).expect("ducklake"),
-            GenerationReadBackendMode::DuckLake
-        );
-        assert_eq!(
-            parse_generation_read_backend(Some("compare")).expect("compare"),
-            GenerationReadBackendMode::Compare
-        );
-        assert!(parse_generation_read_backend(Some("auto")).is_err());
-        assert!(parse_generation_read_backend(Some("unknown")).is_err());
-    }
-
-    #[test]
-    fn parse_storage_backend_is_explicit_and_has_no_dual_mode() {
-        assert_eq!(
-            parse_parse_storage_backend(Some(" ducklake ")).expect("ducklake"),
-            ParseStorageBackend::DuckLake
-        );
-        assert_eq!(
-            parse_parse_storage_backend(Some("SURREAL_LEGACY")).expect("legacy"),
-            ParseStorageBackend::SurrealLegacy
-        );
-        assert!(parse_parse_storage_backend(Some("auto")).is_err());
-        assert!(parse_parse_storage_backend(Some("dual")).is_err());
-        assert!(parse_parse_storage_backend(Some("surreal")).is_err());
-    }
+    // specs/027（ADR-0007/0008）：generation_read_backend / parse_storage_backend
+    // 两枚举已退役删除，对应的显式解析测试随之移除。
 
     #[test]
     fn versioned_generation_defaults_to_surreal_baseline_and_memory_tasks() {
         let options = DbOptionExt::from(DbOption::default());
         assert_eq!(
-            options.generation_read_backend,
-            GenerationReadBackendMode::Surreal
-        );
-        assert_eq!(
             options.boolean_pipeline_mode,
             BooleanPipelineMode::MemoryTasks
-        );
-        assert_eq!(
-            options.parse_storage_backend,
-            ParseStorageBackend::SurrealLegacy
-        );
-        assert_eq!(
-            options.parse_storage_config().staging_directory,
-            PathBuf::from("runtime/ducklake/staging")
         );
         assert!(!options.enable_db_backfill);
     }

@@ -261,16 +261,13 @@ async fn gen_all_geos_data_inner(
         use crate::fast_model::gen_model::precheck_coordinator::{
             PeTransformPrecheckMode, PrecheckConfig, run_precheck,
         };
-        use crate::options::GenerationReadBackendMode;
 
         // GenPipeline 已通过 VersionedReadSession 预加载 transforms → L0。
         // L1（子树）/ L2（整库）仅在显式配置 pe_transform_mode 时使用；
         // debug-model 入口仍会在 gen 前自行 refresh_pe_transform_for_root_refnos。
-        let pe_transform_mode = match db_option.generation_read_backend {
-            GenerationReadBackendMode::Surreal
-            | GenerationReadBackendMode::DuckLake
-            | GenerationReadBackendMode::Compare => PeTransformPrecheckMode::Skip,
-        };
+        // specs/027（ADR-0007/0008）：generation_read_backend 已退役，版本读取统一走
+        // VersionedReadSession（Surreal 主表直读），生成管线 pe_transform 预检查固定 L0/Skip。
+        let pe_transform_mode = PeTransformPrecheckMode::Skip;
         let precheck_config = PrecheckConfig {
             enabled: true,
             check_tree: true,
@@ -284,9 +281,8 @@ async fn gen_all_geos_data_inner(
                 .to_string(),
         };
         println!(
-            "[gen_model] pe_transform precheck mode={:?} (generation_read_backend={})",
-            pe_transform_mode,
-            db_option.generation_read_backend.as_str()
+            "[gen_model] pe_transform precheck mode={:?} (generation read=VersionedReadSession/L0)",
+            pe_transform_mode
         );
         match run_precheck(db_option, Some(precheck_config)).await {
             Ok(stats) => {

@@ -11,19 +11,45 @@ pub fn is_delivery_unit_root_noun(noun: &str) -> bool {
     DELIVERY_UNIT_ROOT_NOUNS.contains(&noun.trim().to_ascii_uppercase().as_str())
 }
 
-/// 判断单个 E3D/PDMS 属性是否会改变生成器的模型输入。
-///
-/// 名称统一按大写比较。该集合来自当前生成链路读取的定位、目录引用、布尔关系、
-/// 管路连接和 primitive 参数；未知属性默认不触发生成，避免“任意属性修改即重建”。
-pub fn attribute_affects_model(raw_name: &str) -> bool {
-    let name = raw_name
+/// 属性对模型生成输入的影响。未知属性保守触发，只有明确列出的业务元数据可跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeModelImpact {
+    AffectsModel,
+    KnownNeutral,
+    Unknown,
+}
+
+pub fn normalize_attribute_name(raw_name: &str) -> String {
+    raw_name
         .trim()
         .trim_start_matches("att.")
         .trim_start_matches("ATT.")
         .split('.')
         .next()
         .unwrap_or_default()
-        .to_ascii_uppercase();
+        .to_ascii_uppercase()
+}
+
+pub fn classify_attribute_model_impact(raw_name: &str) -> AttributeModelImpact {
+    if attribute_affects_model(raw_name) {
+        return AttributeModelImpact::AffectsModel;
+    }
+    match normalize_attribute_name(raw_name).as_str() {
+        "NAME" | "DESC" | "PURP" | "FUNCTION" => AttributeModelImpact::KnownNeutral,
+        _ => AttributeModelImpact::Unknown,
+    }
+}
+
+/// 判断单个 E3D/PDMS 属性是否会改变生成器的模型输入。
+///
+/// 名称统一按大写比较。该集合来自当前生成链路读取的定位、目录引用、布尔关系、
+/// 管路连接和 primitive 参数；未知属性默认不触发生成，避免“任意属性修改即重建”。
+///
+/// 清单经 core.dll/Core3D 逆向 + 运行库 `att_meta`(702) 三方交叉校验补齐，取“宁多勿漏”
+/// （漏判=模型陈旧的正确性 bug；误判=多算一次成本可控）。判定权威语义（内核 `wnoevt`）与
+/// 本取舍见 ADR-0009 及 `docs/reverse/core_dll_noun_att_model_update.md` §13/§14。
+pub fn attribute_affects_model(raw_name: &str) -> bool {
+    let name = normalize_attribute_name(raw_name);
 
     matches!(
         name.as_str(),
@@ -66,7 +92,18 @@ pub fn attribute_affects_model(raw_name: &str) -> bool {
         "NSEX" | "NSRE" | "NUMB" | "RPRO" | "SEXT" | "SLOO" | "SPRO" |
         "SPVE" | "SREV" | "SVER" | "TUFL" |
         // 可见性、负实体和布尔生成开关。
-        "LEVE" | "LEVEL" | "OBST" | "NEG" | "POSI" | "BOOL"
+        "LEVE" | "LEVEL" | "OBST" | "NEG" | "POSI" | "BOOL" |
+        // ── §13/§14 逆向补缺（core.dll/Core3D + att_meta 交叉校验，2026-07-22，见 ADR-0009）──
+        // 顶点/坐标：SPVE/SVER/PVER 等顶点改坐标时 modified_attrs 为 PX/PY/PZ，父不一定重列子表。
+        "PX" | "PY" | "PZ" | "DX" | "DY" |
+        // 定位变体、朝向 Y/Z 轴分量与弯角。
+        "POSL" | "POSS" | "POSE" | "NPOS" | "CPOS" | "YDIR" | "ZDIR" | "BANG" |
+        // 管路布线/几何：坡降/离开点/曲率/外径/路由/排水端点。
+        "ZDIS" | "LEAV" | "CURD" | "CURTYP" | "OPDI" | "ROUT" | "DRNS" | "DRNE" | "DETR" |
+        // 规格/类型/布线定位（CTYP/JFRE 系 Core3D VDESPT (noun,attr) 特例）。
+        "PSPE" | "CTYP" | "JFRE" | "JLIN" |
+        // 设计增量位置 / 保温半径 / P-line 方向键。
+        "DELP" | "RINS" | "PKDI"
     ) || name.starts_with("PARA")
         || name.starts_with("PARAM")
 }
@@ -78,7 +115,10 @@ pub fn field_path_affects_model(path: &str) -> bool {
         // 整条记录 Added/Deleted。
         return true;
     }
-    attribute_affects_model(normalized)
+    !matches!(
+        classify_attribute_model_impact(normalized),
+        AttributeModelImpact::KnownNeutral
+    )
 }
 
 #[cfg(test)]

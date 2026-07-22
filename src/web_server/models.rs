@@ -2096,6 +2096,9 @@ pub struct IncrementalUpdateRequest {
     /// 可选增量区间上界；缺省时读取源文件最新 sesno。
     #[serde(default)]
     pub to_sesno: Option<u32>,
+    /// 紧急逃生口：关闭属性影响过滤，让所有 Modified 元素触发模型更新。
+    #[serde(default)]
+    pub no_model_impact_filter: bool,
 }
 
 /// 更新类型

@@ -16,6 +16,10 @@ supersedes: ADR-0002
 - **交付台账 `model_unit_commit` 搬入模型同库的 Surreal 表，零数据迁移**：该表自 ADR-0005（2026-07-22）出生即在 DuckLake metadata 库，存量数据寿命以天计；新表空表起步，旧账随遗物封存，外置 duckdb CLI 脚本作可选救济（不进主二进制、不留依赖）。ADR-0005 的最小交付单元语义原封不动。
 - **放弃的能力**：独立于 RocksDB 的列式权威副本（审计对账、compare 双后端校验）。窗外/损坏兜底回到唯一原则：重新解析 PDMS 源文件（维持 ADR-0001 retention=0 默认前提）。
 
+> 2026-07-23 修订：上文“首增量前不建立基线”及“此后仅 incremental/model_gen 新增”的判断已由 ADR-0010 修订。新站首次增量显式建立 `incremental_baseline`；legacy `full` 只读兼容，既有 legacy 历史不回填 baseline。
+
 被否决的替代方案：① 保留 DuckLake 权威、把 bootstrap 挪到首次增量——版本仍只由增量产生，但双后端供养全保留，与简化诉求矛盾；② DuckLake 降级为纯交付台账存储——为一张表多养一套存储引擎；③ 软退役过渡期（保留配置键警告回落）——双路径再养一个发布周期，且警告在无人看日志的站点形同虚设。
 
 模型生成读路径的对应决策见 ADR-0008；ADR-0006 的模型水位/欠账闭环不受影响（其依赖的锚点与水位语义由本 ADR 继续保证）。术语变更见根 `CONTEXT.md`（权威版本库、版本化读副本、两种 snapshot 绑定词条废除）。
+
+初始化 staging、首次增量 `incremental_baseline`、legacy `full` 只读兼容及已有历史目录禁止原地重解析的后续边界见 ADR-0010。

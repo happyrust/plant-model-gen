@@ -17,4 +17,6 @@ depends_on: ADR-0002, ADR-0005
 - **职责边界**：SurrealDB MVCC + `model_gen` 锚点 = 库内行级模型历史（查询用）；ADR-0005 的最小交付单元提交 = 交付历史（发布用）；本闭环只推进前者，不自动触发 unit-export。
 - **约束**：mesh `.glb` 按 geo_hash 内容寻址存放在 MVCC 之外——历史可查窗口内禁止清理旧 hash 文件，将来若做 mesh GC 必须以全部 `model_gen` 锚点可达的 geo_hash 集合为存活根；retention 配置为有限窗口的站点，模型历史与数据历史同受窗（维持 ADR-0001 的 retention=0 默认前提）。
 
+> 2026-07-23 修订：ADR-0010 增加多库 generation barrier——任一库数据提交或欠账写入失败时，整轮不生成模型；欠账失败仍沿本 ADR 保留数据并形成覆盖洞。正式站点的 `catch-up --allow-full-regen` 必须收敛为绑定既有数据锚点且写运行审计的受控 catch-up/repair。
+
 实施见 `specs/026-incremental-model-gen-debt-catchup/`；术语（模型生成水位 / 模型生成欠账）见根 `CONTEXT.md`。

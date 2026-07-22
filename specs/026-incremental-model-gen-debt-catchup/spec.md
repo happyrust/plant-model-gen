@@ -3,6 +3,7 @@
 **Created**: 2026-07-22
 **Status**: Accepted for implementation
 **Upstream**: `docs/adr/0006-model-generation-watermark-debt-catchup.md`（依赖 ADR-0002 / ADR-0005）
+**Amended by**: `docs/adr/0010-initialization-and-incremental-version-boundary.md` / specs/027（FR-005 的任意 `allow-full-regen` 已收敛为绑定既有数据锚点、持项目锁且写运行审计的受控 catch-up/repair；欠账失败不回滚数据的语义不变）
 **术语**: 模型生成水位 / 模型生成欠账，见根 `CONTEXT.md`
 
 ## User Scenarios
@@ -17,7 +18,7 @@
 
 ### US3 - 存量断更站点首次追平
 
-升级后站点存在历史断更区间且无欠账行覆盖（洞）。watch 只告警、不自动整库重建；运维用 `model-version catch-up --dbnum N --allow-full-regen` 显式触发整库 regen 追平，之后回到欠账行常态。
+升级后站点存在历史断更区间且无欠账行覆盖（洞）。watch 只告警、不自动整库重建；运维发起绑定既有数据锚点、持项目锁并写运行审计的受控 catch-up/repair，追平后回到欠账行常态。
 
 ### US4 - 元数据修改零生成
 
@@ -37,7 +38,7 @@
 - **FR-002**: 模型生成水位 MUST 定义为该 dbnum `model_gen` 锚点的最高 sesno（无锚点视为 0）。
 - **FR-003**: watch 每轮 MUST 对每个候选 dbnum 比对模型生成水位与已提交水位；落后且欠账行完整覆盖区间时 MUST 合并五桶并集执行一次 Incremental scope 生成。
 - **FR-004**: 追平成功 MUST 只发布一个 `model_gen` 锚点（sesno = 数据水位）并标记所消费欠账行；生成或后处理失败 MUST NOT 发锚点、MUST NOT 消费欠账行。
-- **FR-005**: 欠账区间存在洞 MUST NOT 自动整库重建；MUST 告警并在 dry-run/summary 标注 `needs_full_regen`；整库兜底 MUST 仅由显式 `catch-up --allow-full-regen` 触发。
+- **FR-005**: 欠账区间存在洞 MUST NOT 自动整库重建；MUST 告警并在 dry-run/summary 标注 `needs_full_regen`；整库兜底 MUST 仅由绑定既有数据锚点、持项目 mutation lock 且追加 `model_generation_run` 审计的受控 catch-up/repair 触发，单独的 `--allow-full-regen` 标志不得绕过该门禁。
 - **FR-006**: 纯删除与空操作运行 MUST 照常推进模型生成水位（发锚点）。
 - **FR-007**: `watch-incremental` / `incremental-sesno` 及 web 增量入口的 `generate_model` 默认 MUST 为开；`--no-generate-model` MUST 可显式关闭，关闭时不消费欠账、不发锚点。
 - **FR-008**: 采集分类 MUST 应用属性级影响过滤：仅 Modified 且全部变更属性不影响生成输入的元素不进生成桶；Added/Deleted/OWNER 变化/noun 变化 MUST 无条件进桶；生成链路上未知属性 MUST 默认触发；被过滤元素 MUST 记入 `model_neutral_changes`；`--no-model-impact-filter` MUST 恢复全触发。
@@ -48,7 +49,7 @@
 ## Success Criteria
 
 - **SC-001**: 注入生成失败后，下一轮 watch 自动补生成并追平（锚点 = 数据水位），全程数据提交未被阻断。
-- **SC-002**: 断更站点（模型水位落后且区间有洞）watch 只告警；`catch-up --allow-full-regen` 一次追平并发锚点。
+- **SC-002**: 断更站点（模型水位落后且区间有洞）watch 只告警；绑定目标数据锚点的受控 catch-up/repair 一次追平并发锚点，运行台账可查。
 - **SC-003**: 纯元数据批量修改的增量：生成桶为空、锚点照发、`model_neutral_changes` 列出全部被过滤元素。
 - **SC-004**: delete-only 增量：模型产物 latest 不可见、`VERSION AT` 旧锚点可见、锚点照常推进。
 - **SC-005**: `catch-up --dry-run --json` 与 watch summary 的水位/欠账字段可供 smoke 脚本直接断言。

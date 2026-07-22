@@ -21,6 +21,7 @@ alwaysApply: true
 - **同 dbnum 增量串行**：watch-incremental 单队列；锚点一致性依赖此约束。
 - **watch 增量同一 seam**：`async_watch`/`execute_incr_update` 复用 CLI 的 collect + `persist_collected_pdms_increment_files` → `commit_version()`（fingerprint/lease/锚点走同一入口，禁止旁路直写）；增量起点取 Committed Watermark（`sesno_version_anchor` 优先、回退 `dbnum_info_table`，见 CONTEXT.md）；提交失败的 dbnum 不推进 header/同步通知，Commit Pending 仍需人工 `incremental-sesno --recover-pending`。
 - **启动补增量**：`AiosDBManager::startup_catchup`（config 门控环境变量 `AIOS_WATCH_STARTUP_CATCHUP`，默认关闭）在 `init_watcher` 后追赶停机期间落后区间，走同一 `execute_incr_update` seam；安全性由 lease + Commit Pending + 锚点固化兜底，失败不阻断服务启动。
+- **模型生成欠账**：增量数据锚点成功后必须幂等写 `model_gen_debt`；生成失败不回滚数据，watch 即使源 sesno 未增长也要按连续欠账追平。欠账有洞只告警，整库追平仅允许显式 `model-version catch-up --allow-full-regen`。属性门控未知属性/UDA 默认触发，紧急回退用 `--no-model-impact-filter`；纯数据同步用 `--no-generate-model`。
 - **锚点是唯一业务入口**：对外只暴露 `sesno_version_anchor` 已固化的 sesno；历史查询走 `model-version history *`（rs-core `version_query`），勿绕过锚点裸查 VERSION。
 - **retention**：默认 `0`（无限保留，全量历史；磁盘只增不减）；可按站点改为 `90d`/`30d` 等。改 `version_retention` 后重启即可，无需重建库。若配置了有限窗口，窗外返回明确过期错误，兜底源 db 重扫。
 - **模型数据同库**：SurrealKV/MODEL_KV 分离机制已移除，模型表与 PE/ATT 固定同库（`model_primary_db()` 恒等于 SUL_DB）；versioned 站点模型表一并版本化，磁盘靠 retention 兜底。

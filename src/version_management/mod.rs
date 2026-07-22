@@ -12,8 +12,7 @@ pub mod increment_run;
 #[cfg(feature = "gen_model")]
 pub mod missing_mesh_repair;
 pub mod model_impact;
-#[cfg(all(feature = "generation-read-ducklake", feature = "parquet-export"))]
-pub mod model_unit_simulation;
+pub mod model_gen_catchup;
 pub mod project_mutation_lock;
 pub mod watch_incremental;
 

@@ -320,11 +320,36 @@ pub(crate) fn is_geo_noun(noun: &str) -> bool {
 
 即：**改"可克隆"属性会把 post-set-attribute 事件扩散到所有克隆/绑定副本**，这些副本的几何也随之被标记需要重算。这对增量重算的"波及范围"很关键——Rust 侧若支持 copy/clone/镜像，需要一并把关联副本纳入重算集合。
 
-### 10.4 下一步可深挖方向
+### 10.4 `DB_ComparisonSession`：目录依赖不是只看本元素，而是递归比较引用闭包
 
-1. **消费方模块**：定位实际消费 `DB_UserChanges` / 订阅 `PostSetAttribute` 去重建几何的 DLL（候选：`des*.dll`/`draw*`/图形引擎），在其中找"影响几何的具体属性清单"。
+第二轮对 comparison-session 路径的反编译补齐了 `CATR`/`SPRE` 的作用边界。它们不是 `wnoevt` 总闸的替代品，而是在“已经要判断某元素/目录是否变化”时扩展**依赖闭包**：
+
+| 函数 | 地址(core) | 已确认逻辑 |
+|---|---|---|
+| `DB_ComparisonSession::isModified(element, attr, qualifier, out)` | `0x5a4a7e0` | 通用按属性类型/标量或列表比较新旧会话值；`CATMOD`、`GEOM` 有专门分支 |
+| `DB_ComparisonSession::isModified(element, out)` | `0x5a4a600` | `hasElementChangedSince` 后再查 `attributesChangedSince` / `rulesChangedSince`，排除“只有会话号前进、无实际属性/规则差异” |
+| `DB_ComparisonSession::isDependeeModified` | `0x5a4a2f0` | 递归检查本体、`MEMB`，以及 `ATTLIS` 中所有 element-reference(type=5)；跳过 `OWNER` 和 UDA |
+| `DB_ComparisonSession::dbSesModified` | `0x5a49940` | 非 CATA 元素显式沿 `SPRE`、再沿 `CATR` 进入目录；进入 CATA 后递归成员和引用属性，并按 DB/session 记忆避免重复遍历 |
+
+`isModified(CATMOD)` 的实际分支是：
+
+```c
+target = getAtt(SPRE);
+if (!target.exists)
+    target = getAtt(CATR);
+
+if (isModified(the_chosen_ref_attribute))
+    return true;
+return target != NULL && isDependeeModified(target);
+```
+
+因此即使设计元素自己的 `CATR`/`SPRE` 没变，只要它们指向的目录元素、目录成员、规则或进一步引用发生变化，聚合属性 `CATMOD` 仍会报告 modified。`isModified(GEOM)` 则直接读取派生判据 `GEODIF`。这给 Rust 侧一个明确约束：**只按“本 refno 的 modified_attrs”过滤不够；目录引用必须反向扩散到所有实例，且目录侧要计算传递依赖闭包。**
+
+### 10.5 下一步可深挖方向
+
+1. **其它消费方模块**：Core3D 主链已定位；还可对 `AfiModeling` / `PanelModelling` / `FunctionalModelling` / `CommonReferenceModelling` 的订阅回调做同样的属性常量扫描，补齐专业模块特例。
 2. **`graphicsBehaviour` 枚举取值**：其 int 语义定义在 DDL 字典（字段 5099119），可从字典/DDL 侧或消费方对该值的比较逻辑还原。
-3. **Rust 落地**：按 §7 建议实现「属性显著性表」（等价 `wnoevt=false` 且几何相关的 ATT 集），并把克隆/分布式副本纳入增量重算波及范围。
+3. **运行时权威导出**：从活 E3D 会话导出 `wnoevt`/`isPseudo`/`casc`，验证 `PRTREF`、`TYPEX` 等边界属性；Rust 侧把目录反向引用、克隆/分布式副本纳入波及闭包。
 
 ---
 
@@ -363,6 +388,41 @@ else                          sub_101F33A9(el->asPointer(), &nounHash, &attrHash
 
 另外该函数还比较了 `0xCD240`=`PPRO`、`0xCD234`=`DPRO`、`0x8A1E7`=`DATA` 等（P-point / 设计点联动修正）。这些是"派生几何量随特定属性联动"的定点修正——**通用重建仍由 §11.3 的 PartialUpdateDesiMgr 负责**。
 
+#### 11.2.1 引用属性专用入口：`SPCO.PRTREF` 有显式 post-set 级联
+
+标量入口之外，`DESDRA_SCPlugs::PostSetRefAttribute`（`0x10409be0`）把 `(elementPointer, nounHash, attrHash, newRefPointer)` 交给 `descases/VDESPF`（`sub_101F2A27`）。该函数先调用 `structures/BAKREF`（`sub_102D4724`）维护通用反向引用，再执行一个明确特例：
+
+```c
+if (noun == SPCO && attr == PRTREF) {
+    copy(new_ref, path=GPART, source=CATR, dest=CATR);
+    copy(new_ref, path=GPART, source=DETR, dest=DETA);
+    copy(new_ref, path=GPART, source=MATX, dest=MATX);
+    copy(new_ref, path=GPART, source=CMPR, dest=CMPR);
+    copy(new_ref, path=GPART, source=BLTR, dest=BLTR);
+    copy(new_ref, path=GPART, source=TMPR, dest=TMPR);
+}
+```
+
+原指令是六组 `GATRF1(newRef, GPART, source)` → `BPUTF(dest, currentElement)`。这证明 `PRTREF` 不是仅供显示的普通引用：在 `SPCO` 上修改它会同步当前元素的目录/明细/材料等派生属性。其影响是 **noun-scoped**，不能据此推成“所有 NOUN 的 PRTREF 都必然改几何”，但增量过滤若完全忽略它会漏掉真实 Core3D 级联。
+
+#### 11.2.2 `GATCAT`/`GATCRF`：`SPRE` 选入口、`CATR` 进目录、`PRTREF` 为 TABITE 跳板
+
+目录解析例程进一步给出了三者的分工：
+
+- `catdblib/GATCAT`（`sub_1035C340`）默认以 **`SPRE`** 作为规格/目录入口；`NOZZ`/`ELCONN`/`EQUCOM` 改用 **`CATR`**，`TUBI` 会按 `TYPE` 选 `HSTU/LSTU/HSRO/LSRO`。
+- 对 `TABITE`，`GATCAT` 先读取 **`PRTREF`**：请求 `SPRE` 时直接返回该目标，请求其它目录属性时以该目标继续 `GATCRF`。
+- `catdblib/GATCRF`（`sub_1035D7D8`）若当前 `TYPE==TABITE` 同样先沿 **`PRTREF`** 跳转；请求 `GMRE/PTRE/GSTR/PSTR/DTRE/NGMR/CATR/CCORRE` 时再沿 **`CATR`** 进入目录对象。请求 `CATR` 本身时返回目标的 `REF`，其它请求则在 CATR 目标上读取。
+
+这条链可以概括为：
+
+```text
+设计元素 --SPRE/按 noun 选择的引用--> 规格/目录入口
+         --PRTREF (TABITE)----------> 被引用零件/表项
+         --CATR---------------------> 实际目录组件及几何/设计表属性
+```
+
+哈希实证：`CATR=0xDBCF9`、`SPRE=0x9D165`、`PRTREF=0x557F908`。其中 PRTREF 的 Core3D 原始立即数命中 `VDESPF`，另在 `GATCAT/GATCRF` 的只读常量区作为路径属性使用。
+
 ### 11.3 通用增量重建：`PartialUpdateDesiMgr`（改了就把所在模型块按粒度排队）
 
 ```c
@@ -396,7 +456,10 @@ if (DB_DB::type(el->getDB())==1) {          // 仅 DESIGN 库
 |---|---|---|
 | `DESDRA_SCPlugs::Init` | `0x10409160` | 向 core.dll 注册所有变更/合法性订阅 |
 | `DESDRA_SCPlugs::PostSetAttribute` | `0x10409a60` | 属性变更入口，按 (nounHash,attrHash) 分派 |
+| `DESDRA_SCPlugs::PostSetRefAttribute` | `0x10409be0` | 引用属性变更入口，传入新引用目标 |
 | `sub_101F33A9` / `sub_1005D702` | `0x101f33a9` / `0x1005d702` | 3D / DRAFT 的 (noun,attr) 特例几何修正（descases/VDESPT） |
+| `sub_101F2A27` (`VDESPF`) | `0x101f2a27` | 通用反向引用维护 + `SPCO.PRTREF` 派生属性级联 |
+| `sub_1035C340` / `sub_1035D7D8` | `0x1035c340` / `0x1035d7d8` | `GATCAT/GATCRF` 目录引用解析（SPRE/PRTREF/CATR） |
 | `PartialUpdateDesiMgr::ChangedModelToUpdate` | `0x1047c200` | 遍历变更元素集入队 |
 | `PartialUpdateDesiMgr::ModelToUpdate` | `0x1047e590` | 仅 DESIGN 库；XGEOM 判定后入队 |
 | `PartialUpdateDesiMgr::GranularityExpansion` | `0x1047d8c0` | 计算重算粒度（IsPrimitive/SignificantOwner/Members/AncestorDeletes） |
@@ -462,33 +525,78 @@ def dehash(h: int) -> str:
 1. 该属性 **`wnoevt == false`**（会发事件，§4.2/§10.1），**且**
 2. 元素的 NOUN 是几何类型（**`geomset`/`graphicsBehaviour`** ↔ Rust `is_geo_noun`，§4.1）。
 
-命中后，core.dll 广播 → Core3D `PartialUpdateDesiMgr` 把该元素所属**几何块（significant-owner 粒度）整体排队重算——通用路径不区分具体哪个属性**（§11.3）。波及范围：owner 的摆放改动波及其几何子元素；catalogue（`CATR`/`SPRE`→SCOM）改动波及所有引用它的实例；可克隆属性波及克隆/分布式副本（§10.3）。
+命中后，core.dll 广播 → Core3D `PartialUpdateDesiMgr` 把该元素所属**几何块（significant-owner 粒度）整体排队重算——通用路径不区分具体哪个属性**（§11.3）。波及范围：owner 的摆放改动波及其几何子元素；catalogue（`CATR`/`SPRE`，以及 `SPCO/TABITE` 上的 `PRTREF`）改动波及所有引用它的实例；可克隆属性波及克隆/分布式副本（§10.3）。
 
 > 严格按 PDMS 语义：**任何 `wnoevt=false` 的属性改在几何元素上都会触发重算**。但很多这类属性并不改几何（只改外观/元数据）——`plant-model-gen` 可以更精细，**仅在"几何输入属性"变化时才重算**。清单见 §13.2。
 
-### 13.2 几何输入属性清单（实测：`rs-core` + `plant-model-gen` 的属性读取点，577 处聚合）
+### 13.2 几何/模型输入属性清单（代码读取点 + Core3D 引用级联）
 
-证据来源：`resolve.rs::cata_context_from_session` / `query_gm_param*`，以及全仓 `get_*("ATTR")` 读取点聚合。按类别（改动 → 需重算几何）：
+证据来源：`resolve.rs::cata_context_from_session` / `query_gm_param*` 及全仓 `get_*("ATTR")` 的 577 处读取点聚合，再并入 §11.2 的 Core3D 标量/引用回调与目录解析证据。按类别（改动 → 需重算几何或模型派生数据）：
 
 | 类别 | 属性 | 说明 |
 |---|---|---|
-| **A. 摆放/变换** | `POS` `POSL` `POSS` `POSE` `NPOS` `CPOS` `ORI` `XDIR` `YDIR` `ZDIR` `PAXI` `PZAXI` `PLAX` `ARRI` `LEAV` `BANG` | 位姿/朝向/管件到-离点/弯角，改→位姿变 |
-| **B. 目录/规格选型** | `CATR` `SPRE` `CREF` `HREF` `TREF` `PSPE` `NGMR` `GTYP` | 改→换了元件，几何全变（影响最大） |
+| **A. 摆放/变换** | `POS` `POSL` `POSS` `POSE` `NPOS` `CPOS` `ORI` `YDIR` `ZDIR` `PAXI` `PZAXI` `PLAX` `ARRI` `LEAV` `BANG` | 位姿/朝向/管件到-离点/弯角，改→位姿变（X 轴由 ORI+Y/Z 派生，无独立属性） |
+| **B. 目录/规格选型** | `CATR` `SPRE` `PRTREF` `CREF` `HREF` `TREF` `PSPE` `NGMR` `GTYP` `CTYP` | 改→换了元件/目录解析入口，几何或派生目录数据全变（影响最大）；`PRTREF` 有 `SPCO` post-set 与 `TABITE` 解析特例（§11.2.1/§11.2.2） |
 | **C. 设计参数** | `DESP` `DELP` `PARA` `RINS` `OPDI` `UNIPAR` | 参数化尺寸（喂给目录几何表达式） |
-| **D. 图元/目录尺寸** | `HEIG` `ANGL` `RADI` `RAD` `DIAM` `PRAD` `PWID` `PHEI` `PDIA` `PBDM` `PTDM` `PDIS` `PBDI` `PTDI` `PXTS` `PYTS` `PXBS` `PYBS` `PXLE` `PX` `PY` `PZ` `DX` `DY` | 高/角/径/宽 + P-point 尺寸 |
+| **D. 图元/目录尺寸** | `HEIG` `ANGL` `RADI` `DIAM` `PRAD` `PWID` `PHEI` `PDIA` `PBDM` `PTDM` `PDIS` `PBDI` `PTDI` `PXTS` `PYTS` `PXBS` `PYBS` `PXLE` `PX` `PY` `PZ` `DX` `DY` | 高/角/径/宽 + P-point 尺寸 |
 | **E. 管路/布线** | `ARRI` `LEAV` `ZDIS` `ROUT` `DRNS` `DRNE` `CURD` `CURTYP` `DETR` | 到-离/坡降/路由/曲率 |
-| **F. 定位/对齐** | `JUSL` `SJUS` `JLIN` | 对齐/justification |
+| **F. 定位/对齐** | `JUSL` `SJUS` `JLIN` `JFRE` | 对齐/justification；`JFRE`（§14.3 Core3D VDESPT 特例，与 noun `SJOI` 联动） |
 | **G. 设计表/覆盖** | `DTRE` `DKEY` `DPRO` `PPRO` `PTYP` `PSTR` `PKEY` `PKDI` | 设计表默认值/属性覆盖 |
 
 ### 13.3 明确"不影响几何"的属性（只改这些 → 可跳过重算，这是优化点）
 
-`NAME` `DESC` `REFNO` `OWNER` `DBNUM` `NUMBDB` `TYPE` `NOUN` `LEVE` `RTEX` `CLAI`(claim/锁) `NAPP` `SKEY` `STYP`，以及所有 `wnoevt=true` 的属性。（注：`OBST` 障碍等级影响碰撞/是否参与，但不改几何本体形状。）
+可明确按“几何/模型输入”跳过的主要是 `NAME` `DESC` `REFNO` `DBNUM` `NUMBDB` `RTEX` `CLAI`(claim/锁) `SKEY` `PURP` `FUNCTION`，以及所有已确认 `wnoevt=true` 的属性。
+
+原先把 `OWNER/TYPE/NOUN/LEVE/NAPP/STYP` 放在本节过于激进：`OWNER` 改变世界变换/层级，`TYPE/NOUN/STYP` 改变生成分派，`LEVE/NAPP` 改变参与或显示语义，均应在“宁多勿漏”的生成器策略中保留。`OBST` 不改网格形状，但影响碰撞/参与范围，也属于模型输出策略而非纯元数据。
+
+`TYPEX`（`0xCC6B3F`）在 core 只有两处立即数命中：`DB_Element::checkForUnknownAtts`（`0x5928cf0`）把它列入可容忍的内部/扩展属性；`RCF_Output::outPutSpecificAtt`（`sub_5A99370`，比较点 `0x5a99525`）遇到它直接跳到成功返回，不走普通属性序列化。Core3D 的立即数、符号和 import 扫描均未找到静态消费者。故它当前应标为 **internal/serialization-suppressed，不能仅凭名字并入几何白名单**；最终仍需活会话读取它的 `wnoevt`/pseudo/type 元数据确认。
 
 ### 13.4 给 plant-model-gen 增量重算的落地建议
 
 1. 建一张 `GEOM_AFFECTING_ATTS`（≈ §13.2 全体并集，用 dabacon 哈希存，配合你们已实现的 dehash）。
 2. 增量判定：某几何 refno 的"被改属性集合 ∩ `GEOM_AFFECTING_ATTS` ≠ ∅" → 重算该元素几何；否则**跳过**（纯元数据/外观改动，省掉无谓重算）。
-3. 波及：owner 的 A 类（摆放）改动 → 重算其几何子树；`CATR`/`SPRE` 改 → 重算所有引用该 SCOM 的实例；可克隆属性 → 波及副本。
+3. 波及：owner 的 A 类（摆放）改动 → 重算其几何子树；`CATR`/`SPRE`/noun-scoped `PRTREF` 改动或其目标目录闭包变化 → 反向重算所有实例；可克隆属性 → 波及副本。
 4. 粒度：以 **significant owner**（几何容器，如 `EQUI`/子设备/`BRAN`）为重算单位，而非单图元（对齐 Core3D `GranularityExpansion`）。
 
-> 提示：§13.2 是"读取即用到"的经验并集，覆盖设计件/图元/管路主路径；若要 100% 对齐 PDMS，仍以 §13.1 的 `wnoevt` 为最终权威（该标志是每属性的字典位，可从 dabacon 字典批量导出与本清单核对）。
+当前 `model_impact.rs::attribute_affects_model` 已含 `CATR/SPRE`，但尚缺本轮确认的 `PRTREF`。现有 API 只有 attr、没有 noun；短期按“宁多勿漏”可把 `PRTREF` 加入全局 allowlist，长期改成 `(noun, attr, effect)` 表，把 `SPCO/TABITE` 特例及 `dependency-cascade` 与 `direct-mesh` 区分开。
+
+> 提示：§13.2 是"读取即用到 + Core3D 引用级联"的经验并集，覆盖设计件/图元/管路主路径；若要 100% 对齐 PDMS，仍以 §13.1 的 `wnoevt` 为最终权威（该标志是每属性的字典位，可从 dabacon 字典批量导出与本清单核对，见 §14）。
+
+---
+
+## 14. 与权威属性字典交叉校验（SurrealDB `att_meta`，702 个属性）
+
+对该项目（`AvevaMarineSample`，ns=`1516`）运行中的 SurrealDB（`127.0.0.1:8020`，SurrealDB 3.3）`att_meta` 表做交叉校验。`att_meta` = **702 个属性**，字段 `id`(=`att_meta:<名>`)、`hash`(dabacon 哈希)、`meta_cn_name`。
+
+### 14.1 §13.2 校验结果：全部命中（附 dabacon 哈希），仅剔除 2 个派生/误报
+
+§13.2 的几何输入属性**全部是真实 dabacon 属性**（在 702 属性字典里命中，并拿到各自 hash），仅 2 个剔除：
+- `XDIR`：X 轴由 `ORI`+`YDIR`/`ZDIR` 派生，字典无此独立属性（`YDIR`=`0xD9E0D`、`ZDIR`=`0xD9E0E` 存在，`XDIR` 不在）。
+- `RAD`：真实属性是 `RADI`(`0xADB7D`)，`RAD` 系聚合误报。
+
+命中示例（可直接建 `GEOM_AFFECTING_ATTS` 哈希表）：`POS`=`0x853B1`、`ORI`=`0x83787`、`CATR`=`0xDBCF9`、`SPRE`=`0x9D165`、`PRTREF`=`0x557F908`、`DESP`=`0xD20C7`、`PARA`=`0x89C41`、`HEIG`=`0xA5056`、`DIAM`=`0xC0748`、`JUSL`=`0xBEEF1`、`PDIA`=`0x882F1`、`ARRI`=`0xB0515`、`LEAV`=`0xEBADF`…（全部 hash 可从 `att_meta` 直接 `SELECT name, hash` 取。）
+
+### 14.2 关于 `wnoevt=false` 全量清单（重要结论）
+
+- **`wnoevt` 不在已同步的 SurrealDB 里**：`att_meta` 只有 `hash`+`meta_cn_name`（702 条），**无 `wnoevt`/事件标志**；`dicvir.dat`(0.27MB) 是版本戳、非字典。
+- **`wnoevt` 是 E3D 内核 dabacon 字典的每属性标志**（运行时 `DB_Attribute` 偏移 184 / dabacon 字段 `299311034`，§10.1）。内建属性字典编译在内核里、不随模型库同步 → **静态无法直接导出**。
+- **要拿全量 `wnoevt=false` 清单，需其一**：
+  1. **活的 E3D 会话导出（权威）**：遍历 702 属性、逐个读其字典 `wnoevt` 标志 dump 出来；
+  2. **扩展字典导入工具**：把字段 `299311034` 一并落进 `att_meta`（加一列 `wnoevt`），此后 `SELECT name FROM att_meta WHERE wnoevt=false` 即得清单；
+  3. **等价可行替代（可立即做）**：用已加载的 `Core3D` 会话枚举其设计/几何代码引用的全部属性哈希（解码为名），与 §13.2 对齐——直接反映"3D 生成实际消费哪些属性"，比原始 `wnoevt` 超集更贴合"影响模型生成"。
+
+> 交叉校验结论：**§13.2 清单在权威属性字典中 100% 命中（除 2 个派生项），可放心作为 `GEOM_AFFECTING_ATTS` 的基础**；`wnoevt` 精确门控需按 14.2 其一补齐。
+
+### 14.3 消费方（Core3D）反向交叉校验：§13.2 基本完备
+
+第一轮用已加载的 `Core3D` 会话，把标量属性分派函数（`sub_101F33A9` 3D-VDESPT、`sub_1005D702` DRAFT）里的**全部比较常量**解码，并用 `att_meta`（702）判定"是属性还是 noun"：
+
+- 这些常量**大多是 NOUN 哈希**（分派按 (noun, attr) 键控）：3D 侧 `PLOO`/`SJOI`/`COCO`/`DATA`；DRAFT 侧 `SHEE`/`VIEW`/`LAYE`/`OVER`/`GRIDNM`/`MSTYLE`… 均为元素类型（noun），非属性。
+- 真正是**属性**且被 Core3D 设计代码引用的：`HEIG`/`PPRO`/`DPRO`/`POS`/`PKEY`/`PKDI`（已在 §13.2）+ 3 个新增：
+  - **`CTYP`**（组件类型，与 noun `COCO` 联动）、**`JFRE`**（与 noun `SJOI` 联动）→ **几何相关，已补入 §13.2（B/F）**。
+  - `LOCK`（DRAFT 锁定/状态标志）→ **非几何**（不纳入）。
+- 该结论只覆盖**标量 `PostSetAttribute`**。第二轮继续扫描 `PostSetRefAttribute` 与目录解析器，新增确认：
+  - `CATR`/`SPRE`：`GATCAT/GATCRF` 的主目录解析链，同时被 core comparison-session 用于递归目录依赖；
+  - **`PRTREF`**：`SPCO.PRTREF` 在 `VDESPF` 有显式派生属性回写，`TABITE` 在 `GATCAT/GATCRF` 以它作为目录跳板；已补入 §13.2（B）；
+  - `TYPEX`：core 仅用于 unknown-att 容忍，并在 RCF 输出时显式跳过；Core3D 无静态消费者，暂不纳入。
+- **修正后的结论**：加入 `PRTREF` 后，§13.2 对当前已见 3D 标量特例、引用级联和目录解析路径覆盖完整；通用重建仍按 significant-owner 整块重算，少数 `(noun,attr)` 特例负责派生修正与依赖扩散。

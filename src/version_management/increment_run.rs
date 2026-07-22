@@ -26,6 +26,8 @@ pub struct IncrementRunOptions {
     pub persist_data: bool,
     pub recover_pending: bool,
     pub generate_model: bool,
+    /// 为 false 时所有 Modified 都进入模型更新桶，作为属性门控逃生口。
+    pub model_impact_filter: bool,
     /// specs/023 M3/T8：增量模型生成前要求 pe_owner 完整性证据就绪
     /// （`pe_owner_version_meta` 存在 + 抽查通过）；不就绪快速失败。
     pub require_pe_owner_ready: bool,
@@ -39,6 +41,7 @@ pub struct IncrementRunResult {
     pub persist_stats: crate::data_interface::sesno_increment::PdmsIncrementPersistStats,
     pub generation_success: Option<bool>,
     pub parquet_export: Option<serde_json::Value>,
+    pub failures: Vec<String>,
 }
 
 struct SourceHashGate {
@@ -54,10 +57,10 @@ struct SourceHashGate {
 /// - 轻量抽查：抽样有子 parent 对比 `count(<-pe_owner)` 与 `len(children)`（口径对齐
 ///   `db-data/audit_pe_owner_vs_children.surql` [2] 段，样本上限 200/库）。
 #[derive(Debug, Clone)]
-struct PeOwnerEvidence {
-    ready: bool,
-    not_ready_dbnums: Vec<u32>,
-    summary: serde_json::Value,
+pub(crate) struct PeOwnerEvidence {
+    pub(crate) ready: bool,
+    pub(crate) not_ready_dbnums: Vec<u32>,
+    pub(crate) summary: serde_json::Value,
 }
 
 /// 执行一次增量运行。
@@ -104,12 +107,13 @@ where
             Some(detail.clone()),
             std::time::Duration::from_secs(15),
         );
-        let file_outcome = crate::data_interface::sesno_increment::collect_pdms_increment_for_file_with_operations(
+        let file_outcome = crate::data_interface::sesno_increment::collect_pdms_increment_for_file_with_operations_options(
                 &db_option_ext.inner.project_name,
                 file.clone(),
                 options.from_sesno,
                 options.to_sesno,
                 options.verbose,
+                options.model_impact_filter,
             )?;
         crate::perf_metrics::record_generate_progress(
             "incremental_sesno_collected_file",
@@ -144,13 +148,14 @@ where
                 Some(detail.clone()),
                 std::time::Duration::from_secs(15),
             );
-            let indexed_outcome = match crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations(
+            let indexed_outcome = match crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations_options(
                 &db_option_ext.inner.project_name,
                 &index_path,
                 &options.dbnums,
                 options.from_sesno,
                 options.to_sesno,
                 options.verbose,
+                options.model_impact_filter,
             ) {
                 Ok(outcome) => outcome,
                 Err(err) if !options.rescan_index => {
@@ -162,13 +167,14 @@ where
                         "✅ db_index 已刷新: {} 个库, {} 条 ref0 映射",
                         report.db_files, report.ref0_total
                     );
-                    crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations(
+                    crate::data_interface::sesno_increment::collect_pdms_increment_for_dbnums_from_index_with_operations_options(
                         &db_option_ext.inner.project_name,
                         &index_path,
                         &options.dbnums,
                         options.from_sesno,
                         options.to_sesno,
                         options.verbose,
+                        options.model_impact_filter,
                     )?
                 }
                 Err(err) => return Err(err),
@@ -279,16 +285,6 @@ where
                 stats.dbnum_info_updates
             );
         }
-        if !stats.commit_failures.is_empty() {
-            let partial = serde_json::json!({
-                "committed_anchors": &stats.anchors,
-                "failed_commits": &stats.commit_failures,
-            });
-            anyhow::bail!(
-                "one or more per-dbnum version commits failed; no model generation was started: {}",
-                serde_json::to_string(&partial)?
-            );
-        }
         stats
     } else {
         crate::perf_metrics::record_generate_progress(
@@ -309,173 +305,159 @@ where
         }
         dbnums.into_iter().collect()
     };
-
-    let pe_owner_evidence = if options.generate_model {
-        let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
-            "incremental_sesno_checking_pe_owner",
-            Some(format!("dbnums={generation_dbnums:?}")),
-            std::time::Duration::from_secs(15),
-        );
-        let evidence =
-            build_pe_owner_evidence(&generation_dbnums, options.require_pe_owner_ready).await;
-        crate::perf_metrics::record_generate_progress(
-            "incremental_sesno_pe_owner_checked",
-            Some(if evidence.ready {
-                "pe_owner_ready"
-            } else {
-                "pe_owner_degraded_or_missing"
-            }),
-            metrics_elapsed(),
-        );
-        Some(evidence)
-    } else {
-        None
-    };
-
-    let mut generation_success = None;
-    #[cfg(feature = "gen_model")]
-    let mut export_report_opt: Option<
-        crate::fast_model::export_model::post_gen_export::PostGenerationParquetExportReport,
-    > = None;
-
-    #[cfg(feature = "gen_model")]
-    if options.generate_model {
-        let update_log = outcome.update_log.clone();
-        if update_log.count() == 0 {
-            println!("ℹ️ 未收集到模型变更，模型生成按成功空操作收尾");
-            generation_success = Some(true);
-        } else {
-            if let Some(evidence) = &pe_owner_evidence
-                && options.require_pe_owner_ready
-                && !evidence.ready
+    let mut failures = persist_stats
+        .commit_failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "dbnum={} data commit {}..={} failed: {}",
+                failure.dbnum, failure.from_sesno, failure.to_sesno, failure.error
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut debt_written = Vec::new();
+    let mut debt_write_failures = Vec::new();
+    let mut debt_blocked_dbnums = std::collections::BTreeSet::new();
+    if options.persist_data {
+        for anchor in &persist_stats.anchors {
+            let file = collected_increment_files.iter().find(|file| {
+                file.report.dbnum == anchor.dbnum
+                    && file.report.actual_end_sesno == anchor.sesno
+            });
+            let Some(file) = file else {
+                let message = format!(
+                    "dbnum={} sesno={} committed without matching collected update log",
+                    anchor.dbnum, anchor.sesno
+                );
+                debt_blocked_dbnums.insert(anchor.dbnum);
+                failures.push(message.clone());
+                debt_write_failures.push(serde_json::json!({
+                    "dbnum": anchor.dbnum,
+                    "to_sesno": anchor.sesno,
+                    "error": message,
+                }));
+                continue;
+            };
+            let fingerprint = anchor.fingerprint.as_deref().unwrap_or_default();
+            match crate::versioned_db::model_gen_debt::write_model_gen_debt(
+                anchor.dbnum,
+                file.report.actual_start_sesno,
+                anchor.sesno,
+                fingerprint,
+                &file.update_log,
+            )
+            .await
             {
-                anyhow::bail!(
-                    "pe_owner_not_ready: --require-pe-owner-ready enabled but pe_owner integrity evidence is not ready for dbnums {:?}; run `model-version rebuild-pe-owner --dbnum <n>` (audit: scripts/smoke/pe_owner_children_audit.ps1); checked evidence: {}",
-                    evidence.not_ready_dbnums,
-                    serde_json::to_string(&evidence.summary)?
-                );
+                Ok(written) => debt_written.push(written),
+                Err(error) => {
+                    let message = format!(
+                        "dbnum={} model_gen_debt write failed: {error:#}",
+                        anchor.dbnum
+                    );
+                    debt_blocked_dbnums.insert(anchor.dbnum);
+                    failures.push(message.clone());
+                    debt_write_failures.push(serde_json::json!({
+                        "dbnum": anchor.dbnum,
+                        "from_sesno": file.report.actual_start_sesno,
+                        "to_sesno": anchor.sesno,
+                        "error": message,
+                    }));
+                }
             }
-            let mut gen_db_option_ext = db_option_ext.clone();
-            if !generation_dbnums.is_empty() {
-                gen_db_option_ext.inner.manual_db_nums = Some(generation_dbnums.clone());
-                println!(
-                    "🔧 增量模型生成限定 manual_db_nums -> {:?}",
-                    generation_dbnums
-                );
-            }
-            let generate_started = std::time::Instant::now();
-            crate::perf_metrics::record_generate_progress(
-                "incremental_sesno_generate_started",
-                Some("incremental-sesno"),
-                0,
-            );
-            let gen_result = {
-                let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
-                    "incremental_sesno_generate_running",
-                    Some(format!("dbnums={generation_dbnums:?}")),
-                    std::time::Duration::from_secs(15),
-                );
-                crate::fast_model::gen_all_geos_data(
-                    Vec::new(),
-                    &gen_db_option_ext,
-                    Some(update_log),
-                )
-                .await
-            };
-            let generate_ms = generate_started.elapsed().as_millis() as u64;
-            match &gen_result {
-                Ok(_) => crate::perf_metrics::record_generate_progress(
-                    "incremental_sesno_generate_finished",
-                    Some("incremental-sesno"),
-                    generate_ms,
-                ),
-                Err(err) => crate::perf_metrics::record_generate_progress(
-                    "incremental_sesno_generate_failed",
-                    Some(&err.to_string()),
-                    generate_ms,
-                ),
-            }
-            crate::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
-            let gen_result = gen_result?;
-            generation_success = Some(gen_result.success);
-            let export_report = {
-                let _heartbeat = crate::perf_metrics::start_generate_heartbeat(
-                    "incremental_sesno_exporting_parquet",
-                    Some(format!("dbnums={generation_dbnums:?}")),
-                    std::time::Duration::from_secs(15),
-                );
-                crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
-                    &gen_db_option_ext,
-                    Some(generation_dbnums.clone()),
-                )
-                .await?
-            };
-            crate::perf_metrics::record_generate_progress(
-                "incremental_sesno_parquet_export_checked",
-                Some(if export_report.enabled {
-                    "post_generation_export_enabled"
-                } else {
-                    "post_generation_export_disabled"
-                }),
-                metrics_elapsed(),
-            );
-            if export_report.enabled {
-                println!(
-                    "✅ 生成后 Parquet 导出: dbnums={:?} skipped={:?}",
-                    export_report.exported_dbnums, export_report.skipped_reason
-                );
-            }
-            export_report_opt = Some(export_report);
         }
     }
 
     let source_hash_summary = verify_source_hash_gate(&source_hash_gate)?;
-
-    let mut model_gen_anchors: Vec<crate::versioned_db::version_commit::ModelGenAnchor> =
-        Vec::new();
-    #[cfg(feature = "gen_model")]
-    if generation_success == Some(true)
-        && db_option_ext.use_surrealdb
-        && db_option_ext.model_writer_mode.writes_to_surreal()
-        && !db_option_ext.gen_model_dry_run
-    {
-        let generation_dbnums = generation_dbnums
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut committed_sesnos = std::collections::BTreeMap::new();
-        for anchor in &persist_stats.anchors {
-            if generation_dbnums.contains(&anchor.dbnum) {
-                committed_sesnos
-                    .entry(anchor.dbnum)
-                    .and_modify(|sesno: &mut u32| *sesno = (*sesno).max(anchor.sesno))
-                    .or_insert(anchor.sesno);
+    let committed_dbnums = persist_stats
+        .anchors
+        .iter()
+        .map(|anchor| anchor.dbnum)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut catch_up_results = Vec::new();
+    let mut coverages = Vec::new();
+    if options.persist_data {
+        for dbnum in committed_dbnums {
+            if options.generate_model && !debt_blocked_dbnums.contains(&dbnum) {
+                let catch_up = crate::version_management::model_gen_catchup::catch_up_model_generation(
+                    db_option_ext,
+                    dbnum,
+                    crate::version_management::model_gen_catchup::ModelGenCatchUpOptions {
+                        require_pe_owner_ready: options.require_pe_owner_ready,
+                        allow_full_regen: false,
+                        dry_run: db_option_ext.gen_model_dry_run,
+                    },
+                )
+                .await;
+                match catch_up {
+                    Ok(result) => {
+                        coverages.push(result.coverage.clone());
+                        if result.coverage.needs_full_regen {
+                            failures.push(format!(
+                                "dbnum={dbnum} model debt has a gap; run model-version catch-up --allow-full-regen"
+                            ));
+                        } else if result.generation_success == Some(false) {
+                            failures.push(format!("dbnum={dbnum} model generation failed"));
+                        }
+                        catch_up_results.push(result);
+                    }
+                    Err(error) => failures.push(format!(
+                        "dbnum={dbnum} model generation catch-up failed: {error:#}"
+                    )),
+                }
+            } else {
+                match crate::versioned_db::model_gen_debt::analyze_model_gen_debt(dbnum).await {
+                    Ok(coverage) => coverages.push(coverage),
+                    Err(error) => failures.push(format!(
+                        "dbnum={dbnum} model debt analysis failed: {error:#}"
+                    )),
+                }
             }
         }
-        for (dbnum, sesno) in committed_sesnos {
-            let anchor =
-                crate::versioned_db::version_commit::write_model_gen_anchor(dbnum, sesno).await?;
-            println!(
-                "✅ model_gen 锚点已发布: dbnum={} sesno={} anchored_at={}",
-                anchor.dbnum, anchor.sesno, anchor.anchored_at
-            );
-            model_gen_anchors.push(anchor);
-        }
     }
-
-    #[cfg(feature = "gen_model")]
-    let parquet_export_value: Option<serde_json::Value> = export_report_opt
-        .as_ref()
-        .map(serde_json::to_value)
-        .transpose()?;
-    #[cfg(not(feature = "gen_model"))]
-    let parquet_export_value: Option<serde_json::Value> = None;
+    let model_gen_anchors = catch_up_results
+        .iter()
+        .filter_map(|result| result.model_gen_anchor.clone())
+        .collect::<Vec<_>>();
+    let pe_owner_evidence = catch_up_results
+        .iter()
+        .filter_map(|result| result.pe_owner_evidence.clone())
+        .collect::<Vec<_>>();
+    let parquet_exports = catch_up_results
+        .iter()
+        .filter_map(|result| result.parquet_export.clone())
+        .collect::<Vec<_>>();
+    let parquet_export_value = (!parquet_exports.is_empty()).then_some(serde_json::json!(parquet_exports));
+    let generation_success = options
+        .generate_model
+        .then_some(failures.is_empty());
+    let model_neutral_changes = outcome
+        .element_changes
+        .iter()
+        .filter(|change| {
+            change.impact_decision == "neutral" && change.impact_reason == "known_neutral"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let data_watermarks = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.data_watermark))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let model_generation_watermarks = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.model_generation_watermark))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let debt_ranges = coverages
+        .iter()
+        .map(|coverage| (coverage.dbnum, coverage.debt_ranges.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let coverage_complete = coverages.iter().all(|coverage| coverage.coverage_complete);
+    let needs_full_regen = coverages.iter().any(|coverage| coverage.needs_full_regen);
 
     let summary = serde_json::json!({
         "from_sesno": options.from_sesno,
         "to_sesno": options.to_sesno,
         "source_hash_gate": source_hash_summary,
-        "pe_owner_evidence": pe_owner_evidence.as_ref().map(|evidence| evidence.summary.clone()),
+        "pe_owner_evidence": pe_owner_evidence,
         "source_count": source_count,
         "file_count": outcome.files.len(),
         "session_count": outcome.total_session_count(),
@@ -487,6 +469,15 @@ where
         "data_persist": persist_stats,
         "version_anchor": persist_stats.anchors,
         "model_gen_anchor": model_gen_anchors,
+        "model_neutral_changes": model_neutral_changes,
+        "debt_written": debt_written,
+        "debt_write_failures": debt_write_failures,
+        "data_watermark": data_watermarks,
+        "model_generation_watermark": model_generation_watermarks,
+        "debt_ranges": debt_ranges,
+        "coverage_complete": coverage_complete,
+        "needs_full_regen": needs_full_regen,
+        "generation_failures": failures,
         "generation_dbnums": generation_dbnums,
         "generation_success": generation_success,
         "parquet_export": parquet_export_value,
@@ -509,6 +500,7 @@ where
         persist_stats,
         generation_success,
         parquet_export: parquet_export_value,
+        failures,
     })
 }
 
@@ -591,7 +583,7 @@ fn aggregate_source_hashes(
 /// 证据本身是**咨询性**的（degraded_allowed 语义保留）：单库探测失败不终止增量运行，
 /// 记为该 dbnum not_ready 并把错误写进 summary；只有 `--require-pe-owner-ready`（strict）
 /// 才把 not_ready 升级为快速失败（调用方判定）。
-async fn build_pe_owner_evidence(
+pub(crate) async fn build_pe_owner_evidence(
     generation_dbnums: &[u32],
     require_pe_owner_ready: bool,
 ) -> PeOwnerEvidence {

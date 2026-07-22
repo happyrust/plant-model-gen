@@ -3,9 +3,6 @@
 //! SQL 只能出现在具体 adapter 中；生成算法只依赖本模块公开的领域能力。
 
 mod catalog;
-mod compare;
-#[cfg(feature = "generation-read-ducklake")]
-mod ducklake;
 mod error;
 mod factory;
 mod hierarchy;
@@ -14,11 +11,6 @@ mod traits;
 mod types;
 
 pub use catalog::{CatalogClosure, CatalogResolver, CatalogResolverConfig};
-pub use compare::{
-    ComparingVersionedReadBackend, ComparingVersionedReadSession, TRANSFORM_ABS_TOLERANCE,
-};
-#[cfg(feature = "generation-read-ducklake")]
-pub use ducklake::{DuckLakeVersionedReadBackend, DuckLakeVersionedReadSession};
 pub use error::{GenerationReadError, GenerationReadResult};
 pub use factory::{open_generation_read_session, resolve_input_version_manifest};
 pub use hierarchy::{HierarchyNode, HierarchyQuery, HierarchySnapshot};

@@ -27,9 +27,9 @@ pub struct ParquetIncrementalEnqueueRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ModelUnitVersionQuery {
-    pub dbnum: u32,
+    pub dbnum: Option<u32>,
 }
 
 pub fn ensure_runtime_started() {
@@ -180,7 +180,10 @@ pub async fn api_model_unit_versions(
 ) -> impl IntoResponse {
     #[cfg(feature = "generation-read-ducklake")]
     {
-        let dbnum = query.dbnum;
+        let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+            Ok(dbnum) => dbnum,
+            Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+        };
         let unit_refno = normalize_refno_key(&unit_refno);
         let config = crate::options::get_db_option_ext().ducklake_config();
         let result = tokio::task::spawn_blocking(move || {
@@ -219,7 +222,10 @@ pub async fn api_model_unit_version(
 ) -> impl IntoResponse {
     #[cfg(feature = "generation-read-ducklake")]
     {
-        let dbnum = query.dbnum;
+        let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+            Ok(dbnum) => dbnum,
+            Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+        };
         let unit_refno = normalize_refno_key(&unit_refno);
         let query_refno = unit_refno.clone();
         let config = crate::options::get_db_option_ext().ducklake_config();
@@ -266,7 +272,10 @@ pub async fn api_latest_model_unit_version(
 ) -> impl IntoResponse {
     #[cfg(feature = "generation-read-ducklake")]
     {
-        let dbnum = query.dbnum;
+        let dbnum = match resolve_model_unit_dbnum(&unit_refno, query.dbnum) {
+            Ok(dbnum) => dbnum,
+            Err(error) => return model_unit_error(StatusCode::BAD_REQUEST, error),
+        };
         let unit_refno = normalize_refno_key(&unit_refno);
         let query_refno = unit_refno.clone();
         let config = crate::options::get_db_option_ext().ducklake_config();
@@ -313,6 +322,16 @@ fn model_unit_commit_json(commit: crate::version_store::ModelUnitCommit) -> serd
         "manifest_url": commit.manifest_url(),
         "commit": commit,
     })
+}
+
+#[cfg(feature = "generation-read-ducklake")]
+fn resolve_model_unit_dbnum(unit_refno: &str, dbnum: Option<u32>) -> anyhow::Result<u32> {
+    if let Some(dbnum) = dbnum {
+        return Ok(dbnum);
+    }
+    let refno = aios_core::RefnoEnum::from_str(unit_refno)
+        .map_err(|error| anyhow::anyhow!("无法解析模型单元 refno={unit_refno}: {error:?}"))?;
+    crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(refno)
 }
 
 #[cfg(feature = "generation-read-ducklake")]
@@ -498,5 +517,16 @@ fn aabb_to_json(aabb: Option<&aios_core::types::PlantAabb>) -> serde_json::Value
             "max": [value.maxs().x, value.maxs().y, value.maxs().z]
         }),
         None => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelUnitVersionQuery;
+
+    #[test]
+    fn model_unit_version_query_allows_omitted_dbnum() {
+        let query: ModelUnitVersionQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(query.dbnum, None);
     }
 }

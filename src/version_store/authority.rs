@@ -109,7 +109,8 @@ pub struct DuckLakeAuthority {
 }
 
 impl DuckLakeAuthority {
-    pub fn open(config: DuckLakeConfig) -> anyhow::Result<Self> {
+    pub fn open(mut config: DuckLakeConfig) -> anyhow::Result<Self> {
+        config.data_path = absolute_path(&config.data_path)?;
         config.validate()?;
         create_parent(&config.metadata_catalog)?;
         std::fs::create_dir_all(&config.data_path)?;
@@ -124,7 +125,8 @@ impl DuckLakeAuthority {
         Ok(authority)
     }
 
-    pub fn open_readonly(config: DuckLakeConfig) -> anyhow::Result<Self> {
+    pub fn open_readonly(mut config: DuckLakeConfig) -> anyhow::Result<Self> {
+        config.data_path = absolute_path(&config.data_path)?;
         config.validate()?;
         anyhow::ensure!(
             config.metadata_catalog.is_file(),
@@ -1437,6 +1439,14 @@ fn escape_path(path: &Path) -> String {
     escape_sql_literal(&path.to_string_lossy().replace('\\', "/"))
 }
 
+fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -1446,6 +1456,16 @@ mod tests {
     use super::*;
     use crate::generation_read::AttributeSet;
     use crate::version_store::{DuckLakeParseStager, ParseStageVersion, ParsedFactBatch};
+
+    #[test]
+    fn absolute_path_resolves_relative_and_preserves_absolute() {
+        let current_dir = std::env::current_dir().unwrap();
+        let relative = Path::new("runtime/ducklake/data");
+        let absolute = current_dir.join(relative);
+
+        assert_eq!(absolute_path(relative).unwrap(), absolute);
+        assert_eq!(absolute_path(&absolute).unwrap(), absolute);
+    }
     use aios_core::{AttrVal, NamedAttrMap};
 
     fn commit(versions: Vec<AuthorityDbVersion>) -> AuthorityCommit {

@@ -1,4 +1,5 @@
 use crate::options::DbOptionExt;
+use anyhow::Context;
 use clap::{Arg, ArgMatches, Command};
 #[cfg(feature = "gen_model")]
 use std::path::PathBuf;
@@ -191,6 +192,59 @@ pub fn model_version_command() -> Command {
                 .arg(json_arg()),
         )
         .subcommand(
+            Command::new("unit-simulate-position")
+                .about("LOCAL SMOKE ONLY: clone one unit artifact and shift one component position")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Database number; resolved from unit-refno when omitted"),
+                )
+                .arg(
+                    Arg::new("unit-refno")
+                        .long("unit-refno")
+                        .value_name("REFNO")
+                        .required(true),
+                )
+                .arg(required_u32("from-sesno"))
+                .arg(required_u32("sesno"))
+                .arg(
+                    Arg::new("component-refno")
+                        .long("component-refno")
+                        .value_name("REFNO")
+                        .help("Non-root component to move; defaults to the first movable child"),
+                )
+                .arg(
+                    Arg::new("dx")
+                        .long("dx")
+                        .value_parser(clap::value_parser!(f64))
+                        .default_value("1000")
+                        .help("X translation delta in millimeters"),
+                )
+                .arg(
+                    Arg::new("dy")
+                        .long("dy")
+                        .value_parser(clap::value_parser!(f64))
+                        .default_value("0")
+                        .help("Y translation delta in millimeters"),
+                )
+                .arg(
+                    Arg::new("dz")
+                        .long("dz")
+                        .value_parser(clap::value_parser!(f64))
+                        .default_value("0")
+                        .help("Z translation delta in millimeters"),
+                )
+                .arg(
+                    Arg::new("confirm-simulation")
+                        .long("confirm-simulation")
+                        .action(clap::ArgAction::SetTrue)
+                        .required(true)
+                        .help("Acknowledge that this writes a synthetic local model commit"),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
             Command::new("bootstrap-generation-read")
                 .about(
                     "Migrate the current committed Surreal state into the first DuckLake authority snapshot and bind its read replica",
@@ -342,6 +396,9 @@ pub async fn handle_model_version_command(
         Some(("resolve-anchor", sub)) => handle_resolve_anchor_command(sub).await?,
         Some(("unit-export", sub)) => handle_unit_export_command(sub, db_option_ext).await?,
         Some(("unit-list", sub)) => handle_unit_list_command(sub, db_option_ext).await?,
+        Some(("unit-simulate-position", sub)) => {
+            handle_unit_simulate_position_command(sub, db_option_ext).await?
+        }
         Some(("bootstrap-generation-read", sub)) => {
             handle_generation_read_bootstrap_command(sub, db_option_ext).await?
         }
@@ -770,6 +827,151 @@ async fn handle_unit_list_command(
         }
     }
     Ok(())
+}
+
+#[cfg(all(
+    feature = "generation-read-ducklake",
+    feature = "gen_model",
+    feature = "parquet-export"
+))]
+async fn handle_unit_simulate_position_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    use crate::version_store::{DuckLakeAuthority, ModelUnitCommit, ModelUnitImpactKind};
+
+    let unit_refno = sub
+        .get_one::<String>("unit-refno")
+        .expect("required by clap")
+        .trim()
+        .replace('/', "_");
+    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
+    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
+        Some(value) => value,
+        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
+    };
+    let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required by clap");
+    let target_sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+    anyhow::ensure!(
+        target_sesno > from_sesno,
+        "simulation target sesno must be newer than source: source={from_sesno} target={target_sesno}"
+    );
+
+    let authority = DuckLakeAuthority::open(db_option_ext.ducklake_config())?;
+    let source_commit = authority
+        .model_unit_commit(dbnum, &unit_refno, from_sesno)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "source model unit commit does not exist: ({dbnum}, {unit_refno}, {from_sesno})"
+            )
+        })?;
+    let latest = authority
+        .latest_model_unit_commit(dbnum, &unit_refno)?
+        .ok_or_else(|| anyhow::anyhow!("model unit has no commits: ({dbnum}, {unit_refno})"))?;
+    anyhow::ensure!(
+        latest.sesno == from_sesno,
+        "simulation must append to the latest model unit commit: latest={} source={from_sesno}",
+        latest.sesno
+    );
+    anyhow::ensure!(
+        authority
+            .model_unit_commit(dbnum, &unit_refno, target_sesno)?
+            .is_none(),
+        "target model unit commit already exists: ({dbnum}, {unit_refno}, {target_sesno})"
+    );
+    anyhow::ensure!(
+        source_commit.impact_kind != ModelUnitImpactKind::Tombstone,
+        "cannot simulate from a tombstone model unit commit"
+    );
+
+    let relative_dir = PathBuf::from("model_units")
+        .join(dbnum.to_string())
+        .join(&unit_refno)
+        .join(target_sesno.to_string());
+    let project_output_dir = db_option_ext.get_project_output_dir();
+    let source_manifest = project_output_dir.join(&source_commit.manifest_path);
+    let source_dir = source_manifest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("source model unit manifest has no parent directory"))?;
+    let target_dir = project_output_dir.join(&relative_dir);
+    let delta_mm = [
+        *sub.get_one::<f64>("dx").expect("defaulted by clap"),
+        *sub.get_one::<f64>("dy").expect("defaulted by clap"),
+        *sub.get_one::<f64>("dz").expect("defaulted by clap"),
+    ];
+    let simulation =
+        crate::version_management::model_unit_simulation::create_position_shifted_artifact(
+            source_dir,
+            &target_dir,
+            &unit_refno,
+            from_sesno,
+            target_sesno,
+            sub.get_one::<String>("component-refno").map(String::as_str),
+            delta_mm,
+        )?;
+    let manifest_path = relative_dir
+        .join("manifest.json")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let _ = validate_unit_manifest(&target_dir.join("manifest.json"), dbnum, &unit_refno)?;
+    let outcome = authority
+        .commit_model_unit(ModelUnitCommit {
+            dbnum,
+            unit_refno,
+            unit_noun: source_commit.unit_noun,
+            sesno: target_sesno,
+            impact_kind: ModelUnitImpactKind::Placement,
+            artifact_sesno: target_sesno,
+            project_name: source_commit.project_name,
+            manifest_path,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .with_context(|| {
+            format!(
+                "synthetic artifact was written but model commit failed: {}",
+                target_dir.display()
+            )
+        })?;
+    let output = serde_json::json!({
+        "success": true,
+        "synthetic": true,
+        "snapshot_id": outcome.snapshot_id,
+        "manifest_url": outcome.commit.manifest_url(),
+        "commit": outcome.commit,
+        "simulation": {
+            "source_sesno": from_sesno,
+            "moved_refno": simulation.moved_refno,
+            "delta_mm": simulation.delta_mm,
+        },
+    });
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "synthetic model unit commit: ({}, {}, {}) moved={} delta_mm={:?} manifest={}",
+            outcome.commit.dbnum,
+            outcome.commit.unit_refno,
+            outcome.commit.sesno,
+            simulation.moved_refno,
+            simulation.delta_mm,
+            outcome.commit.manifest_url(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(
+    feature = "generation-read-ducklake",
+    feature = "gen_model",
+    feature = "parquet-export"
+)))]
+async fn handle_unit_simulate_position_command(
+    _sub: &ArgMatches,
+    _db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "unit-simulate-position requires generation-read-ducklake, gen_model and parquet-export features"
+    )
 }
 
 #[cfg(not(feature = "generation-read-ducklake"))]

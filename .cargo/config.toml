@@ -50,8 +50,11 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 [target.x86_64-apple-darwin]
 # rustflags = ["-C", "link-args=-Wl,-stack_size,0x1000000"]
 
+[unstable]
+codegen-backend = true
 
-
+[profile.dev]
+codegen-backend = "cranelift"
 
 [profile.test]
 # 单测/集成测试在 Windows + cranelift 下更易触发内存/链接异常；

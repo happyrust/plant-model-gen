@@ -96,6 +96,14 @@ pub fn create_position_shifted_artifact(
         &old_transform_hash,
     )?;
     ensure_single_source_row(&connection, &aabb_path, "aabb_hash", &old_aabb_hash)?;
+    let legacy_transform_layout: bool = connection.query_row(
+        &format!(
+            "SELECT max(CASE WHEN name='m01' THEN column_id END) < max(CASE WHEN name='m10' THEN column_id END) FROM parquet_schema('{}')",
+            sql_path(&transforms_path),
+        ),
+        [],
+        |row| row.get(0),
+    )?;
 
     let target_parent = target_dir
         .parent()
@@ -129,6 +137,7 @@ pub fn create_position_shifted_artifact(
         &new_transform_hash,
         &new_aabb_hash,
         delta_mm,
+        legacy_transform_layout,
         &mut manifest,
     );
     if let Err(error) = result {
@@ -165,10 +174,12 @@ fn write_shifted_artifact(
     new_transform_hash: &str,
     new_aabb_hash: &str,
     delta_mm: [f64; 3],
+    legacy_transform_layout: bool,
     manifest: &mut serde_json::Value,
 ) -> anyhow::Result<()> {
     copy_unchanged_artifact_files(source_dir, staging_dir)?;
     let [dx, dy, dz] = delta_mm.map(sql_number);
+    let legacy_layout = if legacy_transform_layout { "TRUE" } else { "FALSE" };
     connection.execute_batch(&format!(
         "COPY (
             SELECT * REPLACE (
@@ -181,9 +192,12 @@ fn write_shifted_artifact(
             UNION ALL
             SELECT * REPLACE (
                 '{new_transform}' AS trans_hash,
-                m03 + {dx} AS m03,
-                m13 + {dy} AS m13,
-                m23 + {dz} AS m23
+                CASE WHEN {legacy_layout} THEN m03 ELSE m03 + {dx} END AS m03,
+                CASE WHEN {legacy_layout} THEN m13 ELSE m13 + {dy} END AS m13,
+                CASE WHEN {legacy_layout} THEN m23 ELSE m23 + {dz} END AS m23,
+                CASE WHEN {legacy_layout} THEN m30 + {dx} ELSE m30 END AS m30,
+                CASE WHEN {legacy_layout} THEN m31 + {dy} ELSE m31 END AS m31,
+                CASE WHEN {legacy_layout} THEN m32 + {dz} ELSE m32 END AS m32
             ) FROM read_parquet('{source_transforms}')
             WHERE trans_hash = '{old_transform}'
          ) TO '{target_transforms}' (FORMAT PARQUET);
@@ -206,6 +220,7 @@ fn write_shifted_artifact(
         new_aabb = sql_string(new_aabb_hash),
         old_transform = sql_string(old_transform_hash),
         old_aabb = sql_string(old_aabb_hash),
+        legacy_layout = legacy_layout,
         source_instances = sql_path(instances_path),
         target_instances = sql_path(&staging_dir.join("instances.parquet")),
         source_transforms = sql_path(transforms_path),
@@ -324,7 +339,7 @@ fn sql_string(value: &str) -> String {
 }
 
 fn sql_number(value: f64) -> String {
-    format!("{value:.17}")
+    format!("CAST({value:.17} AS DOUBLE)")
 }
 
 #[cfg(test)]
@@ -347,8 +362,8 @@ mod tests {
             TO '{instances}' (FORMAT PARQUET);
             COPY (SELECT * FROM (VALUES
                 ('tr-root', 1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 10.0,20.0,30.0,1.0),
-                ('tr-child',1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 25.0,35.0,45.0,1.0)
-            ) t(trans_hash,m00,m10,m20,m30,m01,m11,m21,m31,m02,m12,m22,m32,m03,m13,m23,m33))
+                ('tr-child',1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0)
+            ) t(trans_hash,m00,m01,m02,m03,m10,m11,m12,m13,m20,m21,m22,m23,m30,m31,m32,m33))
             TO '{transforms}' (FORMAT PARQUET);
             COPY (SELECT * FROM (VALUES
                 ('bb-root',0.0,0.0,0.0,10.0,10.0,10.0),
@@ -395,12 +410,12 @@ mod tests {
 
         assert_eq!(result.moved_refno, "24381_145019");
         let moved: (String, f64, f64, f64) = connection.query_row(
-            &format!("SELECT i.trans_hash, t.m03, t.m13, t.m23 FROM read_parquet('{}') i JOIN read_parquet('{}') t USING (trans_hash) WHERE i.refno_str='24381_145019'", sql_path(&target.join("instances.parquet")), sql_path(&target.join("transforms.parquet"))),
+            &format!("SELECT i.trans_hash, t.m30, t.m31, t.m32 FROM read_parquet('{}') i JOIN read_parquet('{}') t USING (trans_hash) WHERE i.refno_str='24381_145019'", sql_path(&target.join("instances.parquet")), sql_path(&target.join("transforms.parquet"))),
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).unwrap();
         assert_eq!(moved.0, "sim-897-24381_145019-transform");
-        assert_eq!([moved.1, moved.2, moved.3], [125.0, 15.0, 50.0]);
+        assert_eq!([moved.1, moved.2, moved.3], [100.0, -20.0, 5.0]);
         let moved_min: (f64, f64, f64) = connection.query_row(
             &format!("SELECT a.min_x, a.min_y, a.min_z FROM read_parquet('{}') i JOIN read_parquet('{}') a USING (aabb_hash) WHERE i.refno_str='24381_145019'", sql_path(&target.join("instances.parquet")), sql_path(&target.join("aabb.parquet"))),
             [],

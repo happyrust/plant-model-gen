@@ -62,12 +62,15 @@ pub struct ModelUnitCommit {
 }
 
 impl ModelUnitCommit {
-    pub fn manifest_url(&self) -> String {
-        format!(
+    pub fn manifest_url(&self) -> Option<String> {
+        if self.impact_kind == ModelUnitImpactKind::Tombstone {
+            return None;
+        }
+        Some(format!(
             "/files/output/{}/{}",
             urlencoding::encode(&self.project_name),
             self.manifest_path.replace('\\', "/")
-        )
+        ))
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -110,7 +113,16 @@ impl ModelUnitCommit {
                 "NoOp 提交必须复用更早的 artifact_sesno"
             );
         }
-        if self.impact_kind != ModelUnitImpactKind::Tombstone {
+        if self.impact_kind == ModelUnitImpactKind::Tombstone {
+            anyhow::ensure!(
+                self.artifact_sesno == self.sesno,
+                "Tombstone 提交必须使用当前 sesno 作为兼容 artifact_sesno"
+            );
+            anyhow::ensure!(
+                self.manifest_path.is_empty(),
+                "Tombstone 提交不得包含 manifest_path"
+            );
+        } else {
             validate_relative_manifest_path(&self.manifest_path)?;
         }
         Ok(())
@@ -498,6 +510,22 @@ mod tests {
         commit.manifest_path = "model_units/7997/24381_145018/791/manifest.json".to_string();
         commit.validate().expect("valid noop");
 
+        commit.artifact_sesno = 897;
+        assert!(commit.validate().is_err());
+    }
+
+    #[test]
+    fn tombstone_has_no_model_artifact_url() {
+        let mut commit = model_commit(898);
+        commit.impact_kind = ModelUnitImpactKind::Tombstone;
+        commit.manifest_path.clear();
+
+        commit.validate().expect("valid tombstone");
+        assert_eq!(commit.manifest_url(), None);
+
+        commit.manifest_path = "model_units/7997/24381_145018/898/manifest.json".to_string();
+        assert!(commit.validate().is_err());
+        commit.manifest_path.clear();
         commit.artifact_sesno = 897;
         assert!(commit.validate().is_err());
     }

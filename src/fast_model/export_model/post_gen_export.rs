@@ -205,17 +205,31 @@ async fn export_parquet_after_generation_impl(
             )),
             export_started.elapsed().as_millis() as u64,
         );
-        let output_dir = base_output_dir.join(dbnum.to_string());
-        export_dbnum_instances_parquet(
-            *dbnum,
-            &output_dir,
-            db_option.clone(),
-            true,
-            None,
-            parquet_root_refno,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
+        let output_dir = if parquet_root_refno.is_none() {
+            let (_, artifact_dir) = crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_latest(
+                *dbnum,
+                &base_output_dir,
+                db_option.clone(),
+                true,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
+            artifact_dir
+        } else {
+            let output_dir = base_output_dir.join(dbnum.to_string());
+            export_dbnum_instances_parquet(
+                *dbnum,
+                &output_dir,
+                db_option.clone(),
+                true,
+                None,
+                parquet_root_refno,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
+            output_dir
+        };
 
         #[cfg(feature = "sqlite-index")]
         {

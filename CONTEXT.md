@@ -28,6 +28,10 @@ _Avoid_: 任意元素、dbnum 汇总包、release unit
 最小交付单元在一次 sesno 上的完整模型状态，身份为 `(dbnum, unit_refno, sesno)`；每次变化都是小版本提交，不是人为发布。即使几何未变化，E3D 写入的新 sesno 仍形成可追踪的模型提交。
 _Avoid_: model_version_id、release、发布版本、content_hash
 
+**模型删除提交（Tombstone Model Commit）**:
+最小交付单元在指定 sesno 已不存在的模型提交；它保留删除事实，但不引用模型导出物。
+_Avoid_: 空模型、缺失导出物、加载失败
+
 **权威版本库（Authoritative Version Store）**:
 唯一有权判定某个数据版本是否正式存在并推进已提交水位的版本库。
 _Avoid_: 主库、默认后端

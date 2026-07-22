@@ -3961,7 +3961,9 @@ pub async fn export_dbnum_instances_parquet_mode(
     db_option_ext: &DbOptionExt,
     root_refno: Option<RefnoEnum>,
 ) -> Result<()> {
-    use aios_database::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet;
+    use aios_database::fast_model::export_model::export_dbnum_instances_parquet::{
+        export_dbnum_instances_parquet, export_dbnum_instances_parquet_latest,
+    };
     use aios_database::model_relation_store::global_store;
     use std::sync::Arc;
 
@@ -3997,15 +3999,27 @@ pub async fn export_dbnum_instances_parquet_mode(
 
     // 调用导出函数
     let db_option = Arc::new((**db_option_ext).clone());
-    let stats = export_dbnum_instances_parquet(
-        dbnum,
-        &output_dir,
-        db_option,
-        verbose,
-        None, // 使用默认毫米单位
-        root_refno,
-    )
-    .await?;
+    let (stats, output_dir) = if root_refno.is_none() && parquet_name.is_none() {
+        export_dbnum_instances_parquet_latest(
+            dbnum,
+            &base_output_dir,
+            db_option,
+            verbose,
+            None, // 使用默认毫米单位
+        )
+        .await?
+    } else {
+        let stats = export_dbnum_instances_parquet(
+            dbnum,
+            &output_dir,
+            db_option,
+            verbose,
+            None, // 使用默认毫米单位
+            root_refno,
+        )
+        .await?;
+        (stats, output_dir)
+    };
 
     #[cfg(feature = "sqlite-index")]
     {

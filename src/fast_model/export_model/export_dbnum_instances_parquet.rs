@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,6 +32,7 @@ use arrow_schema::{DataType, Field, Schema};
 use chrono::{SecondsFormat, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use serde_json::json;
 use std::str::FromStr;
@@ -44,6 +46,125 @@ use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 
 // =============================================================================
+
+pub fn publish_dbnum_latest_manifest(
+    artifact_dir: &Path,
+    latest_root: &Path,
+    dbnum: u32,
+) -> Result<PathBuf> {
+    let local_manifest_path = artifact_dir.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&local_manifest_path).with_context(|| {
+            format!("读取本地 manifest 失败: {}", local_manifest_path.display())
+        })?)?;
+    anyhow::ensure!(
+        manifest.get("dbnum").and_then(serde_json::Value::as_u64) == Some(u64::from(dbnum)),
+        "本地 manifest dbnum 与 latest pointer 不匹配"
+    );
+    anyhow::ensure!(
+        manifest
+            .get("root_refno")
+            .is_none_or(serde_json::Value::is_null),
+        "root-scoped 模型不得发布为 dbnum latest"
+    );
+
+    let relative_dir = artifact_dir.strip_prefix(latest_root).with_context(|| {
+        format!(
+            "artifact 目录不在 latest 根目录内: artifact={} root={}",
+            artifact_dir.display(),
+            latest_root.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !relative_dir.as_os_str().is_empty(),
+        "artifact 目录不能等于 latest 根目录"
+    );
+    let prefix = relative_dir.to_string_lossy().replace('\\', "/");
+
+    let tables = manifest
+        .get_mut("tables")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("本地 manifest 缺少 tables"))?;
+    anyhow::ensure!(!tables.is_empty(), "本地 manifest 的 tables 不能为空");
+    for table in tables.values_mut() {
+        let expected_rows = table
+            .get("rows")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("manifest table rows 必须是非负整数"))?;
+        let file = table
+            .get_mut("file")
+            .ok_or_else(|| anyhow::anyhow!("manifest table 缺少 file"))?;
+        let local_file = file
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("manifest table file 必须是字符串"))?;
+        let local_path = Path::new(local_file);
+        anyhow::ensure!(
+            !local_path.is_absolute()
+                && local_path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "manifest table file 必须是安全相对路径: {local_file}"
+        );
+        anyhow::ensure!(
+            artifact_dir.join(local_path).is_file(),
+            "manifest 引用文件不存在: {}",
+            artifact_dir.join(local_path).display()
+        );
+        let parquet_file = fs::File::open(artifact_dir.join(local_path))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_file).with_context(|| {
+            format!(
+                "读取 Parquet schema 失败: {}",
+                artifact_dir.join(local_path).display()
+            )
+        })?;
+        anyhow::ensure!(
+            !reader.schema().fields().is_empty(),
+            "Parquet schema 不能为空: {}",
+            artifact_dir.join(local_path).display()
+        );
+        let actual_rows = u64::try_from(reader.metadata().file_metadata().num_rows())
+            .context("Parquet row count 不能为负数")?;
+        anyhow::ensure!(
+            actual_rows == expected_rows,
+            "Parquet 行数与 manifest 不一致: file={} expected={} actual={}",
+            artifact_dir.join(local_path).display(),
+            expected_rows,
+            actual_rows
+        );
+        *file = json!(format!("{prefix}/{local_file}"));
+    }
+
+    if let Some(report_file) = manifest
+        .pointer_mut("/mesh_validation/report_file")
+        .and_then(|value| value.as_str().map(str::to_string))
+    {
+        let report_path = Path::new(&report_file);
+        anyhow::ensure!(
+            !report_path.is_absolute()
+                && report_path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_))),
+            "mesh report 必须是安全相对路径: {report_file}"
+        );
+        anyhow::ensure!(
+            artifact_dir.join(report_path).is_file(),
+            "mesh report 不存在: {}",
+            artifact_dir.join(report_path).display()
+        );
+        *manifest
+            .pointer_mut("/mesh_validation/report_file")
+            .expect("report_file exists") = json!(format!("{prefix}/{report_file}"));
+    }
+
+    fs::create_dir_all(latest_root)?;
+    let pointer_path = latest_root.join(format!("manifest_{dbnum}.json"));
+    let mut temp = tempfile::NamedTempFile::new_in(latest_root)?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), &manifest)?;
+    temp.as_file_mut().write_all(b"\n")?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(&pointer_path).map_err(|error| error.error)?;
+    Ok(pointer_path)
+}
 // Parquet 行结构体
 // =============================================================================
 
@@ -3136,113 +3257,6 @@ pub async fn export_dbnum_instances_parquet(
         println!("   ✅ manifest.json 已写入");
     }
 
-    // 写一份 manifest_{dbnum}.json 到 parquet/ 根目录，文件路径加 {dbnum}/ 前缀，
-    // 与前端 buildFilesOutputUrl(`parquet/manifest_${dbno}.json`) 路径对齐。
-    if let Some(parent) = output_dir.parent() {
-        let subdir = output_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| dbnum.to_string());
-        let web_manifest = json!({
-            "version": 1,
-            "format": "parquet",
-            "generated_at": generated_at,
-            "dbnum": dbnum,
-            "root_refno": root_refno.map(|r| r.to_string()),
-            "tables": {
-                "instances": {
-                    "file": format!("{}/instances.parquet", subdir),
-                    "rows": instance_rows.len(),
-                },
-                "ptsets": {
-                    "file": format!("{}/ptsets.parquet", subdir),
-                    "rows": ptset_rows.len(),
-                    "key": ["cata_hash", "point_number"],
-                },
-                "primitive_keypoints": {
-                    "file": format!("{}/primitive_keypoints.parquet", subdir),
-                    "rows": primitive_keypoint_rows.len(),
-                    "key": ["geo_hash", "keypoint_index"],
-                },
-                "geo_instances": {
-                    "file": format!("{}/geo_instances.parquet", subdir),
-                    "rows": geo_instance_rows.len(),
-                },
-                "tubings": {
-                    "file": format!("{}/tubings.parquet", subdir),
-                    "rows": tubing_rows.len(),
-                },
-                "transforms": {
-                    "file": format!("{}/transforms.parquet", subdir),
-                    "rows": transform_rows.len(),
-                },
-                "aabb": {
-                    "file": format!("{}/aabb.parquet", subdir),
-                    "rows": aabb_row_data.len(),
-                },
-            },
-            "mesh_validation": {
-                "lod_tag": MESH_CHECK_LOD_TAG,
-                "report_file": format!("{}/{}", subdir, missing_mesh_report.report_file),
-                "policy": mesh_validation_summary.policy,
-                "checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
-                "missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
-                "missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
-                "raw_checked_geo_hashes": mesh_validation_summary.raw_checked_geo_hashes,
-                "raw_missing_geo_hashes": mesh_validation_summary.raw_missing_geo_hashes,
-                "raw_missing_owner_refnos": mesh_validation_summary.raw_missing_owner_refnos,
-                "render_missing_geo_hashes": mesh_validation_summary.render_missing_geo_hashes,
-                "render_missing_owner_refnos": mesh_validation_summary.render_missing_owner_refnos,
-                "quarantined_geo_hashes": mesh_validation_summary.quarantined_geo_hashes,
-                "quarantined_owner_refnos": mesh_validation_summary.quarantined_owner_refnos,
-                "dropped_geo_instance_rows": mesh_validation_summary.dropped_geo_instance_rows,
-                "dropped_tubing_rows": mesh_validation_summary.dropped_tubing_rows,
-                "dropped_instance_rows": mesh_validation_summary.dropped_instance_rows,
-            },
-            "spec_info_validation": {
-                "fallback_count": spec_info_fallback_count,
-                "instance_fallback_rows": instance_spec_info_fallback_rows,
-                "tubing_fallback_rows": tubing_spec_info_fallback_rows,
-                "definition": "raw/default zero spec_value unresolved by spec_info self, owner, or ancestor lookup",
-            },
-            "spec_info_fallback_count": spec_info_fallback_count,
-            "ptset_unit": {
-                "source": LengthUnit::Millimeter.name(),
-                "target": target.name(),
-                "conversion_factor": unit_converter.conversion_factor(),
-                "coordinate_space": "local",
-            },
-            "primitive_keypoint_unit": {
-                "source": LengthUnit::Millimeter.name(),
-                "target": target.name(),
-                "conversion_factor": unit_converter.conversion_factor(),
-                "coordinate_space": "geo_local",
-            },
-            "ptset_export": {
-                "cata_hashes": used_cata_hashes.len(),
-                "used_cata_hashes": used_cata_hashes.len(),
-                "available_cata_hashes": ptset_export_data.rows_by_cata_hash.len(),
-                "refno_cata_hashes": ptset_export_data.refno_cata_hash.len(),
-                "requested_refnos": ptset_export_data.requested_refnos,
-                "relation_rows": ptset_export_data.relation_rows,
-                "inst_info_rows": ptset_export_data.inst_info_rows,
-                "written_ptset_points": ptset_rows.len(),
-                "invalid_cata_hash_rows": ptset_export_data.invalid_cata_hash_rows,
-                "missing_cata_hash_refnos": ptset_export_data.missing_cata_hash_refnos,
-                "empty_ptset_hashes": ptset_export_data.empty_ptset_hashes,
-            },
-            "total_bytes": total_bytes,
-        });
-        let web_manifest_path = parent.join(format!("manifest_{}.json", dbnum));
-        fs::write(
-            &web_manifest_path,
-            serde_json::to_string_pretty(&web_manifest)?,
-        )?;
-        if verbose {
-            println!("   ✅ manifest_{}.json 已写入 (web 兼容)", dbnum);
-        }
-    }
-
     let elapsed = start_time.elapsed();
 
     Ok(ParquetExportStats {
@@ -3262,3 +3276,155 @@ pub async fn export_dbnum_instances_parquet(
 // =============================================================================
 // Cache → Parquet 导出
 // =============================================================================
+pub async fn export_dbnum_instances_parquet_latest(
+    dbnum: u32,
+    latest_root: &Path,
+    db_option: Arc<DbOption>,
+    verbose: bool,
+    target_unit: Option<LengthUnit>,
+) -> Result<(ParquetExportStats, PathBuf)> {
+    let dbnum_root = latest_root.join(dbnum.to_string());
+    fs::create_dir_all(&dbnum_root)?;
+    let generation = format!(
+        "generation-{}-{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
+    );
+    let staging_dir = dbnum_root.join(format!(".{generation}.staging"));
+    let artifact_dir = dbnum_root.join(&generation);
+
+    let stats = match export_dbnum_instances_parquet(
+        dbnum,
+        &staging_dir,
+        db_option,
+        verbose,
+        target_unit,
+        None,
+    )
+    .await
+    {
+        Ok(stats) => stats,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::rename(&staging_dir, &artifact_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error).with_context(|| {
+            format!(
+                "发布 dbnum generation 目录失败: {} -> {}",
+                staging_dir.display(),
+                artifact_dir.display()
+            )
+        });
+    }
+    publish_dbnum_latest_manifest(&artifact_dir, latest_root, dbnum)?;
+    Ok((stats, artifact_dir))
+}
+
+#[cfg(test)]
+mod latest_manifest_tests {
+    use super::*;
+
+    fn write_local_manifest(artifact_dir: &Path, root_refno: serde_json::Value) {
+        fs::create_dir_all(artifact_dir).expect("artifact dir");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "refno",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["24381_145018"]))],
+        )
+        .expect("record batch");
+        let file = fs::File::create(artifact_dir.join("instances.parquet")).expect("table");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+        writer.write(&batch).expect("parquet batch");
+        writer.close().expect("parquet close");
+        fs::write(
+            artifact_dir.join("manifest.json"),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "format": "parquet",
+                "generated_at": "2026-07-22T00:00:00Z",
+                "dbnum": 7997,
+                "root_refno": root_refno,
+                "tables": {
+                    "instances": {"file": "instances.parquet", "rows": 1}
+                }
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest");
+    }
+
+    #[test]
+    fn latest_pointer_rejects_root_scoped_artifact_without_replacing_previous() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let latest_root = temp.path().join("parquet");
+        let artifact_dir = latest_root.join("7997/generation-a");
+        write_local_manifest(&artifact_dir, json!("24381_145018"));
+        let pointer = latest_root.join("manifest_7997.json");
+        fs::write(&pointer, br#"{"generation":"previous"}"#).expect("old pointer");
+
+        assert!(publish_dbnum_latest_manifest(&artifact_dir, &latest_root, 7997).is_err());
+        assert_eq!(
+            fs::read_to_string(pointer).expect("preserved pointer"),
+            r#"{"generation":"previous"}"#
+        );
+    }
+
+    #[test]
+    fn latest_pointer_rewrites_table_paths_to_one_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let latest_root = temp.path().join("parquet");
+        let artifact_dir = latest_root.join("7997/generation-a");
+        write_local_manifest(&artifact_dir, serde_json::Value::Null);
+        let old_pointer = latest_root.join("manifest_7997.json");
+        fs::write(&old_pointer, br#"{"generation":"previous"}"#).expect("old pointer");
+
+        let pointer = publish_dbnum_latest_manifest(&artifact_dir, &latest_root, 7997)
+            .expect("publish latest");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(pointer).expect("pointer bytes"))
+                .expect("pointer json");
+        assert_eq!(
+            manifest
+                .pointer("/tables/instances/file")
+                .and_then(|value| value.as_str()),
+            Some("7997/generation-a/instances.parquet")
+        );
+        assert_ne!(
+            fs::read_to_string(old_pointer).expect("new pointer"),
+            r#"{"generation":"previous"}"#
+        );
+    }
+
+    #[test]
+    fn latest_pointer_preserves_previous_when_parquet_rows_do_not_match() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let latest_root = temp.path().join("parquet");
+        let artifact_dir = latest_root.join("7997/generation-a");
+        write_local_manifest(&artifact_dir, serde_json::Value::Null);
+        let local_manifest = artifact_dir.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&local_manifest).expect("manifest bytes"))
+                .expect("manifest json");
+        manifest["tables"]["instances"]["rows"] = json!(2);
+        fs::write(
+            local_manifest,
+            serde_json::to_vec(&manifest).expect("manifest json"),
+        )
+        .expect("manifest");
+        let pointer = latest_root.join("manifest_7997.json");
+        fs::write(&pointer, br#"{"generation":"previous"}"#).expect("old pointer");
+
+        assert!(publish_dbnum_latest_manifest(&artifact_dir, &latest_root, 7997).is_err());
+        assert_eq!(
+            fs::read_to_string(pointer).expect("preserved pointer"),
+            r#"{"generation":"previous"}"#
+        );
+    }
+}

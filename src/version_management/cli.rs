@@ -518,6 +518,52 @@ async fn resolve_unit_impact(
         previous.sesno
     );
 
+    if previous.impact_kind == ModelUnitImpactKind::Tombstone {
+        return Ok((
+            ModelUnitImpactKind::Mesh,
+            serde_json::json!({
+                "reason": "unit_recreated_after_tombstone",
+                "from_sesno": previous.sesno,
+                "to_sesno": sesno,
+            }),
+        ));
+    }
+
+    let root_diffs = aios_core::diff_range(&[root_refno], previous.sesno, sesno, dbnum).await?;
+    if model_unit_root_deleted(root_refno, &root_diffs) {
+        let root_diff = root_diffs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 diff"))?;
+        let from = root_diff
+            .from_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 from snapshot"))?;
+        let to = root_diff
+            .to_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 to snapshot"))?;
+        anyhow::ensure!(
+            from.exact_anchor && from.resolved_sesno == previous.sesno,
+            "unit impact 必须精确命中上一提交 sesno={}，refno={}",
+            previous.sesno,
+            root_diff.pe_key
+        );
+        anyhow::ensure!(
+            to.exact_anchor && to.resolved_sesno == sesno,
+            "unit impact 必须精确命中目标 sesno={sesno}，refno={}",
+            root_diff.pe_key
+        );
+        return Ok((
+            ModelUnitImpactKind::Tombstone,
+            serde_json::json!({
+                "reason": "unit_root_deleted",
+                "from_sesno": previous.sesno,
+                "to_sesno": sesno,
+                "root_refno": root_refno.to_string(),
+            }),
+        ));
+    }
+
     let previous_manifest = project_output_dir.join(&previous.manifest_path);
     let mut refnos = unit_manifest_refnos(&previous_manifest)?
         .into_iter()
@@ -601,6 +647,62 @@ async fn resolve_unit_impact(
     feature = "gen_model",
     feature = "parquet-export"
 ))]
+fn model_unit_root_deleted(
+    root_refno: aios_core::RefnoEnum,
+    diffs: &[aios_core::ElementDiff],
+) -> bool {
+    diffs.iter().any(|diff| {
+        diff.refno_u64 == root_refno.refno().0
+            && matches!(
+                diff.kind,
+                aios_core::DiffKind::Deleted | aios_core::DiffKind::Removed
+            )
+    })
+}
+
+#[cfg(all(
+    test,
+    feature = "generation-read-ducklake",
+    feature = "gen_model",
+    feature = "parquet-export"
+))]
+mod unit_impact_tests {
+    use super::*;
+
+    fn element_diff(refno_u64: u64, kind: aios_core::DiffKind) -> aios_core::ElementDiff {
+        aios_core::ElementDiff {
+            refno_u64,
+            pe_key: String::new(),
+            kind,
+            from_sesno: 897,
+            to_sesno: 898,
+            changes: Vec::new(),
+            from_snapshot: None,
+            to_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn only_root_deletion_is_a_model_unit_tombstone() {
+        let root = aios_core::RefnoEnum::from("24381/145018");
+        let child = aios_core::RefnoEnum::from("24381/145035");
+
+        assert!(model_unit_root_deleted(
+            root,
+            &[element_diff(root.refno().0, aios_core::DiffKind::Deleted)]
+        ));
+        assert!(!model_unit_root_deleted(
+            root,
+            &[element_diff(child.refno().0, aios_core::DiffKind::Deleted)]
+        ));
+    }
+}
+
+#[cfg(all(
+    feature = "generation-read-ducklake",
+    feature = "gen_model",
+    feature = "parquet-export"
+))]
 async fn handle_unit_export_command(
     sub: &ArgMatches,
     db_option_ext: &DbOptionExt,
@@ -617,24 +719,14 @@ async fn handle_unit_export_command(
         Some(value) => value,
         None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
     };
-    let unit_noun = aios_core::get_type_name(root_refno)
-        .await?
-        .trim()
-        .to_ascii_uppercase();
-    anyhow::ensure!(
-        crate::version_management::model_impact::is_delivery_unit_root_noun(&unit_noun),
-        "{} 的 noun={}，不是最小交付单元根 BRAN/HANG/EQUI/WALL/FLOOR；其他模型仍按 dbnum 汇总导出",
-        unit_refno,
-        unit_noun
-    );
     let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
     let project_name = db_option_ext.inner.project_name.trim().to_string();
     let authority = DuckLakeAuthority::open(db_option_ext.ducklake_config())?;
 
     if let Some(existing) = authority.model_unit_commit(dbnum, &unit_refno, sesno)? {
         anyhow::ensure!(
-            existing.unit_noun == unit_noun && existing.project_name == project_name,
-            "已存在提交与当前 unit/project 不一致"
+            existing.project_name == project_name,
+            "已存在提交与当前 project 不一致"
         );
         if existing.impact_kind != ModelUnitImpactKind::Tombstone {
             let manifest = db_option_ext
@@ -661,7 +753,10 @@ async fn handle_unit_export_command(
                 outcome.commit.unit_refno,
                 outcome.commit.sesno,
                 outcome.commit.artifact_sesno,
-                outcome.commit.manifest_url(),
+                outcome
+                    .commit
+                    .manifest_url()
+                    .unwrap_or_else(|| "<none>".to_string()),
             );
         }
         return Ok(());
@@ -676,6 +771,26 @@ async fn handle_unit_export_command(
         &db_option_ext.get_project_output_dir(),
     )
     .await?;
+
+    let unit_noun = if impact_kind == ModelUnitImpactKind::Tombstone {
+        previous
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tombstone 提交缺少上一模型提交"))?
+            .unit_noun
+            .clone()
+    } else {
+        let noun = aios_core::get_type_name(root_refno)
+            .await?
+            .trim()
+            .to_ascii_uppercase();
+        anyhow::ensure!(
+            crate::version_management::model_impact::is_delivery_unit_root_noun(&noun),
+            "{} 的 noun={}，不是最小交付单元根 BRAN/HANG/EQUI/WALL/FLOOR；其他模型仍按 dbnum 汇总导出",
+            unit_refno,
+            noun
+        );
+        noun
+    };
 
     let mut stats = None;
     let (artifact_sesno, manifest_path) = match impact_kind {
@@ -734,7 +849,8 @@ async fn handle_unit_export_command(
             let _ = validate_unit_manifest(&reused_manifest, dbnum, &unit_refno)?;
             (previous.artifact_sesno, previous.manifest_path.clone())
         }
-        _ => anyhow::bail!("unit-export 当前只接受 mesh 或 noop"),
+        ModelUnitImpactKind::Tombstone => (sesno, String::new()),
+        _ => anyhow::bail!("unit-export 当前只接受 mesh、noop 或 tombstone"),
     };
 
     let outcome = authority.commit_model_unit(ModelUnitCommit {
@@ -767,7 +883,10 @@ async fn handle_unit_export_command(
             outcome.commit.sesno,
             outcome.commit.impact_kind.as_str(),
             outcome.commit.artifact_sesno,
-            outcome.commit.manifest_url(),
+            outcome
+                .commit
+                .manifest_url()
+                .unwrap_or_else(|| "<none>".to_string()),
         );
     }
     Ok(())
@@ -822,7 +941,9 @@ async fn handle_unit_list_command(
                 commit.sesno,
                 commit.impact_kind.as_str(),
                 commit.artifact_sesno,
-                commit.manifest_url(),
+                commit
+                    .manifest_url()
+                    .unwrap_or_else(|| "<none>".to_string()),
             );
         }
     }
@@ -954,7 +1075,10 @@ async fn handle_unit_simulate_position_command(
             outcome.commit.sesno,
             simulation.moved_refno,
             simulation.delta_mm,
-            outcome.commit.manifest_url(),
+            outcome
+                .commit
+                .manifest_url()
+                .unwrap_or_else(|| "<none>".to_string()),
         );
     }
     Ok(())

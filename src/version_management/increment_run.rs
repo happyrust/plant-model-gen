@@ -634,6 +634,15 @@ where
     let coverage_complete = coverages.iter().all(|coverage| coverage.coverage_complete);
     let needs_full_regen = coverages.iter().any(|coverage| coverage.needs_full_regen);
 
+    // ADR-0011 P2 shadow：目录反向波及闭包**旁路观测**——只计算并写进 summary/日志，
+    // 绝不改动生成目标（P3 接管等 specs/027）。失败被吞、不影响增量运行。
+    // kill-switch：设 `AIOS_DISABLE_CATA_REVERSE_SHADOW` 即可关闭。
+    let catalogue_reverse_shadow = if options.persist_data {
+        compute_catalogue_reverse_shadow(&persist_stats, &outcome.element_changes).await
+    } else {
+        serde_json::Value::Null
+    };
+
     let summary = serde_json::json!({
         "from_sesno": options.from_sesno,
         "to_sesno": options.to_sesno,
@@ -698,6 +707,7 @@ where
         "files": outcome.files,
         "element_changes": outcome.element_changes,
         "update_log": outcome.update_log,
+        "catalogue_reverse_shadow": catalogue_reverse_shadow,
     });
 
     Ok(IncrementRunResult {
@@ -888,4 +898,83 @@ pub(crate) async fn build_pe_owner_evidence(
             "recommendation": recommendation,
         }),
     }
+}
+
+/// ADR-0011 **P2 shadow**：对本轮已提交 dbnum 计算「目录反向波及闭包」并只写进 summary/日志。
+///
+/// 红线：**不改动任何生成目标**（`IncrGeoUpdateLog`/debt 一律不碰），P3 才接管（等 specs/027）。
+/// 语义安全性：seeds = 本轮**触发模型**的被改 refno；expander 反查「谁引用了它」——
+/// 设计实例改自身 CATR/SPRE 不会被别人引用 → 空结果（不扇兄弟，符合红线）；只有被引用的
+/// 目录定义才会扇出到引用实例。任何错误都被吞掉，绝不影响增量运行。
+/// kill-switch：设环境变量 `AIOS_DISABLE_CATA_REVERSE_SHADOW`。
+async fn compute_catalogue_reverse_shadow(
+    persist_stats: &crate::data_interface::sesno_increment::PdmsIncrementPersistStats,
+    element_changes: &[crate::data_interface::sesno_increment::PdmsSesnoElementChange],
+) -> serde_json::Value {
+    use crate::versioned_db::{cata_ref_closure, cata_ref_index};
+
+    if std::env::var_os("AIOS_DISABLE_CATA_REVERSE_SHADOW").is_some() {
+        return serde_json::json!({"mode": "disabled", "reason": "AIOS_DISABLE_CATA_REVERSE_SHADOW"});
+    }
+
+    let committed: std::collections::BTreeSet<u32> =
+        persist_stats.anchors.iter().map(|anchor| anchor.dbnum).collect();
+    let limits = cata_ref_closure::ReverseClosureLimits::default();
+    let mut per_dbnum = Vec::new();
+
+    for dbnum in committed {
+        // 项目级 ready 门是 P3 的严格要求；shadow 阶段按 per-dbnum ready 放行（只观测）。
+        let ready = matches!(cata_ref_index::read_state(dbnum).await, Ok(Some(state)) if state.ready);
+        if !ready {
+            per_dbnum.push(serde_json::json!({"dbnum": dbnum, "skipped": "index_not_ready"}));
+            continue;
+        }
+        // seeds：本轮该 dbnum 内「触发模型」的被改 refno（neutral 不入 seed）。
+        let mut seeds: Vec<aios_core::RefU64> = element_changes
+            .iter()
+            .filter(|c| c.dbnum == dbnum && c.impact_decision != "neutral")
+            .map(|c| c.refno.refno())
+            .filter(|r| !r.is_unset())
+            .collect();
+        seeds.sort_by_key(aios_core::RefU64::to_string);
+        seeds.dedup();
+        if seeds.is_empty() {
+            continue;
+        }
+
+        match cata_ref_closure::expand_catalogue_reverse_targets(&seeds, None, &limits).await {
+            Ok(result) => {
+                let sample: Vec<String> =
+                    result.instances.iter().take(20).map(|r| r.to_string()).collect();
+                if !result.instances.is_empty() {
+                    println!(
+                        "🔎 [P2 shadow] dbnum={dbnum} 目录反向闭包: {} seed → {} 引用实例 (depth={}, size_trunc={}) —— 仅观测，未并入生成目标",
+                        seeds.len(),
+                        result.instances.len(),
+                        result.depth_reached,
+                        result.truncated_size
+                    );
+                }
+                per_dbnum.push(serde_json::json!({
+                    "dbnum": dbnum,
+                    "seed_count": seeds.len(),
+                    "reverse_instance_count": result.instances.len(),
+                    "depth_reached": result.depth_reached,
+                    "truncated_depth": result.truncated_depth,
+                    "truncated_size": result.truncated_size,
+                    "visited_count": result.visited_count,
+                    "sample": sample,
+                }));
+            }
+            Err(error) => {
+                per_dbnum.push(serde_json::json!({"dbnum": dbnum, "error": format!("{error:#}")}));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "mode": "shadow_only_not_consumed",
+        "note": "ADR-0011 P2: catalogue reverse-reference closure computed for observability only; generation targets unchanged (P3 gated on specs/027).",
+        "dbnums": per_dbnum,
+    })
 }

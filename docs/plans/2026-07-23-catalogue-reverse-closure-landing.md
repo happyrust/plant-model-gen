@@ -133,12 +133,22 @@ aios-database -c db_options/DbOption model-version reference-index audit --dbnum
     环有界+去种子、深度截断、规模截断（超集降级信号）、空 seeds。
 - **红线守住**：本模块**不 import/不触碰** `IncrGeoUpdateLog`/生成目标，纯计算+返回，
   与 effect 分类器（ADR-0009）正交。effect `needs_dependency_redirect()` 作为将来挑
-  seeds 的门（DependencyCascade/Structural），本轮未接入热路径。
+  seeds 的门（DependencyCascade/Structural）。
+- **增量 shadow 接入（2026-07-24）**：`increment_run.rs::run_increment_with_lock` 在数据提交后
+  新增 `compute_catalogue_reverse_shadow`：对本轮已提交 dbnum，per-dbnum `read_state` ready 门 →
+  seeds = 本轮「触发模型」的被改 refno → `expand_catalogue_reverse_targets` → 结果写进 summary
+  字段 `catalogue_reverse_shadow` + 打印一行日志。**只观测、绝不改生成目标**；任何错误被吞、
+  不影响增量运行；env kill-switch `AIOS_DISABLE_CATA_REVERSE_SHADOW`。
+  语义安全：seeds 是被改元素自身，反查「谁引用它」——设计实例改自身 CATR/SPRE 无人引用→空
+  （不扇兄弟，符合红线）；只有被引用的目录定义才扇出到引用实例。
 
 ### 未做（下一步）
-- **增量 shadow 接入**：在增量链路挑「目录定义被改」seeds（noun/CATA 库判定 + effect
-  `needs_dependency_redirect`）→ 项目级 ready 门校验 → 调 `expand_catalogue_reverse_targets`
-  → 仅日志/落 shadow 表，**不改生成目标**。
+- **seed 收窄**：当前 seeds = 全部「触发模型」被改 refno（靠"无人引用→空"天然过滤实例自改）；
+  可进一步按 noun/CATA 库判定只挑「目录定义」seeds，减少无效反查。
+- **项目级 ready 门**：现为 per-dbnum ready 放行（shadow 只观测足够）；P3 消费前须升级为
+  "所有活动 dbnum ready"（跨库）。
+- **上卷 definition root**：seeds 直接用被改 refno；可加"上卷 SCOM definition root"
+  （复用 `get_or_create_scom_info` owner 逻辑）更贴合 Core3D。
 - **oracle 差分（Q6）**：解析全扫描实例集 vs 索引 BFS 实例集 的对账 harness。
 - **P3 接管**：等 specs/027 项目 run barrier；届时反查目标并入生成目标 + 跨库项目级发布 +
   热门 SCOM 超集降级。

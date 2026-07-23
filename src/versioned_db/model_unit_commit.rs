@@ -199,6 +199,12 @@ DEFINE INDEX IF NOT EXISTS idx_model_unit_commit_identity ON TABLE model_unit_co
     FIELDS dbnum, unit_refno, sesno UNIQUE;
 DEFINE INDEX IF NOT EXISTS idx_model_unit_commit_list ON TABLE model_unit_commit
     FIELDS dbnum, unit_refno, sesno;
+DEFINE TABLE IF NOT EXISTS model_unit_commit_head SCHEMAFULL
+    PERMISSIONS FOR select FULL FOR create FULL FOR update FULL FOR delete NONE;
+DEFINE FIELD IF NOT EXISTS dbnum ON TABLE model_unit_commit_head TYPE int;
+DEFINE FIELD IF NOT EXISTS unit_refno ON TABLE model_unit_commit_head TYPE string;
+DEFINE FIELD IF NOT EXISTS sesno ON TABLE model_unit_commit_head TYPE int;
+DEFINE FIELD IF NOT EXISTS updated_at ON TABLE model_unit_commit_head TYPE datetime;
 "#;
     project_primary_db()
         .query(sql)
@@ -227,17 +233,36 @@ pub async fn commit_model_unit(commit: ModelUnitCommit) -> anyhow::Result<ModelU
             idempotent: true,
         });
     }
+    if let Some(latest) = latest_model_unit_commit(commit.dbnum, &commit.unit_refno).await? {
+        anyhow::ensure!(
+            latest.sesno < commit.sesno,
+            "model unit commit must append after latest sesno={}: ({}, {}, {})",
+            latest.sesno,
+            commit.dbnum,
+            commit.unit_refno,
+            commit.sesno
+        );
+    }
 
     let payload_json = serde_json::to_string(&commit)?;
     let payload_hash = payload_hash(&commit);
     let record_id = record_id(commit.dbnum, &commit.unit_refno, commit.sesno);
+    let head_record_id = head_record_id(commit.dbnum, &commit.unit_refno);
     let sql = format!(
-        "CREATE ONLY {record_id} SET dbnum = $dbnum, unit_refno = $unit_refno, \
+        "BEGIN TRANSACTION;\n\
+         LET $current = (SELECT sesno FROM {head_record_id});\n\
+         IF array::len($current) > 0 AND $current[0].sesno >= $sesno {{\n\
+             THROW \"MODEL_UNIT_COMMIT_NOT_APPEND_ONLY\";\n\
+         }};\n\
+         CREATE ONLY {record_id} SET dbnum = $dbnum, unit_refno = $unit_refno, \
          unit_noun = $unit_noun, sesno = $sesno, impact_kind = $impact_kind, \
          artifact_sesno = $artifact_sesno, project_name = $project_name, \
          manifest_path = $manifest_path, artifact_hash = $artifact_hash, \
          generated_at = $generated_at, payload_hash = $payload_hash, \
-         payload_json = $payload_json, created_at = time::now();"
+         payload_json = $payload_json, created_at = time::now();\n\
+         UPSERT {head_record_id} SET dbnum = $dbnum, unit_refno = $unit_refno, \
+         sesno = $sesno, updated_at = time::now();\n\
+         COMMIT TRANSACTION;"
     );
     let create_result: anyhow::Result<()> = async {
         project_primary_db()
@@ -282,6 +307,17 @@ pub async fn commit_model_unit(commit: ModelUnitCommit) -> anyhow::Result<ModelU
                     commit: existing,
                     idempotent: true,
                 });
+            }
+            if error
+                .to_string()
+                .contains("MODEL_UNIT_COMMIT_NOT_APPEND_ONLY")
+            {
+                anyhow::bail!(
+                    "model unit commit must append after the current head: ({}, {}, {})",
+                    commit.dbnum,
+                    commit.unit_refno,
+                    commit.sesno
+                );
             }
             Err(error)
         }
@@ -421,4 +457,13 @@ fn record_id(dbnum: u32, unit_refno: &str, sesno: u32) -> String {
     bytes.extend_from_slice(&sesno.to_le_bytes());
     let hash = crate::version_management::hashing::sha256_bytes(&bytes);
     format!("{TABLE_NAME}:⟨{hash}⟩")
+}
+
+fn head_record_id(dbnum: u32, unit_refno: &str) -> String {
+    let mut bytes = Vec::with_capacity(PAYLOAD_VERSION.len() + unit_refno.len() + 8);
+    bytes.extend_from_slice(PAYLOAD_VERSION.as_bytes());
+    bytes.extend_from_slice(&dbnum.to_le_bytes());
+    bytes.extend_from_slice(unit_refno.as_bytes());
+    let hash = crate::version_management::hashing::sha256_bytes(&bytes);
+    format!("model_unit_commit_head:⟨{hash}⟩")
 }

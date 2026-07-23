@@ -151,7 +151,7 @@ pub fn model_version_command() -> Command {
         )
         .subcommand(
             Command::new("unit-export")
-                .about("Export and record one minimum delivery unit model commit in DuckLake")
+                .about("Export and record one minimum delivery unit model commit in Surreal")
                 .arg(
                     Arg::new("dbnum")
                         .long("dbnum")
@@ -232,97 +232,6 @@ pub fn model_version_command() -> Command {
                         .value_name("RELATIVE_PATH")
                         .required(true)
                         .help("Path relative to the configured project output directory"),
-                )
-                .arg(json_arg()),
-        )
-        .subcommand(
-            Command::new("unit-simulate-position")
-                .about("LOCAL SMOKE ONLY: clone one unit artifact and shift one component position")
-                .arg(
-                    Arg::new("dbnum")
-                        .long("dbnum")
-                        .value_parser(clap::value_parser!(u32))
-                        .help("Database number; resolved from unit-refno when omitted"),
-                )
-                .arg(
-                    Arg::new("unit-refno")
-                        .long("unit-refno")
-                        .value_name("REFNO")
-                        .required(true),
-                )
-                .arg(required_u32("from-sesno"))
-                .arg(required_u32("sesno"))
-                .arg(
-                    Arg::new("component-refno")
-                        .long("component-refno")
-                        .value_name("REFNO")
-                        .help("Non-root component to move; defaults to the first movable child"),
-                )
-                .arg(
-                    Arg::new("dx")
-                        .long("dx")
-                        .value_parser(clap::value_parser!(f64))
-                        .default_value("1000")
-                        .help("X translation delta in millimeters"),
-                )
-                .arg(
-                    Arg::new("dy")
-                        .long("dy")
-                        .value_parser(clap::value_parser!(f64))
-                        .default_value("0")
-                        .help("Y translation delta in millimeters"),
-                )
-                .arg(
-                    Arg::new("dz")
-                        .long("dz")
-                        .value_parser(clap::value_parser!(f64))
-                        .default_value("0")
-                        .help("Z translation delta in millimeters"),
-                )
-                .arg(
-                    Arg::new("confirm-simulation")
-                        .long("confirm-simulation")
-                        .action(clap::ArgAction::SetTrue)
-                        .required(true)
-                        .help("Acknowledge that this writes a synthetic local model commit"),
-                )
-                .arg(json_arg()),
-        )
-        .subcommand(
-            Command::new("bootstrap-generation-read")
-                .about(
-                    "Migrate the current committed Surreal state into the first DuckLake authority snapshot and bind its read replica",
-                )
-                .arg(
-                    Arg::new("dbnum")
-                        .long("dbnum")
-                        .value_parser(clap::value_parser!(u32))
-                        .action(clap::ArgAction::Append)
-                        .help("Optional dbnum filter; repeatable. Default: all committed dbnums"),
-                )
-                .arg(
-                    Arg::new("authority-only")
-                        .long("authority-only")
-                        .action(clap::ArgAction::SetTrue)
-                        .help(
-                            "Only commit DuckLake authority (skip Surreal replica apply). Use with generation_read_backend=ducklake",
-                        ),
-                )
-                .arg(
-                    Arg::new("max-elements")
-                        .long("max-elements")
-                        .value_parser(clap::value_parser!(usize))
-                        .help(
-                            "Smoke/debug: truncate loaded PE to the first N elements (by id order). Hierarchy/transforms are filtered to the kept set.",
-                        ),
-                )
-                .arg(
-                    Arg::new("root-refno")
-                        .long("root-refno")
-                        .action(clap::ArgAction::Append)
-                        .help(
-                            "Bootstrap only the pe.children closure of these roots (plus attribute-referenced CATA). Enables fast Surreal-replica smoke for a BRAN/SITE.",
-                        ),
                 )
                 .arg(json_arg()),
         )
@@ -472,12 +381,6 @@ pub async fn handle_model_version_command(
         Some(("unit-export", sub)) => handle_unit_export_command(sub, db_option_ext).await?,
         Some(("unit-list", sub)) => handle_unit_list_command(sub, db_option_ext).await?,
         Some(("unit-import", sub)) => handle_unit_import_command(sub, db_option_ext).await?,
-        Some(("unit-simulate-position", sub)) => {
-            handle_unit_simulate_position_command(sub, db_option_ext).await?
-        }
-        Some(("bootstrap-generation-read", sub)) => {
-            handle_generation_read_bootstrap_command(sub, db_option_ext).await?
-        }
         Some(("backfill-pe-cata-hash", sub)) => handle_backfill_pe_cata_hash_command(sub).await?,
         Some(("catch-up", sub)) => handle_model_gen_catch_up_command(sub, db_option_ext).await?,
         Some(("rebuild-pe-owner", sub)) => handle_rebuild_pe_owner_command(sub).await?,
@@ -615,12 +518,33 @@ fn validate_unit_manifest(
     Ok(manifest)
 }
 
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
-fn unit_manifest_refnos(
+fn verify_unit_commit_artifact(
+    commit: &crate::versioned_db::model_unit_commit::ModelUnitCommit,
+    project_output_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use crate::versioned_db::model_unit_commit::ModelUnitImpactKind;
+
+    if commit.impact_kind == ModelUnitImpactKind::Tombstone {
+        return Ok(());
+    }
+    let manifest_path = project_output_dir.join(&commit.manifest_path);
+    let _ = validate_unit_manifest(&manifest_path, commit.dbnum, &commit.unit_refno)?;
+    let actual_hash = crate::version_management::hashing::sha256_file(&manifest_path)?;
+    anyhow::ensure!(
+        actual_hash == commit.artifact_hash,
+        "模型单元 artifact 已变化: ({}, {}, {}) expected={} actual={} path={}",
+        commit.dbnum,
+        commit.unit_refno,
+        commit.sesno,
+        commit.artifact_hash,
+        actual_hash,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
+async fn unit_manifest_refnos(
     manifest_path: &std::path::Path,
 ) -> anyhow::Result<Vec<aios_core::RefnoEnum>> {
     let instances_path = manifest_path
@@ -632,35 +556,41 @@ fn unit_manifest_refnos(
         "unit manifest 缺少 instances.parquet: {}",
         instances_path.display()
     );
-    let connection = duckdb::Connection::open_in_memory()?;
-    let mut statement = connection
-        .prepare("SELECT DISTINCT refno_str FROM read_parquet(?) WHERE refno_str IS NOT NULL")?;
-    let refnos = statement
-        .query_map([instances_path.to_string_lossy().as_ref()], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|value| aios_core::RefnoEnum::from(value.as_str()))
-        .collect();
-    Ok(refnos)
+    tokio::task::spawn_blocking(move || {
+        use polars::prelude::{ParquetReader, SerReader};
+
+        let frame = ParquetReader::new(std::fs::File::open(&instances_path)?)
+            .with_columns(Some(vec!["refno_str".into()]))
+            .finish()?;
+        let mut refnos = frame
+            .column("refno_str")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .map(aios_core::RefnoEnum::from)
+            .collect::<Vec<_>>();
+        refnos.sort_unstable();
+        refnos.dedup();
+        anyhow::Ok(refnos)
+    })
+    .await
+    .context("读取模型单元 instances.parquet 任务失败")?
 }
 
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
 async fn resolve_unit_impact(
     dbnum: u32,
     root_refno: aios_core::RefnoEnum,
     sesno: u32,
-    previous: Option<&crate::version_store::ModelUnitCommit>,
+    previous: Option<&crate::versioned_db::model_unit_commit::ModelUnitCommit>,
     project_output_dir: &std::path::Path,
-) -> anyhow::Result<(crate::version_store::ModelUnitImpactKind, serde_json::Value)> {
+) -> anyhow::Result<(
+    crate::versioned_db::model_unit_commit::ModelUnitImpactKind,
+    serde_json::Value,
+)> {
     use std::collections::BTreeSet;
 
-    use crate::version_store::ModelUnitImpactKind;
+    use crate::versioned_db::model_unit_commit::ModelUnitImpactKind;
     use aios_core::DiffKind;
 
     let Some(previous) = previous else {
@@ -722,7 +652,8 @@ async fn resolve_unit_impact(
     }
 
     let previous_manifest = project_output_dir.join(&previous.manifest_path);
-    let mut refnos = unit_manifest_refnos(&previous_manifest)?
+    let mut refnos = unit_manifest_refnos(&previous_manifest)
+        .await?
         .into_iter()
         .collect::<BTreeSet<_>>();
     refnos.insert(root_refno);
@@ -799,11 +730,7 @@ async fn resolve_unit_impact(
     ))
 }
 
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
 fn model_unit_root_deleted(
     root_refno: aios_core::RefnoEnum,
     diffs: &[aios_core::ElementDiff],
@@ -817,55 +744,17 @@ fn model_unit_root_deleted(
     })
 }
 
-#[cfg(all(
-    test,
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
-mod unit_impact_tests {
-    use super::*;
-
-    fn element_diff(refno_u64: u64, kind: aios_core::DiffKind) -> aios_core::ElementDiff {
-        aios_core::ElementDiff {
-            refno_u64,
-            pe_key: String::new(),
-            kind,
-            from_sesno: 897,
-            to_sesno: 898,
-            changes: Vec::new(),
-            from_snapshot: None,
-            to_snapshot: None,
-        }
-    }
-
-    #[test]
-    fn only_root_deletion_is_a_model_unit_tombstone() {
-        let root = aios_core::RefnoEnum::from("24381/145018");
-        let child = aios_core::RefnoEnum::from("24381/145035");
-
-        assert!(model_unit_root_deleted(
-            root,
-            &[element_diff(root.refno().0, aios_core::DiffKind::Deleted)]
-        ));
-        assert!(!model_unit_root_deleted(
-            root,
-            &[element_diff(child.refno().0, aios_core::DiffKind::Deleted)]
-        ));
-    }
-}
-
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
 async fn handle_unit_export_command(
     sub: &ArgMatches,
     db_option_ext: &DbOptionExt,
 ) -> anyhow::Result<()> {
-    use crate::version_store::{DuckLakeAuthority, ModelUnitCommit, ModelUnitImpactKind};
+    use crate::versioned_db::model_unit_commit::{
+        ModelUnitCommit, ModelUnitImpactKind, commit_model_unit, latest_model_unit_commit,
+        model_unit_commit,
+    };
 
+    ensure_model_unit_store_connection().await?;
     let unit_refno = sub
         .get_one::<String>("unit-refno")
         .expect("required by clap")
@@ -878,23 +767,15 @@ async fn handle_unit_export_command(
     };
     let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
     let project_name = db_option_ext.inner.project_name.trim().to_string();
-    let authority = DuckLakeAuthority::open(db_option_ext.ducklake_config())?;
-
-    if let Some(existing) = authority.model_unit_commit(dbnum, &unit_refno, sesno)? {
+    if let Some(existing) = model_unit_commit(dbnum, &unit_refno, sesno).await? {
         anyhow::ensure!(
             existing.project_name == project_name,
             "已存在提交与当前 project 不一致"
         );
-        if existing.impact_kind != ModelUnitImpactKind::Tombstone {
-            let manifest = db_option_ext
-                .get_project_output_dir()
-                .join(&existing.manifest_path);
-            let _ = validate_unit_manifest(&manifest, dbnum, &unit_refno)?;
-        }
-        let outcome = authority.commit_model_unit(existing)?;
+        verify_unit_commit_artifact(&existing, &db_option_ext.get_project_output_dir())?;
+        let outcome = commit_model_unit(existing).await?;
         let output = serde_json::json!({
             "success": true,
-            "snapshot_id": outcome.snapshot_id,
             "idempotent": true,
             "manifest_url": outcome.commit.manifest_url(),
             "commit": outcome.commit,
@@ -919,7 +800,7 @@ async fn handle_unit_export_command(
         return Ok(());
     }
 
-    let previous = authority.latest_model_unit_commit(dbnum, &unit_refno)?;
+    let previous = latest_model_unit_commit(dbnum, &unit_refno).await?;
     let (impact_kind, impact_evidence) = resolve_unit_impact(
         dbnum,
         root_refno,
@@ -950,7 +831,7 @@ async fn handle_unit_export_command(
     };
 
     let mut stats = None;
-    let (artifact_sesno, manifest_path) = match impact_kind {
+    let (artifact_sesno, manifest_path, artifact_hash) = match impact_kind {
         ModelUnitImpactKind::Mesh => {
             let relative_dir = PathBuf::from("model_units")
                 .join(dbnum.to_string())
@@ -980,12 +861,14 @@ async fn handle_unit_export_command(
                 }));
             }
             let _ = validate_unit_manifest(&manifest, dbnum, &unit_refno)?;
+            let artifact_hash = crate::version_management::hashing::sha256_file(&manifest)?;
             (
                 sesno,
                 relative_dir
                     .join("manifest.json")
                     .to_string_lossy()
                     .replace('\\', "/"),
+                artifact_hash,
             )
         }
         ModelUnitImpactKind::Noop => {
@@ -1000,17 +883,18 @@ async fn handle_unit_export_command(
                 previous.project_name == project_name,
                 "NoOp project_name 与被复用提交不一致"
             );
-            let reused_manifest = db_option_ext
-                .get_project_output_dir()
-                .join(&previous.manifest_path);
-            let _ = validate_unit_manifest(&reused_manifest, dbnum, &unit_refno)?;
-            (previous.artifact_sesno, previous.manifest_path.clone())
+            verify_unit_commit_artifact(previous, &db_option_ext.get_project_output_dir())?;
+            (
+                previous.artifact_sesno,
+                previous.manifest_path.clone(),
+                previous.artifact_hash.clone(),
+            )
         }
-        ModelUnitImpactKind::Tombstone => (sesno, String::new()),
+        ModelUnitImpactKind::Tombstone => (sesno, String::new(), String::new()),
         _ => anyhow::bail!("unit-export 当前只接受 mesh、noop 或 tombstone"),
     };
 
-    let outcome = authority.commit_model_unit(ModelUnitCommit {
+    let outcome = commit_model_unit(ModelUnitCommit {
         dbnum,
         unit_refno,
         unit_noun,
@@ -1019,11 +903,12 @@ async fn handle_unit_export_command(
         artifact_sesno,
         project_name,
         manifest_path,
+        artifact_hash,
         generated_at: chrono::Utc::now().to_rfc3339(),
-    })?;
+    })
+    .await?;
     let output = serde_json::json!({
         "success": true,
-        "snapshot_id": outcome.snapshot_id,
         "idempotent": outcome.idempotent,
         "manifest_url": outcome.commit.manifest_url(),
         "commit": outcome.commit,
@@ -1049,16 +934,12 @@ async fn handle_unit_export_command(
     Ok(())
 }
 
-#[cfg(not(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-)))]
+#[cfg(not(all(feature = "gen_model", feature = "parquet-export")))]
 async fn handle_unit_export_command(
     _sub: &ArgMatches,
     _db_option_ext: &DbOptionExt,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("unit-export 需要 generation-read-ducklake、gen_model 与 parquet-export features")
+    anyhow::bail!("unit-export 需要 gen_model 与 parquet-export features")
 }
 
 async fn handle_unit_list_command(
@@ -1219,286 +1100,6 @@ async fn ensure_model_unit_store_connection() -> anyhow::Result<()> {
         aios_core::init_surreal().await?;
     }
     Ok(())
-}
-
-#[cfg(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-))]
-async fn handle_unit_simulate_position_command(
-    sub: &ArgMatches,
-    db_option_ext: &DbOptionExt,
-) -> anyhow::Result<()> {
-    use crate::version_store::{DuckLakeAuthority, ModelUnitCommit, ModelUnitImpactKind};
-
-    let unit_refno = sub
-        .get_one::<String>("unit-refno")
-        .expect("required by clap")
-        .trim()
-        .replace('/', "_");
-    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
-    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
-        Some(value) => value,
-        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
-    };
-    let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required by clap");
-    let target_sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
-    anyhow::ensure!(
-        target_sesno > from_sesno,
-        "simulation target sesno must be newer than source: source={from_sesno} target={target_sesno}"
-    );
-
-    let authority = DuckLakeAuthority::open(db_option_ext.ducklake_config())?;
-    let source_commit = authority
-        .model_unit_commit(dbnum, &unit_refno, from_sesno)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "source model unit commit does not exist: ({dbnum}, {unit_refno}, {from_sesno})"
-            )
-        })?;
-    let latest = authority
-        .latest_model_unit_commit(dbnum, &unit_refno)?
-        .ok_or_else(|| anyhow::anyhow!("model unit has no commits: ({dbnum}, {unit_refno})"))?;
-    anyhow::ensure!(
-        latest.sesno == from_sesno,
-        "simulation must append to the latest model unit commit: latest={} source={from_sesno}",
-        latest.sesno
-    );
-    anyhow::ensure!(
-        authority
-            .model_unit_commit(dbnum, &unit_refno, target_sesno)?
-            .is_none(),
-        "target model unit commit already exists: ({dbnum}, {unit_refno}, {target_sesno})"
-    );
-    anyhow::ensure!(
-        source_commit.impact_kind != ModelUnitImpactKind::Tombstone,
-        "cannot simulate from a tombstone model unit commit"
-    );
-
-    let relative_dir = PathBuf::from("model_units")
-        .join(dbnum.to_string())
-        .join(&unit_refno)
-        .join(target_sesno.to_string());
-    let project_output_dir = db_option_ext.get_project_output_dir();
-    let source_manifest = project_output_dir.join(&source_commit.manifest_path);
-    let source_dir = source_manifest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("source model unit manifest has no parent directory"))?;
-    let target_dir = project_output_dir.join(&relative_dir);
-    let delta_mm = [
-        *sub.get_one::<f64>("dx").expect("defaulted by clap"),
-        *sub.get_one::<f64>("dy").expect("defaulted by clap"),
-        *sub.get_one::<f64>("dz").expect("defaulted by clap"),
-    ];
-    let simulation =
-        crate::version_management::model_unit_simulation::create_position_shifted_artifact(
-            source_dir,
-            &target_dir,
-            &unit_refno,
-            from_sesno,
-            target_sesno,
-            sub.get_one::<String>("component-refno").map(String::as_str),
-            delta_mm,
-        )?;
-    let manifest_path = relative_dir
-        .join("manifest.json")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let _ = validate_unit_manifest(&target_dir.join("manifest.json"), dbnum, &unit_refno)?;
-    let outcome = authority
-        .commit_model_unit(ModelUnitCommit {
-            dbnum,
-            unit_refno,
-            unit_noun: source_commit.unit_noun,
-            sesno: target_sesno,
-            impact_kind: ModelUnitImpactKind::Placement,
-            artifact_sesno: target_sesno,
-            project_name: source_commit.project_name,
-            manifest_path,
-            generated_at: chrono::Utc::now().to_rfc3339(),
-        })
-        .with_context(|| {
-            format!(
-                "synthetic artifact was written but model commit failed: {}",
-                target_dir.display()
-            )
-        })?;
-    let output = serde_json::json!({
-        "success": true,
-        "synthetic": true,
-        "snapshot_id": outcome.snapshot_id,
-        "manifest_url": outcome.commit.manifest_url(),
-        "commit": outcome.commit,
-        "simulation": {
-            "source_sesno": from_sesno,
-            "moved_refno": simulation.moved_refno,
-            "delta_mm": simulation.delta_mm,
-        },
-    });
-    if sub.get_flag("json") {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!(
-            "synthetic model unit commit: ({}, {}, {}) moved={} delta_mm={:?} manifest={}",
-            outcome.commit.dbnum,
-            outcome.commit.unit_refno,
-            outcome.commit.sesno,
-            simulation.moved_refno,
-            simulation.delta_mm,
-            outcome
-                .commit
-                .manifest_url()
-                .unwrap_or_else(|| "<none>".to_string()),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(all(
-    feature = "generation-read-ducklake",
-    feature = "gen_model",
-    feature = "parquet-export"
-)))]
-async fn handle_unit_simulate_position_command(
-    _sub: &ArgMatches,
-    _db_option_ext: &DbOptionExt,
-) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "unit-simulate-position requires generation-read-ducklake, gen_model and parquet-export features"
-    )
-}
-
-#[cfg(feature = "generation-read-ducklake")]
-async fn handle_generation_read_bootstrap_command(
-    sub: &ArgMatches,
-    db_option_ext: &DbOptionExt,
-) -> anyhow::Result<()> {
-    let selected = sub
-        .get_many::<u32>("dbnum")
-        .map(|values| values.copied().collect::<Vec<_>>());
-    let authority_only = sub.get_flag("authority-only");
-    let max_elements = sub.get_one::<usize>("max-elements").copied();
-    let root_refnos = sub
-        .get_many::<String>("root-refno")
-        .map(|values| {
-            values
-                .map(|raw| {
-                    let normalized = raw.trim().replace('/', "_");
-                    aios_core::RefnoEnum::from(normalized.as_str())
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let options = crate::version_store::BootstrapOptions { authority_only };
-
-    let config = db_option_ext.ducklake_config();
-    let authority =
-        tokio::task::spawn_blocking(move || crate::version_store::DuckLakeAuthority::open(config))
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("open DuckLake authority task join failed: {error}")
-            })??;
-    // 大库 attribute 并发过高易触发 Surreal WS Connection reset；64→24。
-    let source = crate::version_store::SurrealCurrentStateBootstrapSource::new(24)?;
-    let replica = crate::version_store::SurrealReplicaStore;
-
-    let report = if !root_refnos.is_empty() {
-        anyhow::ensure!(
-            max_elements.is_none(),
-            "--max-elements 与 --root-refno 不能同时使用"
-        );
-        println!(
-            "generation-read bootstrap: root-refno={root_refnos:?} authority_only={authority_only}"
-        );
-        let state = source.load_refno_closure_state(&root_refnos).await?;
-        println!(
-            "generation-read bootstrap: committing elements={} edges={} transforms={} dbnums={:?}",
-            state.elements.len(),
-            state.hierarchy_rows.len(),
-            state.transforms.len(),
-            state.dbnum_sesnos.keys().copied().collect::<Vec<_>>()
-        );
-        crate::version_store::bootstrap_state(state, &authority, &replica, options).await?
-    } else if let Some(dbnums) = selected.as_deref() {
-        let dbnum_sesnos =
-            crate::version_store::resolve_bootstrap_dbnum_sesnos(Some(dbnums)).await?;
-        println!(
-            "generation-read bootstrap: selected dbnums={:?} authority_only={authority_only} max_elements={max_elements:?}",
-            dbnum_sesnos.keys().copied().collect::<Vec<_>>()
-        );
-        let mut state = source
-            .load_selected_current_state_limited(dbnum_sesnos, max_elements)
-            .await?;
-        if max_elements.is_some() {
-            // 截断后 children 可能指向未加载节点；只保留两端都在集合内的边。
-            let keep = state.elements.len();
-            truncate_bootstrap_state(&mut state, keep);
-        }
-        println!(
-            "generation-read bootstrap: committing elements={} edges={} transforms={}",
-            state.elements.len(),
-            state.hierarchy_rows.len(),
-            state.transforms.len()
-        );
-        crate::version_store::bootstrap_state(state, &authority, &replica, options).await?
-    } else {
-        anyhow::ensure!(
-            max_elements.is_none(),
-            "--max-elements 仅支持与 --dbnum 或 --root-refno 联用（避免误截断全库 bootstrap）"
-        );
-        println!("generation-read bootstrap: all committed dbnums authority_only={authority_only}");
-        crate::version_store::bootstrap_current_state_with_options(
-            &source, &authority, &replica, options,
-        )
-        .await?
-    };
-
-    if sub.get_flag("json") {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "generation-read bootstrap complete: snapshot={} history_start={} elements={} edges={} transforms={} replica_time={}",
-            report.authoritative_snapshot_id,
-            report.history_start_snapshot,
-            report.element_count,
-            report.hierarchy_edge_count,
-            report.transform_count,
-            report.replica_version_time
-        );
-    }
-    Ok(())
-}
-
-#[cfg(feature = "generation-read-ducklake")]
-fn truncate_bootstrap_state(state: &mut crate::version_store::BootstrapState, limit: usize) {
-    if limit == 0 || state.elements.len() <= limit {
-        return;
-    }
-    println!(
-        "generation-read bootstrap: truncating elements {} -> {limit} (--max-elements)",
-        state.elements.len()
-    );
-    state.elements.truncate(limit);
-    let kept: std::collections::BTreeSet<_> = state
-        .elements
-        .iter()
-        .map(|item| item.element.refno)
-        .collect();
-    state
-        .hierarchy_rows
-        .retain(|row| kept.contains(&row.parent) && kept.contains(&row.child));
-    state
-        .transforms
-        .retain(|transform| kept.contains(&transform.refno));
-}
-
-#[cfg(not(feature = "generation-read-ducklake"))]
-async fn handle_generation_read_bootstrap_command(
-    _sub: &ArgMatches,
-    _db_option_ext: &DbOptionExt,
-) -> anyhow::Result<()> {
-    anyhow::bail!("bootstrap-generation-read 需要 generation-read-ducklake feature")
 }
 
 /// specs/023 T018 / M3-T8：存量 versioned 站点重建 pe_owner 边。

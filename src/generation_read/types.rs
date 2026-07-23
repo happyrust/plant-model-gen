@@ -13,16 +13,12 @@ const ATTRIBUTE_PAYLOAD_JSON_MAGIC: &[u8; 4] = b"ATJ1";
 #[serde(rename_all = "kebab-case")]
 pub enum GenerationReadBackendKind {
     Surreal,
-    DuckLake,
-    Compare,
 }
 
 impl GenerationReadBackendKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Surreal => "surreal",
-            Self::DuckLake => "ducklake",
-            Self::Compare => "compare",
         }
     }
 }

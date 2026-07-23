@@ -7,7 +7,7 @@
 - [x] **T001 DuckLake 退役删除清单**：已有 `docs/plans/2026-07-22-ducklake-retirement-deletion-manifest.md`，覆盖 adapters、Cargo、CLI、package、tests 和运行遗物。
 - [x] **T002 建立可恢复基线**：用户选择 Git 方案；分支 `agent/spec026-027-debt-catchup` 的 `955c7ff` 固化实现前工作区，可用 `git show 955c7ff:<path>` 抽样恢复。
 - [x] **T003 冻结第二轮架构决策**：根 `CONTEXT.md`、ADR-0010、ADR-0007/0008 引用、`spec.md` 与 `plan.md` 已统一初始化/增量边界。
-- [ ] **T004 重新盘点实际残留**：更新 T001 清单的状态栏，至少核对 `write_full_version_anchors`、`VersionCommitSource::Full`、`version_store/replica.rs`、`generation_replica_*`、CLI `DuckLakeAuthority`、package 原生扩展和 history 配置分支。验收：每项有符号、处置、依赖任务和 keep/delete 理由。
+- [x] **T004 重新盘点实际残留**：更新 T001 清单的状态栏，至少核对 `write_full_version_anchors`、`VersionCommitSource::Full`、`version_store/replica.rs`、`generation_replica_*`、CLI `DuckLakeAuthority`、package 原生扩展和 history 配置分支。验收：每项有符号、处置、依赖任务和 keep/delete 理由。
 
 ## P1 — 初始化与会话元数据（依赖 T002、T004）
 
@@ -42,7 +42,7 @@
 ## P4 — 主表读取与模型运行审计（依赖 T019–T022）
 
 - [ ] **T026 主表直读 adapter**：`generation_read::surreal` 通过既有 trait 批量读取主 PE/ATT、owner、reference、transform；初始化 staging 活读，增量/repair 强制 `VERSION AT`。验收：同一 fixture 与旧 replica 输出语义一致。
-- [ ] **T027 删除 generation replica**：删除 `version_store/replica.rs`、五张 `generation_replica_*` schema、binding/authoritative snapshot、复制与覆盖校验；manifest 仅保留观测字段。验收：非历史源码无 `generation_replica`。
+- [ ] **T027 删除 generation replica**：删除 `version_store/replica.rs`、五张 `generation_replica_*` schema、binding/authoritative snapshot、复制与覆盖校验；manifest 仅保留观测字段。验收：非历史源码无 `generation_replica`。`version_store` 与五表已删；manifest 的 `authoritative_snapshot_id` 观测字段改名仍待完成。
 - [ ] **T028 append-only `model_generation_run`**：定义 run event schema/repository，覆盖 initialization、incremental、no-op、catch-up、repair 的 started/terminal；记录 actor/reason/input/read_at/contract/error/旧新 anchor。验收：历史 event 不可 update/delete，started-only 可识别为 abandoned。
 - [ ] **T029 正式站点生成权限**：普通 generate/regen 对 Ready versioned 站点硬拒绝；只允许 initialization staging 或绑定现存 data anchor 的 repair/catch-up。验收：HTTP、CLI、内部调用三层都不能绕过 service guard。
 - [ ] **T030 受控 repair**：解析目标 data/model anchor，持锁，以原 read_at 重做后处理并刷新同 sesno model_gen；sesno 身份不变。验收：两次 repair 产生两个 run id 和各自事件，但模型提交身份不增加。
@@ -51,9 +51,9 @@
 
 - [x] **T031 retired 配置分级检测**：`get_db_option_ext` raw TOML 已对 ducklake/compare 行为值硬错误、惰性键 warning；仍需纳入 T038 手测。
 - [x] **T032 Surreal `model_unit_commit` repository**：定义 `(dbnum, unit_refno, sesno)` 唯一提交、impact、artifact pointer/hash 与 latest/list API。验收：幂等写、冲突检测和有序查询。
-- [ ] **T033 改造 unit-export/rollback/runtime 调用方**：移除 CLI/web 对 `DuckLakeAuthority` 的引用，统一依赖 T032；rollback 继续只允许从 latest 派生。验收：unit-export 后 Surreal 可查且 runtime 可消费。
+- [x] **T033 改造 unit-export/rollback/runtime 调用方**：移除 CLI/web 对 `DuckLakeAuthority` 的引用，统一依赖 T032；rollback 继续只允许从 latest 派生。验收：unit-export 后 Surreal 可查且 runtime 可消费。
 - [ ] **T034 可选旧台账救济工具**：外置 PowerShell 调 duckdb CLI 导 JSON，再调用新 CLI dry-run/import；主二进制不重新引入 duckdb。验收：dry-run 数量正确、重复导入幂等、坏 hash 拒绝。
-- [ ] **T035 删除原生 DuckLake 残留**：依 T004 清单删 adapters/CLI/features/perf gate/原生扩展参数和复制；保留前端 viewer 的 duckdb-wasm/parquet 离线资产并在清单说明。验收：`cargo tree -i duckdb` 空，源码命中仅错误/迁移/历史说明。
+- [x] **T035 删除原生 DuckLake 残留**：依 T004 清单删 adapters/CLI/features/perf gate/原生扩展参数和复制；保留前端 viewer 的 duckdb-wasm/parquet 离线资产并在清单说明。验收：`cargo tree -i duckdb` 空，源码命中仅错误/迁移/历史说明。
 
 ## P6 — 管理端与文档
 

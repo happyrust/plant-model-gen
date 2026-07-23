@@ -59,7 +59,12 @@ pub async fn pe_transform_covers_dbnum(dbnum: u32) -> Result<bool> {
 pub async fn pe_transform_covers_instances_for_dbnum(dbnum: u32) -> Result<bool> {
     let expected = query_inst_relate_count_for_dbnum(dbnum)
         .await
-        .with_context(|| format!("探测 pe_transform 实例覆盖时统计 dbnum {} inst_relate 失败", dbnum))?;
+        .with_context(|| {
+            format!(
+                "探测 pe_transform 实例覆盖时统计 dbnum {} inst_relate 失败",
+                dbnum
+            )
+        })?;
     if expected == 0 {
         return Ok(true);
     }

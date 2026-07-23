@@ -7,11 +7,6 @@ param(
     [string]$SurrealVersion = "3.2.0-nightly",
     [string]$SurrealExePath = "",
     [string]$SurrealSha256 = "",
-    [string]$DuckDbCoreVersion = "1.5.4",
-    [string]$DuckLakeExtensionPath = "",
-    [string]$DuckLakeExtensionSha256 = "",
-    [string]$DuckDbSqliteExtensionPath = "",
-    [string]$DuckDbSqliteExtensionSha256 = "",
     [ValidateSet("cranelift", "llvm")]
     [string]$DebugCodegenBackend = "cranelift",
     [switch]$SkipBackendBuild,
@@ -34,10 +29,6 @@ if (-not $OutputRoot) {
 
 $PackageRoot = Join-Path $OutputRoot $BundleName
 $TargetTriple = "x86_64-pc-windows-msvc"
-$BundledDuckDbCoreVersion = "1.5.4" # duckdb-rs ~1.10504.0
-if ($DuckDbCoreVersion -ne $BundledDuckDbCoreVersion) {
-    throw "DuckDbCoreVersion mismatch: Rust bundle uses $BundledDuckDbCoreVersion, requested $DuckDbCoreVersion"
-}
 $FrontendDist = Join-Path $FrontendRoot "dist"
 $FrontendBuildCacheRoot = Join-Path $OutputRoot "_frontend-builds"
 $ViewerFallbackDist = Join-Path $FrontendBuildCacheRoot "viewer"
@@ -46,15 +37,8 @@ $WebStaticDist = Join-Path $RepoRoot "src/web_server/static"
 $AdminStaticDist = Join-Path $RepoRoot "src/web_server/static/admin"
 $SurrealCacheExe = Join-Path $RepoRoot "tools/surrealdb/windows/surreal.exe"
 $NginxCacheExe = Join-Path $RepoRoot "tools/nginx/windows/nginx.exe"
-$DuckDbExtensionCacheDir = Join-Path $RepoRoot "tools/duckdb/extensions/$DuckDbCoreVersion/windows_amd64"
-if (-not $DuckLakeExtensionPath) {
-    $DuckLakeExtensionPath = Join-Path $DuckDbExtensionCacheDir "ducklake.duckdb_extension"
-}
-if (-not $DuckDbSqliteExtensionPath) {
-    $DuckDbSqliteExtensionPath = Join-Path $DuckDbExtensionCacheDir "sqlite.duckdb_extension"
-}
 $SurrealResourceDir = [System.IO.Path]::GetFullPath((Join-Path $RepoRoot "../rs-core/resource/surreal"))
-$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import,mbd-pipe,generation-read-ducklake"
+$Features = "ws,gen_model,manifold,project_hd,surreal-save,write-to-surrealdb,sqlite-index,web_server,parquet-export,rvm-import,mbd-pipe"
 if ($BuildProfile -eq "both") {
     $RequestedProfiles = @("release", "debug")
 } else {
@@ -384,11 +368,8 @@ function Update-PackageDbOption([string]$Path) {
         "__root__.surreal_port" = "8020"
         "__root__.surreal_user" = '"root"'
         "__root__.surreal_password" = '"root"'
-        "__root__.generation_read_backend" = '"surreal"'
-        "__root__.ducklake_metadata_catalog" = '"runtime/ducklake/metadata/generation.sqlite"'
-        "__root__.ducklake_data_path" = '"runtime/ducklake/data"'
-        "__root__.ducklake_temp_directory" = '"runtime/ducklake/temp"'
-        "__root__.ducklake_extension_directory" = '"runtime/ducklake/extensions"'
+        "__root__.versioned_storage" = "true"
+        "__root__.version_retention" = '"0"'
         "web_server.port" = "3100"
         "web_server.bind_host" = '"0.0.0.0"'
         "web_server.auto_start_surreal" = "true"
@@ -406,7 +387,7 @@ function Update-PackageDbOption([string]$Path) {
     }
     $sectionOrder = @("__root__", "web_server", "surrealdb")
     $keysBySection = @{
-        "__root__" = @("meshes_path", "surreal_script_dir", "surreal_ip", "surreal_port", "surreal_user", "surreal_password", "generation_read_backend", "ducklake_metadata_catalog", "ducklake_data_path", "ducklake_temp_directory", "ducklake_extension_directory")
+        "__root__" = @("meshes_path", "surreal_script_dir", "surreal_ip", "surreal_port", "surreal_user", "surreal_password", "versioned_storage", "version_retention")
         "web_server" = @("port", "bind_host", "auto_start_surreal", "surreal_bin", "surreal_data_path", "surreal_bind", "surreal_user", "surreal_password")
         "surrealdb" = @("mode", "ip", "port", "user", "password", "path")
     }
@@ -480,20 +461,6 @@ if (-not (Test-Path -LiteralPath $WebStaticDist -PathType Container)) {
     throw "Web static dist not found: $WebStaticDist"
 }
 
-Step "Resolve offline DuckDB extensions"
-if (-not $DuckDbCoreVersion) {
-    throw "DuckDbCoreVersion is required for ABI-compatible offline extensions"
-}
-if (-not $DuckLakeExtensionSha256 -or -not $DuckDbSqliteExtensionSha256) {
-    throw "DuckLakeExtensionSha256 and DuckDbSqliteExtensionSha256 are required; unverified DuckDB extensions cannot be packaged"
-}
-Require-File $DuckLakeExtensionPath "DuckLake extension for DuckDB $DuckDbCoreVersion"
-Require-File $DuckDbSqliteExtensionPath "SQLite extension for DuckDB $DuckDbCoreVersion"
-Assert-Sha256 $DuckLakeExtensionPath $DuckLakeExtensionSha256
-Assert-Sha256 $DuckDbSqliteExtensionPath $DuckDbSqliteExtensionSha256
-$duckLakeExtensionSha = Get-FileSha256 $DuckLakeExtensionPath
-$duckDbSqliteExtensionSha = Get-FileSha256 $DuckDbSqliteExtensionPath
-
 if (-not $SkipBackendBuild) {
     Step "Build backend web_server, offline_deployer and aios-database ($($RequestedProfiles -join ', '))"
     if ($env:AIOS_PACKAGE_CARGO_INCREMENTAL) {
@@ -565,7 +532,7 @@ if (-not (Test-Path -LiteralPath $SurrealResourceDir -PathType Container)) {
 }
 foreach ($profile in $RequestedProfiles) {
     $profilePackageRoot = Join-Path $PackageRoot $profile
-    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static", "db_options", "resource/surreal", "runtime/surrealdb", "runtime/ducklake/metadata", "runtime/ducklake/data", "runtime/ducklake/temp", "runtime/ducklake/extensions", "output", "assets/meshes", "logs")) {
+    foreach ($dir in @("bin", "bin/surreal", "bin/nginx", "viewer", "viewer-root", "src/web_server/static", "db_options", "resource/surreal", "runtime/surrealdb", "output", "assets/meshes", "logs")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $profilePackageRoot $dir) | Out-Null
     }
 
@@ -578,8 +545,6 @@ foreach ($profile in $RequestedProfiles) {
     Copy-Item -LiteralPath $offlineDeployerExe -Destination (Join-Path $profilePackageRoot "offline_deployer.exe") -Force
     Copy-Item -LiteralPath $aiosDatabaseExe -Destination (Join-Path $profilePackageRoot "bin/aios-database.exe") -Force
     Copy-Item -LiteralPath $ResolvedSurreal -Destination (Join-Path $profilePackageRoot "bin/surreal/surreal.exe") -Force
-    Copy-Item -LiteralPath $DuckLakeExtensionPath -Destination (Join-Path $profilePackageRoot "runtime/ducklake/extensions/ducklake.duckdb_extension") -Force
-    Copy-Item -LiteralPath $DuckDbSqliteExtensionPath -Destination (Join-Path $profilePackageRoot "runtime/ducklake/extensions/sqlite.duckdb_extension") -Force
     $nginxBundled = $false
     if (Test-Path -LiteralPath $NginxCacheExe -PathType Leaf) {
         Copy-Item -LiteralPath $NginxCacheExe -Destination (Join-Path $profilePackageRoot "bin/nginx/nginx.exe") -Force
@@ -618,11 +583,6 @@ foreach ($profile in $RequestedProfiles) {
         surrealVersionText = $surrealVersionText
         surrealSha256 = $surrealSha
         surrealBundled = $true
-        duckDbCoreVersion = $DuckDbCoreVersion
-        duckLakeExtensionSha256 = $duckLakeExtensionSha
-        duckDbSqliteExtensionSha256 = $duckDbSqliteExtensionSha
-        duckDbExtensionsBundled = $true
-        duckDbExtensionDirectory = "runtime/ducklake/extensions"
         nginxBundled = $nginxBundled
         nginxExe = if ($nginxBundled) { "bin/nginx/nginx.exe" } else { $null }
         aiosDatabaseBundled = $true
@@ -752,7 +712,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\verify-offline-viewer.
 - `src/web_server/static/admin/`：站点部署管理后台，挂载在 `/admin`。
 - `db_options/DbOption.toml`：默认运行配置。
 - `runtime/surrealdb/`：目标电脑首次启动时创建的新 SurrealDB 数据目录；安装包不包含本机数据库数据。
-- `runtime/ducklake/`：DuckLake metadata/data/temp 目录及与内置 DuckDB 核心版本严格匹配、经 SHA-256 校验的离线扩展。
 - `output/`、`assets/meshes/`：模型输出与网格资源目录。
 - `logs/`：启动日志。
 

@@ -15,17 +15,6 @@ pub enum GenerationReadError {
         actual: String,
     },
 
-    #[error(
-        "版本化读副本落后: requested_snapshot={requested_snapshot}, replica_watermark={replica_watermark}"
-    )]
-    ReplicaLagging {
-        requested_snapshot: u64,
-        replica_watermark: u64,
-    },
-
-    #[error("缺少副本 snapshot 绑定: snapshot_id={snapshot_id}")]
-    ReplicaBindingMissing { snapshot_id: u64 },
-
     #[error("能力 {capability} 缺少必需数据: {refnos:?}")]
     MissingRequiredData {
         capability: &'static str,

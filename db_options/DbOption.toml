@@ -10,6 +10,9 @@ sync_tidb = false
 sync_live = false
 enable_index = false
 sync_chunk_size = 10_0000
+# 新站点固定使用版本化主库；不可对既有非版本化数据目录原地开启。
+versioned_storage = true
+version_retention = "0"
 
 # ====== 项目设置 ======
 project_path = "D:/AVEVA/Projects/E3D2.1"
@@ -30,18 +33,6 @@ gen_model = true
 gen_mesh = true
 replace_mesh = false
 save_db = true
-# 解析存储后端必须显式选择；ducklake 为权威，发布后再原子复制到 Surreal。
-parse_storage_backend = "ducklake"
-# 生成输入后端必须显式选择；surreal 是分阶段发布的默认值，不会自动回退。
-generation_read_backend = "surreal"
-ducklake_metadata_catalog = "runtime/ducklake/metadata/generation.sqlite"
-ducklake_data_path = "runtime/ducklake/data"
-ducklake_temp_directory = "runtime/ducklake/temp"
-ducklake_extension_directory = "runtime/ducklake/extensions"
-ducklake_staging_directory = "runtime/ducklake/staging"
-duckdb_memory_limit = "4GB"
-duckdb_threads = 4
-duckdb_pool_size = 2
 defer_db_write = false
 boolean_pipeline_mode = "memory_tasks"
 gen_db_meta_only = false

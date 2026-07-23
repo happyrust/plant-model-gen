@@ -3,6 +3,12 @@
 > 产出：2026-07-22，specs/027-version-single-source-refactor T001。逐项经 grep/读文件核实（行号为当日基线 `338b546e`，不代表当前完成状态）。
 > 用途：退役范围基线；实施前必须按 specs/027 T004 重新核对路径/符号并补状态栏，删除顺序以当前 `specs/027-version-single-source-refactor/plan.md` 为准。
 
+## 2026-07-23 关闭状态
+
+- 已删除 `src/version_store/`、`generation_replica_*` schema/复制链、`bootstrap-generation-read`、database DuckLake 解析发布路径和 native package 扩展。
+- `unit-export` 已统一写 Surreal `model_unit_commit`，Parquet refno 读取改用现有 Polars 依赖；默认配置不再携带 retired 行为键或惰性路径键。
+- 保留项仅为 `src/options.rs` 的升级拒绝/告警和 viewer 的 DuckDB-WASM parquet 离线资产；`cargo tree -i duckdb` 无 native Rust 依赖。
+
 ## A 整文件删除
 
 | 路径 | 说明 / 依赖影响 |

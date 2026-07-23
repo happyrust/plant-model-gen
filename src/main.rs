@@ -1415,7 +1415,6 @@ async fn main() -> anyhow::Result<()> {
         if mv.subcommand_matches("history").is_some()
             || mv.subcommand_matches("export").is_some()
             || mv.subcommand_matches("resolve-anchor").is_some()
-            || mv.subcommand_matches("bootstrap-generation-read").is_some()
             || mv.subcommand_matches("backfill-pe-cata-hash").is_some()
             || mv.subcommand_matches("catch-up").is_some()
             || mv.subcommand_matches("rebuild-pe-owner").is_some()
@@ -2970,7 +2969,9 @@ async fn main() -> anyhow::Result<()> {
             .expect("required by clap");
         let json_output = incr_matches.get_flag("json");
         if incr_matches.get_flag("generate-model") {
-            eprintln!("⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭");
+            eprintln!(
+                "⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭"
+            );
         }
         let options = IncrementRunOptions {
             file: incr_matches.get_one::<String>("file").map(PathBuf::from),
@@ -3007,7 +3008,10 @@ async fn main() -> anyhow::Result<()> {
 
         if !result.failures.is_empty() {
             aios_database::perf_metrics::finalize_task_metrics(false);
-            anyhow::bail!("incremental-sesno completed with failures: {}", result.failures.join("; "));
+            anyhow::bail!(
+                "incremental-sesno completed with failures: {}",
+                result.failures.join("; ")
+            );
         }
         aios_database::perf_metrics::finalize_task_metrics(true);
         return Ok(());
@@ -3016,7 +3020,9 @@ async fn main() -> anyhow::Result<()> {
     // ========== 处理 watch-incremental 子命令 ==========
     if let Some(watch_matches) = matches.subcommand_matches("watch-incremental") {
         if watch_matches.get_flag("generate-model") {
-            eprintln!("⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭");
+            eprintln!(
+                "⚠️ --generate-model 已废弃：模型生成默认开启；请改用 --no-generate-model 显式关闭"
+            );
         }
         crate::cli_modes::ensure_surreal_connected(&db_option_ext).await?;
         aios_database::version_management::watch_incremental::run_watch_incremental(

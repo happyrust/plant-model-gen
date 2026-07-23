@@ -423,6 +423,7 @@ path = "$dbUriPath"
         "src/version_management/ducklake_store.rs",
         "src/version_management/model_release.rs",
         "src/version_management/release_package.rs",
+        "src/version_store",
         "src/fast_model/gen_model/model_writer_ducklake.rs",
         "src/bin/ducklake_parity.rs"
     )

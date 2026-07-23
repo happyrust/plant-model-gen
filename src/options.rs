@@ -182,7 +182,10 @@ pub fn check_retired_ducklake_keys(raw_toml: &toml::Value) -> anyhow::Result<()>
             );
         }
     }
-    if let Some(value) = table.get("generation_read_backend").and_then(|v| v.as_str()) {
+    if let Some(value) = table
+        .get("generation_read_backend")
+        .and_then(|v| v.as_str())
+    {
         let normalized = value.trim().to_ascii_lowercase();
         if normalized == "ducklake" || normalized == "compare" {
             anyhow::bail!(

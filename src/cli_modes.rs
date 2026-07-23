@@ -2000,6 +2000,13 @@ pub async fn run_regen_model(
         generate_started.elapsed().as_millis() as u64,
     );
     ensure_surreal_connected(db_option_ext).await?;
+    // 必须在任何 regen 清理之前拒绝 Ready versioned 站点。
+    // gen_all_geos_data 内部的同类校验只能保护生成阶段，无法撤销前置清理。
+    aios_database::versioned_db::version_commit::ensure_live_generation_allowed(
+        db_option_ext,
+        "--regen-model",
+    )
+    .await?;
 
     // 4. 确定目标 refnos 并执行生成
     use aios_database::fast_model::gen_all_geos_data;

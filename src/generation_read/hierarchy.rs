@@ -389,6 +389,7 @@ mod tests {
             owner: refno(owner),
             noun: noun.to_string(),
             name: value.to_string(),
+            children: Vec::new(),
             has_children: false,
         }
     }

@@ -760,6 +760,7 @@ mod tests {
                 owner: RefnoEnum::from("0/0"),
                 noun: "WORLD".into(),
                 name: "world".into(),
+                children: vec![bran, cate, prim],
                 has_children: true,
             },
             ElementSnapshot {
@@ -768,6 +769,7 @@ mod tests {
                 owner: world,
                 noun: "BRAN".into(),
                 name: "bran".into(),
+                children: Vec::new(),
                 has_children: false,
             },
             ElementSnapshot {
@@ -776,6 +778,7 @@ mod tests {
                 owner: world,
                 noun: "EQUI".into(),
                 name: "cate".into(),
+                children: Vec::new(),
                 has_children: false,
             },
             ElementSnapshot {
@@ -784,6 +787,7 @@ mod tests {
                 owner: world,
                 noun: "BOX".into(),
                 name: "prim".into(),
+                children: Vec::new(),
                 has_children: false,
             },
         ];

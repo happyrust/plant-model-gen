@@ -263,7 +263,7 @@ async fn run_with_sqlite_index(
                 Err(error) => {
                     generation_barrier_blocked = true;
                     let message = format!("{error:#}");
-                    if error_is_normal_contention(&message) {
+                    if super::project_mutation_lock::is_mutation_contention_error(&message) {
                         println!("ℹ️ 多库增量轮次让路（正常竞争/待人工恢复）: {message}");
                     } else {
                         eprintln!("❌ 多库增量轮次失败，下一轮重试: {message}");
@@ -377,14 +377,6 @@ async fn run_with_sqlite_index(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "sqlite-index")]
-fn error_is_normal_contention(message: &str) -> bool {
-    message.contains("LeaseBusy")
-        || message.contains("already held")
-        || message.contains("PendingCommit")
-        || message.contains("pending version commit")
 }
 
 pub fn print_incremental_sesno_summary(result: &IncrementRunResult) {

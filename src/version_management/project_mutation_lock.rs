@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use crate::options::DbOptionExt;
 
+/// `ProjectMutationLock::acquire` 抢锁失败信息里的稳定标记；contention 分类器据此识别。
+pub const PROJECT_MUTATION_LOCK_BUSY_MARKER: &str = "项目写入锁已被占用";
+
 #[derive(Debug, Serialize)]
 struct LockOwner {
     pid: u32,
@@ -56,7 +59,7 @@ impl ProjectMutationLock {
             let _ = file.read_to_string(&mut owner);
             let owner = owner.trim();
             anyhow::bail!(
-                "项目写入锁已被占用: {}（holder={}；error={}）。watch-incremental、incremental-sesno 与模型生成不可并发。",
+                "{PROJECT_MUTATION_LOCK_BUSY_MARKER}: {}（holder={}；error={}）。watch-incremental、incremental-sesno 与模型生成不可并发。",
                 path.display(),
                 if owner.is_empty() { "unknown" } else { owner },
                 error
@@ -115,4 +118,17 @@ pub fn lock_path(db_option: &DbOptionExt) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("output"))
         .join(&db_option.inner.project_name)
         .join("incremental.lock")
+}
+
+/// 判断错误信息是否代表“另有写者/提交正在进行”的正常并发让路（而非真实故障）。
+///
+/// 覆盖三层竞争源：项目写入锁（本模块 acquire 失败）、dbnum lease（`LeaseBusy`）、
+/// 未决 Version Commit（`PendingCommit` / `pending version commit`）。watch / CLI /
+/// Web 据此把并发竞争统一呈现为结构化 contention，而不是通用失败（specs/026 P2.4、P6.6）。
+pub fn is_mutation_contention_error(message: &str) -> bool {
+    message.contains(PROJECT_MUTATION_LOCK_BUSY_MARKER)
+        || message.contains("LeaseBusy")
+        || message.contains("already held")
+        || message.contains("PendingCommit")
+        || message.contains("pending version commit")
 }

@@ -39,7 +39,7 @@ pub struct IncrementRunStatus {
     pub dbnum: u32,
     /// "sync"（落库）| "detect"（只读试跑）| "sync+generate"（落库+增量生成）
     pub kind: String,
-    /// "queued" | "running" | "succeeded" | "failed"
+    /// "queued" | "running" | "succeeded" | "failed" | "contention"
     pub state: String,
     pub from_sesno: u32,
     pub started_at: String,
@@ -111,8 +111,17 @@ fn record_run_result(
                 entry.summary = Some(run.summary);
             }
             Err(err) => {
-                entry.state = "failed".to_string();
-                entry.error = Some(err.to_string());
+                let message = err.to_string();
+                // 并发让路（另有写者/提交进行中）不是真实故障，呈现为结构化 contention
+                // 而非 failed（specs/026 P2.4/P6.6），UI 据此可区分"排队等锁"与"真错误"。
+                entry.state = if crate::version_management::project_mutation_lock::is_mutation_contention_error(
+                    &message,
+                ) {
+                    "contention".to_string()
+                } else {
+                    "failed".to_string()
+                };
+                entry.error = Some(message);
             }
         }
     }
@@ -299,7 +308,17 @@ pub async fn execute_incremental_update(
                 model_impact_filter,
             )
             .await;
-            let result_tag = if result.is_ok() { "Success" } else { "Failed" };
+            let result_tag = match &result {
+                Ok(_) => "Success",
+                Err(err)
+                    if crate::version_management::project_mutation_lock::is_mutation_contention_error(
+                        &err.to_string(),
+                    ) =>
+                {
+                    "Contention"
+                }
+                Err(_) => "Failed",
+            };
             record_run_result(&run_id, result);
             set_dbnum_updating(dbnum, false, Some(result_tag)).await;
         }

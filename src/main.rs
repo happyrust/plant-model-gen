@@ -2993,6 +2993,25 @@ async fn main() -> anyhow::Result<()> {
         let result = match run_incremental_sesno_once(&db_option_ext, options).await {
             Ok(result) => result,
             Err(err) => {
+                let message = format!("{err:#}");
+                // 并发让路：另有写者/提交进行中，本次不是失败，结构化告知后正常退出
+                // （specs/026 P2.4/P6.6），与 watch 的"让路"语义一致。
+                if aios_database::version_management::project_mutation_lock::is_mutation_contention_error(
+                    &message,
+                ) {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "status": "contention", "message": message })
+                        );
+                    } else {
+                        println!(
+                            "ℹ️ incremental-sesno 让路（正常竞争：另有写者/提交进行中）: {message}"
+                        );
+                    }
+                    aios_database::perf_metrics::finalize_task_metrics(true);
+                    return Ok(());
+                }
                 aios_database::perf_metrics::finalize_task_metrics(false);
                 return Err(err);
             }

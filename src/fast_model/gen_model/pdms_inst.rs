@@ -28,8 +28,8 @@ use parry3d::math::Point;
 
 use super::mesh_generate::MeshResult;
 use super::model_record_id::{
-    geo_relate_id, geo_relate_id_for_inst, model_refno_id, model_refno_range, neg_relate_id,
-    ngmr_relate_id, tubi_relate_id,
+    geo_relate_id, geo_relate_id_for_inst, model_ref0_range, model_refno_id, model_refno_range,
+    neg_relate_id, ngmr_relate_id, refno_id_parts, tubi_relate_id,
 };
 use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::fast_model::debug_model_debug;
@@ -758,20 +758,87 @@ async fn query_cleanup_bran_hang_or_seed(seed_refnos: &[RefnoEnum]) -> Vec<Refno
 /// 将清理逻辑集中到前处理阶段，避免与并行的 mesh worker 产生竞态条件
 /// （此前 DELETE + INSERT IGNORE 在 save_instance_data_optimize 中执行，
 ///   会覆盖 mesh worker 已写入的 meshed=true）。
-pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
-    pre_cleanup_for_regen_inner(seed_refnos, None).await
+pub async fn pre_cleanup_for_regen(
+    seed_refnos: &[RefnoEnum],
+    whole_dbnum_scope: bool,
+) -> anyhow::Result<()> {
+    pre_cleanup_for_regen_inner(seed_refnos, None, whole_dbnum_scope).await
 }
 
 pub async fn pre_cleanup_for_regen_versioned(
     seed_refnos: &[RefnoEnum],
     hierarchy: &crate::generation_read::HierarchySnapshot,
 ) -> anyhow::Result<()> {
-    pre_cleanup_for_regen_inner(seed_refnos, Some(hierarchy)).await
+    // 版本化增量路径始终是部分范围（子树），不得走整库 ref0 快路径。
+    pre_cleanup_for_regen_inner(seed_refnos, Some(hierarchy), false).await
+}
+
+/// O6 整库快路径：仅当调用方判定“范围覆盖整个 dbnum”（--regen-model 无子 refno 过滤）时使用。
+/// 按 ref0（= dbnum 的 db 文件号）区间批量清理各模型表，用与逐 refno 相同的已验证
+/// `LET $ids = SELECT VALUE id FROM <range>; DELETE $ids;` 形式（只是把区间放大到整 ref0），
+/// 把 O(元素数) 条语句压到每 dbnum ~10 条。正确性由调用范围门保证：整库范围下该 ref0 的
+/// 全部元素都在重生成，ref0 区间删除恰好命中且不会误删同库其它 ZONE。
+async fn pre_cleanup_ref0_range_for_refnos(all_refnos: &[RefnoEnum]) -> anyhow::Result<()> {
+    let ref0s: BTreeSet<u32> = all_refnos
+        .iter()
+        .map(|refno| refno_id_parts(*refno).ref0)
+        .collect();
+    if ref0s.is_empty() {
+        return Ok(());
+    }
+    let t = Instant::now();
+    println!(
+        "[pre_cleanup_for_regen] 整库快路径: 按 {} 个 dbnum(ref0) 区间清理",
+        ref0s.len()
+    );
+    for ref0 in ref0s {
+        // inst_geo 按 geo_relate.out 收集的 hash 点删（与逐 refno 路径一致；跳过内置 <10）。
+        let geo_range = model_ref0_range("geo_relate", ref0);
+        let mut resp = project_primary_db()
+            .query_response(&format!("SELECT VALUE record::id(out) FROM {geo_range};"))
+            .await?;
+        let geo_rows: Vec<String> = resp.take(0)?;
+        let hashes = geo_rows
+            .iter()
+            .filter_map(|s| parse_inst_geo_hash(s))
+            .collect::<Vec<_>>();
+        if !hashes.is_empty() {
+            delete_inst_geo_by_hashes(&hashes, 200).await?;
+        }
+        // 各模型表按 ref0 区间删除（精确 id 表 id 首元素即 ref0，区间同样命中）。
+        let mut cleanup_sql = String::new();
+        for table in [
+            "inst_relate",
+            "inst_relate_aabb",
+            "inst_relate_bool",
+            "inst_relate_cata_bool",
+            "refno_relations",
+            "neg_relate",
+            "ngmr_relate",
+            "geo_relate",
+            "tubi_relate",
+        ] {
+            let range = model_ref0_range(table, ref0);
+            cleanup_sql.push_str(&format!(
+                "LET $ids = SELECT VALUE id FROM {range}; DELETE $ids;\n"
+            ));
+        }
+        project_primary_db()
+            .query_response(&cleanup_sql)
+            .await?
+            .check()?;
+    }
+    println!(
+        "[pre_cleanup_for_regen] 整库快路径完成，耗时 {} ms",
+        t.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 async fn pre_cleanup_for_regen_inner(
     seed_refnos: &[RefnoEnum],
     hierarchy: Option<&crate::generation_read::HierarchySnapshot>,
+    whole_dbnum_fast_path: bool,
 ) -> anyhow::Result<()> {
     if seed_refnos.is_empty() {
         return Ok(());
@@ -834,6 +901,12 @@ async fn pre_cleanup_for_regen_inner(
 
     if all_refnos.is_empty() {
         return Ok(());
+    }
+
+    // O6：整库范围（--regen-model 无子 refno 过滤）→ 按 ref0（dbnum）区间批量清理，
+    // 替代 O(元素数) 的逐 refno 删除；仅整库范围启用，保证不误删同库其它 ZONE。
+    if whole_dbnum_fast_path {
+        return pre_cleanup_ref0_range_for_refnos(&all_refnos).await;
     }
 
     let t = Instant::now();

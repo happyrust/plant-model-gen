@@ -2029,8 +2029,14 @@ pub async fn run_regen_model(
             generate_started.elapsed().as_millis() as u64,
         );
         // 在统一清理入口中删除全部模型关系，避免 regen 后残留旧数据。
-        aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(&target_refnos)
-            .await?;
+        // O6：refnos_str 为空 ⟺ 整库范围（dbnum/manual_db_nums/run_all_dbnos → 展开 SITE），
+        // 走 ref0 区间快路径；指定具体 refnos（子 ZONE）时仍逐 refno，避免误删同库其它 ZONE。
+        let whole_dbnum_scope = config.refnos_str.is_empty();
+        aios_database::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(
+            &target_refnos,
+            whole_dbnum_scope,
+        )
+        .await?;
     } else {
         println!("   - drain-only 压测模式：跳过 regen cleanup，避免删除现有 SurrealDB 模型数据");
     }

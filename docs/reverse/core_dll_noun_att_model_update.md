@@ -692,10 +692,10 @@ def dehash(h: int) -> str:
    展开 Members/AbsentPrimitives/AncestorDeletes，而非只算单图元。
 5. noun 名单只负责把最终目标路由到具体生成器，不能提前丢弃目录/规格等依赖源。
 
-当前 `model_impact.rs::attribute_affects_model` 已含 `CATR/SPRE`，但尚缺本轮确认的
-`PRTREF`。现有 API 只有 attr、没有 noun；短期按“宁多勿漏”可把 `PRTREF` 加入全局
-allowlist，长期改成 `(noun, attr, effect, raw_dchc)`，把 `SPCO/TABITE` 特例及
-`dependency-cascade` 与 `direct-mesh` 区分开。
+`model_impact.rs::attribute_affects_model` 已含 `CATR/SPRE`，并已按本轮“宁多勿漏”
+把 `PRTREF` 加入全局 allowlist（2026-07-23）。现有 API 只有 attr、没有 noun；长期改成
+`(noun, attr, effect, raw_dchc)`，把 `SPCO/TABITE` 特例及 `dependency-cascade` 与
+`direct-mesh` 区分开。
 
 > 提示：§13.2 是“读取即用到 + Core3D 引用级联”的经验并集。若要逼近 Core3D，
 > 应以 `DCHC/EVALAT` 动态轨迹为模型影响依据；`wnoevt` 仅用于复刻事件边界。
@@ -734,6 +734,126 @@ allowlist，长期改成 `(noun, attr, effect, raw_dchc)`，把 `SPCO/TABITE` �
 > 交叉校验结论：§13.2 清单在属性名/哈希字典中 100% 命中（除 2 个派生项），可作为
 > 保守生成器基线；它没有因此自动获得 DCHC 真相源地位。`wnoevt` 用于事件兼容，
 > `DCHC + EVALAT/QCHGLS` 用于模型影响验证。
+
+---
+
+## 15. DCHC 变化码 1..4 的语义与 EVALAT 传播规则（2026-07-24 深挖，填补 §9「未知」）★
+
+> 本节直接反编译 `Core3D.dll` 的 `IDCHNG / EVALAT / EVALCD / EVALST / FNDTOP / ADSTCH`
+> （session `core3d-retrace`），把此前标注「DCHC=1..4 官方枚举名未知」的关口补成
+> **可操作语义**。结论：DCHC 的整数值本身在二进制里没有枚举名（DDL 数据里只是整数），
+> 但它在 `EVALAT` 里被当作**「路由/作用域选择器」**消费，各值的行为已完整还原。
+
+### 15.1 code 从哪来：`IDCHNG` + `EVALAT` 的强制规则
+
+`EVALAT @0x1022c679` 起始处决定变化码 `v16`（`a4=&attrHash`，`a3=&nounHash`，`a2=elementRef`）：
+
+```c
+if      (*a4 == 331445106 /*REDRAW*/) v16 = 4;   // 强制 code 4
+else if (*a4 ==  73767168 /*INTUBE*/) v16 = 1;   // 强制 code 1
+else                                  v16 = IDCHNG(a4);  // 读 DCHC
+if (v16) { /* 仅当非 0 才进入路由/传播 */ }
+```
+
+`IDCHNG @0x1022e302` 只做字典查询（实证反编译）：
+
+```c
+int IDCHNG(attrHash){
+    v = ATAINT(attrHash, DCHC/*596407*/);   // 读设计变化码
+    if (lookup_error) return 0;             // 查不到 → 0（等价 NoChange）
+    if (ATAINT(attrHash, PLCF/*652066*/)==1) dword_10E98500 = -1; // plot/clash 删除挂起
+    return v;                               // 原样返回 DCHC 整数
+}
+```
+
+即 **DCHC 原值 = EVALAT 的起始 code**，仅 `REDRAW→4`、`INTUBE→1` 两个属性会绕过字典强制取值。整个 EVALAT 只显式比较 `1/2/3/4`，其余非零值会落到通用传播尾部。
+
+### 15.2 各 code 的作用域路由（EVALAT 控制流实证）
+
+| code | EVALAT 行为（实证） | 语义（PDMS） | 最终写入 QCHGLS 的 code |
+|---|---|---|---|
+| **0** | `if(v16)` 不成立，EVALAT 直接返回 | **NoChange**：该属性改动**不进** QCHGLS（数据-only） | —（不写） |
+| **1** | `DGOTO(el)`；INTUBE 另做 `CRETUR+NATTA`；`DGETF(REF=535968)→v48`；`v16=4`；`EVALCD(v48,4)` | **重定向到关联/被引用元素**（改在引用目标上生效，而非属性持有者本身） | 4 |
+| **2** | `v16=4`；`EVALCD(self,4)` | **自身重建**（只重算该元素） | 4 |
+| **3** | 进入 component/point/owner/ref 通用传播体（与 4 同一段 `(v16==3||v16==4)`） | **传播**：自身 + 组件/点/owner/引用依赖 | 3 或 4（多数分支置 4） |
+| **4** | 与 3 完全相同的传播体；且是 REDRAW 级强制值、1/2/3 归一后的终值 | **强制全量传播/重绘** | 4 |
+
+要点：
+
+- **DCHC 是「路由」而非「严重度标量」**：1=去关联对象、2=去自身、3/4=自身+依赖闭包。它只在 EVALAT 内部决定**哪些 ref 被写入 QCHGLS**。
+- **3 与 4 在 EVALAT 里行为等价**（同一 `(v16==3||v16==4)` 分支）；4 只是 REDRAW 级/归一后的规范终值，并在去重时胜出（见 §15.3）。
+- 下游 `PartialUpdateDesiMgr::ChangedModelToUpdate` 传 `ModelState=0`（§11.3），**不消费 QCHGLS 里存的 code 值**——DCHC 的数值影响仅体现在「选了哪些 ref」，不体现在下游粒度状态。
+
+### 15.3 code 如何落库：`EVALCD → EVALST`（QCHGLS 三元组 + 保留最大 code）
+
+```c
+// EVALCD @0x1022e020：仅是包装，写全局 QCHGLS 句柄 dword_10E98540
+EVALCD(ref, &code){ EVALST(&QCHGLS/*dword_10E98540*/, ref, &code); }
+
+// EVALST @0x1022e0a7：按 ref 去重、保留较大 code
+EVALST(list, ref, &code){
+    if (NULREF(ref)) return;
+    for (i=1; i<len(list); i+=3)              // 步长 3：ref_hi, ref_lo, code
+        if (EQREF(ref, list[i])) {            // ref 已存在
+            if (list[i+2] < code) list[i+2]=code;  // 只在更大时覆盖
+            return;
+        }
+    append(list, ref_hi, ref_lo, code);       // 不存在 → 追加三元组
+}
+```
+
+证实 §4.3/§5.3 的旧结论：**QCHGLS = `(ref[2], changeCode)` 列表，按 ref 去重、保留最大 code**。
+
+### 15.4 EVALAT 的 (noun) 专例传播（DEHASH 全部解出）
+
+`v16` 非零后，EVALAT 按 `*a3`(nounHash) 走一批硬编码专例；除标注外均把命中目标以 code 4 写入 QCHGLS：
+
+| 专例分支 | 机制 | 命中 noun（DEHASH 还原） |
+|---|---|---|
+| owner 上溯 `FNDTOP`(`sub_10380E38`) | 上卷到显著 owner，强制 code 4 | `FLRLAY STRTWR WLOPEN HRGATE RAIL KICKPL HRPOST BPOPEN AIDLIN AIDARC AIDCIR AIDPOI AIDTEX` |
+| 成员遍历 `CGETEL/XTREE` | 展开子成员并入队 | `GRIDPL GRIDCY GRIDEL GRIDFA`（子项 `GRIDPL/GRIDCY`） |
+| 引用遍历 `DFIND/DGETI` | 沿引用集扩散 | 容器 `CGRDCP CGRDLP`；命中项 `FPFITT ELFITT HVACFI INFITT`（各专业 fitting） |
+| 引用遍历 | 同上 | `CTRAY`（命中 `HVACFI`）、`CLNPNG→CLNCGR→CLNTIL`（洁净室嵌套） |
+| `GATREF` 反查 | 目录/引用反查入队 | `PLTGRD/INTFRM`(`CWBRAN/POINTR`)、`SUBCOM`(`EQUI/ELCONN`) |
+| component 判定 `INCOMP/IPCOMP/IHCOMP` | 组件→自身 code 4 + 目录字段 | `PLTGRD INTFRM SUBCOM`；引用集 `PLOPEN DPCA DPCY DPSP DPSE`、`POHE`、`PANE/TMPL` |
+
+`FNDTOP`（trace `desdblib/FNDTOP`）沿 owner 链上卷，边界 noun 为 `TUBI(710633)/BRAN(808220)/WORL(781187)/TMPL(779672)`——即 Core3D 的「显著几何容器」判定；`ADSTCH`（`sub_1022D774`，trace `change/ADSTCH`）是通用「关联结构变化」展开器（`CLIMBA`+`XTREE` 遍历关系字段再入队）。
+
+### 15.5 官方枚举名的可得性
+
+在 `core.dll` 中检索仅得到诊断串 `"DCHC = "`（`0x5d4c0b8`）与导出符号
+`?dchc@DB_Attribute@@QBEHXZ`（`0x5ec8bdf`）；**没有 1..4 的枚举名字符串/枚举表**。
+DCHC 的取值是 DDL 字典里的裸整数，故其**枚举名无法从二进制静态恢复**；§15.2 的
+「路由语义」即为可得的权威还原。
+
+### 15.6 对 plant-model-gen 的直接启示（升级 `AttributeModelImpact`）
+
+当前 `attribute_affects_model` 是**扁平布尔白名单**，把 DCHC 的「路由维度」压平了。据 §15.2 可把三态升级为**带路由的 effect**（Rust 无法静态读每属性 DCHC，故保留 inclusive 兜底，但可表达路由）：
+
+| DCHC | 建议 Rust effect | 目标选择 |
+|---|---|---|
+| 0 | `KnownNeutral`（data-only） | 不写欠账 |
+| 1 | `RedirectToRelated`（owner/ref） | 入队**关联/owner**而非自身 |
+| 2 | `SelfGeometry`（direct-geometry） | 入队自身 |
+| 3/4 | `PropagateClosure`（dependency-cascade） | 自身 + 成员/引用/owner 闭包 |
+
+价值点：现实现对 `INTUBE`/`CATR`/`SPRE`/克隆等**「改在 A、模型欠账应记在 B」**的情形，只把 A 自身入桶；对齐 DCHC 路由后应把欠账**重定向/扩散**到 owner、被引用实例与显著容器（呼应 §13.4、ADR-0009、ADR-0011）。
+
+### 15.7 关键地址/字段速查（本轮新增）
+
+| 符号 | 地址(core3d) | 作用 |
+|---|---|---|
+| `IDCHNG` | `0x1022e302` | 读 DCHC(596407)/PLCF(652066)，返回变化码 |
+| `EVALAT` | `0x1022c679` | 按 code 1..4 路由 + noun 专例传播 |
+| `EVALCD` | `0x1022e020` | 写全局 QCHGLS(`dword_10E98540`) 的包装 |
+| `EVALST` | `0x1022e0a7` | QCHGLS 三元组去重 + 保留最大 code |
+| `FNDTOP`(`sub_10380E38`) | `0x10380e38` | 显著 owner 上溯（边界 TUBI/BRAN/WORL/TMPL） |
+| `ADSTCH`(`sub_1022D774`) | `0x1022d774` | 关联结构变化展开器 |
+| `plcDeletePending` | `dword_10E98500` | PLCF==1 时置位，`UPDATD` 开头 `PLCDEL` |
+| `QCHGLS` | `dword_10E98540` | 全局设计变化列表句柄 |
+
+> DEHASH 本轮新验证：`DCHC=596407`、`PLCF=652066`、`REF=535968`、`REDRAW=331445106`、
+> `INTUBE=73767168`、`TUBI=710633`、`BRAN=808220`、`WORL=781187`、`TMPL=779672`。
 
 ### 14.3 消费方（Core3D）反向交叉校验：§13.2 基本完备
 

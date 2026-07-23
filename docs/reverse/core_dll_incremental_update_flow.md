@@ -193,12 +193,15 @@ return changeCode;
 
 `EVALAT` 对 `REDRAW`（hash `331445106`）强制 code 4，对 `INTUBE`
 （`73767168`）强制 code 1；其余属性以 `DCHC` 为起点，再按 noun、owner、
-component/ref 特例决定真正入队的 ref。当前控制流只显式比较 `0..4`：
+component/ref 特例决定真正入队的 ref。当前控制流只显式比较 `0..4`，
+**DCHC 是「作用域路由选择器」**（完整实证与专例表见证据文档 §15）：
 
-- `0`：不进入 QCHGLS；
-- `1/2`：先重定向到关联对象，再提升为 code 4；
-- `3/4`：进入 component、point、owner、引用扩散分支；
-- 重复 ref 由 `EVALST` 保留更大的 change code。
+- `0`：NoChange，属性改动**不进** QCHGLS；
+- `1`：重定向到**关联/被引用元素**（`DGETF(REF=535968)`），提升为 code 4 后入队该目标；
+- `2`：**自身**重建，提升为 code 4 后入队自身；
+- `3/4`：**自身 + 组件/点/owner/引用依赖闭包**传播（两者在 EVALAT 中行为等价）；
+- 重复 ref 由 `EVALST` 保留更大的 change code；下游 `ChangedModelToUpdate` 传
+  `ModelState=0`，**不消费**存下的 code 值。
 
 ### 3.3 NOUN / owner：决定更新目标和粒度
 
@@ -593,7 +596,8 @@ reorderAfter / reorderBefore      core!0x594bce0 / 0x594c100
 | 删除、跨父移动、同父重排进入不同变化集合 | 强 | `elementDeleted/Included/Reordered` 对 `Deleted/Moved/Reordered/MemberChanged` 的直接写入 |
 | `TransmitChanges` 为同步插件交付且允许回调重入形成下一批 | 强 | `m_current` 移交/清空顺序与 Plugger 三阶段直接调用 |
 | 低层 dab child helper 不是主增量入口 | 强（当前静态范围） | 函数自身无 Plugger/UserChanges 调用，现有 xref 仅内部维护路径 |
-| `DCHC=1..4` 的官方枚举名 | 未知 | 控制流语义已知，枚举符号未恢复 |
+| `DCHC=1..4` 的**操作语义** | 强（2026-07-24 补） | 见证据文档 §15：0=NoChange、1=重定向到关联/owner(REF)、2=自身、3/4=自身+依赖闭包传播；REDRAW→4、INTUBE→1 |
+| `DCHC=1..4` 的官方**枚举名** | 未知（无法静态恢复） | 二进制仅有串 `"DCHC = "` 与符号 `?dchc@…`，取值是 DDL 裸整数，无枚举名表 |
 | QCHGLS 与整批 `DB_UserChanges` 的唯一桥接点 | 未知 | 两条链都已确认，但未发现单一直接转换函数 |
 | `ModelState=4` 的静态入口 | 未知 | Granularity 有分支，现有静态 callers 只传 0/1/3 |
 

@@ -55,6 +55,16 @@ date: 2026-07-22
 > 该表述错误，现以 `wnoevt=事件边界、DCHC/EVALAT=模型影响、
 > noun/ref/SignificantOwner=目标与粒度` 为准。
 
+> 2026-07-24 补充：已反编译 `Core3D.dll` 的 `IDCHNG/EVALAT/EVALCD/EVALST`，还原
+> DCHC 1..4 的**操作语义**（证据文档 §15）：**DCHC 是「作用域路由选择器」**——
+> `0`=NoChange、`1`=重定向到关联/owner(REF)、`2`=自身、`3/4`=自身+依赖闭包传播；
+> `REDRAW→4`、`INTUBE→1`；QCHGLS 按 ref 去重保留最大 code，但下游 `ModelState=0`
+> 不消费该 code。**枚举名**在二进制中不可静态恢复（DDL 裸整数）。据此，本 ADR
+> 「未来演进」的 `effect` 升级可落为：0→data-only、1→redirect-to-related、
+> 2→self-direct-geometry、3/4→dependency-cascade；Rust 静态拿不到每属性 DCHC，
+> 仍保留 inclusive 兜底，但应补齐**「改在 A、欠账记到 owner/被引用实例 B」**的路由
+> （呼应 §13.4 与 ADR-0011 目录反向闭包）。
+
 参见实现 `src/version_management/model_impact.rs`、
 `src/data_interface/sesno_increment.rs`，逆向总览
 `docs/reverse/core_dll_incremental_update_flow.md`，详细证据

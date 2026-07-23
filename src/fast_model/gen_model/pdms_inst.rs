@@ -407,7 +407,14 @@ fn build_delete_tubi_relate_by_branch_refnos_sql(
     out
 }
 
-fn build_delete_model_records_by_refno_sql(refno: RefnoEnum) -> String {
+/// O2：单精确 id 表的删除按整块批成「每表一条列表点删」
+/// `DELETE [t:[a,b], t:[c,d], …];`——与 `build_delete_inst_relate_bool_records_sql`
+/// 同一已验证形式（数组 record-id 列表点删），把每块约 5×N 条单删收敛到 5 条，
+/// 大幅降低 SurrealQL 语句解析/规划开销。空输入返回空串。
+fn build_delete_exact_model_records_sql(refnos: &[RefnoEnum]) -> String {
+    if refnos.is_empty() {
+        return String::new();
+    }
     let mut sql = String::new();
     for table in [
         "inst_relate",
@@ -416,8 +423,21 @@ fn build_delete_model_records_by_refno_sql(refno: RefnoEnum) -> String {
         "inst_relate_cata_bool",
         "refno_relations",
     ] {
-        sql.push_str(&format!("DELETE {};\n", model_refno_id(table, refno)));
+        let ids = refnos
+            .iter()
+            .map(|refno| model_refno_id(table, *refno))
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!("DELETE [{ids}];\n"));
     }
+    sql
+}
+
+/// 区间表（neg_relate/ngmr_relate/geo_relate）按 refno 区间删除。保留已验证的
+/// `LET $ids = SELECT VALUE id FROM <range>; DELETE $ids;` 形式；直接
+/// `DELETE <range>` 需先用区间删除探针确认锁定版本 SurrealDB 支持后再切换（O1）。
+fn build_delete_range_model_records_by_refno_sql(refno: RefnoEnum) -> String {
+    let mut sql = String::new();
     for table in ["neg_relate", "ngmr_relate", "geo_relate"] {
         let range = model_refno_range(table, refno);
         sql.push_str(&format!(
@@ -855,8 +875,10 @@ async fn pre_cleanup_for_regen_inner(
                     let geo_range = model_refno_range("geo_relate", *refno);
                     geo_query_sql
                         .push_str(&format!("SELECT VALUE record::id(out) FROM {geo_range};\n"));
-                    cleanup_sql.push_str(&build_delete_model_records_by_refno_sql(*refno));
+                    cleanup_sql.push_str(&build_delete_range_model_records_by_refno_sql(*refno));
                 }
+                // O2：5 张精确 id 表整块批量点删（每表一条列表删），替代每 refno 5 条单删。
+                cleanup_sql.push_str(&build_delete_exact_model_records_sql(&chunk_vec));
 
                 let mut geo_hashes = Vec::new();
                 if !geo_query_sql.trim().is_empty() {

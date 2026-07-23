@@ -22,7 +22,43 @@ impl GenerationReadContext {
     pub async fn load(session: Arc<dyn VersionedReadSession>) -> anyhow::Result<Arc<Self>> {
         let hierarchy =
             HierarchySnapshot::load(Arc::clone(&session), &session.manifest().dbnums()).await?;
-        let refnos = hierarchy.all_refnos();
+        Self::from_hierarchy(session, hierarchy).await
+    }
+
+    pub async fn load_for_refnos(
+        session: Arc<dyn VersionedReadSession>,
+        refnos: &[aios_core::RefnoEnum],
+    ) -> anyhow::Result<Arc<Self>> {
+        if refnos.is_empty() {
+            return Self::load(session).await;
+        }
+        let hierarchy = HierarchySnapshot::load_for_refnos(Arc::clone(&session), refnos).await?;
+        Self::from_hierarchy(session, hierarchy).await
+    }
+
+    async fn from_hierarchy(
+        session: Arc<dyn VersionedReadSession>,
+        hierarchy: HierarchySnapshot,
+    ) -> anyhow::Result<Arc<Self>> {
+        let hierarchy_refnos = hierarchy.all_refnos();
+        let direct_catalog_nodes = session
+            .load_catalog_nodes(&hierarchy_refnos)
+            .await?
+            .require_all("generation.preload.catalog_nodes")?;
+        let catalog_seeds = direct_catalog_nodes
+            .values()
+            .flat_map(|node| node.outbound.iter().map(|edge| edge.target))
+            .filter(aios_core::RefnoEnum::is_valid)
+            .collect::<Vec<_>>();
+        let catalog_closure =
+            CatalogResolver::new(Arc::clone(&session), CatalogResolverConfig::default())
+                .resolve(&catalog_seeds)
+                .await?;
+        let mut refnos = hierarchy_refnos
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        refnos.extend(catalog_closure.ordered_refnos);
+        let refnos = refnos.into_iter().collect::<Vec<_>>();
         let (attributes, catalog_nodes, transforms) = tokio::try_join!(
             session.load_attribute_sets(&refnos),
             session.load_catalog_nodes(&refnos),

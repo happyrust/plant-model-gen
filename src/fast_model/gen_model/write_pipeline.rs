@@ -587,6 +587,7 @@ async fn run_inst_aabb_writer(
 pub(crate) struct WritePipelineStart {
     pub db_option: DbOptionExt,
     pub generation_read: Arc<GenerationReadContext>,
+    pub cleanup_hierarchy: Option<Arc<crate::generation_read::HierarchySnapshot>>,
     pub incremental_cleanup_roots: Vec<RefnoEnum>,
     pub model_writer: Arc<dyn ModelWriterBackend>,
     pub artifacts: Arc<GenerationArtifacts>,
@@ -649,7 +650,10 @@ impl ModelWritePipeline {
             );
             crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen_versioned(
                 &request.incremental_cleanup_roots,
-                &request.generation_read,
+                request
+                    .cleanup_hierarchy
+                    .as_deref()
+                    .unwrap_or(&request.generation_read.hierarchy),
             )
             .await?;
             println!("[write-pipeline] incremental cleanup complete");

@@ -603,7 +603,10 @@ fn classify_modified_element(
             changed_attributes,
         };
     }
-    if changed_attributes.iter().any(|name| name.starts_with("UDA:")) {
+    if changed_attributes
+        .iter()
+        .any(|name| name.starts_with("UDA:"))
+    {
         return OperationModelImpact {
             decision: "unknown_fallback",
             reason: "unknown_uda",
@@ -698,11 +701,10 @@ fn apply_pdms_operation(
             }
             match insert_change_by_noun(update_log, refno, &noun, false) {
                 Some(category) => Some(PdmsModelChangeTarget { refno, category }),
-                None
-                    if impact
-                        .changed_attributes
-                        .iter()
-                        .any(|name| matches!(name.as_str(), "NOUN" | "TYPE")) =>
+                None if impact
+                    .changed_attributes
+                    .iter()
+                    .any(|name| matches!(name.as_str(), "NOUN" | "TYPE")) =>
                 {
                     insert_change_by_noun(update_log, refno, "DELETED", true)
                         .map(|category| PdmsModelChangeTarget { refno, category })
@@ -763,11 +765,7 @@ fn apply_critical_model_expansion(
         return;
     }
 
-    if impact
-        .changed_attributes
-        .iter()
-        .any(|name| name == "OWNER")
-    {
+    if impact.changed_attributes.iter().any(|name| name == "OWNER") {
         for (name, (old, new)) in &modified.modified_attrs {
             if crate::version_management::model_impact::normalize_attribute_name(name) == "OWNER" {
                 if let Some(old_owner) = named_attr_refno(old) {
@@ -812,12 +810,7 @@ fn apply_critical_model_expansion(
             );
         }
         for child in new.difference(&old) {
-            insert_existing_model_target(
-                io,
-                update_log,
-                RefnoEnum::from(*child),
-                operation.sesno,
-            );
+            insert_existing_model_target(io, update_log, RefnoEnum::from(*child), operation.sesno);
         }
     }
 }
@@ -1158,7 +1151,6 @@ pub async fn persist_pdms_increment_files(
 
 pub async fn persist_collected_pdms_increment_files(
     files: &[PdmsSesnoCollectedFile],
-    source_hash: Option<&str>,
     recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats::default();
@@ -1166,7 +1158,7 @@ pub async fn persist_collected_pdms_increment_files(
         match persist_pdms_increment_grouped(
             &file.report,
             &file.grouped_operations,
-            source_hash,
+            Some(file.report.source_sha256_before.as_str()),
             recover_pending,
         )
         .await
@@ -1367,8 +1359,7 @@ pub fn collect_pdms_increment_for_file_with_operations_options(
             }
 
             let impact = classify_operation(operation, model_impact_filter);
-            let model_change =
-                apply_pdms_operation(&mut io, &mut update_log, operation, &impact);
+            let model_change = apply_pdms_operation(&mut io, &mut update_log, operation, &impact);
             apply_critical_model_expansion(&mut io, &mut update_log, operation, &impact);
             let classified = model_change.is_some()
                 || is_none_operation

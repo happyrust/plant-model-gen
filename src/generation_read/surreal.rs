@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use aios_core::{RefnoEnum, SurrealQueryExt, Transform, project_primary_db};
+use aios_core::rs_surreal::PlantTransform;
+use aios_core::{NamedAttrMap, RefnoEnum, SPdmsElement, SurrealQueryExt, project_primary_db};
 use async_trait::async_trait;
+use serde::Deserialize;
 use surrealdb::types::SurrealValue;
 
 use super::error::{GenerationReadError, GenerationReadResult};
@@ -12,30 +14,34 @@ use super::traits::{
     TransformRead, VersionedReadSession,
 };
 use super::types::{
-    AttributeReference, AttributeSet, BatchLookup, CatalogNode, ElementQuery, ElementSnapshot,
+    AttributeSet, BatchLookup, CatalogNode, ElementQuery, ElementSnapshot,
     GenerationReadBackendKind, HierarchyRow, InputVersionManifest, SessionMetricsSnapshot,
-    TransformSnapshot, decode_attribute_set_payload, hash_serializable,
+    TransformSnapshot,
 };
-use crate::version_store::{ReplicaSnapshotBinding, SurrealReplicaStore};
 
+const QUERY_CHUNK_SIZE: usize = 500;
+
+/// Surreal main-table generation reader.
+///
+/// `read_at=None` is reserved for initialization against an isolated staging
+/// database. Incremental, catch-up, and repair runs pass one data-anchor time;
+/// every query emitted by the session then carries the same `VERSION` suffix.
 #[derive(Debug, Clone, Default)]
 pub struct SurrealVersionedReadBackend {
-    replica: SurrealReplicaStore,
+    read_at: Option<String>,
 }
 
 impl SurrealVersionedReadBackend {
-    pub fn new(replica: SurrealReplicaStore) -> Self {
-        Self { replica }
+    pub fn new(read_at: Option<String>) -> Self {
+        Self { read_at }
     }
 }
 
 pub struct SurrealVersionedReadSession {
     manifest: Arc<InputVersionManifest>,
-    binding: ReplicaSnapshotBinding,
-    /// Surreal 3.x：`VERSION` 必须在 WHERE/ORDER BY 之后；读最新 watermark 时为空
-    ///（非 versioned RocksDB 仅支持当前态，且当前态即最新已 apply 的副本）。
     version_suffix: String,
     metrics: Mutex<SessionMetricsSnapshot>,
+    attribute_cache: Mutex<BTreeMap<RefnoEnum, AttributeSet>>,
 }
 
 #[async_trait]
@@ -48,30 +54,12 @@ impl GenerationReadBackend for SurrealVersionedReadBackend {
         &self,
         manifest: Arc<InputVersionManifest>,
     ) -> GenerationReadResult<Arc<dyn VersionedReadSession>> {
-        let binding = self.replica.validate_manifest(&manifest).await?;
-        let replica_manifest = self
-            .replica
-            .manifest_at(&binding)
-            .await
-            .map_err(|error| backend_error("open_session.manifest", error))?;
-        if replica_manifest.manifest_hash != manifest.manifest_hash {
-            return Err(GenerationReadError::ManifestMismatch {
-                snapshot_id: manifest.authoritative_snapshot_id,
-                expected: manifest.manifest_hash.clone(),
-                actual: replica_manifest.manifest_hash,
-            });
-        }
-        let watermark = self
-            .replica
-            .current_watermark()
-            .await
-            .map_err(|error| backend_error("open_session.watermark", error))?;
-        let version_suffix = replica_version_suffix(&binding, watermark)?;
+        let version_suffix = main_table_version_suffix(self.read_at.as_deref())?;
         Ok(Arc::new(SurrealVersionedReadSession {
             manifest,
-            binding,
             version_suffix,
             metrics: Mutex::new(SessionMetricsSnapshot::default()),
+            attribute_cache: Mutex::new(BTreeMap::new()),
         }))
     }
 }
@@ -103,25 +91,15 @@ impl ElementRead for SurrealVersionedReadSession {
         if refnos.is_empty() {
             return Ok(BatchLookup::default());
         }
-        let requested_refnos = refnos.iter().copied().collect::<BTreeSet<_>>();
-        let rows = self
-            .load_element_rows(
-                "WHERE refno IN $refnos",
-                Some(
-                    requested_refnos
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                ),
-            )
-            .await?;
+        let requested = refnos.iter().copied().collect::<BTreeSet<_>>();
+        let rows = self.load_pe_rows_by_refnos(&requested).await?;
         let found = rows
             .into_iter()
-            .map(element_from_row)
+            .map(element_from_pe)
             .collect::<GenerationReadResult<Vec<_>>>()?;
         self.record(
             "element.load",
-            requested_refnos.len(),
+            requested.len(),
             found.len(),
             started.elapsed().as_micros() as u64,
         );
@@ -136,7 +114,298 @@ impl ElementRead for SurrealVersionedReadSession {
         query: &ElementQuery,
     ) -> GenerationReadResult<Vec<ElementSnapshot>> {
         let started = Instant::now();
-        let mut clauses = Vec::new();
+        let rows = self.load_pe_rows_by_query(query).await?;
+        let elements = rows
+            .into_iter()
+            .map(element_from_pe)
+            .collect::<GenerationReadResult<Vec<_>>>()?;
+        self.record(
+            "element.query",
+            query.dbnums.len(),
+            elements.len(),
+            started.elapsed().as_micros() as u64,
+        );
+        Ok(elements)
+    }
+}
+
+#[async_trait]
+impl AttributeRead for SurrealVersionedReadSession {
+    async fn load_attribute_sets(
+        &self,
+        refnos: &[RefnoEnum],
+    ) -> GenerationReadResult<BatchLookup<AttributeSet>> {
+        let started = Instant::now();
+        if refnos.is_empty() {
+            return Ok(BatchLookup::default());
+        }
+        let requested = refnos.iter().copied().collect::<BTreeSet<_>>();
+        let mut found = self
+            .attribute_cache
+            .lock()
+            .map(|cache| {
+                requested
+                    .iter()
+                    .filter_map(|refno| cache.get(refno).cloned().map(|value| (*refno, value)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let cached = found
+            .iter()
+            .map(|(refno, _)| *refno)
+            .collect::<BTreeSet<_>>();
+        let missing = requested
+            .iter()
+            .filter(|refno| !cached.contains(refno))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if missing.is_empty() {
+            return Ok(BatchLookup::from_found(refnos, found));
+        }
+        let pe_rows = self.load_pe_rows_by_refnos(&missing).await?;
+        let mut loaded = Vec::with_capacity(pe_rows.len());
+
+        for chunk in pe_rows.chunks(QUERY_CHUNK_SIZE) {
+            let record_ids = chunk
+                .iter()
+                .map(|pe| pe.refno.to_table_key(&pe.noun))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM [{record_ids}] ORDER BY id{};",
+                self.version_suffix
+            );
+            let mut response = project_primary_db()
+                .query(sql)
+                .await
+                .map_err(|error| backend_error("attribute.load", error))?
+                .check()
+                .map_err(|error| backend_error("attribute.load", error))?;
+            let attributes: Vec<NamedAttrMap> = response
+                .take(0)
+                .map_err(|error| backend_error("attribute.decode", error))?;
+            for attributes in attributes {
+                let refno = RefnoEnum::from(attributes.get_refno_or_default());
+                if missing.contains(&refno) {
+                    loaded.push((refno, AttributeSet::from_named_attr_map(refno, &attributes)));
+                }
+            }
+        }
+
+        self.record(
+            "attribute.load",
+            missing.len(),
+            loaded.len(),
+            started.elapsed().as_micros() as u64,
+        );
+        if let Ok(mut cache) = self.attribute_cache.lock() {
+            cache.extend(loaded.iter().cloned());
+        }
+        found.extend(loaded);
+        Ok(BatchLookup::from_found(refnos, found))
+    }
+}
+
+#[async_trait]
+impl HierarchyRead for SurrealVersionedReadSession {
+    async fn load_hierarchy_rows(&self, dbnums: &[u32]) -> GenerationReadResult<Vec<HierarchyRow>> {
+        let started = Instant::now();
+        if dbnums.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = ElementQuery {
+            dbnums: dbnums.iter().copied().collect(),
+            ..ElementQuery::default()
+        };
+        let pe_rows = self.load_pe_rows_by_query(&query).await?;
+        let known = pe_rows.iter().map(|pe| pe.refno).collect::<BTreeSet<_>>();
+        let mut rows = Vec::new();
+        for pe in pe_rows {
+            let dbnum = checked_u32(pe.dbnum, "hierarchy.dbnum")?;
+            for (ordinal, child) in pe.children.unwrap_or_default().into_iter().enumerate() {
+                let child = RefnoEnum::from(child);
+                // A partial CATA closure can contain links to records which were
+                // intentionally not materialized. They are catalog references,
+                // not hierarchy nodes in this generation manifest.
+                if known.contains(&child) {
+                    rows.push(HierarchyRow {
+                        dbnum,
+                        parent: pe.refno,
+                        child,
+                        ordinal: ordinal as u32,
+                    });
+                }
+            }
+        }
+        self.record(
+            "hierarchy.load",
+            dbnums.len(),
+            rows.len(),
+            started.elapsed().as_micros() as u64,
+        );
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl CatalogGraphRead for SurrealVersionedReadSession {
+    async fn load_catalog_nodes(
+        &self,
+        refnos: &[RefnoEnum],
+    ) -> GenerationReadResult<BatchLookup<CatalogNode>> {
+        let started = Instant::now();
+        if refnos.is_empty() {
+            return Ok(BatchLookup::default());
+        }
+        let requested = refnos.iter().copied().collect::<BTreeSet<_>>();
+        let pe_rows = self.load_pe_rows_by_refnos(&requested).await?;
+        let attributes = self.load_attribute_sets(refnos).await?;
+        let requested_dbnums = pe_rows
+            .iter()
+            .filter_map(|pe| u32::try_from(pe.dbnum).ok())
+            .collect::<BTreeSet<_>>();
+        let db_types = self.load_db_types(&requested_dbnums).await?;
+        let mut found = Vec::with_capacity(pe_rows.len());
+
+        for pe in pe_rows {
+            let dbnum = checked_u32(pe.dbnum, "catalog.dbnum")?;
+            let attributes = attributes.found.get(&pe.refno).ok_or_else(|| {
+                GenerationReadError::MissingRequiredData {
+                    capability: "catalog.attributes",
+                    refnos: vec![pe.refno],
+                }
+            })?;
+            let db_type = db_types.get(&dbnum).cloned().ok_or_else(|| {
+                GenerationReadError::MissingRequiredData {
+                    capability: "catalog.db_type",
+                    refnos: vec![pe.refno],
+                }
+            })?;
+            let node = CatalogNode {
+                refno: pe.refno,
+                dbnum,
+                db_type,
+                noun: pe.noun,
+                owner: pe.owner,
+                children: pe
+                    .children
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(RefnoEnum::from)
+                    .collect(),
+                outbound: attributes.reference_edges(dbnum),
+            };
+            found.push((node.refno, node));
+        }
+
+        self.record(
+            "catalog.load",
+            requested.len(),
+            found.len(),
+            started.elapsed().as_micros() as u64,
+        );
+        Ok(BatchLookup::from_found(refnos, found))
+    }
+}
+
+#[async_trait]
+impl TransformRead for SurrealVersionedReadSession {
+    async fn load_transforms(
+        &self,
+        refnos: &[RefnoEnum],
+    ) -> GenerationReadResult<BatchLookup<TransformSnapshot>> {
+        let started = Instant::now();
+        if refnos.is_empty() {
+            return Ok(BatchLookup::default());
+        }
+        let requested = refnos.iter().copied().collect::<BTreeSet<_>>();
+        let pe_rows = self.load_pe_rows_by_refnos(&requested).await?;
+        let dbnums = pe_rows
+            .into_iter()
+            .filter_map(|pe| u32::try_from(pe.dbnum).ok().map(|dbnum| (pe.refno, dbnum)))
+            .collect::<BTreeMap<_, _>>();
+        let mut found = Vec::new();
+
+        for chunk in requested
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .chunks(QUERY_CHUNK_SIZE)
+        {
+            let ids = chunk
+                .iter()
+                .map(|refno| refno.to_table_key("pe_transform"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT meta::id(id) AS refno, local_trans.d AS local, \
+                 world_trans.d AS world FROM [{ids}]{};",
+                self.version_suffix
+            );
+            let mut response = project_primary_db()
+                .query(sql)
+                .await
+                .map_err(|error| backend_error("transform.load", error))?
+                .check()
+                .map_err(|error| backend_error("transform.load", error))?;
+            let rows: Vec<MainTransformRow> = response
+                .take(0)
+                .map_err(|error| backend_error("transform.decode", error))?;
+            for row in rows {
+                let Some(world) = row.world else {
+                    continue;
+                };
+                let Some(dbnum) = dbnums.get(&row.refno).copied() else {
+                    continue;
+                };
+                let snapshot = TransformSnapshot {
+                    refno: row.refno,
+                    dbnum,
+                    local: row.local.map(|value| value.0),
+                    world: world.0,
+                };
+                found.push((snapshot.refno, snapshot));
+            }
+        }
+
+        self.record(
+            "transform.load",
+            requested.len(),
+            found.len(),
+            started.elapsed().as_micros() as u64,
+        );
+        Ok(BatchLookup::from_found(refnos, found))
+    }
+}
+
+impl SurrealVersionedReadSession {
+    async fn load_pe_rows_by_refnos(
+        &self,
+        refnos: &BTreeSet<RefnoEnum>,
+    ) -> GenerationReadResult<Vec<SPdmsElement>> {
+        let mut rows = Vec::new();
+        let ordered = refnos.iter().copied().collect::<Vec<_>>();
+        for chunk in ordered.chunks(QUERY_CHUNK_SIZE) {
+            let ids = chunk
+                .iter()
+                .map(|refno| refno.to_pe_key())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM [{ids}] WHERE deleted = false OR deleted = NONE \
+                 ORDER BY dbnum, id{};",
+                self.version_suffix
+            );
+            rows.extend(self.query_pe_rows(sql, "element.load_rows").await?);
+        }
+        Ok(rows)
+    }
+
+    async fn load_pe_rows_by_query(
+        &self,
+        query: &ElementQuery,
+    ) -> GenerationReadResult<Vec<SPdmsElement>> {
+        let mut clauses = vec!["(deleted = false OR deleted = NONE)".to_string()];
         if !query.dbnums.is_empty() {
             clauses.push(format!(
                 "dbnum IN [{}]",
@@ -160,77 +429,44 @@ impl ElementRead for SurrealVersionedReadSession {
             ));
         }
         if let Some(has_children) = query.has_children {
-            clauses.push(format!("has_children = {has_children}"));
+            let predicate = if has_children {
+                "array::len(children) > 0"
+            } else {
+                "array::len(children) = 0"
+            };
+            clauses.push(predicate.to_string());
         }
-        let filter = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", clauses.join(" AND "))
-        };
-        let rows = self.load_element_rows(&filter, None).await?;
-        let elements = rows
-            .into_iter()
-            .map(element_from_row)
-            .collect::<GenerationReadResult<Vec<_>>>()?;
-        self.record(
-            "element.query",
-            query.dbnums.len(),
-            elements.len(),
-            started.elapsed().as_micros() as u64,
-        );
-        Ok(elements)
-    }
-}
-
-#[async_trait]
-impl AttributeRead for SurrealVersionedReadSession {
-    async fn load_attribute_sets(
-        &self,
-        refnos: &[RefnoEnum],
-    ) -> GenerationReadResult<BatchLookup<AttributeSet>> {
-        let started = Instant::now();
-        if refnos.is_empty() {
-            return Ok(BatchLookup::default());
-        }
-        let requested_refnos = refnos.iter().copied().collect::<BTreeSet<_>>();
-        let rows = self
-            .load_element_rows(
-                "WHERE refno IN $refnos",
-                Some(
-                    requested_refnos
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                ),
-            )
-            .await?;
-        let mut found = Vec::with_capacity(rows.len());
-        for row in rows {
-            let attributes = decode_attribute_set(&row)?;
-            found.push((attributes.refno, attributes));
-        }
-        self.record(
-            "attribute.load",
-            requested_refnos.len(),
-            found.len(),
-            started.elapsed().as_micros() as u64,
-        );
-        Ok(BatchLookup::from_found(refnos, found))
-    }
-}
-
-#[async_trait]
-impl HierarchyRead for SurrealVersionedReadSession {
-    async fn load_hierarchy_rows(&self, dbnums: &[u32]) -> GenerationReadResult<Vec<HierarchyRow>> {
-        let started = Instant::now();
-        if dbnums.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dbnums = dbnums.iter().copied().collect::<BTreeSet<_>>();
         let sql = format!(
-            "SELECT dbnum, parent_refno, child_refno, ordinal \
-             FROM generation_replica_hierarchy \
-             WHERE dbnum IN [{}] ORDER BY dbnum, parent_refno, ordinal{};",
+            "SELECT * FROM pe WHERE {} ORDER BY dbnum, id{};",
+            clauses.join(" AND "),
+            self.version_suffix
+        );
+        self.query_pe_rows(sql, "element.query_rows").await
+    }
+
+    async fn query_pe_rows(
+        &self,
+        sql: String,
+        operation: &'static str,
+    ) -> GenerationReadResult<Vec<SPdmsElement>> {
+        let mut response = project_primary_db()
+            .query(sql)
+            .await
+            .map_err(|error| backend_error(operation, error))?
+            .check()
+            .map_err(|error| backend_error(operation, error))?;
+        response
+            .take(0)
+            .map_err(|error| backend_error("element.decode_rows", error))
+    }
+
+    async fn load_db_types(
+        &self,
+        dbnums: &BTreeSet<u32>,
+    ) -> GenerationReadResult<BTreeMap<u32, String>> {
+        let sql = format!(
+            "SELECT dbnum, db_type FROM dbnum_info_table WHERE dbnum IN [{}] \
+             ORDER BY dbnum{};",
             dbnums
                 .iter()
                 .map(u32::to_string)
@@ -241,254 +477,21 @@ impl HierarchyRead for SurrealVersionedReadSession {
         let mut response = project_primary_db()
             .query(sql)
             .await
-            .map_err(|error| backend_error("hierarchy.load", error))?
+            .map_err(|error| backend_error("catalog.db_types", error))?
             .check()
-            .map_err(|error| backend_error("hierarchy.load", error))?;
-        let rows: Vec<HierarchyReplicaRow> = response
+            .map_err(|error| backend_error("catalog.db_types", error))?;
+        let rows: Vec<DbTypeRow> = response
             .take(0)
-            .map_err(|error| backend_error("hierarchy.decode", error))?;
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                Ok(HierarchyRow {
-                    dbnum: checked_u32(row.dbnum, "hierarchy.dbnum")?,
-                    parent: parse_refno(&row.parent_refno, "hierarchy.parent")?,
-                    child: parse_refno(&row.child_refno, "hierarchy.child")?,
-                    ordinal: checked_u32(row.ordinal, "hierarchy.ordinal")?,
-                })
-            })
-            .collect::<GenerationReadResult<Vec<_>>>()?;
-        self.record(
-            "hierarchy.load",
-            dbnums.len(),
-            rows.len(),
-            started.elapsed().as_micros() as u64,
-        );
-        Ok(rows)
-    }
-}
-
-#[async_trait]
-impl CatalogGraphRead for SurrealVersionedReadSession {
-    async fn load_catalog_nodes(
-        &self,
-        refnos: &[RefnoEnum],
-    ) -> GenerationReadResult<BatchLookup<CatalogNode>> {
-        let started = Instant::now();
-        if refnos.is_empty() {
-            return Ok(BatchLookup::default());
-        }
-        let refno_strings = refnos
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let requested = refno_strings.len();
-        let dbnums = self.manifest.dbnums();
-        let version = &self.version_suffix;
-        let sql = format!(
-            "SELECT dbnum, refno, owner_refno, noun, name, has_children, \
-                    attr_codec_version, attr_payload_hex, attr_hash \
-             FROM generation_replica_element WHERE refno IN $refnos{version};\n\
-             SELECT dbnum, source_refno, attribute_name, target_refno, ordinal \
-             FROM generation_replica_reference \
-             WHERE source_refno IN $refnos ORDER BY source_refno, attribute_name, ordinal{version};\n\
-             SELECT dbnum, parent_refno, child_refno, ordinal \
-             FROM generation_replica_hierarchy \
-             WHERE parent_refno IN $refnos ORDER BY parent_refno, ordinal{version};\n\
-             SELECT dbnum, db_type, project FROM generation_replica_db_catalog \
-             WHERE dbnum IN [{}]{version};",
-            dbnums
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let mut response = project_primary_db()
-            .query(sql)
-            .bind(("refnos", refno_strings))
-            .await
-            .map_err(|error| backend_error("catalog.load", error))?
-            .check()
-            .map_err(|error| backend_error("catalog.load", error))?;
-        let elements: Vec<ElementReplicaRow> = response
-            .take(0)
-            .map_err(|error| backend_error("catalog.elements", error))?;
-        let references: Vec<ReferenceReplicaRow> = response
-            .take(1)
-            .map_err(|error| backend_error("catalog.references", error))?;
-        let children: Vec<HierarchyReplicaRow> = response
-            .take(2)
-            .map_err(|error| backend_error("catalog.children", error))?;
-        let catalogs: Vec<DbCatalogReplicaRow> = response
-            .take(3)
-            .map_err(|error| backend_error("catalog.db_catalog", error))?;
-
+            .map_err(|error| backend_error("catalog.db_types.decode", error))?;
         let mut db_types = BTreeMap::new();
-        for row in catalogs {
-            db_types.insert(checked_u32(row.dbnum, "catalog.dbnum")?, row.db_type);
-        }
-
-        let mut references_by_source: BTreeMap<RefnoEnum, Vec<AttributeReference>> =
-            BTreeMap::new();
-        for row in references {
-            let source = parse_refno(&row.source_refno, "catalog.reference.source")?;
-            references_by_source
-                .entry(source)
-                .or_default()
-                .push(AttributeReference {
-                    dbnum: checked_u32(row.dbnum, "catalog.reference.dbnum")?,
-                    source,
-                    attribute_name: row.attribute_name,
-                    target: parse_refno(&row.target_refno, "catalog.reference.target")?,
-                    ordinal: checked_u32(row.ordinal, "catalog.reference.ordinal")?,
-                });
-        }
-
-        let mut children_by_parent: BTreeMap<RefnoEnum, Vec<(u32, RefnoEnum)>> = BTreeMap::new();
-        for row in children {
-            children_by_parent
-                .entry(parse_refno(&row.parent_refno, "catalog.child.parent")?)
-                .or_default()
-                .push((
-                    checked_u32(row.ordinal, "catalog.child.ordinal")?,
-                    parse_refno(&row.child_refno, "catalog.child.child")?,
-                ));
-        }
-
-        let mut found = Vec::with_capacity(elements.len());
-        for row in elements {
-            let element = element_from_row(row)?;
-            let db_type = db_types.get(&element.dbnum).cloned().ok_or_else(|| {
-                GenerationReadError::MissingRequiredData {
-                    capability: "catalog.db_type",
-                    refnos: vec![element.refno],
-                }
-            })?;
-            let mut child_rows = children_by_parent
-                .remove(&element.refno)
-                .unwrap_or_default();
-            child_rows.sort_unstable();
-            let node = CatalogNode {
-                refno: element.refno,
-                dbnum: element.dbnum,
-                db_type,
-                noun: element.noun,
-                owner: element.owner,
-                children: child_rows.into_iter().map(|(_, child)| child).collect(),
-                outbound: references_by_source
-                    .remove(&element.refno)
-                    .unwrap_or_default(),
-            };
-            found.push((node.refno, node));
-        }
-        self.record(
-            "catalog.load",
-            requested,
-            found.len(),
-            started.elapsed().as_micros() as u64,
-        );
-        Ok(BatchLookup::from_found(refnos, found))
-    }
-}
-
-#[async_trait]
-impl TransformRead for SurrealVersionedReadSession {
-    async fn load_transforms(
-        &self,
-        refnos: &[RefnoEnum],
-    ) -> GenerationReadResult<BatchLookup<TransformSnapshot>> {
-        let started = Instant::now();
-        if refnos.is_empty() {
-            return Ok(BatchLookup::default());
-        }
-        let refno_strings = refnos
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let requested = refno_strings.len();
-        let sql = format!(
-            "SELECT dbnum, refno, local_transform_hex, world_transform_hex, transform_hash \
-             FROM generation_replica_transform WHERE refno IN $refnos{};",
-            self.version_suffix
-        );
-        let mut response = project_primary_db()
-            .query(sql)
-            .bind(("refnos", refno_strings))
-            .await
-            .map_err(|error| backend_error("transform.load", error))?
-            .check()
-            .map_err(|error| backend_error("transform.load", error))?;
-        let rows: Vec<TransformReplicaRow> = response
-            .take(0)
-            .map_err(|error| backend_error("transform.decode_rows", error))?;
-        let mut found = Vec::with_capacity(rows.len());
         for row in rows {
-            let refno = parse_refno(&row.refno, "transform.refno")?;
-            let local = row
-                .local_transform_hex
-                .as_deref()
-                .map(|value| decode_transform(value, refno, "local"))
-                .transpose()?;
-            let world = decode_transform(&row.world_transform_hex, refno, "world")?;
-            let snapshot = TransformSnapshot {
-                refno,
-                dbnum: checked_u32(row.dbnum, "transform.dbnum")?,
-                local,
-                world,
-            };
-            let actual = hash_serializable(&snapshot);
-            if actual != row.transform_hash {
-                return Err(GenerationReadError::PayloadCorrupt {
-                    refno: snapshot.refno,
-                    detail: format!(
-                        "transform hash mismatch expected={} actual={actual}",
-                        row.transform_hash
-                    ),
-                });
+            if let Ok(dbnum) = u32::try_from(row.dbnum)
+                && !row.db_type.trim().is_empty()
+            {
+                db_types.entry(dbnum).or_insert(row.db_type);
             }
-            found.push((snapshot.refno, snapshot));
         }
-        self.record(
-            "transform.load",
-            requested,
-            found.len(),
-            started.elapsed().as_micros() as u64,
-        );
-        Ok(BatchLookup::from_found(refnos, found))
-    }
-}
-
-impl SurrealVersionedReadSession {
-    pub fn replica_version_time(&self) -> &str {
-        &self.binding.replica_version_time
-    }
-
-    async fn load_element_rows(
-        &self,
-        filter: &str,
-        refnos: Option<Vec<String>>,
-    ) -> GenerationReadResult<Vec<ElementReplicaRow>> {
-        let sql = format!(
-            "SELECT dbnum, refno, owner_refno, noun, name, has_children, \
-                    attr_codec_version, attr_payload_hex, attr_hash \
-             FROM generation_replica_element {filter} ORDER BY dbnum, refno{};",
-            self.version_suffix
-        );
-        let query = project_primary_db().query(sql);
-        let mut response = match refnos {
-            Some(refnos) => query.bind(("refnos", refnos)).await,
-            None => query.await,
-        }
-        .map_err(|error| backend_error("element.load_rows", error))?
-        .check()
-        .map_err(|error| backend_error("element.load_rows", error))?;
-        response
-            .take(0)
-            .map_err(|error| backend_error("element.decode_rows", error))
+        Ok(db_types)
     }
 
     fn record(&self, capability: &str, requested: usize, returned: usize, elapsed_micros: u64) {
@@ -514,153 +517,80 @@ impl SurrealVersionedReadSession {
     }
 }
 
-#[derive(Debug, SurrealValue)]
-struct ElementReplicaRow {
-    dbnum: i64,
-    refno: String,
-    owner_refno: String,
-    noun: String,
-    name: String,
-    has_children: bool,
-    attr_codec_version: i64,
-    attr_payload_hex: String,
-    attr_hash: String,
-}
-
-#[derive(Debug, SurrealValue)]
-struct HierarchyReplicaRow {
-    dbnum: i64,
-    parent_refno: String,
-    child_refno: String,
-    ordinal: i64,
-}
-
-#[derive(Debug, SurrealValue)]
-struct ReferenceReplicaRow {
-    dbnum: i64,
-    source_refno: String,
-    attribute_name: String,
-    target_refno: String,
-    ordinal: i64,
-}
-
-#[derive(Debug, SurrealValue)]
-struct TransformReplicaRow {
-    dbnum: i64,
-    refno: String,
-    local_transform_hex: Option<String>,
-    world_transform_hex: String,
-    transform_hash: String,
-}
-
-#[derive(Debug, SurrealValue)]
-struct DbCatalogReplicaRow {
-    dbnum: i64,
-    db_type: String,
-    #[allow(dead_code)]
-    project: String,
-}
-
-fn element_from_row(row: ElementReplicaRow) -> GenerationReadResult<ElementSnapshot> {
-    Ok(ElementSnapshot {
-        refno: parse_refno(&row.refno, "element.refno")?,
-        dbnum: checked_u32(row.dbnum, "element.dbnum")?,
-        owner: parse_refno(&row.owner_refno, "element.owner")?,
-        noun: row.noun,
-        name: row.name,
-        has_children: row.has_children,
-    })
-}
-
-fn decode_attribute_set(row: &ElementReplicaRow) -> GenerationReadResult<AttributeSet> {
-    let bytes = hex::decode(&row.attr_payload_hex).map_err(|error| {
-        GenerationReadError::PayloadCorrupt {
-            refno: RefnoEnum::from(row.refno.as_str()),
-            detail: format!("invalid payload hex: {error}"),
-        }
-    })?;
-    let attributes = decode_attribute_set_payload(&bytes).map_err(|error| {
-        GenerationReadError::PayloadCorrupt {
-            refno: RefnoEnum::from(row.refno.as_str()),
-            detail: format!("invalid payload binary: {error}"),
-        }
-    })?;
-    let row_refno = parse_refno(&row.refno, "attribute.refno")?;
-    if attributes.refno != row_refno
-        || i64::from(attributes.codec_version) != row.attr_codec_version
-        || attributes.canonical_hash != row.attr_hash
-    {
-        return Err(GenerationReadError::PayloadCorrupt {
-            refno: attributes.refno,
-            detail: "projected codec/hash does not match payload".to_string(),
-        });
-    }
-    attributes.verify()?;
-    Ok(attributes)
-}
-
-fn replica_version_suffix(
-    binding: &ReplicaSnapshotBinding,
-    watermark: u64,
-) -> GenerationReadResult<String> {
-    if watermark == binding.authoritative_snapshot_id {
-        return Ok(String::new());
-    }
-    if binding.replica_version_time.contains('\'') {
-        return Err(GenerationReadError::BackendQuery {
-            backend: "surreal",
-            operation: "version_suffix",
-            message: "replica_version_time 含非法字符".to_string(),
-        });
-    }
-    // Surreal 3.x：VERSION 必须出现在 WHERE/ORDER BY 之后。
-    Ok(format!(" VERSION d'{}'", binding.replica_version_time))
-}
-
-fn decode_transform(
-    value: &str,
+#[derive(Debug, Deserialize, SurrealValue)]
+struct MainTransformRow {
     refno: RefnoEnum,
-    kind: &'static str,
-) -> GenerationReadResult<Transform> {
-    let bytes = hex::decode(value).map_err(|error| GenerationReadError::PayloadCorrupt {
-        refno,
-        detail: format!("{kind} transform hex invalid: {error}"),
-    })?;
-    bincode::deserialize(&bytes).map_err(|error| GenerationReadError::PayloadCorrupt {
-        refno,
-        detail: format!("{kind} transform binary invalid: {error}"),
+    #[serde(default)]
+    local: Option<PlantTransform>,
+    #[serde(default)]
+    world: Option<PlantTransform>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct DbTypeRow {
+    dbnum: i64,
+    #[serde(default)]
+    db_type: String,
+}
+
+fn element_from_pe(pe: SPdmsElement) -> GenerationReadResult<ElementSnapshot> {
+    let children = pe
+        .children
+        .unwrap_or_default()
+        .into_iter()
+        .map(RefnoEnum::from)
+        .collect::<Vec<_>>();
+    Ok(ElementSnapshot {
+        refno: pe.refno,
+        dbnum: checked_u32(pe.dbnum, "element.dbnum")?,
+        owner: pe.owner,
+        noun: pe.noun,
+        name: pe.name,
+        has_children: !children.is_empty(),
+        children,
     })
 }
 
-fn parse_refno(value: &str, operation: &'static str) -> GenerationReadResult<RefnoEnum> {
-    let refno = RefnoEnum::from(value);
-    if refno.is_valid() || refno.is_unset() {
-        Ok(refno)
-    } else {
-        Err(GenerationReadError::BackendQuery {
-            backend: "surreal",
-            operation,
-            message: format!("invalid refno {value:?}"),
-        })
-    }
-}
-
-fn checked_u32(value: i64, operation: &'static str) -> GenerationReadResult<u32> {
+fn checked_u32(value: i32, field: &'static str) -> GenerationReadResult<u32> {
     u32::try_from(value).map_err(|_| GenerationReadError::BackendQuery {
-        backend: "surreal",
-        operation,
-        message: format!("value {value} outside u32 range"),
+        backend: "surreal-main",
+        operation: field,
+        message: format!("value {value} is outside u32"),
     })
 }
 
 fn surreal_string(value: &str) -> String {
-    serde_json::to_string(value).expect("string serialization cannot fail")
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn main_table_version_suffix(read_at: Option<&str>) -> GenerationReadResult<String> {
+    let Some(read_at) = read_at else {
+        return Ok(String::new());
+    };
+    if read_at.is_empty() || read_at.contains('\'') || read_at.contains('\0') {
+        return Err(GenerationReadError::InvalidReadSpec(
+            "read_at contains invalid characters".to_string(),
+        ));
+    }
+    // Surreal 3.x requires VERSION after WHERE/ORDER BY.
+    Ok(format!(" VERSION d'{read_at}'"))
 }
 
 fn backend_error(operation: &'static str, error: impl std::fmt::Display) -> GenerationReadError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    let history_expired = lower.contains("invalidargument")
+        || lower.contains("invalid argument")
+        || lower.contains("below the garbage collection")
+        || lower.contains("full_history_ts_low")
+        || lower.contains("retention")
+            && (lower.contains("version") || lower.contains("history") || lower.contains("gc"));
+    if history_expired {
+        return GenerationReadError::HistoryExpired { operation, message };
+    }
     GenerationReadError::BackendQuery {
-        backend: "surreal",
+        backend: "surreal-main",
         operation,
-        message: error.to_string(),
+        message,
     }
 }

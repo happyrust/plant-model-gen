@@ -42,6 +42,15 @@ pub enum GenerationReadError {
         message: String,
     },
 
+    #[error(
+        "生成读取历史已超出 retention 窗口: operation={operation}; \
+         请改用 PDMS 源 db 文件重扫或放宽 version_retention: {message}"
+    )]
+    HistoryExpired {
+        operation: &'static str,
+        message: String,
+    },
+
     #[error("生成读取契约非法: {0}")]
     InvalidReadSpec(String),
 

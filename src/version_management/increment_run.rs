@@ -325,7 +325,6 @@ where
             );
             crate::data_interface::sesno_increment::persist_collected_pdms_increment_files(
                 &collected_increment_files,
-                Some(source_hash_gate.aggregate_sha256.as_str()),
                 options.recover_pending,
             )
             .await?
@@ -496,23 +495,66 @@ where
             }
         }
     }
-    let source_hash_summary = verify_source_hash_gate(&source_hash_gate).context(
-        "source hash gate failed after model generation; no deferred model_gen anchors were published",
-    )?;
+    let source_hash_summary = match verify_source_hash_gate(&source_hash_gate) {
+        Ok(summary) => summary,
+        Err(error) => {
+            let message = format!(
+                "source hash gate failed after model generation; no deferred model_gen anchors were published: {error:#}"
+            );
+            for result in &catch_up_results {
+                if result.generation_success == Some(true) {
+                    let _ = crate::version_management::model_gen_catchup::append_deferred_terminal(
+                        result,
+                        false,
+                        Some(message.clone()),
+                    )
+                    .await;
+                }
+            }
+            return Err(error).context(message);
+        }
+    };
     if db_option_ext.use_surrealdb
         && db_option_ext.model_writer_mode.writes_to_surreal()
         && !db_option_ext.gen_model_dry_run
     {
         for result in &mut catch_up_results {
             if result.generation_success == Some(true) && result.model_gen_anchor.is_none() {
-                result.model_gen_anchor = Some(
-                    crate::versioned_db::model_gen_debt::finalize_model_generation(
-                        result.dbnum,
-                        result.coverage.data_watermark,
-                    )
-                    .await?,
-                );
+                match crate::versioned_db::model_gen_debt::finalize_model_generation(
+                    result.dbnum,
+                    result.coverage.data_watermark,
+                    result
+                        .model_gen_note
+                        .as_deref()
+                        .unwrap_or("model generation completed"),
+                )
+                .await
+                {
+                    Ok(anchor) => result.model_gen_anchor = Some(anchor),
+                    Err(error) => {
+                        let message = format!(
+                            "dbnum={} finalize_model_generation failed: {error:#}",
+                            result.dbnum
+                        );
+                        let _ =
+                            crate::version_management::model_gen_catchup::append_deferred_terminal(
+                                result,
+                                false,
+                                Some(message.clone()),
+                            )
+                            .await;
+                        return Err(error).context(message);
+                    }
+                }
             }
+        }
+    }
+    for result in &catch_up_results {
+        if result.generation_success == Some(true) {
+            crate::version_management::model_gen_catchup::append_deferred_terminal(
+                result, true, None,
+            )
+            .await?;
         }
     }
     let model_gen_anchors = catch_up_results
@@ -613,6 +655,18 @@ where
         "generation_failures": failures,
         "generation_dbnums": generation_dbnums,
         "generation_success": generation_success,
+        "generation_read_at": catch_up_results
+            .iter()
+            .filter_map(|result| result.read_at.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "cleanup_read_at": catch_up_results
+            .iter()
+            .filter_map(|result| result.cleanup_read_at.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "model_generation_run_ids": catch_up_results
+            .iter()
+            .filter_map(|result| result.model_generation_run_id.clone())
+            .collect::<Vec<_>>(),
         "parquet_export": parquet_export_value,
         "category_counts": {
             "prim": outcome.update_log.prim_refnos.len(),

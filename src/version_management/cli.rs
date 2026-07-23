@@ -371,7 +371,7 @@ pub fn model_version_command() -> Command {
                         .long("allow-full-regen")
                         .action(clap::ArgAction::SetTrue)
                         .help(
-                            "Deprecated compatibility flag; mutating execution is rejected in favor of controlled repair",
+                            "Explicitly authorize controlled full-db repair at the existing data anchor when debt coverage has a gap",
                         ),
                 )
                 .arg(

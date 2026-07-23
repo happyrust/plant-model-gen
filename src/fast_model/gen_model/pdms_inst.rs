@@ -744,14 +744,14 @@ pub async fn pre_cleanup_for_regen(seed_refnos: &[RefnoEnum]) -> anyhow::Result<
 
 pub async fn pre_cleanup_for_regen_versioned(
     seed_refnos: &[RefnoEnum],
-    read: &super::context::GenerationReadContext,
+    hierarchy: &crate::generation_read::HierarchySnapshot,
 ) -> anyhow::Result<()> {
-    pre_cleanup_for_regen_inner(seed_refnos, Some(read)).await
+    pre_cleanup_for_regen_inner(seed_refnos, Some(hierarchy)).await
 }
 
 async fn pre_cleanup_for_regen_inner(
     seed_refnos: &[RefnoEnum],
-    read: Option<&super::context::GenerationReadContext>,
+    hierarchy: Option<&crate::generation_read::HierarchySnapshot>,
 ) -> anyhow::Result<()> {
     if seed_refnos.is_empty() {
         return Ok(());
@@ -760,8 +760,8 @@ async fn pre_cleanup_for_regen_inner(
     const CHUNK_SIZE: usize = 200;
 
     // 版本化正式路径严格使用会话 hierarchy；legacy 调用保留旧查询入口。
-    let (all_refnos, bran_refnos) = if let Some(read) = read {
-        let all_refnos = read.hierarchy.descendants(
+    let (all_refnos, bran_refnos) = if let Some(hierarchy) = hierarchy {
+        let all_refnos = hierarchy.descendants(
             seed_refnos,
             &crate::generation_read::HierarchyQuery {
                 include_self: true,
@@ -774,7 +774,7 @@ async fn pre_cleanup_for_regen_inner(
             .iter()
             .copied()
             .filter(|refno| {
-                read.hierarchy
+                hierarchy
                     .node(*refno)
                     .is_some_and(|node| matches!(node.noun.as_str(), "BRAN" | "HANG"))
             })

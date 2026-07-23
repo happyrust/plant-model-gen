@@ -147,6 +147,12 @@ pub async fn gen_all_geos_data(
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
 ) -> Result<GenModelResult> {
+    crate::versioned_db::version_commit::ensure_live_generation_allowed(
+        db_option,
+        "live model generation",
+    )
+    .await
+    .map_err(GenPipelineError::Other)?;
     gen_all_geos_data_with_read_spec(
         manual_refnos,
         db_option,
@@ -168,11 +174,56 @@ pub async fn gen_all_geos_data_with_read_spec(
     incr_updates: Option<IncrGeoUpdateLog>,
     read_spec: GenerationReadSpec,
 ) -> Result<GenModelResult> {
+    gen_all_geos_data_with_read_specs(manual_refnos, db_option, incr_updates, read_spec, None).await
+}
+
+/// Opens the target generation slice and, when supplied, a separate old-model
+/// hierarchy slice used exclusively by incremental cleanup.
+pub async fn gen_all_geos_data_with_read_specs(
+    manual_refnos: Vec<RefnoEnum>,
+    db_option: &DbOptionExt,
+    incr_updates: Option<IncrGeoUpdateLog>,
+    read_spec: GenerationReadSpec,
+    cleanup_read_spec: Option<GenerationReadSpec>,
+) -> Result<GenModelResult> {
+    let scope_refnos = generation_scope_refnos(&manual_refnos, incr_updates.as_ref());
     let session =
         crate::generation_read::open_generation_read_session_with_spec(db_option, &read_spec)
             .await
             .map_err(anyhow::Error::new)?;
-    gen_all_geos_data_with_session(manual_refnos, db_option, incr_updates, session).await
+    let cleanup_hierarchy = if let Some(cleanup_read_spec) = cleanup_read_spec {
+        let cleanup_session = crate::generation_read::open_generation_read_session_with_spec(
+            db_option,
+            &cleanup_read_spec,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
+        let hierarchy = if scope_refnos.is_empty() {
+            crate::generation_read::HierarchySnapshot::load(
+                Arc::clone(&cleanup_session),
+                &cleanup_session.manifest().dbnums(),
+            )
+            .await
+        } else {
+            crate::generation_read::HierarchySnapshot::load_for_refnos(
+                Arc::clone(&cleanup_session),
+                &scope_refnos,
+            )
+            .await
+        };
+        Some(Arc::new(hierarchy.map_err(anyhow::Error::new)?))
+    } else {
+        None
+    };
+    let generation_read = GenerationReadContext::load_for_refnos(session, &scope_refnos).await?;
+    gen_all_geos_data_inner(
+        manual_refnos,
+        db_option,
+        incr_updates,
+        generation_read,
+        cleanup_hierarchy,
+    )
+    .await
 }
 
 pub async fn gen_all_geos_data_with_session(
@@ -181,8 +232,31 @@ pub async fn gen_all_geos_data_with_session(
     incr_updates: Option<IncrGeoUpdateLog>,
     session: Arc<dyn crate::generation_read::VersionedReadSession>,
 ) -> Result<GenModelResult> {
-    let generation_read = GenerationReadContext::load(session).await?;
-    gen_all_geos_data_inner(manual_refnos, db_option, incr_updates, generation_read).await
+    let scope_refnos = generation_scope_refnos(&manual_refnos, incr_updates.as_ref());
+    let generation_read = GenerationReadContext::load_for_refnos(session, &scope_refnos).await?;
+    gen_all_geos_data_inner(
+        manual_refnos,
+        db_option,
+        incr_updates,
+        generation_read,
+        None,
+    )
+    .await
+}
+
+fn generation_scope_refnos(
+    manual_refnos: &[RefnoEnum],
+    incr_updates: Option<&IncrGeoUpdateLog>,
+) -> Vec<RefnoEnum> {
+    let mut refnos = manual_refnos.iter().copied().collect::<BTreeSet<_>>();
+    if let Some(update) = incr_updates {
+        refnos.extend(update.prim_refnos.iter().copied());
+        refnos.extend(update.loop_owner_refnos.iter().copied());
+        refnos.extend(update.bran_hanger_refnos.iter().copied());
+        refnos.extend(update.basic_cata_refnos.iter().copied());
+        refnos.extend(update.delete_refnos.iter().copied());
+    }
+    refnos.into_iter().collect()
 }
 
 #[cfg_attr(
@@ -194,6 +268,7 @@ async fn gen_all_geos_data_inner(
     db_option: &DbOptionExt,
     incr_updates: Option<IncrGeoUpdateLog>,
     generation_read: Arc<GenerationReadContext>,
+    cleanup_hierarchy: Option<Arc<crate::generation_read::HierarchySnapshot>>,
 ) -> Result<GenModelResult> {
     let time = Instant::now();
     let mut perf = crate::perf_timer::PerfTimer::new("gen_all_geos_data");
@@ -387,7 +462,8 @@ async fn gen_all_geos_data_inner(
     }
 
     perf.mark("gen_pipeline_generation");
-    let result = process_gen_pipeline(scope, db_option, time, generation_read).await;
+    let result =
+        process_gen_pipeline(scope, db_option, time, generation_read, cleanup_hierarchy).await;
     perf.print_summary();
 
     // 输出 cache miss 报告（覆盖写）。
@@ -417,6 +493,7 @@ async fn process_gen_pipeline(
     db_option: &DbOptionExt,
     time: Instant,
     generation_read: Arc<GenerationReadContext>,
+    cleanup_hierarchy: Option<Arc<crate::generation_read::HierarchySnapshot>>,
 ) -> Result<GenModelResult> {
     let authoritative_snapshot_id = generation_read.session.manifest().authoritative_snapshot_id;
     let mut perf = crate::perf_timer::PerfTimer::new("gen_pipeline_generation");
@@ -573,6 +650,7 @@ async fn process_gen_pipeline(
     let (sender, write_pipeline) = ModelWritePipeline::start(WritePipelineStart {
         db_option: db_option.clone(),
         generation_read: Arc::clone(&generation_read),
+        cleanup_hierarchy,
         incremental_cleanup_roots,
         model_writer: Arc::clone(&base_model_writer),
         artifacts: Arc::clone(&artifacts),

@@ -63,6 +63,86 @@ impl HierarchySnapshot {
         Self::from_parts(session.manifest().authoritative_snapshot_id, elements, rows)
     }
 
+    pub async fn load_for_refnos(
+        session: Arc<dyn VersionedReadSession>,
+        seeds: &[RefnoEnum],
+    ) -> GenerationReadResult<Self> {
+        let mut elements = BTreeMap::<RefnoEnum, ElementSnapshot>::new();
+        let mut descendants = seeds
+            .iter()
+            .copied()
+            .filter(RefnoEnum::is_valid)
+            .collect::<BTreeSet<_>>();
+
+        while !descendants.is_empty() {
+            let requested = descendants
+                .iter()
+                .filter(|refno| !elements.contains_key(refno))
+                .copied()
+                .collect::<Vec<_>>();
+            descendants.clear();
+            if requested.is_empty() {
+                break;
+            }
+            for (refno, element) in session.load_elements(&requested).await?.found {
+                descendants.extend(
+                    element
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|child| !elements.contains_key(child)),
+                );
+                elements.insert(refno, element);
+            }
+        }
+
+        let mut ancestors = elements
+            .values()
+            .map(|element| element.owner)
+            .filter(RefnoEnum::is_valid)
+            .collect::<BTreeSet<_>>();
+        while !ancestors.is_empty() {
+            let requested = ancestors
+                .iter()
+                .filter(|refno| !elements.contains_key(refno))
+                .copied()
+                .collect::<Vec<_>>();
+            ancestors.clear();
+            if requested.is_empty() {
+                break;
+            }
+            for (refno, element) in session.load_elements(&requested).await?.found {
+                if element.owner.is_valid() && !elements.contains_key(&element.owner) {
+                    ancestors.insert(element.owner);
+                }
+                elements.insert(refno, element);
+            }
+        }
+
+        let rows = elements
+            .values()
+            .flat_map(|element| {
+                element
+                    .children
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, child)| elements.contains_key(child))
+                    .map(move |(ordinal, child)| HierarchyRow {
+                        dbnum: element.dbnum,
+                        parent: element.refno,
+                        child,
+                        ordinal: ordinal as u32,
+                    })
+            })
+            .collect();
+        Self::from_parts(
+            session.manifest().authoritative_snapshot_id,
+            elements.into_values().collect(),
+            rows,
+        )
+    }
+
     pub fn from_parts(
         snapshot_id: u64,
         elements: Vec<ElementSnapshot>,

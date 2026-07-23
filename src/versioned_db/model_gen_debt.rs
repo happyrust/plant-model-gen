@@ -256,7 +256,11 @@ pub async fn model_generation_watermark(dbnum: u32) -> anyhow::Result<u32> {
          WHERE dbnum = {dbnum} AND source = 'model_gen']));"
     );
     let mut response = project_primary_db().query(sql).await?.check()?;
-    Ok(response.take::<Option<u32>>(0)?.unwrap_or_default())
+    let value = response.take::<surrealdb::types::Value>(0)?;
+    Ok(
+        super::version_commit::optional_u32_from_value(value, "model generation watermark")?
+            .unwrap_or_default(),
+    )
 }
 
 pub async fn list_model_gen_candidate_dbnums() -> anyhow::Result<Vec<u32>> {
@@ -405,6 +409,7 @@ pub async fn analyze_model_gen_debt(dbnum: u32) -> anyhow::Result<ModelGenDebtCo
 pub async fn finalize_model_generation(
     dbnum: u32,
     target_sesno: u32,
+    note: &str,
 ) -> anyhow::Result<super::version_commit::ModelGenAnchor> {
     ensure_model_gen_debt_schema().await?;
     super::database::ensure_sesno_version_anchor_schema().await?;
@@ -413,13 +418,17 @@ pub async fn finalize_model_generation(
 BEGIN TRANSACTION;
 UPSERT sesno_version_anchor:[{dbnum}, {target_sesno}, 'model_gen'] SET
     dbnum = {dbnum}, sesno = {target_sesno}, source = 'model_gen',
-    anchored_at = time::now(), note = 'model generation completed';
+    anchored_at = time::now(), note = $note;
 UPDATE model_gen_debt SET consumed_at = time::now()
     WHERE dbnum = {dbnum} AND to_sesno <= {target_sesno} AND consumed_at = NONE;
 COMMIT TRANSACTION;
 "#
     );
-    project_primary_db().query(sql).await?.check()?;
+    project_primary_db()
+        .query(sql)
+        .bind(("note", note.to_string()))
+        .await?
+        .check()?;
     let mut response = project_primary_db()
         .query(format!(
             "SELECT VALUE anchored_at FROM ONLY sesno_version_anchor:[{dbnum}, {target_sesno}, 'model_gen'];"
@@ -435,5 +444,6 @@ COMMIT TRANSACTION;
         sesno: target_sesno,
         source: "model_gen".to_string(),
         anchored_at,
+        note: note.to_string(),
     })
 }

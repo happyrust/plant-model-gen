@@ -14,6 +14,7 @@ pub use catalog::{CatalogClosure, CatalogResolver, CatalogResolverConfig};
 pub use error::{GenerationReadError, GenerationReadResult};
 pub use factory::{
     open_generation_read_session, open_generation_read_session_with_spec,
+    resolve_anchored_generation_read_spec, resolve_cleanup_read_spec,
     resolve_input_version_manifest,
 };
 pub use hierarchy::{HierarchyNode, HierarchyQuery, HierarchySnapshot};

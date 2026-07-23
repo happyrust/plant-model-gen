@@ -57,10 +57,6 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::tables::*;
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
-use crate::versioned_db::version_commit::{
-    VersionCommitCounts, VersionCommitError, VersionCommitRequest, VersionCommitSource,
-    commit_version, compute_commit_fingerprint, recover_version_commit,
-};
 use aios_core::tree_query::TreeNodeMeta;
 
 pub enum SenderJsonsData {
@@ -565,7 +561,7 @@ DEFINE TABLE IF NOT EXISTS sesno_version_anchor SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS dbnum ON TABLE sesno_version_anchor TYPE int;
 DEFINE FIELD IF NOT EXISTS sesno ON TABLE sesno_version_anchor TYPE int;
 DEFINE FIELD IF NOT EXISTS anchored_at ON TABLE sesno_version_anchor TYPE datetime DEFAULT time::now();
-DEFINE FIELD OVERWRITE source ON TABLE sesno_version_anchor TYPE string ASSERT $value IN ['full', 'incremental', 'model_gen'];
+DEFINE FIELD OVERWRITE source ON TABLE sesno_version_anchor TYPE string ASSERT $value IN ['full', 'incremental_baseline', 'incremental', 'model_gen'];
 DEFINE FIELD IF NOT EXISTS note ON TABLE sesno_version_anchor TYPE option<string>;
 REMOVE INDEX IF EXISTS idx_sesno_version_anchor_dbnum_sesno ON sesno_version_anchor;
 DEFINE INDEX IF NOT EXISTS idx_sesno_version_anchor_dbnum_sesno_source ON TABLE sesno_version_anchor FIELDS dbnum, sesno, source UNIQUE;
@@ -690,78 +686,14 @@ DEFINE FUNCTION OVERWRITE fn::model_sesno_version_hit($dbnum: number, $sesno: nu
     Ok(())
 }
 
-/// specs/022 T010：把本轮全量解析成功的 (dbnum, latest_sesno) 固化为 `source='full'` 锚点。
+/// 全量解析只维护当前态完整性元数据，不发布数据版本锚点。
 ///
-/// 调用时机约束：必须在本轮写库任务全部 join 之后（sync_total_async_threaded* 内
-/// `drop(sender)` + 等待 insert_handles 排空之后）调用，保证 anchored_at 晚于该
-/// dbnum 本轮全部 PE/ATT 写入；不能在解析循环里逐文件写（写库经 flume channel
-/// 异步 flush，逐文件时刻数据未必已落库）。
-///
-/// specs/023 T008：pe_owner 边（PERelateJson）走同一 sender/sink 通道，上述 join
-/// 约束同样保证"边全部落库先于 full 锚点固化"——锚点时刻的 VERSION 查询必然
-/// 覆盖本轮全部边。锚点成功后按 dbnum 写 `pe_owner_version_meta`（full_reload
-/// 重置可信起点；仅 surreal-save 构建下有边可信可言）。
-///
-/// 锚点失败必须向上传播。数据写入已经完成，调用方可只重试收尾；但在锚点成功前
-/// 不能把本次 full sync 宣告为可供历史查询的完整提交。
-async fn write_full_version_anchors(
-    pending: &[(u32, u32, String)],
-) -> anyhow::Result<Vec<crate::data_interface::sesno_increment::VersionAnchorRecord>> {
-    let mut written = Vec::with_capacity(pending.len());
-    for (dbnum, sesno, source_evidence) in pending {
-        let fingerprint_input = format!("full-sync-v1:{dbnum}:{sesno}");
-        let fingerprint = compute_commit_fingerprint(
-            *dbnum,
-            *sesno,
-            *sesno,
-            VersionCommitSource::Full,
-            None,
-            [fingerprint_input.as_str(), source_evidence.as_str()],
-        );
-        let counts = VersionCommitCounts::default();
-        let request = VersionCommitRequest {
-            dbnum: *dbnum,
-            from_sesno: *sesno,
-            to_sesno: *sesno,
-            source: VersionCommitSource::Full,
-            fingerprint,
-            source_hash: None,
-            expected_counts: Some(counts.clone()),
-        };
-        let outcome = match commit_version(request.clone(), || async { Ok(counts.clone()) }).await {
-            Ok(outcome) => outcome,
-            Err(VersionCommitError::PendingCommit { pending_sesno, .. })
-                if pending_sesno == *sesno =>
-            {
-                recover_version_commit(request, || async { Ok(counts) })
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "full sync 数据已写入，但 pending 锚点恢复失败(dbnum={dbnum} sesno={sesno})"
-                        )
-                    })?
-            }
-            Err(error) => {
-                return Err(anyhow::Error::new(error).context(format!(
-                    "full sync 数据已写入，但锚点发布失败(dbnum={dbnum} sesno={sesno})"
-                )));
-            }
-        };
-        let record = crate::data_interface::sesno_increment::VersionAnchorRecord {
-            dbnum: outcome.dbnum,
-            sesno: outcome.to_sesno,
-            source: "full".to_string(),
-            anchored_at: Some(outcome.anchored_at),
-            fingerprint: Some(outcome.fingerprint),
-            idempotent: outcome.idempotent,
-            recovered: outcome.recovered,
-        };
-        info!(
-            "sesno_version_anchor(full) 已写入: dbnum={} sesno={} anchored_at={:?}",
-            record.dbnum, record.sesno, record.anchored_at
-        );
+/// specs/027 规定数据历史从首次增量开始：初始化/全量解析完成后，模型可发布
+/// `model_gen` 基线，但 `source='full'` 只作为 legacy 读兼容，禁止继续写入。
+async fn record_full_parse_integrity(pending: &[(u32, u32, String)]) -> anyhow::Result<()> {
+    for (dbnum, sesno, _) in pending {
         // specs/023 T008：full 重灌以先删后插覆盖了全部 owner 的边，
-        // 自本 sesno 起 pe_owner 历史可信；meta 失败不阻断（读侧回退 pe.children 天然安全）。
+        // 当前态 pe_owner 完整；该元数据不再绑定或暗示 full 数据锚点。
         #[cfg(feature = "surreal-save")]
         if let Err(e) = crate::versioned_db::pe_owner_meta::upsert_maintained_since(
             *dbnum,
@@ -774,9 +706,8 @@ async fn write_full_version_anchors(
                 "pe_owner_version_meta(full_reload) 写入失败(dbnum={dbnum} sesno={sesno}): {e}"
             );
         }
-        written.push(record);
     }
-    Ok(written)
+    Ok(())
 }
 
 fn full_sync_source_evidence(path: &Path) -> String {
@@ -1605,8 +1536,8 @@ where
     let cata_filter =
         crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
-    // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
-    let mut pending_full_version_anchors: Vec<(u32, u32, String)> = Vec::new();
+    // specs/027：全量解析只在写库 worker join 后维护当前态完整性元数据，不写数据锚点。
+    let mut full_parse_integrity: Vec<(u32, u32, String)> = Vec::new();
     // spec 004：解析阶段总耗时计时起点。
     let sync_stage_started = Instant::now();
 
@@ -2018,13 +1949,9 @@ where
             )
         })?;
 
-        // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
+        // 登记本轮解析完成的 dbnum，供写库 worker join 后维护当前态完整性元数据。
         if is_save_db && sesno > 0 {
-            pending_full_version_anchors.push((
-                dbnum,
-                sesno as u32,
-                full_sync_source_evidence(&path),
-            ));
+            full_parse_integrity.push((dbnum, sesno as u32, full_sync_source_evidence(&path)));
         }
 
         parsed_artifacts.push(ParsedDbArtifact {
@@ -2068,8 +1995,7 @@ where
     while let Some(result) = insert_handles.next().await {
         result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
-    // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
-    write_full_version_anchors(&pending_full_version_anchors).await?;
+    record_full_parse_integrity(&full_parse_integrity).await?;
     validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
     crate::perf_metrics::finish_parse_stage(
         parse_failed_sql_count(),
@@ -2167,6 +2093,14 @@ fn build_parsed_fact_batch(
                 owner,
                 noun: attributes.get_type_str().to_string(),
                 name,
+                children: db_basic
+                    .children_map
+                    .get(&raw_refno)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .map(RefnoEnum::from)
+                    .collect(),
                 has_children,
             },
             attributes: crate::generation_read::AttributeSet::from_named_attr_map(
@@ -2916,11 +2850,10 @@ pub async fn sync_total_async_threaded(
     let children_files_len = children_files.len();
     let db_file_progress_chunk = (proj_progress_chunk as f32 / children_files_len as f32) as usize;
     // let progress_sender_clone = progress_sender.clone();
-    // 解析任务返回本轮成功解析的 (dbnum, latest_sesno)，供收尾固化 full 锚点（specs/022 T010）。
-    let pending_full_version_anchors = tokio::spawn(async move {
+    // 解析任务返回本轮成功解析的 (dbnum, latest_sesno)，供收尾维护完整性元数据。
+    let full_parse_integrity = tokio::spawn(async move {
         let mut parsed_artifacts = Vec::new();
-        // specs/022 T010：本轮解析成功的 (dbnum, latest_sesno)，写库任务 join 后固化为 full 锚点。
-        let mut pending_full_version_anchors: Vec<(u32, u32, String)> = Vec::new();
+        let mut full_parse_integrity: Vec<(u32, u32, String)> = Vec::new();
         // spec 004：解析阶段总耗时计时起点。
         let sync_stage_started = Instant::now();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
@@ -3442,9 +3375,9 @@ pub async fn sync_total_async_threaded(
                     })?;
                 }
 
-                // specs/022 T010：登记本轮解析完成的 dbnum，收尾（写库任务 join 后）统一固化 full 锚点。
+                // 登记本轮解析完成的 dbnum，供写库 worker join 后维护当前态完整性元数据。
                 if is_save_db && sesno > 0 {
-                    pending_full_version_anchors.push((
+                    full_parse_integrity.push((
                         dbnum,
                         sesno as u32,
                         full_sync_source_evidence(&path),
@@ -3502,7 +3435,7 @@ pub async fn sync_total_async_threaded(
             parse_failed_sql_count(),
             sync_stage_started.elapsed().as_millis() as u64,
         );
-        anyhow::Ok(pending_full_version_anchors)
+        anyhow::Ok(full_parse_integrity)
     })
     .await
     .map_err(|e| anyhow::anyhow!("解析任务 join 失败: {}", e))??;
@@ -3511,8 +3444,7 @@ pub async fn sync_total_async_threaded(
     while let Some(result) = insert_handles.next().await {
         result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
-    // specs/022 T010：写库任务已全部 join，此刻固化 full 锚点晚于本轮全部写入。
-    write_full_version_anchors(&pending_full_version_anchors).await?;
+    record_full_parse_integrity(&full_parse_integrity).await?;
     // all_handles.push(parse_handle);
     // futures::future::join_all(take(&mut all_handles)).await;
     // futures::future::join_all(&mut [parse_handle]).await;
@@ -3913,6 +3845,6 @@ pub async fn parse_single_db_file(
     );
 
     // specs/022 R1：本路径只更新 db_meta，不向 Surreal 写入 PE/ATT，
-    // 因此不写 sesno_version_anchor。full 锚点由 sync_pdms* 在写库 join 完成后固化。
+    // 因此不写 sesno_version_anchor；数据历史由首次增量的 pre-apply baseline 起版。
     Ok(())
 }

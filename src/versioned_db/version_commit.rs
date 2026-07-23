@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aios_core::project_primary_db;
+use aios_core::{SurrealQueryExt, project_primary_db};
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,14 +16,14 @@ static OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionCommitSource {
-    Full,
+    IncrementalBaseline,
     Incremental,
 }
 
 impl VersionCommitSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Full => "full",
+            Self::IncrementalBaseline => "incremental_baseline",
             Self::Incremental => "incremental",
         }
     }
@@ -73,6 +73,7 @@ pub struct ModelGenAnchor {
     pub sesno: u32,
     pub source: String,
     pub anchored_at: String,
+    pub note: String,
 }
 
 #[derive(Debug, Deserialize, SurrealValue)]
@@ -250,6 +251,11 @@ where
 }
 
 fn validate_request(request: &VersionCommitRequest) -> CommitResult<()> {
+    if request.source != VersionCommitSource::Incremental {
+        return Err(VersionCommitError::Storage(anyhow!(
+            "incremental_baseline is reserved for the internal pre-apply handshake"
+        )));
+    }
     if request.dbnum == 0 {
         return Err(VersionCommitError::Storage(anyhow!(
             "dbnum must be non-zero"
@@ -288,6 +294,9 @@ where
         reject_continuity_gap(request).await?;
     }
     reject_pending_commit(request, recovered).await?;
+    if !recovered {
+        ensure_incremental_baseline_before_apply(request).await?;
+    }
     mark_commit_preparing(request).await?;
 
     let counts = match apply().await {
@@ -358,7 +367,7 @@ DEFINE TABLE IF NOT EXISTS version_commit_state SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS dbnum ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS from_sesno ON TABLE version_commit_state TYPE int;
 DEFINE FIELD IF NOT EXISTS to_sesno ON TABLE version_commit_state TYPE int;
-DEFINE FIELD IF NOT EXISTS source ON TABLE version_commit_state TYPE string ASSERT $value IN ['full', 'incremental'];
+DEFINE FIELD OVERWRITE source ON TABLE version_commit_state TYPE string ASSERT $value IN ['full', 'incremental_baseline', 'incremental'];
 DEFINE FIELD IF NOT EXISTS fingerprint ON TABLE version_commit_state TYPE string;
 DEFINE FIELD IF NOT EXISTS source_hash ON TABLE version_commit_state TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS status ON TABLE version_commit_state TYPE string ASSERT $value IN ['preparing', 'pending', 'committed'];
@@ -471,9 +480,10 @@ async fn existing_idempotent_outcome(
 /// - `request.from_sesno > watermark + 1` → `ContinuityGap`（间隙未采集）；
 ///   `from_sesno <= watermark + 1` 的重叠重放合法。
 ///
-/// full 是基线重置语义、豁免本门禁；recover 路径已由 `require_matching_pending`
-/// 的 fingerprint 匹配把关，且存在 legacy 站点 `dbnum_info_table` 在半次 apply
-/// 中被推进导致回退水位虚高的边界，故 recover 跳过门禁。
+/// baseline 由普通 incremental 在 apply 前、同一 lease 内幂等创建；recover 路径
+/// 已由 `require_matching_pending` 的 fingerprint 匹配把关，且存在 legacy 站点
+/// `dbnum_info_table` 在半次 apply 中被推进导致回退水位虚高的边界，故 recover
+/// 跳过门禁。
 async fn reject_continuity_gap(request: &VersionCommitRequest) -> CommitResult<()> {
     if request.source != VersionCommitSource::Incremental {
         return Ok(());
@@ -492,6 +502,79 @@ async fn reject_continuity_gap(request: &VersionCommitRequest) -> CommitResult<(
             requested_to: request.to_sesno,
         });
     }
+    Ok(())
+}
+
+/// 首次增量的 pre-apply handshake。
+///
+/// 初始化只写当前态与 model_gen 基线，不写数据锚点。第一个 incremental 在实际
+/// 业务 mutation 前，把当时 `dbnum_info_table` 水位固化为完整前态；legacy
+/// full/incremental 历史则保持原链，不回填 baseline。
+async fn ensure_incremental_baseline_before_apply(
+    request: &VersionCommitRequest,
+) -> CommitResult<()> {
+    if request.source != VersionCommitSource::Incremental {
+        return Ok(());
+    }
+    let sql = format!(
+        "SELECT VALUE count() FROM sesno_version_anchor \
+         WHERE dbnum = {} AND source IN ['full', 'incremental_baseline', 'incremental'] GROUP ALL;",
+        request.dbnum
+    );
+    let existing = match project_primary_db()
+        .query_take::<Vec<surrealdb::types::Value>>(sql, 0)
+        .await
+    {
+        Ok(values) => match values.into_iter().next() {
+            Some(value) => optional_u32_from_value(value, "data anchor count")
+                .map_err(VersionCommitError::Storage)?
+                .unwrap_or_default(),
+            None => 0,
+        },
+        Err(error) if error.to_string().contains("does not exist") => 0,
+        Err(error) => return Err(VersionCommitError::Storage(error.into())),
+    };
+    if existing > 0 {
+        return Ok(());
+    }
+
+    let baseline_sesno = committed_watermark(request.dbnum)
+        .await
+        .map_err(VersionCommitError::Storage)?;
+    if baseline_sesno == 0 {
+        return Err(VersionCommitError::Storage(anyhow!(
+            "dbnum={} has no initialized dbnum_info watermark; import the complete current state before the first incremental",
+            request.dbnum
+        )));
+    }
+    let fingerprint_input = format!(
+        "incremental-baseline-v1:{}:{}",
+        request.dbnum, baseline_sesno
+    );
+    let fingerprint = compute_commit_fingerprint(
+        request.dbnum,
+        baseline_sesno,
+        baseline_sesno,
+        VersionCommitSource::IncrementalBaseline,
+        None,
+        [fingerprint_input.as_str()],
+    );
+    let sql = format!(
+        "CREATE ONLY sesno_version_anchor:[{}, {}, 'incremental_baseline'] SET \
+         dbnum = {}, sesno = {}, from_sesno = {}, source = 'incremental_baseline', \
+         fingerprint = $fingerprint, source_hash = NONE, \
+         pe_rows = 0, att_rows = 0, uda_rows = 0, delete_count = 0, \
+         dbnum_info_updates = 0, pe_owner_rows = 0, anchored_at = time::now(), \
+         note = 'complete pre-apply state captured before first incremental';",
+        request.dbnum, baseline_sesno, request.dbnum, baseline_sesno, baseline_sesno
+    );
+    project_primary_db()
+        .query(sql)
+        .bind(("fingerprint", fingerprint))
+        .await
+        .map_err(|error| VersionCommitError::Storage(error.into()))?
+        .check()
+        .map_err(|error| VersionCommitError::Storage(error.into()))?;
     Ok(())
 }
 
@@ -680,14 +763,26 @@ async fn create_immutable_anchor(
 /// 仅在调用方确认全部模型写入和已启用的后处理成功后调用。同一
 /// `(dbnum, sesno)` 成功重跑会刷新 `anchored_at`，失败路径不得调用。
 pub async fn write_model_gen_anchor(dbnum: u32, sesno: u32) -> anyhow::Result<ModelGenAnchor> {
+    write_model_gen_anchor_with_note(dbnum, sesno, "model generation completed").await
+}
+
+pub async fn write_model_gen_anchor_with_note(
+    dbnum: u32,
+    sesno: u32,
+    note: &str,
+) -> anyhow::Result<ModelGenAnchor> {
     crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
     let sql = format!(
         "UPSERT sesno_version_anchor:[{dbnum}, {sesno}, 'model_gen'] SET \
          dbnum = {dbnum}, sesno = {sesno}, source = 'model_gen', \
-         anchored_at = time::now(), note = 'model generation completed' \
+         anchored_at = time::now(), note = $note \
          RETURN anchored_at;"
     );
-    let mut response = project_primary_db().query(sql).await?.check()?;
+    let mut response = project_primary_db()
+        .query(sql)
+        .bind(("note", note.to_string()))
+        .await?
+        .check()?;
     let anchored_at: Option<Datetime> = response.take((0, "anchored_at"))?;
     let anchored_at = anchored_at
         .map(|value| value.to_string())
@@ -697,6 +792,7 @@ pub async fn write_model_gen_anchor(dbnum: u32, sesno: u32) -> anyhow::Result<Mo
         sesno,
         source: "model_gen".to_string(),
         anchored_at,
+        note: note.to_string(),
     })
 }
 
@@ -797,6 +893,42 @@ pub async fn publish_model_gen_anchors_after_generation(
     Ok(anchors)
 }
 
+/// Live/manual generation is only valid while building an initialization
+/// staging database. A staging database has no business anchors yet; once any
+/// legacy/data/model anchor exists, every subsequent model mutation must bind
+/// an existing data anchor through catch-up or controlled repair.
+pub async fn ensure_live_generation_allowed(
+    db_option: &crate::options::DbOptionExt,
+    operation: &str,
+) -> anyhow::Result<()> {
+    if !db_option.versioned_storage {
+        return Ok(());
+    }
+    let sql = "SELECT VALUE count() FROM sesno_version_anchor \
+               WHERE source IN ['full', 'incremental_baseline', 'incremental', 'model_gen'] GROUP ALL;";
+    let existing = match project_primary_db()
+        .query_take::<Vec<surrealdb::types::Value>>(sql, 0)
+        .await
+    {
+        Ok(counts) => match counts.into_iter().next() {
+            Some(value) => {
+                optional_u32_from_value(value, "business anchor count")?.unwrap_or_default()
+            }
+            None => 0,
+        },
+        Err(error) if error.to_string().contains("does not exist") => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if existing > 0 {
+        anyhow::bail!(
+            "{operation} is disabled for a Ready versioned site; use `model-version catch-up` \
+             for continuous debt or `model-version catch-up --allow-full-regen` for explicit \
+             controlled repair"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct VersionCommitLease {
     dbnum: u32,
@@ -873,24 +1005,46 @@ fn next_owner() -> String {
 pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
     let sql = format!(
         "math::max(array::flatten([SELECT VALUE sesno FROM sesno_version_anchor \
-             WHERE dbnum = {dbnum} AND source IN ['full', 'incremental']]));\n\
+             WHERE dbnum = {dbnum} AND source IN ['full', 'incremental_baseline', 'incremental']]));\n\
          math::max(array::flatten([SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {dbnum}]));"
     );
     let mut response = project_primary_db().query(sql).await?.check()?;
     // 语句级取值：表不存在（例如从未跑过版本提交的存量站点没有
     // `sesno_version_anchor`）按"无记录"处理，其余语句错误照常上抛。
-    let anchored = match response.take::<Option<u32>>(0) {
-        Ok(value) => value,
+    let anchored = match response.take::<surrealdb::types::Value>(0) {
+        Ok(value) => optional_u32_from_value(value, "data anchor sesno")?,
         Err(error) if error.to_string().contains("does not exist") => None,
         Err(error) => return Err(error.into()),
     };
     if let Some(sesno) = anchored.filter(|sesno| *sesno > 0) {
         return Ok(sesno);
     }
-    let legacy = match response.take::<Option<u32>>(1) {
-        Ok(value) => value,
+    let legacy = match response.take::<surrealdb::types::Value>(1) {
+        Ok(value) => optional_u32_from_value(value, "legacy watermark sesno")?,
         Err(error) if error.to_string().contains("does not exist") => None,
         Err(error) => return Err(error.into()),
     };
     Ok(legacy.unwrap_or_default())
+}
+
+pub(super) fn optional_u32_from_value(
+    value: surrealdb::types::Value,
+    field: &str,
+) -> anyhow::Result<Option<u32>> {
+    use surrealdb::types::{Number, Value};
+
+    let integer = match value {
+        Value::None | Value::Null => return Ok(None),
+        Value::Number(Number::Int(value)) => value,
+        Value::Number(Number::Float(value)) if !value.is_finite() => return Ok(None),
+        Value::Number(Number::Float(value)) if value.fract() == 0.0 => value as i64,
+        Value::Number(Number::Decimal(value)) => value
+            .to_string()
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("{field} 不是整数: {value}"))?,
+        other => anyhow::bail!("{field} 不是整数: {other:?}"),
+    };
+    Ok(Some(u32::try_from(integer).map_err(|_| {
+        anyhow::anyhow!("{field} 超出 u32 范围: {integer}")
+    })?))
 }

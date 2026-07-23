@@ -16,7 +16,7 @@ use crate::fast_model::mesh_generate::MeshResult;
 use crate::fast_model::pdms_inst::{
     InstRelatePrecomputed, build_inst_relate_aabb_rows, persist_negative_relations_from_artifacts,
     persist_tubi_relations_from_artifacts, save_inst_relate_aabb_rows,
-    save_instance_data_with_report_versioned, save_tubi_info_batch_with_replace,
+    save_instance_data_with_report_versioned,
 };
 use crate::fast_model::utils::{save_aabb_to_surreal_checked, save_pts_to_surreal_checked};
 use crate::options::{BooleanPipelineMode, ModelWriterMode};
@@ -778,9 +778,12 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
             ));
         }
 
+        // tubi 版本存储的唯一真相源是 persist_tubi_relations_from_artifacts 写入的
+        // `tubi_relate`（按分支 refno 键、可随 regen 版本化清理、导出/历史读取都只认它）。
+        // `tubi_info` 表从不被任何读取方消费，且按内容哈希键、无法按分支范围清理，
+        // 保留写入只会在 versioned 库里持续膨胀，故不再写入（遗留行由 pre_cleanup 兜底清空）。
         let submitted = persist_negative_relations_from_artifacts(artifacts).await?
-            + persist_tubi_relations_from_artifacts(artifacts).await?
-            + save_tubi_info_batch_with_replace(tubi_info, true).await?;
+            + persist_tubi_relations_from_artifacts(artifacts).await?;
         Ok(ModelWriterStageReport::executed(
             "run_relation_artifacts",
             submitted,

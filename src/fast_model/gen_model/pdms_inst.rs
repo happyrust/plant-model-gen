@@ -124,48 +124,6 @@ pub struct SaveInstanceDataReport {
     pub missing_neg_carriers: Vec<RefnoEnum>,
 }
 
-/// 将 tubi_info 数据写入数据库（可选覆盖）。
-///
-pub async fn save_tubi_info_batch_with_replace(
-    tubi_info_map: &dashmap::DashMap<String, TubiInfoData>,
-    _replace_exist: bool,
-) -> anyhow::Result<usize> {
-    use anyhow::Context;
-
-    if tubi_info_map.is_empty() {
-        return Ok(0);
-    }
-
-    const CHUNK_SIZE: usize = 200;
-    let ids = tubi_info_map
-        .iter()
-        .map(|e| e.key().clone())
-        .collect::<Vec<_>>();
-    let mut written = 0usize;
-
-    for chunk in ids.chunks(CHUNK_SIZE) {
-        let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
-        for id in chunk {
-            let Some(v) = tubi_info_map.get(id) else {
-                continue;
-            };
-            rows.push(v.value().to_surreal_json());
-            written += 1;
-        }
-        if !rows.is_empty() {
-            let sql = format!("INSERT IGNORE INTO tubi_info [{}];", rows.join(","));
-            project_primary_db()
-                .query_response(&sql)
-                .await
-                .with_context(|| format!("写入 tubi_info 失败 (insert ignore): {}", written))?
-                .check()
-                .with_context(|| format!("写入 tubi_info 语句失败 (insert ignore): {}", written))?;
-        }
-    }
-
-    Ok(written)
-}
-
 async fn delete_inst_relate_by_in_with_dbnum(
     refnos: &[RefnoEnum],
     chunk_size: usize,
@@ -1028,6 +986,15 @@ async fn pre_cleanup_for_regen_inner(
             t.elapsed().as_millis() as u64,
         );
         delete_tubi_relate_by_branch_refnos(&bran_refnos, CHUNK_SIZE).await?;
+
+        // 兜底清空已退役的 `tubi_info` 表：它按内容哈希键、不带分支归属，无法按分支范围删，
+        // 且不再被任何写入路径写入、也从无读取方（tubi 版本存储唯一真相源是 `tubi_relate`）。
+        // 有分支参与 regen 时顺带幂等清空遗留行，避免历史遗留在 versioned 库里继续膨胀；
+        // 清空后不再重新写入，后续 regen 命中空表即为廉价 no-op。
+        project_primary_db()
+            .query_response("DELETE tubi_info;")
+            .await?
+            .check()?;
     }
 
     crate::perf_metrics::record_generate_progress(

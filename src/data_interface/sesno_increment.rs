@@ -15,6 +15,9 @@ use pdms_io::io::{EleOperationData, EleOperationDetail};
 use serde::{Deserialize, Serialize};
 
 use crate::data_interface::increment_record::IncrGeoUpdateLog;
+use crate::versioned_db::model_gen_debt::{
+    ModelGenDebtWriteOutcome, debt_upsert_sql, ensure_model_gen_debt_schema,
+};
 use crate::versioned_db::version_commit::{
     VersionCommitCounts, VersionCommitRequest, VersionCommitSource, commit_version,
     compute_commit_fingerprint, recover_version_commit,
@@ -250,6 +253,10 @@ pub struct PdmsIncrementPersistStats {
     /// 每个 dbnum 独立提交；多库命令保留已成功锚点并显式报告失败项。
     #[serde(default)]
     pub commit_failures: Vec<VersionCommitFailureRecord>,
+    /// specs/026：本批在 commit apply 事务内幂等写入的模型欠账记录。debt 与数据
+    /// 锚点同域提交，写失败即 commit 失败并计入 `commit_failures`，不再单列。
+    #[serde(default)]
+    pub debt_written: Vec<ModelGenDebtWriteOutcome>,
 }
 
 impl PdmsIncrementPersistStats {
@@ -265,6 +272,7 @@ impl PdmsIncrementPersistStats {
         self.pe_owner_rows += other.pe_owner_rows;
         self.anchors.extend(other.anchors);
         self.commit_failures.extend(other.commit_failures);
+        self.debt_written.extend(other.debt_written);
     }
 }
 
@@ -916,7 +924,7 @@ async fn persist_pdms_increment_file(
             )
         })?;
 
-    persist_pdms_increment_grouped(report, &grouped, None, false).await
+    persist_pdms_increment_grouped(report, &grouped, None, false, None).await
 }
 
 async fn persist_pdms_increment_grouped(
@@ -924,6 +932,7 @@ async fn persist_pdms_increment_grouped(
     grouped: &BTreeMap<u32, Vec<EleOperationData>>,
     source_hash: Option<&str>,
     recover_pending: bool,
+    update_log: Option<&IncrGeoUpdateLog>,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
     let mut stats = PdmsIncrementPersistStats {
         file_count: 1,
@@ -1095,6 +1104,18 @@ async fn persist_pdms_increment_grouped(
         dbnum_info_updates: stats.dbnum_info_updates,
         pe_owner_rows: stats.pe_owner_rows,
     };
+    // debt 与数据锚点同处 apply 保护域：数据 fingerprint 不含 debt（debt 是附属产物，
+    // 不构成数据版本身份），但 debt 的 UPSERT 与数据写入在同一 commit_version 保护域内。
+    let has_debt = update_log.is_some();
+    let debt_sql = update_log.map(|log| {
+        debt_upsert_sql(
+            report.dbnum,
+            report.actual_start_sesno,
+            report.actual_end_sesno,
+            &fingerprint,
+            log,
+        )
+    });
     let request = VersionCommitRequest {
         dbnum: report.dbnum,
         from_sesno: report.actual_start_sesno,
@@ -1104,27 +1125,33 @@ async fn persist_pdms_increment_grouped(
         source_hash: source_hash.map(str::to_string),
         expected_counts: Some(commit_counts.clone()),
     };
-    let outcome = if recover_pending {
-        recover_version_commit(request, || async move {
-            exec_statements(&mutation_sqls, 200).await?;
-            // 边先删段与后插段分属不同 exec 调用（不同请求），保证删除对插入可见
-            exec_statements(&edge_delete_sqls, 200).await?;
-            exec_statements(&edge_insert_sqls, 200).await?;
-            exec_statements(&dbnum_sqls, 200).await?;
-            Ok(commit_counts)
-        })
-        .await?
-    } else {
-        commit_version(request, || async move {
-            exec_statements(&mutation_sqls, 200).await?;
-            // 边先删段与后插段分属不同 exec 调用（不同请求），保证删除对插入可见
-            exec_statements(&edge_delete_sqls, 200).await?;
-            exec_statements(&edge_insert_sqls, 200).await?;
-            exec_statements(&dbnum_sqls, 200).await?;
-            Ok(commit_counts)
-        })
-        .await?
+    // apply 全成功才创建锚点、转 committed；任一步（含 debt）失败留 pending，
+    // recover 重放同一 apply（数据 UPSERT / 边先删后插 / debt UPSERT 均幂等）。
+    // 由此消除"数据锚点已提交、debt 未写"导致模型欠账永久丢失、只能整库 full-regen 的窗口。
+    let apply = || async move {
+        exec_statements(&mutation_sqls, 200).await?;
+        // 边先删段与后插段分属不同 exec 调用（不同请求），保证删除对插入可见
+        exec_statements(&edge_delete_sqls, 200).await?;
+        exec_statements(&edge_insert_sqls, 200).await?;
+        exec_statements(&dbnum_sqls, 200).await?;
+        if let Some(debt_sql) = debt_sql.as_deref() {
+            project_primary_db().query(debt_sql).await?.check()?;
+        }
+        Ok(commit_counts)
     };
+    let outcome = if recover_pending {
+        recover_version_commit(request, apply).await?
+    } else {
+        commit_version(request, apply).await?
+    };
+    if has_debt {
+        stats.debt_written.push(ModelGenDebtWriteOutcome {
+            dbnum: outcome.dbnum,
+            from_sesno: outcome.from_sesno,
+            to_sesno: outcome.to_sesno,
+            idempotent: outcome.idempotent,
+        });
+    }
     stats.anchors.push(VersionAnchorRecord {
         dbnum: outcome.dbnum,
         sesno: outcome.to_sesno,
@@ -1153,6 +1180,8 @@ pub async fn persist_collected_pdms_increment_files(
     files: &[PdmsSesnoCollectedFile],
     recover_pending: bool,
 ) -> anyhow::Result<PdmsIncrementPersistStats> {
+    // debt 现在于各 file 的 commit apply 事务内写入，schema 在此统一 ensure 一次。
+    ensure_model_gen_debt_schema().await?;
     let mut stats = PdmsIncrementPersistStats::default();
     for file in files {
         match persist_pdms_increment_grouped(
@@ -1160,6 +1189,7 @@ pub async fn persist_collected_pdms_increment_files(
             &file.grouped_operations,
             Some(file.report.source_sha256_before.as_str()),
             recover_pending,
+            Some(&file.update_log),
         )
         .await
         {

@@ -106,10 +106,36 @@ async fn run_with_sqlite_index(
     let mqtt_file_publisher = crate::data_interface::mqtt_file_sync::MqttFilePublisher::start();
     let mut never_parsed_warned = std::collections::BTreeSet::new();
     loop {
-        let report = crate::data_interface::db_index::rebuild_from_config(false).await?;
-        let records = {
-            let store = crate::data_interface::db_index::DbIndexStore::open(&index_path)?;
-            store.all_db_files()
+        // 常驻 watch：主循环级的 db_index 刷新/打开属瞬时可恢复错误（配置文件被
+        // 临时占用、网络盘抖动、sqlite 短暂被锁），记录后下一轮重试，绝不让常驻
+        // watcher 因一次抖动整体退出；仅 --once（CLI 一次性运行）保持失败即返回。
+        let report = match crate::data_interface::db_index::rebuild_from_config(false).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ watch-incremental 本轮 db_index 刷新失败，{}s 后重试: {:#}",
+                    options.interval_secs, error
+                );
+                if options.once {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(options.interval_secs)).await;
+                continue;
+            }
+        };
+        let records = match crate::data_interface::db_index::DbIndexStore::open(&index_path) {
+            Ok(store) => store.all_db_files(),
+            Err(error) => {
+                eprintln!(
+                    "⚠️ watch-incremental 本轮打开 db_index 失败，{}s 后重试: {:#}",
+                    options.interval_secs, error
+                );
+                if options.once {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(options.interval_secs)).await;
+                continue;
+            }
         };
         let mut cycle_summaries = Vec::new();
         let mut cycle_failures: Vec<(u32, String)> = Vec::new();

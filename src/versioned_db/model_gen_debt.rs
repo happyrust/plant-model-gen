@@ -249,6 +249,45 @@ pub async fn write_model_gen_debt(
     })
 }
 
+/// 生成幂等的 `model_gen_debt` UPSERT 语句，供增量 `commit_version` 的 apply
+/// 闭包内**与数据写入同一提交保护域**执行（消除"数据 commit 成功、debt 未写"
+/// 的崩溃窗口）。
+///
+/// 与 `write_model_gen_debt` 的 CREATE-once + payload 冲突检查不同：这里用
+/// UPSERT 且**不触碰 `created_at`/`consumed_at`**——新建行靠 schema 默认（
+/// `created_at` DEFAULT、`consumed_at` 为 NONE），recover 重放已存在行时保留原值，
+/// 从而在 `preparing → apply → committed` 状态机内可安全重放。apply 闭包用拼接 SQL
+/// 无 bind，故 refnos/fingerprint 内联为字面量（refno 为安全字符，fingerprint 为 hex）。
+pub fn debt_upsert_sql(
+    dbnum: u32,
+    from_sesno: u32,
+    to_sesno: u32,
+    commit_fingerprint: &str,
+    log: &IncrGeoUpdateLog,
+) -> String {
+    let record = record_from_log(dbnum, from_sesno, to_sesno, commit_fingerprint, log);
+    let fp = record.commit_fingerprint.replace('\'', "\\'");
+    let fmt = |values: &[String]| -> String {
+        let inner = values
+            .iter()
+            .map(|value| format!("'{}'", value.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{inner}]")
+    };
+    format!(
+        "UPSERT model_gen_debt:[{dbnum}, {to_sesno}] SET \
+         dbnum = {dbnum}, from_sesno = {from_sesno}, to_sesno = {to_sesno}, \
+         commit_fingerprint = '{fp}', prim_refnos = {}, loop_owner_refnos = {}, \
+         bran_hanger_refnos = {}, basic_cata_refnos = {}, delete_refnos = {};",
+        fmt(&record.prim_refnos),
+        fmt(&record.loop_owner_refnos),
+        fmt(&record.bran_hanger_refnos),
+        fmt(&record.basic_cata_refnos),
+        fmt(&record.delete_refnos),
+    )
+}
+
 pub async fn model_generation_watermark(dbnum: u32) -> anyhow::Result<u32> {
     super::database::ensure_sesno_version_anchor_schema().await?;
     let sql = format!(

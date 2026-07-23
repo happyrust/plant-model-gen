@@ -382,7 +382,26 @@ where
     let mut debt_write_failures = Vec::new();
     let mut debt_blocked_dbnums = std::collections::BTreeSet::new();
     if options.persist_data {
+        // 事务内 debt 写入结果索引（(dbnum, to_sesno) → 结果）：apply 实际执行过的提交，
+        // 其 debt 已由 commit_version 与数据锚点同域落库，这里直接采纳、不再二次写。
+        let in_txn_debt: std::collections::HashMap<
+            (u32, u32),
+            crate::versioned_db::model_gen_debt::ModelGenDebtWriteOutcome,
+        > = persist_stats
+            .debt_written
+            .iter()
+            .map(|outcome| ((outcome.dbnum, outcome.to_sesno), outcome.clone()))
+            .collect();
         for anchor in &persist_stats.anchors {
+            // 事务内已原子写入（apply 跑过、非 idempotent-skip）→ 采纳该结果即可。
+            if let Some(outcome) = in_txn_debt.get(&(anchor.dbnum, anchor.sesno))
+                && !outcome.idempotent
+            {
+                debt_written.push(outcome.clone());
+                continue;
+            }
+            // 走到这里=commit 命中已提交锚点（idempotent-skip：apply 及其事务内 debt
+            // UPSERT 被跳过，含本次改动前的遗留锚点）→ 用幂等 writer 回填 debt。
             let file = collected_increment_files.iter().find(|file| {
                 file.report.dbnum == anchor.dbnum && file.report.actual_end_sesno == anchor.sesno
             });
@@ -413,7 +432,7 @@ where
                 Ok(written) => debt_written.push(written),
                 Err(error) => {
                     let message = format!(
-                        "dbnum={} model_gen_debt write failed: {error:#}",
+                        "dbnum={} model_gen_debt backfill failed: {error:#}",
                         anchor.dbnum
                     );
                     debt_blocked_dbnums.insert(anchor.dbnum);

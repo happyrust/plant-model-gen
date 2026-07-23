@@ -761,8 +761,26 @@ async fn pre_cleanup_for_regen_inner(
 
     // 版本化正式路径严格使用会话 hierarchy；legacy 调用保留旧查询入口。
     let (all_refnos, bran_refnos) = if let Some(hierarchy) = hierarchy {
+        // delete-only / 先增后删：删除的（或从未进入已发布模型切面的）refno 不在该
+        // hierarchy 里。cleanup 只清理"曾存在于此切面"的产物——先过滤掉缺席根再展开，
+        // 缺席根跳过而非硬失败（plan §4.3/§7；descendants() 对缺席根会返回
+        // MissingRequiredData，正是 delete-only cleanup 的崩溃点）。
+        let present_roots = seed_refnos
+            .iter()
+            .copied()
+            .filter(|refno| hierarchy.node(*refno).is_some())
+            .collect::<Vec<_>>();
+        let skipped = seed_refnos.len().saturating_sub(present_roots.len());
+        if skipped > 0 {
+            println!(
+                "[pre_cleanup_for_regen] 跳过 {skipped} 个不在 cleanup 切面的根（删除/先增后删，无已发布产物需清理）"
+            );
+        }
+        if present_roots.is_empty() {
+            return Ok(());
+        }
         let all_refnos = hierarchy.descendants(
-            seed_refnos,
+            &present_roots,
             &crate::generation_read::HierarchyQuery {
                 include_self: true,
                 nouns: BTreeSet::new(),

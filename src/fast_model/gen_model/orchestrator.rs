@@ -649,7 +649,6 @@ async fn process_gen_pipeline(
 
     let (sender, write_pipeline) = ModelWritePipeline::start(WritePipelineStart {
         db_option: db_option.clone(),
-        generation_read: Arc::clone(&generation_read),
         cleanup_hierarchy,
         incremental_cleanup_roots,
         model_writer: Arc::clone(&base_model_writer),

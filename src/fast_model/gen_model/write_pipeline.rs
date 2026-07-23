@@ -14,7 +14,6 @@ use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::boolean_task::BooleanTask;
-use super::context::GenerationReadContext;
 use super::model_writer::{GenerationArtifacts, ModelWriterBackend, ModelWriterFinishReport};
 use crate::fast_model::mesh_generate::{MeshResult, query_existing_meshed_inst_geo_ids};
 use crate::options::DbOptionExt;
@@ -586,7 +585,6 @@ async fn run_inst_aabb_writer(
 
 pub(crate) struct WritePipelineStart {
     pub db_option: DbOptionExt,
-    pub generation_read: Arc<GenerationReadContext>,
     pub cleanup_hierarchy: Option<Arc<crate::generation_read::HierarchySnapshot>>,
     pub incremental_cleanup_roots: Vec<RefnoEnum>,
     pub model_writer: Arc<dyn ModelWriterBackend>,
@@ -644,19 +642,27 @@ impl ModelWritePipeline {
     ) -> anyhow::Result<(Sender<ShapeInstancesData>, Self)> {
         if request.model_writer.writes_to_surreal() && !request.incremental_cleanup_roots.is_empty()
         {
-            println!(
-                "[write-pipeline] incremental cleanup start: roots={}",
-                request.incremental_cleanup_roots.len()
-            );
-            crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen_versioned(
-                &request.incremental_cleanup_roots,
-                request
-                    .cleanup_hierarchy
-                    .as_deref()
-                    .unwrap_or(&request.generation_read.hierarchy),
-            )
-            .await?;
-            println!("[write-pipeline] incremental cleanup complete");
+            // cleanup 必须使用"已发布模型对应的旧层级切面"。无旧切面（尚无 model_gen
+            // 锚点、model watermark=0）时没有可清理的已发布产物，跳过而不是回退到目标
+            // 生成切面——回退会把删除根解析到已无删除 PE 的目标切面上，触发
+            // MissingRequiredData（plan §4.3；delete-only cleanup 阻断项）。
+            if let Some(cleanup_hierarchy) = request.cleanup_hierarchy.as_deref() {
+                println!(
+                    "[write-pipeline] incremental cleanup start: roots={}",
+                    request.incremental_cleanup_roots.len()
+                );
+                crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen_versioned(
+                    &request.incremental_cleanup_roots,
+                    cleanup_hierarchy,
+                )
+                .await?;
+                println!("[write-pipeline] incremental cleanup complete");
+            } else {
+                println!(
+                    "[write-pipeline] incremental cleanup skipped: 无已发布模型旧切面(model watermark=0), roots={}",
+                    request.incremental_cleanup_roots.len()
+                );
+            }
         } else if !request.incremental_cleanup_roots.is_empty() {
             println!(
                 "[write-pipeline] incremental cleanup skipped: writer={} roots={}",

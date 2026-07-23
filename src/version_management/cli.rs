@@ -311,6 +311,50 @@ pub fn model_version_command() -> Command {
                 )
                 .arg(json_arg()),
         )
+        .subcommand(
+            Command::new("reference-index")
+                .about(
+                    "ADR-0011 P1: catalogue reverse-reference index (cata_ref_index) backfill/audit",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("backfill")
+                        .about(
+                            "Build/replace cata_ref_index edges for a dbnum from current PE/ATT (replace-by-source), then mark cata_ref_index_state ready",
+                        )
+                        .arg(required_u32("dbnum"))
+                        .arg(
+                            Arg::new("batch-size")
+                                .long("batch-size")
+                                .value_parser(clap::value_parser!(usize))
+                                .default_value("500")
+                                .help("PE page / apply chunk size (clamped to 50..=1000)"),
+                        )
+                        .arg(
+                            Arg::new("dry-run")
+                                .long("dry-run")
+                                .action(clap::ArgAction::SetTrue)
+                                .help("Extract and count only; do not write edges or state"),
+                        )
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("audit")
+                        .about(
+                            "Reconcile cata_ref_index vs a fresh full-scan PE/ATT extraction (count + content checksum + orphan detection); non-zero exit on mismatch",
+                        )
+                        .arg(required_u32("dbnum"))
+                        .arg(
+                            Arg::new("sample")
+                                .long("sample")
+                                .value_parser(clap::value_parser!(usize))
+                                .default_value("20")
+                                .help("Max per-source mismatches to include in the report"),
+                        )
+                        .arg(json_arg()),
+                ),
+        )
 }
 
 pub fn repair_missing_meshes_command() -> Command {
@@ -384,6 +428,7 @@ pub async fn handle_model_version_command(
         Some(("backfill-pe-cata-hash", sub)) => handle_backfill_pe_cata_hash_command(sub).await?,
         Some(("catch-up", sub)) => handle_model_gen_catch_up_command(sub, db_option_ext).await?,
         Some(("rebuild-pe-owner", sub)) => handle_rebuild_pe_owner_command(sub).await?,
+        Some(("reference-index", sub)) => handle_reference_index_command(sub).await?,
         _ => unreachable!("subcommand_required by clap"),
     }
     Ok(true)
@@ -1537,6 +1582,248 @@ async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()>
 ///
 /// 幂等可重跑：UPDATE 只 SET cata_hash，不触碰其他字段；重复执行结果一致。
 /// 增量常态维护由 sesno_increment 的 UPSERT 注入负责，本命令只管存量。
+async fn handle_reference_index_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    match sub.subcommand() {
+        Some(("backfill", m)) => handle_reference_index_backfill_command(m).await,
+        Some(("audit", m)) => handle_reference_index_audit_command(m).await,
+        _ => unreachable!("subcommand_required by clap"),
+    }
+}
+
+/// ADR-0011 P1 step-1：从当前 PE/ATT 全量重建某 dbnum 的 `cata_ref_index` 出边
+/// （replace-by-source），并写 `cata_ref_index_state` ready 水位 + 内容 checksum。
+/// 不触碰增量提交热路径，可独立 CLI 自测。
+async fn handle_reference_index_backfill_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use crate::versioned_db::cata_ref_index as crx;
+    use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let batch = (*sub.get_one::<usize>("batch-size").expect("defaulted")).clamp(50, 1000);
+    let dry_run = sub.get_flag("dry-run");
+    let json_output = sub.get_flag("json");
+    let started = std::time::Instant::now();
+
+    crx::ensure_cata_ref_index_schema().await?;
+    // 分页枚举 WHERE dbnum 依赖该索引（幂等）。
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    let mut scanned = 0usize;
+    let mut sources_with_edges = 0usize;
+    let mut edge_count = 0usize;
+    let mut att_errors = 0usize;
+    let mut digest = crx::EdgeDigest::new();
+    let mut last_key: Option<String> = None;
+
+    loop {
+        let page_sql = match &last_key {
+            Some(key) => format!(
+                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {batch};"
+            ),
+            None => {
+                format!("SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {batch};")
+            }
+        };
+        let ids: Vec<RefnoEnum> = project_primary_db().query_take(&page_sql, 0).await?;
+        if ids.is_empty() {
+            break;
+        }
+        last_key = ids.last().map(|r| r.refno().to_pe_key());
+        scanned += ids.len();
+
+        let mut page_sources: Vec<String> = Vec::with_capacity(ids.len());
+        let mut page_edges: Vec<crx::RefEdge> = Vec::new();
+        for refno_enum in &ids {
+            let refno = refno_enum.refno();
+            let att = match aios_core::get_named_attmap(*refno_enum).await {
+                Ok(att) => att,
+                Err(_) => {
+                    att_errors += 1;
+                    continue;
+                }
+            };
+            let edges = crx::extract_ref_edges(refno, dbnum, &att);
+            page_sources.push(refno.to_string());
+            if !edges.is_empty() {
+                sources_with_edges += 1;
+                edge_count += edges.len();
+                digest.absorb_all(edges.iter());
+                page_edges.extend(edges);
+            }
+        }
+
+        if !dry_run {
+            // 先删后插分属不同请求（同请求内删+重插同 id 会撞唯一约束）。
+            if let Some(del_sql) = crx::delete_sources_sql(dbnum, &page_sources) {
+                project_primary_db().query(del_sql).await?.check()?;
+            }
+            for insert_sql in crx::insert_edges_sql(&page_edges, batch) {
+                project_primary_db().query(insert_sql).await?.check()?;
+            }
+        }
+
+        if scanned % (batch * 20) == 0 {
+            eprintln!(
+                "[reference-index backfill] dbnum={dbnum} scanned={scanned} edges={edge_count} ..."
+            );
+        }
+    }
+
+    let checksum = digest.checksum();
+    if !dry_run {
+        crx::write_state(dbnum, true, edge_count, &checksum).await?;
+    }
+
+    let summary = serde_json::json!({
+        "command": "reference-index backfill",
+        "dbnum": dbnum,
+        "scanned_sources": scanned,
+        "sources_with_edges": sources_with_edges,
+        "edge_count": edge_count,
+        "checksum": checksum,
+        "att_read_errors": att_errors,
+        "applied": !dry_run,
+        "extractor_version": crx::EXTRACTOR_VERSION,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "✅ reference-index backfill dbnum={dbnum} sources={scanned} edges={edge_count} checksum={checksum} applied={}",
+            !dry_run
+        );
+    }
+    Ok(())
+}
+
+/// ADR-0011 P1 step-1：对账 `cata_ref_index` 与「当前 PE/ATT 全扫描抽取」的边集
+/// （行数 + 顺序无关 checksum + 孤儿行检测 + 抽样逐 source 差分）。不一致时非零退出。
+/// 注：step-1 在 latest 快照对账；`VERSION AT` 历史对账随 P2 读会话接入。
+async fn handle_reference_index_audit_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use crate::versioned_db::cata_ref_index as crx;
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
+    use std::collections::HashMap;
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let sample_limit = *sub.get_one::<usize>("sample").expect("defaulted");
+    let _json_output = sub.get_flag("json"); // 对账工具恒输出 JSON，保留 flag 兼容
+    let started = std::time::Instant::now();
+
+    crx::ensure_cata_ref_index_schema().await?;
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    const PAGE: usize = 500;
+    let mut scanned = 0usize;
+    let mut fresh_digest = crx::EdgeDigest::new();
+    let mut index_digest = crx::EdgeDigest::new();
+    let mut fresh_rows = 0usize;
+    let mut index_rows_by_source = 0usize;
+    let mut att_errors = 0usize;
+    let mut mismatches: Vec<serde_json::Value> = Vec::new();
+    let mut last_key: Option<String> = None;
+
+    loop {
+        let page_sql = match &last_key {
+            Some(key) => format!(
+                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {PAGE};"
+            ),
+            None => {
+                format!("SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {PAGE};")
+            }
+        };
+        let ids: Vec<RefnoEnum> = project_primary_db().query_take(&page_sql, 0).await?;
+        if ids.is_empty() {
+            break;
+        }
+        last_key = ids.last().map(|r| r.refno().to_pe_key());
+        scanned += ids.len();
+
+        // 当前 PE/ATT 全扫描抽取（oracle）。
+        let mut fresh_by_source: HashMap<String, Vec<crx::RefEdge>> = HashMap::new();
+        let refus: Vec<RefU64> = ids.iter().map(|r| r.refno()).collect();
+        for refno_enum in &ids {
+            let refno = refno_enum.refno();
+            let att = match aios_core::get_named_attmap(*refno_enum).await {
+                Ok(att) => att,
+                Err(_) => {
+                    att_errors += 1;
+                    continue;
+                }
+            };
+            let edges = crx::extract_ref_edges(refno, dbnum, &att);
+            fresh_rows += edges.len();
+            fresh_digest.absorb_all(edges.iter());
+            fresh_by_source.insert(refno.to_string(), edges);
+        }
+
+        // 索引侧出边。
+        let index_edges = crx::load_outbound_references(dbnum, &refus).await?;
+        index_rows_by_source += index_edges.len();
+        index_digest.absorb_all(index_edges.iter());
+        let mut index_by_source: HashMap<String, Vec<crx::RefEdge>> = HashMap::new();
+        for edge in index_edges {
+            index_by_source
+                .entry(edge.source_refno.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        for (source, fresh_edges) in &fresh_by_source {
+            let empty: Vec<crx::RefEdge> = Vec::new();
+            let idx_edges = index_by_source.get(source).unwrap_or(&empty);
+            if !crx::edges_equal_ignoring_order(fresh_edges, idx_edges)
+                && mismatches.len() < sample_limit
+            {
+                mismatches.push(serde_json::json!({
+                    "source_refno": source,
+                    "fresh_edges": fresh_edges.len(),
+                    "index_edges": idx_edges.len(),
+                }));
+            }
+        }
+    }
+
+    let total_index_rows = crx::count_index_rows(dbnum).await?;
+    let orphan_rows = total_index_rows.saturating_sub(index_rows_by_source);
+    let fresh_checksum = fresh_digest.checksum();
+    let index_checksum = index_digest.checksum();
+    let state = crx::read_state(dbnum).await?;
+    let state_ready = state.as_ref().map(|s| s.ready).unwrap_or(false);
+
+    let passed = fresh_rows == index_rows_by_source
+        && fresh_checksum == index_checksum
+        && orphan_rows == 0
+        && mismatches.is_empty();
+
+    let summary = serde_json::json!({
+        "command": "reference-index audit",
+        "dbnum": dbnum,
+        "scanned_sources": scanned,
+        "fresh_edge_count": fresh_rows,
+        "index_edge_count": index_rows_by_source,
+        "index_total_rows": total_index_rows,
+        "orphan_rows": orphan_rows,
+        "fresh_checksum": fresh_checksum,
+        "index_checksum": index_checksum,
+        "checksum_match": fresh_checksum == index_checksum,
+        "att_read_errors": att_errors,
+        "state_ready": state_ready,
+        "state_extractor_version": state.as_ref().and_then(|s| s.extractor_version.clone()),
+        "mismatch_sample": mismatches,
+        "passed": passed,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    if !passed {
+        anyhow::bail!(
+            "reference-index audit FAILED for dbnum={dbnum}: fresh={fresh_rows} index={index_rows_by_source} orphans={orphan_rows} mismatches={}",
+            mismatches.len()
+        );
+    }
+    Ok(())
+}
+
 async fn handle_backfill_pe_cata_hash_command(sub: &ArgMatches) -> anyhow::Result<()> {
     use aios_core::utils::RecordIdExt;
     use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};

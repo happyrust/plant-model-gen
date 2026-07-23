@@ -1,4 +1,6 @@
 pub mod attmap;
+pub mod cata_ref_closure;
+pub mod cata_ref_index;
 pub mod database;
 pub mod db_meta_info;
 pub mod model_gen_debt;

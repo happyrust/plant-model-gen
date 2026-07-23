@@ -944,6 +944,9 @@ async fn persist_pdms_increment_grouped(
 
     stats.session_count = grouped.len();
 
+    // ADR-0011 P1：反向索引 schema 代码内 ensure（幂等 DDL，非版本化数据；覆盖所有入口路径）。
+    crate::versioned_db::cata_ref_index::ensure_cata_ref_index_schema().await?;
+
     // Keep mutations in sesno order. The previous implementation buffered PE/ATT
     // separately while executing deletes immediately, so add→delete in one range
     // could be replayed as delete→add and expose the wrong final state.
@@ -960,6 +963,12 @@ async fn persist_pdms_increment_grouped(
     // 这里对被删元素仍登记空重写（owner 侧显式清边），兜底"pe 行已缺失但残留边"的脏数据。
     let mut edge_final: indexmap::IndexMap<RefU64, Vec<RefU64>> = indexmap::IndexMap::new();
 
+    // ADR-0011 P1 step-2：目录引用反向索引 replace-by-source。与 PE/ATT/debt 同处
+    // commit_version apply 保护域，但（仿 debt）**不进数据 fingerprint**——索引是附属产物、
+    // 不构成数据版本身份。收集本轮被触及的 source（含删除）以整体先删，再插 add/modified 新出边。
+    let mut crx_touched_sources: Vec<String> = Vec::new();
+    let mut crx_new_edges: Vec<crate::versioned_db::cata_ref_index::RefEdge> = Vec::new();
+
     for operations in grouped.values() {
         for operation in operations {
             if matches!(&operation.detail, EleOperationDetail::Deleted) {
@@ -968,6 +977,8 @@ async fn persist_pdms_increment_grouped(
                 stats.att_rows += deleted_sqls.len().saturating_sub(1);
                 mutation_sqls.extend(deleted_sqls);
                 edge_final.insert(operation.refno, Vec::new());
+                // 删除元素：清其反向索引出边（不级联删指向它的入边——被删 SCOM 仍可反查引用者）。
+                crx_touched_sources.push(operation.refno.to_string());
                 continue;
             }
 
@@ -984,6 +995,14 @@ async fn persist_pdms_increment_grouped(
                 aios_core::NamedAttrValue::IntegerType(report.dbnum as i32),
             );
             let refno = operation.refno;
+            // ADR-0011 P1：从最终 att 抽 as-written 引用边（除 OWNER/层级/自身轴），与 pe/att 同批。
+            // changed source 一律 replace-by-source（过替换无害：重写同一批边）。
+            crx_touched_sources.push(refno.to_string());
+            crx_new_edges.extend(crate::versioned_db::cata_ref_index::extract_ref_edges(
+                refno,
+                report.dbnum,
+                &att,
+            ));
             let pe_data = att.pe(report.dbnum as i32);
             let pe_json = inject_children_into_pe_json(
                 pe_data.gen_sur_json(Some(refno.to_pe_key())),
@@ -1083,6 +1102,19 @@ async fn persist_pdms_increment_grouped(
     }
     stats.dbnum_info_updates = dbnum_sqls.len();
 
+    // ADR-0011 P1：把本轮 changed source 的反向索引 replace-by-source 拆成先删段（按 source
+    // 分块、含删除元素）与后插段（add/modified 新出边），分属不同 exec 请求提交
+    // （同请求删+重插同 id 可能撞约束，见 pe_owner 先例）。
+    let mut crx_delete_sqls: Vec<String> = Vec::new();
+    for chunk in crx_touched_sources.chunks(500) {
+        if let Some(sql) =
+            crate::versioned_db::cata_ref_index::delete_sources_sql(report.dbnum, chunk)
+        {
+            crx_delete_sqls.push(sql);
+        }
+    }
+    let crx_insert_sqls = crate::versioned_db::cata_ref_index::insert_edges_sql(&crx_new_edges, 500);
+
     let fingerprint = compute_commit_fingerprint(
         report.dbnum,
         report.actual_start_sesno,
@@ -1137,6 +1169,10 @@ async fn persist_pdms_increment_grouped(
         if let Some(debt_sql) = debt_sql.as_deref() {
             project_primary_db().query(debt_sql).await?.check()?;
         }
+        // ADR-0011 P1：反向索引 replace-by-source（先删后插分属不同请求；不进 fingerprint）。
+        // 失败与数据同处 pending，recover 重放同一 apply 幂等收敛。
+        exec_statements(&crx_delete_sqls, 200).await?;
+        exec_statements(&crx_insert_sqls, 200).await?;
         Ok(commit_counts)
     };
     let outcome = if recover_pending {

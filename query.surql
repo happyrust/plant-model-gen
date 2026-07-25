@@ -1,1 +1,0 @@
-SELECT id, world_trans FROM [pe_transform:⟨24381_145019⟩, pe_transform:⟨24381_145021⟩];

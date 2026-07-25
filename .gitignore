@@ -200,6 +200,7 @@ artifacts/
 
 # 一次性调试脚本与验证截图（非可复用测试基线）
 /debug_scripts/
+/.ida_scratch/
 /verification/*.png
 /verification/**/*.png
 

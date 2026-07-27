@@ -48,6 +48,38 @@ pub struct IncrementRunStatus {
     pub error: Option<String>,
 }
 
+fn publish_increment_run_progress(
+    hub: &crate::shared::ProgressHub,
+    run: &IncrementRunStatus,
+    processed: usize,
+    total: usize,
+) {
+    use crate::shared::{ProgressMessageBuilder, TaskStatus};
+
+    let status = match run.state.as_str() {
+        "queued" => TaskStatus::Pending,
+        "running" => TaskStatus::Running,
+        "succeeded" => TaskStatus::Completed,
+        _ => TaskStatus::Failed,
+    };
+    let percentage = match &status {
+        TaskStatus::Pending => 0.0,
+        TaskStatus::Running if total > 0 => processed as f32 * 100.0 / total as f32,
+        TaskStatus::Running => 0.0,
+        _ => 100.0,
+    };
+    let _ = hub.publish(
+        ProgressMessageBuilder::new(&run.run_id)
+            .status(status)
+            .percentage(percentage)
+            .step("manual_model_update", processed as u32, total as u32)
+            .items(processed as u64, total as u64)
+            .message(format!("dbnum={} {}", run.dbnum, run.state))
+            .details(json!(run))
+            .build(),
+    );
+}
+
 fn new_run_id(kind: &str, dbnum: u32) -> String {
     format!(
         "{kind}-db{dbnum}-{}",
@@ -210,9 +242,9 @@ async fn spawn_increment_run(
 ///   串行是为了避免生成管线并发互踩
 /// - 真正的全量重解析是另一个显式动作（任务创建 API / CLI sync_pdms），不在此端点
 pub async fn execute_incremental_update(
-    _state: State<AppState>,
+    State(state): State<AppState>,
     Json(request): Json<IncrementalUpdateRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let generate_model = !matches!(request.update_type, UpdateType::ParseOnly);
     let model_impact_filter = !request.no_model_impact_filter;
     if generate_model && !cfg!(feature = "gen_model") {
@@ -269,6 +301,10 @@ pub async fn execute_incremental_update(
                         error: None,
                     },
                 );
+                state.progress_hub.register(run_id.clone());
+                if let Some(entry) = INCREMENT_RUNS.get(&run_id) {
+                    publish_increment_run_progress(&state.progress_hub, entry.value(), 0, 1);
+                }
                 accepted.push((dbnum, watermark, run_id));
             }
             Err(e) => skipped.push(json!({
@@ -292,11 +328,13 @@ pub async fn execute_incremental_update(
     let run_ids: Vec<String> = accepted.iter().map(|(_, _, id)| id.clone()).collect();
     let accepted_dbnums: Vec<u32> = accepted.iter().map(|(dbnum, _, _)| *dbnum).collect();
     let to_sesno = request.to_sesno;
+    let progress_hub = state.progress_hub.clone();
     tokio::spawn(async move {
         for (dbnum, watermark, run_id) in accepted {
             if let Some(mut entry) = INCREMENT_RUNS.get_mut(&run_id) {
                 entry.state = "running".to_string();
                 entry.started_at = chrono::Utc::now().to_rfc3339();
+                publish_increment_run_progress(&progress_hub, entry.value(), 0, 1);
             }
             set_dbnum_updating(dbnum, true, None).await;
             let result = run_increment_once(
@@ -309,7 +347,8 @@ pub async fn execute_incremental_update(
             )
             .await;
             let result_tag = match &result {
-                Ok(_) => "Success",
+                Ok(run) if run.failures.is_empty() => "Success",
+                Ok(_) => "Failed",
                 Err(err)
                     if crate::version_management::project_mutation_lock::is_mutation_contention_error(
                         &err.to_string(),
@@ -320,6 +359,9 @@ pub async fn execute_incremental_update(
                 Err(_) => "Failed",
             };
             record_run_result(&run_id, result);
+            if let Some(entry) = INCREMENT_RUNS.get(&run_id) {
+                publish_increment_run_progress(&progress_hub, entry.value(), 1, 1);
+            }
             set_dbnum_updating(dbnum, false, Some(result_tag)).await;
         }
     });
@@ -573,6 +615,486 @@ SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_
     }
 
     Ok(by_dbnum.into_values().collect())
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdatePreviewRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub dbnums: Vec<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdateExecuteRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub dbnums: Vec<u32>,
+    #[serde(default)]
+    pub to_sesno: Option<u32>,
+    #[serde(default)]
+    pub no_model_impact_filter: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdateTaskQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PendingModelUnitsQuery {
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    #[serde(default)]
+    pub include_complete: bool,
+}
+
+fn operation_counts<'a>(
+    changes: impl Iterator<Item = &'a crate::data_interface::sesno_increment::PdmsSesnoElementChange>,
+) -> (usize, usize, usize) {
+    let mut added = 0;
+    let mut modified = 0;
+    let mut deleted = 0;
+    for change in changes {
+        match change.operation.trim().to_ascii_lowercase().as_str() {
+            "add" | "added" => added += 1,
+            "delete" | "deleted" => deleted += 1,
+            _ => modified += 1,
+        }
+    }
+    (added, modified, deleted)
+}
+
+/// `POST /api/v1/update/preview`
+///
+/// 只读执行 IncrementRun collect 阶段，不写 PE/ATT、Version Anchor 或模型。执行范围仍是
+/// dbnum + committed sesno；ZONE 只用于把受影响的最小生成根分桶给前端展示。
+pub async fn preview_manual_model_update(
+    _state: State<AppState>,
+    Json(request): Json<ManualUpdatePreviewRequest>,
+) -> impl IntoResponse {
+    let current_project = aios_core::get_db_option().project_name.clone();
+    if let Some(project) = request.project.as_deref()
+        && !project.trim().is_empty()
+        && !project.eq_ignore_ascii_case(&current_project)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!(
+                    "当前服务只承载项目 {current_project}，不能预览项目 {project}"
+                ),
+            })),
+        );
+    }
+
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let mut dbnums = if request.dbnums.is_empty() {
+        meta.get_dbnums_by_type("DESI")
+    } else {
+        request.dbnums
+    };
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    let mut previews = Vec::new();
+    let mut warnings = Vec::new();
+    for dbnum in dbnums {
+        let Some(file_info) = meta.get_db_file_info(dbnum) else {
+            warnings.push(format!("dbnum={dbnum} 不在 db_meta_info 中，已跳过"));
+            continue;
+        };
+        if !file_info.db_type.eq_ignore_ascii_case("DESI") {
+            warnings.push(format!(
+                "dbnum={dbnum} 类型为 {}，本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+                file_info.db_type
+            ));
+            continue;
+        }
+
+        let watermark = match committed_watermark(dbnum).await {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "dbnum={dbnum} 查询 Committed Watermark 失败: {error}"
+                ));
+                continue;
+            }
+        };
+        if watermark == 0 {
+            previews.push(json!({
+                "dbnum": dbnum,
+                "db_type": file_info.db_type,
+                "file_name": file_info.file_name,
+                "file_path": file_info.file_path,
+                "applied_sesno": 0,
+                "file_latest_sesno": file_info.latest_sesno,
+                "sessions": [],
+                "units": [],
+                "zones": [],
+                "blocked": true,
+                "anomaly": "无 Committed Watermark，请先全量建库",
+            }));
+            continue;
+        }
+
+        let run = match run_increment_once(dbnum, watermark, None, false, false, true).await {
+            Ok(run) => run,
+            Err(error) => {
+                let message = error.to_string();
+                let status = if crate::version_management::project_mutation_lock::
+                    is_mutation_contention_error(&message)
+                {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return (
+                    status,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("dbnum={dbnum} 增量预览失败: {message}"),
+                    })),
+                );
+            }
+        };
+
+        let hierarchy = crate::fast_model::gen_model::hier_view::HierView::load(vec![dbnum])
+            .await
+            .ok();
+        let mut units = std::collections::BTreeMap::<String, serde_json::Value>::new();
+        for change in &run.outcome.element_changes {
+            let Some(root) = change.model_refno else {
+                continue;
+            };
+            let root_key = root.to_string();
+            units.entry(root_key.clone()).or_insert_with(|| {
+                let noun = hierarchy
+                    .as_ref()
+                    .and_then(|view| view.get_noun(root))
+                    .unwrap_or_else(|| change.noun.clone());
+                let zone = hierarchy.as_ref().and_then(|view| {
+                    if noun.eq_ignore_ascii_case("ZONE") {
+                        Some(root)
+                    } else {
+                        view.query_ancestors_filtered(root, &["ZONE"])
+                            .last()
+                            .copied()
+                            .or_else(|| {
+                                change.owner_refno.and_then(|owner| {
+                                    view.query_ancestors_filtered(owner, &["ZONE"])
+                                        .last()
+                                        .copied()
+                                })
+                            })
+                    }
+                });
+                json!({
+                    "root_refno": root_key,
+                    "noun": noun,
+                    "zone_refno": zone.map(|value| value.to_string()),
+                    "model_category": change.model_category,
+                })
+            });
+        }
+        let units: Vec<serde_json::Value> = units.into_values().collect();
+
+        let mut zone_buckets = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for unit in &units {
+            let zone = unit
+                .get("zone_refno")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("UNASSIGNED")
+                .to_string();
+            zone_buckets.entry(zone).or_default().push(unit.clone());
+        }
+        let zones: Vec<serde_json::Value> = zone_buckets
+            .into_iter()
+            .map(|(zone_refno, units)| {
+                json!({
+                    "zone_refno": if zone_refno == "UNASSIGNED" {
+                        serde_json::Value::Null
+                    } else {
+                        json!(zone_refno)
+                    },
+                    "unit_count": units.len(),
+                    "units": units,
+                })
+            })
+            .collect();
+
+        let mut by_session = std::collections::BTreeMap::<u32, Vec<_>>::new();
+        for change in &run.outcome.element_changes {
+            by_session.entry(change.sesno).or_default().push(change);
+        }
+        let sessions: Vec<serde_json::Value> = by_session
+            .into_iter()
+            .map(|(sesno, changes)| {
+                let (added, modified, deleted) = operation_counts(changes.iter().copied());
+                json!({
+                    "sesno": sesno,
+                    "added": added,
+                    "modified": modified,
+                    "deleted": deleted,
+                    "changed_count": changes.len(),
+                })
+            })
+            .collect();
+        let (added, modified, deleted) = operation_counts(run.outcome.element_changes.iter());
+        let file_latest_sesno = run
+            .outcome
+            .files
+            .iter()
+            .map(|file| file.latest_sesno)
+            .max()
+            .unwrap_or(file_info.latest_sesno);
+
+        previews.push(json!({
+            "dbnum": dbnum,
+            "db_type": file_info.db_type,
+            "file_name": file_info.file_name,
+            "file_path": file_info.file_path,
+            "applied_sesno": watermark,
+            "file_latest_sesno": file_latest_sesno,
+            "sessions": sessions,
+            "net_added": added,
+            "net_modified": modified,
+            "net_deleted": deleted,
+            "model_affecting": run.outcome.element_changes.iter()
+                .filter(|change| change.model_refno.is_some())
+                .count(),
+            "units": units,
+            "zones": zones,
+            "blocked": false,
+            "anomaly": serde_json::Value::Null,
+        }));
+    }
+
+    let up_to_date = !previews.is_empty()
+        && previews.iter().all(|preview| {
+            preview.get("blocked").and_then(serde_json::Value::as_bool) == Some(false)
+                && preview
+                    .get("sessions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "project": current_project,
+            "dbnums": previews,
+            "warnings": warnings,
+            "up_to_date": up_to_date,
+            "execution_scope": "dbnum+sesno",
+            "zone_role": "reporting_bucket",
+        })),
+    )
+}
+
+/// `POST /api/v1/update/execute`
+///
+/// 执行仍按 dbnum + sesno；未指定 dbnum 时选择全部 DESI，CATA 等非 DESI 库直接排除。
+pub async fn execute_manual_model_update(
+    state: State<AppState>,
+    Json(request): Json<ManualUpdateExecuteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let current_project = aios_core::get_db_option().project_name.clone();
+    if let Some(project) = request.project.as_deref()
+        && !project.trim().is_empty()
+        && !project.eq_ignore_ascii_case(&current_project)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("当前服务只承载项目 {current_project}，不能更新项目 {project}"),
+            })),
+        );
+    }
+
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let mut requested = if request.dbnums.is_empty() {
+        meta.get_dbnums_by_type("DESI")
+    } else {
+        request.dbnums
+    };
+    requested.sort_unstable();
+    requested.dedup();
+
+    let mut dbnums = Vec::new();
+    let mut excluded = Vec::new();
+    for dbnum in requested {
+        match meta.get_db_file_info(dbnum) {
+            Some(info) if info.db_type.eq_ignore_ascii_case("DESI") => dbnums.push(dbnum),
+            Some(info) => excluded.push(json!({
+                "dbnum": dbnum,
+                "db_type": info.db_type,
+                "reason": "本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+            })),
+            None => excluded.push(json!({
+                "dbnum": dbnum,
+                "reason": "不在 db_meta_info 中",
+            })),
+        }
+    }
+
+    let (status, Json(mut body)) = execute_incremental_update(
+        state,
+        Json(IncrementalUpdateRequest {
+            dbnums,
+            force_update: false,
+            update_type: UpdateType::ParseAndModel,
+            to_sesno: request.to_sesno,
+            no_model_impact_filter: request.no_model_impact_filter,
+        }),
+    )
+    .await;
+    body["project"] = json!(current_project);
+    body["excluded"] = json!(excluded);
+    body["execution_scope"] = json!("dbnum+sesno");
+    (status, Json(body))
+}
+
+/// `GET /api/v1/tasks`：进程内 IncrementRun 运行记录；版本锚点仍是持久化事实源。
+pub async fn list_manual_update_tasks(
+    _state: State<AppState>,
+    Query(query): Query<ManualUpdateTaskQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut runs: Vec<IncrementRunStatus> = INCREMENT_RUNS
+        .iter()
+        .filter(|entry| {
+            query
+                .state
+                .as_deref()
+                .is_none_or(|state| entry.state.eq_ignore_ascii_case(state))
+                && query
+                    .kind
+                    .as_deref()
+                    .is_none_or(|kind| entry.kind.eq_ignore_ascii_case(kind))
+        })
+        .map(|entry| entry.value().clone())
+        .collect();
+    runs.sort_unstable_by(|left, right| right.started_at.cmp(&left.started_at));
+    runs.truncate(query.limit.unwrap_or(100).min(1000));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "tasks": runs,
+            "persistence": "in_memory",
+        })),
+    )
+}
+
+/// `GET /api/v1/update/pending-units`
+///
+/// 直接投影持久化的 model_gen_debt；只返回 DESI 库，不维护第二份 pending 状态。
+pub async fn list_pending_model_units(
+    _state: State<AppState>,
+    Query(query): Query<PendingModelUnitsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let dbnums = match query.dbnum {
+        Some(dbnum) => vec![dbnum],
+        None => {
+            match crate::versioned_db::model_gen_debt::list_model_gen_candidate_dbnums().await {
+                Ok(dbnums) => dbnums,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "success": false,
+                            "error": format!("查询 model_gen_debt 候选库失败: {error}"),
+                        })),
+                    );
+                }
+            }
+        }
+    };
+
+    let mut units = Vec::new();
+    let mut excluded = Vec::new();
+    for dbnum in dbnums {
+        let Some(info) = meta.get_db_file_info(dbnum) else {
+            excluded.push(json!({ "dbnum": dbnum, "reason": "不在 db_meta_info 中" }));
+            continue;
+        };
+        if !info.db_type.eq_ignore_ascii_case("DESI") {
+            excluded.push(json!({
+                "dbnum": dbnum,
+                "db_type": info.db_type,
+                "reason": "本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+            }));
+            continue;
+        }
+        match crate::versioned_db::model_gen_debt::analyze_model_gen_debt(dbnum).await {
+            Ok(coverage)
+                if query.include_complete
+                    || coverage.data_watermark > coverage.model_generation_watermark
+                    || coverage.debt_bucket_counts.total > 0 =>
+            {
+                units.push(coverage)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("分析 dbnum={dbnum} model_gen_debt 失败: {error}"),
+                    })),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "units": units,
+            "excluded": excluded,
+            "source": "model_gen_debt",
+        })),
+    )
 }
 
 /// 全部 dbnum 的增量/版本状态（真实数据：锚点 + 水位 + Commit Pending）。

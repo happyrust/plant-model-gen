@@ -30,13 +30,19 @@ static LOOP_OWNER_NOUN_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| GNERAL_LOOP_OWNER_NOUN_NAMES.iter().copied().collect());
 
 static CATA_NOUN_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    TOTAL_CATA_GEO_NOUN_NAMES
+    let mut nouns = TOTAL_CATA_GEO_NOUN_NAMES
         .iter()
         .chain(USE_CATE_NOUN_NAMES.iter())
-        .chain(BRAN_COMPONENT_NOUN_NAMES.iter())
         .copied()
-        .collect()
+        .collect::<HashSet<_>>();
+    for noun in BRAN_COMPONENT_NOUN_NAMES {
+        nouns.remove(noun);
+    }
+    nouns
 });
+
+static BRAN_COMPONENT_NOUN_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| BRAN_COMPONENT_NOUN_NAMES.iter().copied().collect());
 
 static LOOP_CONTAINER_NOUN_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     TOTAL_LOOP_NOUN_NAMES
@@ -679,13 +685,28 @@ fn apply_pdms_operation(
 ) -> Option<PdmsModelChangeTarget> {
     let refno = RefnoEnum::from(operation.refno);
     match &operation.detail {
-        EleOperationDetail::Deleted => insert_change_by_noun(update_log, refno, "DELETED", true)
-            .map(|category| PdmsModelChangeTarget { refno, category }),
+        EleOperationDetail::Deleted => {
+            let target = insert_existing_model_target(
+                io,
+                update_log,
+                refno,
+                operation.sesno.saturating_sub(1),
+            )
+            .filter(|target| target.refno != refno);
+            remove_refno_from_log(update_log, refno);
+            update_log.delete_refnos.insert(refno);
+            target.or(Some(PdmsModelChangeTarget {
+                refno,
+                category: "delete",
+            }))
+        }
         EleOperationDetail::None => None,
         EleOperationDetail::Modified(_) if !impact.triggers_model() => None,
         _ => {
             let noun = operation.get_noun_type();
-            if is_loop_container_noun(&noun) {
+            if is_loop_container_noun(&noun)
+                || BRAN_COMPONENT_NOUN_SET.contains(noun.trim().to_ascii_uppercase().as_str())
+            {
                 if let Some((owner_refno, owner_noun)) = resolve_non_container_owner(
                     io,
                     operation_owner_refno(operation),
@@ -737,26 +758,39 @@ fn insert_existing_model_target(
     update_log: &mut IncrGeoUpdateLog,
     refno: RefnoEnum,
     sesno: u32,
-) {
+) -> Option<PdmsModelChangeTarget> {
     let Some((_, offset)) = io.search_latest_refno(refno.refno(), Some(sesno)) else {
-        return;
+        return None;
     };
     let Ok(ele) = io.parse_raw_element(offset) else {
-        return;
+        return None;
     };
     let noun = ele.att_map().get_type();
-    if is_loop_container_noun(&noun) {
+    if is_loop_container_noun(&noun)
+        || BRAN_COMPONENT_NOUN_SET.contains(noun.trim().to_ascii_uppercase().as_str())
+    {
         if let Some((owner_refno, owner_noun)) =
             resolve_non_container_owner(io, element_owner_refno(&ele), sesno)
         {
             if owner_noun.is_empty() {
                 update_log.loop_owner_refnos.insert(owner_refno);
+                return Some(PdmsModelChangeTarget {
+                    refno: owner_refno,
+                    category: "loop_owner",
+                });
             } else {
-                insert_change_by_noun(update_log, owner_refno, &owner_noun, false);
+                return insert_change_by_noun(update_log, owner_refno, &owner_noun, false).map(
+                    |category| PdmsModelChangeTarget {
+                        refno: owner_refno,
+                        category,
+                    },
+                );
             }
         }
+        None
     } else {
-        insert_change_by_noun(update_log, refno, &noun, false);
+        insert_change_by_noun(update_log, refno, &noun, false)
+            .map(|category| PdmsModelChangeTarget { refno, category })
     }
 }
 
@@ -777,7 +811,7 @@ fn apply_critical_model_expansion(
         for (name, (old, new)) in &modified.modified_attrs {
             if crate::version_management::model_impact::normalize_attribute_name(name) == "OWNER" {
                 if let Some(old_owner) = named_attr_refno(old) {
-                    insert_existing_model_target(
+                    let _ = insert_existing_model_target(
                         io,
                         update_log,
                         old_owner,
@@ -785,7 +819,8 @@ fn apply_critical_model_expansion(
                     );
                 }
                 if let Some(new_owner) = named_attr_refno(new) {
-                    insert_existing_model_target(io, update_log, new_owner, operation.sesno);
+                    let _ =
+                        insert_existing_model_target(io, update_log, new_owner, operation.sesno);
                 }
             }
         }
@@ -793,7 +828,7 @@ fn apply_critical_model_expansion(
             if crate::version_management::model_impact::normalize_attribute_name(name) == "OWNER"
                 && let Some(old_owner) = named_attr_refno(value)
             {
-                insert_existing_model_target(
+                let _ = insert_existing_model_target(
                     io,
                     update_log,
                     old_owner,
@@ -802,7 +837,7 @@ fn apply_critical_model_expansion(
             }
         }
         if let Some(new_owner) = operation_owner_refno(operation) {
-            insert_existing_model_target(io, update_log, new_owner, operation.sesno);
+            let _ = insert_existing_model_target(io, update_log, new_owner, operation.sesno);
         }
     }
 
@@ -810,7 +845,7 @@ fn apply_critical_model_expansion(
         let old = old_children.0.iter().copied().collect::<HashSet<_>>();
         let new = new_children.0.iter().copied().collect::<HashSet<_>>();
         for child in old.difference(&new) {
-            insert_existing_model_target(
+            let _ = insert_existing_model_target(
                 io,
                 update_log,
                 RefnoEnum::from(*child),
@@ -818,7 +853,12 @@ fn apply_critical_model_expansion(
             );
         }
         for child in new.difference(&old) {
-            insert_existing_model_target(io, update_log, RefnoEnum::from(*child), operation.sesno);
+            let _ = insert_existing_model_target(
+                io,
+                update_log,
+                RefnoEnum::from(*child),
+                operation.sesno,
+            );
         }
     }
 }
@@ -1113,7 +1153,8 @@ async fn persist_pdms_increment_grouped(
             crx_delete_sqls.push(sql);
         }
     }
-    let crx_insert_sqls = crate::versioned_db::cata_ref_index::insert_edges_sql(&crx_new_edges, 500);
+    let crx_insert_sqls =
+        crate::versioned_db::cata_ref_index::insert_edges_sql(&crx_new_edges, 500);
 
     let fingerprint = compute_commit_fingerprint(
         report.dbnum,

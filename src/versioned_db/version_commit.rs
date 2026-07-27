@@ -1008,7 +1008,9 @@ pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
              WHERE dbnum = {dbnum} AND source IN ['full', 'incremental_baseline', 'incremental']]));\n\
          math::max(array::flatten([SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {dbnum}]));"
     );
-    let mut response = project_primary_db().query(sql).await?.check()?;
+    // 两条兼容查询需要逐语句处理“表不存在”；提前 check() 会在 take() 的
+    // 兼容分支执行前直接返回错误，使旧站点无法回退到 dbnum_info_table。
+    let mut response = project_primary_db().query(sql).await?;
     // 语句级取值：表不存在（例如从未跑过版本提交的存量站点没有
     // `sesno_version_anchor`）按"无记录"处理，其余语句错误照常上抛。
     let anchored = match response.take::<surrealdb::types::Value>(0) {

@@ -741,6 +741,32 @@ pub async fn start_web_server_with_config(
             "/api/incremental/status",
             get(incremental_update_handlers::get_all_incremental_status),
         )
+        .route("/api/v1/health", get(litefs_handlers::health_check))
+        .route(
+            "/api/v1/dbnums",
+            get(incremental_update_handlers::get_all_incremental_status),
+        )
+        .route(
+            "/api/v1/update/preview",
+            post(incremental_update_handlers::preview_manual_model_update),
+        )
+        .route(
+            "/api/v1/update/execute",
+            post(incremental_update_handlers::execute_manual_model_update),
+        )
+        .route(
+            "/api/v1/tasks",
+            get(incremental_update_handlers::list_manual_update_tasks),
+        )
+        .route(
+            "/api/v1/tasks/{task_id}",
+            get(incremental_update_handlers::get_detection_task_status),
+        )
+        .route(
+            "/api/v1/update/pending-units",
+            get(incremental_update_handlers::list_pending_model_units),
+        )
+        .route("/api/v1/ws", get(ws::ws_tasks_handler))
         .route(
             "/api/incremental/site/{site_id}",
             get(incremental_update_handlers::get_site_incremental_details),

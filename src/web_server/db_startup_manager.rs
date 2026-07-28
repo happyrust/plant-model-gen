@@ -280,7 +280,8 @@ pub async fn start_database_with_progress(
         format!("{}-{}.db", db_file, port)
     };
     // versioned 开启时改用带参数的 rocksdb:// 连接串（file: 是 rocksdb 的旧别名）
-    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params()
+        .map_err(|err| err.to_string())?;
     let db_path = if versioned_storage {
         crate::options::rocksdb_conn_str(&db_file_with_port, true, &version_retention)
     } else {

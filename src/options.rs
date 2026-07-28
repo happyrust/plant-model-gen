@@ -211,6 +211,148 @@ pub fn check_retired_ducklake_keys(raw_toml: &toml::Value) -> anyhow::Result<()>
     Ok(())
 }
 
+/// specs/027 FR-015 / T011：history 解析配置退役检测。
+///
+/// - `sync_history = true` → **硬错误**：历史会话回放已随版本单源架构移除
+///   （pdms_io fork 不再提供 sync_history，旧分支会静默跳过文件解析、丢数据）；
+///   会话元数据请等待独立导入入口（spec 027 T010），数据历史由锚点体系提供。
+/// - `sync_history = false` → 兼容期忽略并告警（建议删除该键）。
+/// - `sync_versioned` 残留 → 已退役，仅告警。
+pub fn check_retired_history_keys(raw_toml: &toml::Value) -> anyhow::Result<()> {
+    let Some(table) = raw_toml.as_table() else {
+        return Ok(());
+    };
+    if let Some(value) = table.get("sync_history").and_then(|v| v.as_bool()) {
+        if value {
+            anyhow::bail!(
+                "sync_history=true 已退役（spec 027 FR-015：历史会话回放已随版本单源架构移除，\
+                 旧分支只会静默跳过文件解析）。数据/模型历史由 sesno 锚点体系提供\
+                 （incremental-sesno / model-version history *）；\
+                 会话元数据请使用独立导入入口（spec 027 T010）。请删除该配置行后重试。"
+            );
+        }
+        log::warn!(
+            "配置键 `sync_history` 已退役（spec 027 FR-015），false 在兼容期被忽略；建议从配置文件删除"
+        );
+    }
+    if table.contains_key("sync_versioned") {
+        log::warn!(
+            "配置键 `sync_versioned` 已退役（spec 027 FR-015），当前被忽略；建议从配置文件删除"
+        );
+    }
+    Ok(())
+}
+
+/// specs/022/024：`version_retention` 格式校验。
+///
+/// 与 surreal fork `kvs::config::parse_duration` 语法对齐：纯秒数（`0`=无限保留）
+/// 或 `数字+单位`（us/µs/ms/s/m/h/d，单单位、不允许 `30d8h` 复合）。
+/// fork 端非法值会被 `.ok()` 静默吞掉退回默认，因此必须在部署侧 fail-loud。
+pub fn validate_version_retention(value: &str) -> anyhow::Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("version_retention 不能为空字符串（无限保留请写 \"0\"）");
+    }
+    if trimmed.parse::<u64>().is_ok() {
+        return Ok(());
+    }
+    let unit_start = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (num, unit) = trimmed.split_at(unit_start);
+    let valid_unit = matches!(unit, "us" | "µs" | "ms" | "s" | "m" | "h" | "d");
+    if num.is_empty() || !valid_unit || num.parse::<u64>().is_err() {
+        anyhow::bail!(
+            "version_retention=\"{trimmed}\" 格式非法：只接受纯秒数（\"0\"=无限保留）\
+             或 数字+单位（us/ms/s/m/h/d，例如 \"90d\"），不支持复合单位；\
+             surreal 端会静默忽略非法值并退回默认，必须在这里拦截"
+        );
+    }
+    Ok(())
+}
+
+/// specs/022 建库属性防护：把 versioned 参数与数据目录绑定（P5 双轨真源收敛）。
+///
+/// `versioned` 是 RocksDB 建库属性（UDT comparator），但托管站点配置 / 全局
+/// `DB_OPTION_FILE` 都是与目录分离的第二真源，配置翻转后直接启动只会得到
+/// comparator mismatch 的晦涩报错。此函数在启动前用旁车标记文件
+/// `<data_path>.plant3d-versioned.json` 固化目录的建库属性：
+///
+/// - 标记存在且 `versioned` 不一致 → 硬错误（指引新建目录重灌）；
+/// - 标记存在且 retention 不同 → 更新标记（retention 可在线调整）；
+/// - 标记缺失 + 目录已有数据 → 以当前配置为准补写标记并告警（兼容存量目录）；
+/// - 标记缺失 + 目录为空/不存在 → 写入标记（新建目录）。
+pub fn bind_versioned_dir_marker(
+    data_path: &str,
+    versioned: bool,
+    retention: &str,
+) -> anyhow::Result<()> {
+    use std::path::Path;
+
+    let marker_path = format!("{}.plant3d-versioned.json", data_path.trim_end_matches(['/', '\\']));
+    let marker_path = Path::new(&marker_path);
+    let dir = Path::new(data_path);
+    let dir_has_data = dir.exists()
+        && std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct VersionedDirMarker {
+        versioned: bool,
+        retention: String,
+    }
+
+    if marker_path.exists() {
+        let raw = std::fs::read_to_string(marker_path).map_err(|e| {
+            anyhow::anyhow!("读取 versioned 目录标记失败 {}: {e}", marker_path.display())
+        })?;
+        let marker: VersionedDirMarker = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "versioned 目录标记损坏 {}: {e}；请人工确认目录建库属性后修复/删除该标记",
+                marker_path.display()
+            )
+        })?;
+        if marker.versioned != versioned {
+            anyhow::bail!(
+                "数据目录 {} 的建库属性为 versioned={}，但当前配置要求 versioned={}。\
+                 versioned 是 RocksDB 建库属性，不能原地切换；请新建数据目录并全量重灌\
+                 （specs/022-versioned-pe-att-storage/quickstart.md），或恢复配置。",
+                data_path,
+                marker.versioned,
+                versioned
+            );
+        }
+        if marker.retention != retention {
+            let content = serde_json::to_string_pretty(&VersionedDirMarker {
+                versioned,
+                retention: retention.to_string(),
+            })?;
+            std::fs::write(marker_path, content)?;
+        }
+        return Ok(());
+    }
+
+    if dir_has_data {
+        log::warn!(
+            "数据目录 {} 缺少 versioned 标记（存量目录），按当前配置 versioned={} retention={} 补写标记；\
+             若与实际建库属性不符，SurrealDB 启动会报 comparator mismatch",
+            data_path,
+            versioned,
+            retention
+        );
+    }
+    if let Some(parent) = marker_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = serde_json::to_string_pretty(&VersionedDirMarker {
+        versioned,
+        retention: retention.to_string(),
+    })?;
+    std::fs::write(marker_path, content)?;
+    Ok(())
+}
+
 /// 模型生成结果写入后端。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -720,15 +862,26 @@ impl From<DbOption> for DbOptionExt {
 /// 读取当前运行时配置中的 versioned 存储参数（specs/022）。
 ///
 /// versioned_storage/version_retention 是 DbOptionExt 扩展字段，
-/// `aios_core::get_db_option()` 拿不到；这里优先从 DB_OPTION_FILE 指向的
-/// toml 提取，失败时按关闭处理（不影响存量启动路径）。
-pub fn current_versioned_params() -> (bool, String) {
+/// `aios_core::get_db_option()` 拿不到；这里从 DB_OPTION_FILE 指向的 toml 提取。
+///
+/// fail-loud 语义（P4）：配置文件**不存在**视为合法的非 versioned 部署，
+/// 返回关闭；文件**存在但读取/解析失败**必须报错——静默按关闭处理会把
+/// versioned 库拼成非 versioned 连接串，启动时只会得到 comparator mismatch
+/// 的晦涩报错，与真因（配置损坏）完全脱节。
+pub fn current_versioned_params() -> anyhow::Result<(bool, String)> {
     let raw = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".into());
     let config_path = raw.strip_suffix(".toml").unwrap_or(&raw).to_string();
-    match get_db_option_ext_from_path(&config_path) {
-        Ok(ext) => (ext.versioned_storage, ext.version_retention),
-        Err(_) => (false, default_version_retention()),
+    let config_file = format!("{}.toml", config_path);
+    if !std::path::Path::new(&config_file).exists() {
+        return Ok((false, default_version_retention()));
     }
+    let ext = get_db_option_ext_from_path(&config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "读取 versioned 存储参数失败（配置文件 {} 存在但不可用，拒绝按非 versioned 静默降级）: {e}",
+            config_file
+        )
+    })?;
+    Ok((ext.versioned_storage, ext.version_retention))
 }
 
 /// 获取扩展的数据库选项
@@ -904,6 +1057,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
 
     // specs/027（ADR-0007）：DuckLake 配置键分级检测（行为键硬错误、惰性键警告）。
     check_retired_ducklake_keys(&toml_value)?;
+    // specs/027 FR-015 / T011：sync_history=true 硬错误、false 与 sync_versioned 告警。
+    check_retired_history_keys(&toml_value)?;
 
     let model_cache_dir = toml_value
         .get("model_cache_dir")
@@ -1025,6 +1180,9 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_version_retention);
+    // specs/022/024（P7）：retention 非法值在 surreal 端会被静默吞掉，这里必须拦截。
+    validate_version_retention(&version_retention)
+        .map_err(|e| anyhow::anyhow!("配置文件 {} version_retention 非法: {}", config_file, e))?;
 
     // 构建 DbOptionExt
     let db_option_ext = DbOptionExt {

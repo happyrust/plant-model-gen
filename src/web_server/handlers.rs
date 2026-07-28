@@ -4188,7 +4188,8 @@ async fn start_surreal_process_improved(
         }
     }
 
-    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let db_path = crate::options::rocksdb_conn_str(
         &format!("{}.rdb", project),
         versioned_storage,
@@ -7888,7 +7889,7 @@ async fn create_default_startup_script(
     std::fs::create_dir_all("cmd")?;
 
     // 创建脚本内容（连接串加引号：versioned 参数含 & 与 ?，bash 下必须留在引号内）
-    let (versioned_storage, version_retention) = crate::options::current_versioned_params();
+    let (versioned_storage, version_retention) = crate::options::current_versioned_params()?;
     let db_uri = crate::options::rocksdb_conn_str(
         &format!("ams-{}-test.db", port),
         versioned_storage,

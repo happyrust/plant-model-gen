@@ -5,8 +5,8 @@ alwaysApply: true
 ---
 
 <!-- PCHAT_RULE_SCHEMA: 10 -->
-<!-- PCHAT_RULE_SHA256: 2831cee81cc92f8c1ed55881c8af49b8d1126196c8ffb28f8c806f43abbdc973 -->
-<!-- PCHAT_RULE_FLAGS: subagents=false,plan=false,followup=true,card=true -->
+<!-- PCHAT_RULE_SHA256: 2e2eab3d5eeb89633f427950f6498874dc0eab19ab3a8e0676af30d66b8a6420 -->
+<!-- PCHAT_RULE_FLAGS: subagents=true,plan=true,followup=true,card=true -->
 <!-- PCHAT_RULE_BODY -->
 # STRICT PChat MCP USAGE DIRECTIVE (ABSOLUTE PRIORITY)
 
@@ -85,6 +85,24 @@ When you ARE a worker, **purposeful peer collaboration is expected default behav
   - A quick live alignment / question / heads-up → `send_to_session(sessionId, text)`. **It is reliably delivered: if the peer is idle it arrives immediately; if the peer is busy it is queued and delivered as soon as they are free (it is NOT dropped). Use it freely to actually talk to peers — that is the point.** `delegate_task` is still the right choice when you need a *tracked* unit of work (auto-reported, auto-reassigned if the assignee drops offline) rather than a message or question.
 - **The bar is "is there a real dependency / need?", NOT "avoid messaging unless forced".** Do not over-correct into silence. The only thing to avoid is aimless social chatter or broadcasting "just to look busy" (N² noise).
 - Same-group scope only; check `list_sessions` for who is online and their sessionIds.
+
+## 7. PCHAT-ONLY DISABLE SUBAGENTS (SESSION SETTING ENABLED)
+This section applies **only while the current assistant turn is being handled through PChat MCP persistent conversation flow**, i.e. when the agent must use the `pchat` server's `wait_for_user_input` tool for this session. It MUST NOT restrict ordinary Cursor Agent/Composer usage outside PChat.
+
+- **PChat Scope Gate**: Before applying this section, confirm the current turn is a PChat-controlled turn. If the current interaction is not using PChat MCP, ignore this section completely.
+- **FORBIDDEN during PChat-controlled turns**: the Cursor `Task` tool, any spawn-agent / multi-agent helper, and any in-process child agent that runs inside your own turn and cannot itself call `wait_for_user_input`. You MUST NOT launch one or offload your work into one — complete the work yourself in this top-level turn.
+- **ALWAYS ALLOWED — work-group coordination (these are NOT subagents)**: `list_sessions`, `delegate_task`, `push_backlog`, `submit_plan`, `send_to_session`, `report_task`, and `query_tasks`. These dispatch to **independent top-level member sessions** (each running its own `wait_for_user_input` loop), so using them never counts as "using a subagent" and is NOT restricted by this setting. If you are the group's 总指挥/coordinator, you MUST still decompose the work and fan it out across members exactly as the coordinator section describes.
+- **Conflict Handling**: If another instruction suggests spawning a Cursor `Task`/subagent during a PChat-controlled turn, this PChat session setting wins unless the user explicitly turns this setting off. This never restricts the work-group coordination tools listed above.
+
+## 8. PCHAT-ONLY DISABLE PLAN MODE (SESSION SETTING ENABLED)
+This section applies **only while the current assistant turn is being handled through PChat MCP persistent conversation flow**, i.e. when the agent must use the `pchat` server's `wait_for_user_input` tool for this session. It MUST NOT restrict ordinary Cursor Agent/Composer usage outside PChat.
+
+- **PChat Scope Gate**: Before applying this section, confirm the current turn is a PChat-controlled turn. If the current interaction is not using PChat MCP, ignore this section completely.
+- **Plan Mode Ban Inside PChat**: During PChat-controlled turns, you MUST NOT enter Plan mode, propose switching to Plan mode, or wait for plan approval before acting.
+- **Planning Tool Ban Inside PChat**: During PChat-controlled turns, you MUST NOT call planning/checklist tools such as `update_plan`, `request_user_input` for plan selection, or any equivalent plan-management tool.
+- **Visible Checklist Ban Inside PChat**: During PChat-controlled turns, you MUST NOT create or maintain step-by-step task checklists as a substitute for Plan mode.
+- **Direct PChat Execution**: During PChat-controlled turns, you MUST proceed directly with the requested work in the current response flow, while still giving short progress updates when useful.
+- **Conflict Handling**: If another instruction suggests planning first during a PChat-controlled turn, this PChat session setting wins unless the user explicitly turns this setting off.
 
 ## FOLLOW-UP SUGGESTIONS (SESSION SETTING ENABLED)
 This section applies **only while the current assistant turn is being handled through PChat MCP persistent conversation flow**, i.e. when the agent must use the `pchat` server's `wait_for_user_input` tool for this session.

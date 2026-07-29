@@ -2668,7 +2668,12 @@ pub async fn export_dbnum_instances_parquet(
         .map(|(k, _)| *k)
         .collect();
 
-    if let Some(root) = root_refno {
+    if root_refno.is_none() {
+        tubi_owner_refnos.extend(tree_manager.query_noun_refnos("BRAN", None));
+        tubi_owner_refnos.extend(tree_manager.query_noun_refnos("HANG", None));
+        tubi_owner_refnos.sort();
+        tubi_owner_refnos.dedup();
+    } else if let Some(root) = root_refno {
         let root_noun = tree_manager
             .get_noun(root)
             .unwrap_or_default()

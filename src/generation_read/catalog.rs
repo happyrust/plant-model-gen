@@ -22,14 +22,14 @@ pub struct CatalogResolverConfig {
 impl Default for CatalogResolverConfig {
     fn default() -> Self {
         Self {
-            resolver_contract_version: 1,
+            resolver_contract_version: 2,
             max_rounds: 128,
             include_owner_chain: true,
             catalog_db_types: ["CATA", "SCHE", "DICT", "PROP"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            excluded_nouns: ["GMSE", "DTEXT", "PTCA", "SPINE"]
+            excluded_nouns: ["DTEXT", "PTCA", "SPINE"]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -37,7 +37,10 @@ impl Default for CatalogResolverConfig {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            precise_children_nouns: ["FULL", "TOPD", "TMPL", "PBOR", "CYLI"]
+            precise_children_nouns: [
+                "FULL", "TOPD", "TMPL", "PBOR", "CYLI", "GMSE", "NGMS", "PTSE", "PSTR",
+                "SPRO", "DTSE",
+            ]
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
@@ -59,6 +62,7 @@ pub struct CatalogResolver {
     session: Arc<dyn VersionedReadSession>,
     config: CatalogResolverConfig,
     preloaded_nodes: Option<Arc<BTreeMap<RefnoEnum, CatalogNode>>>,
+    allow_missing_nodes: bool,
 }
 
 impl CatalogResolver {
@@ -67,6 +71,7 @@ impl CatalogResolver {
             session,
             config,
             preloaded_nodes: None,
+            allow_missing_nodes: false,
         }
     }
 
@@ -79,7 +84,13 @@ impl CatalogResolver {
             session,
             config,
             preloaded_nodes: Some(nodes),
+            allow_missing_nodes: false,
         }
+    }
+
+    pub fn allow_missing_nodes(mut self) -> Self {
+        self.allow_missing_nodes = true;
+        self
     }
 
     pub fn config(&self) -> &CatalogResolverConfig {
@@ -124,21 +135,30 @@ impl CatalogResolver {
                         preloaded.get(refno).cloned().map(|node| (*refno, node))
                     }),
                 );
-                lookup.require_all("catalog.nodes")?
+                if self.allow_missing_nodes {
+                    lookup.found
+                } else {
+                    lookup.require_all("catalog.nodes")?
+                }
             } else {
-                self.session
-                    .load_catalog_nodes(&frontier)
-                    .await?
-                    .require_all("catalog.nodes")?
+                let lookup = self.session.load_catalog_nodes(&frontier).await?;
+                if self.allow_missing_nodes {
+                    lookup.found
+                } else {
+                    lookup.require_all("catalog.nodes")?
+                }
             };
             let mut next = Vec::new();
 
             for refno in &frontier {
-                let node = nodes.get(refno).ok_or_else(|| {
-                    GenerationReadError::InvalidCatalog(format!(
+                let Some(node) = nodes.get(refno) else {
+                    if self.allow_missing_nodes {
+                        continue;
+                    }
+                    return Err(GenerationReadError::InvalidCatalog(format!(
                         "adapter 未返回已声明存在的节点 {refno}"
-                    ))
-                })?;
+                    )));
+                };
                 if !self.is_catalog_node(node) {
                     continue;
                 }

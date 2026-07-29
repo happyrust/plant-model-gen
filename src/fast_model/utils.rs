@@ -32,7 +32,10 @@ pub async fn ensure_surreal_init() -> anyhow::Result<()> {
             // "The table 'ses' does not exist" 整条 RELATE 失败（且历史上被静默吞掉）。
             // 这里无条件确保空表存在：空表上 fn::ses_date 安全返回 none。
             let _ = project_primary_db()
-                .query("DEFINE TABLE IF NOT EXISTS ses SCHEMALESS;")
+                .query(
+                    "DEFINE TABLE IF NOT EXISTS ses SCHEMALESS; \
+                     DEFINE TABLE IF NOT EXISTS pe_transform SCHEMALESS;",
+                )
                 .await;
             anyhow::Ok(())
         })

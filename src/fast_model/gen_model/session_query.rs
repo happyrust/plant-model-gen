@@ -39,19 +39,27 @@ pub async fn get_world_transforms(
     read: &GenerationReadContext,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<BTreeMap<RefnoEnum, Transform>> {
-    Ok(crate::generation_read::BatchLookup::from_found(
-        refnos,
-        refnos.iter().filter_map(|refno| {
+    let mut found = refnos
+        .iter()
+        .filter_map(|refno| {
             read.transforms
                 .get(refno)
                 .cloned()
-                .map(|transform| (*refno, transform))
-        }),
-    )
-    .require_all("generation.transforms")?
-    .into_iter()
-    .map(|(refno, snapshot)| (refno, snapshot.world))
-    .collect())
+                .map(|transform| (*refno, transform.world))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let missing = refnos
+        .iter()
+        .copied()
+        .filter(|refno| !found.contains_key(refno))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        found.extend(
+            super::transform_cache::get_world_transforms_cache_first_batch(None, &missing).await?,
+        );
+    }
+    Ok(crate::generation_read::BatchLookup::from_found(refnos, found)
+        .require_all("generation.transforms")?)
 }
 
 pub async fn get_world_transform(
@@ -65,7 +73,15 @@ pub async fn get_world_transform(
 }
 
 pub fn get_children(read: &GenerationReadContext, refno: RefnoEnum) -> Vec<RefnoEnum> {
-    read.hierarchy.children_of(refno).to_vec()
+    read.hierarchy
+        .node(refno)
+        .map(|_| read.hierarchy.children_of(refno).to_vec())
+        .or_else(|| {
+            read.catalog_nodes
+                .get(&refno)
+                .map(|node| node.children.clone())
+        })
+        .unwrap_or_default()
 }
 
 pub fn get_type_name(read: &GenerationReadContext, refno: RefnoEnum) -> anyhow::Result<String> {

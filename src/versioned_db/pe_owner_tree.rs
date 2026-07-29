@@ -190,7 +190,8 @@ impl PeOwnerTreeStore {
     pub async fn query_ancestors(node: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
         let key = node.to_pe_key();
         let sql = format!("RETURN {key}.{{..{MAX_RECURSE_DEPTH}+collect}}(.owner);");
-        let mut chain: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await?;
+        let chain: Vec<Option<RefnoEnum>> = project_primary_db().query_take(&sql, 0).await?;
+        let mut chain: Vec<RefnoEnum> = chain.into_iter().flatten().collect();
         // 根节点 owner 自指会把自身收进链；剔除后反转为 根→父。
         chain.retain(|r| *r != node);
         chain.reverse();

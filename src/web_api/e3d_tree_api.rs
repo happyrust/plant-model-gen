@@ -1251,8 +1251,8 @@ async fn get_visible_insts_inner(
         }
     };
 
-    // 兼容：如果没有子孙可见节点，至少包含自己
-    if candidates.is_empty() {
+    // 请求根本身也可能承载几何（例如 BRAN/HANG 的 tubi_relate）。
+    if !candidates.contains(&refno) {
         candidates.push(refno);
     }
     let candidates_count = candidates.len();

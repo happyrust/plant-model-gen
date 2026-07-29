@@ -192,15 +192,12 @@ async fn query_gm_params_from_session(
     read: &GenerationReadContext,
     root: RefnoEnum,
 ) -> anyhow::Result<Vec<GmParam>> {
-    let refnos = read.hierarchy.descendants(
-        &[root],
-        &crate::generation_read::HierarchyQuery {
-            include_self: false,
-            nouns: Default::default(),
-            max_depth: Some(2),
-            prune_on_match: false,
-        },
-    )?;
+    let mut refnos = session_query::get_children(read, root);
+    let nested = refnos
+        .iter()
+        .flat_map(|refno| session_query::get_children(read, *refno))
+        .collect::<Vec<_>>();
+    refnos.extend(nested);
     let mut attributes = session_query::get_named_attmaps(read, &refnos).await?;
     let mut result = Vec::new();
     for refno in refnos {

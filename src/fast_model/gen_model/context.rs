@@ -50,10 +50,27 @@ impl GenerationReadContext {
             .flat_map(|node| node.outbound.iter().map(|edge| edge.target))
             .filter(aios_core::RefnoEnum::is_valid)
             .collect::<Vec<_>>();
-        let catalog_closure =
-            CatalogResolver::new(Arc::clone(&session), CatalogResolverConfig::default())
-                .resolve(&catalog_seeds)
+        let catalog_resolver =
+            CatalogResolver::new(Arc::clone(&session), CatalogResolverConfig::default());
+        let catalog_closure = match catalog_resolver.resolve(&catalog_seeds).await {
+            #[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+            Err(crate::generation_read::GenerationReadError::MissingRequiredData {
+                capability: "catalog.nodes",
+                refnos,
+            }) if crate::data_interface::cata_closure::cata_closure_sync_mode()
+                == crate::data_interface::cata_closure::CataClosureSyncMode::Manifest =>
+            {
+                crate::data_interface::cata_closure::ensure_cata_refnos_parsed(
+                    &refnos.iter().map(|refno| refno.refno()).collect::<Vec<_>>(),
+                )
                 .await?;
+                CatalogResolver::new(Arc::clone(&session), CatalogResolverConfig::default())
+                    .allow_missing_nodes()
+                    .resolve(&catalog_seeds)
+                    .await?
+            }
+            result => result?,
+        };
         let mut refnos = hierarchy_refnos
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();

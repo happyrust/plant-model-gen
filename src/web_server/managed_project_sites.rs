@@ -778,13 +778,6 @@ fn parse_state_inputs_changed(old_site: &ManagedProjectSite, site: &ManagedProje
         || old_site.force_rebuild_system_db != site.force_rebuild_system_db
         || old_site.auto_parse_related_dbnums != site.auto_parse_related_dbnums
         || old_site.cata_partial_parse != site.cata_partial_parse
-        || old_site.gen_model != site.gen_model
-        || old_site.gen_mesh != site.gen_mesh
-        || old_site.gen_spatial_tree != site.gen_spatial_tree
-        || old_site.apply_boolean_operation != site.apply_boolean_operation
-        || (old_site.mesh_tol_ratio - site.mesh_tol_ratio).abs() > f64::EPSILON
-        || old_site.export_json != site.export_json
-        || old_site.export_parquet != site.export_parquet
         || old_site.pipeline_db_mode != site.pipeline_db_mode
 }
 
@@ -10235,7 +10228,7 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
     // spec 004：本次生成任务的指标产物。
     let metrics_task_id = crate::web_server::site_task_metrics::new_metrics_task_id("generate");
     let metrics_runtime_dir = site_runtime_dir_for_site(&site);
-    let metrics_env: HashMap<String, String> =
+    let mut generate_env: HashMap<String, String> =
         crate::web_server::site_task_metrics::metrics_env_for_runtime_dir(
             metrics_runtime_dir.clone(),
             &metrics_task_id,
@@ -10243,9 +10236,23 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         )
         .into_iter()
         .collect();
+    if site.auto_parse_related_dbnums && site.cata_partial_parse {
+        generate_env.insert("AIOS_CATA_CLOSURE_MODE".to_string(), "manifest".to_string());
+        #[cfg(feature = "sqlite-index")]
+        {
+            generate_env.insert(
+                "AIOS_CATA_CLOSURE_MANIFEST_PATH".to_string(),
+                cata_manifest_path_for_site(&site).display().to_string(),
+            );
+            generate_env.insert(
+                "AIOS_CATA_CLOSURE_MAIN_PROJECT".to_string(),
+                site_deployment_project_name(&site),
+            );
+        }
+    }
     let mut generate_args = Vec::new();
+    generate_args.push("--root-model".to_string());
     if !site.manual_refnos.is_empty() {
-        generate_args.push("--root-model".to_string());
         generate_args.push(site.manual_refnos.join(","));
     }
     generate_args.push("--export-parquet-after-gen".to_string());
@@ -10259,7 +10266,7 @@ async fn spawn_generation_process(site_id: String) -> Result<()> {
         generate_log_path.clone(),
         generate_log_path,
         generate_args,
-        metrics_env,
+        generate_env,
     )
     .await
     .map_err(|err| anyhow!("aios-database sidecar 模型生成作业失败: {}", err.message))?;

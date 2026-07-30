@@ -95,6 +95,8 @@ v_ip = "localhost"
 v_port = 8020
 v_user = "root"
 v_password = "root"
+surreal_user = "root"
+surreal_password = "root"
 pe_chunk = 300
 att_chunk = 200
 
@@ -305,8 +307,6 @@ surreal_password = "root"
 mode = "ws"
 ip = "127.0.0.1"
 port = 8020
-user = "root"
-password = "root"
 path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

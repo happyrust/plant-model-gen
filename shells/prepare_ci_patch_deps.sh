@@ -27,3 +27,5 @@ prepare_repo "https://github.com/happyrust/rs-core.git" "dev-3.1" \
   "$WORKSPACE_PARENT/rs-core"
 prepare_repo "https://github.com/happyrust/pdms-io.git" "dev-3.1" \
   "$WORKSPACE_PARENT/pdms-io-fork"
+prepare_repo "https://github.com/happyrust/dpc-sync.git" "master" \
+  "$WORKSPACE_PARENT/dpc-sync"

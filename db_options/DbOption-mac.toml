@@ -305,6 +305,8 @@ surreal_password = "root"
 mode = "ws"
 ip = "127.0.0.1"
 port = 8020
+user = "root"
+password = "root"
 path = "/Volumes/DPC/work/db-data/ams-8020.db"
 
 # SurrealKV 连接配置 (模型数据写入)

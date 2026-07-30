@@ -81,7 +81,8 @@ impl GenerationReadContext {
             session.load_catalog_nodes(&refnos),
             session.load_transforms(&refnos),
         )?;
-        let attributes = Arc::new(attributes.require_all("generation.preload.attributes")?);
+        // 层级中允许存在只有 PE/UDA、没有基础 ATT 的连接标记；真正消费属性时仍会强校验。
+        let attributes = Arc::new(attributes.found);
         let catalog_nodes =
             Arc::new(catalog_nodes.require_all("generation.preload.catalog_nodes")?);
         // 并非每个容器节点都具有 transform；缺失在具体消费点按 required 语义失败。

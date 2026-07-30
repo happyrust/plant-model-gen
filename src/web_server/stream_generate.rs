@@ -250,6 +250,10 @@ async fn filter_geo_refnos(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum
             if !crate::scene_tree::is_geo_noun(&row.noun) {
                 continue;
             }
+            // FITT 等连接标记可能只有 PE/UDA，没有可供模型生成使用的基础 ATT。
+            if aios_core::get_named_attmap(row.refno).await.is_err() {
+                continue;
+            }
             out.push(row.refno);
         }
     }

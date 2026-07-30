@@ -269,12 +269,6 @@ impl CatalogGraphRead for SurrealVersionedReadSession {
 
         for pe in pe_rows {
             let dbnum = checked_u32(pe.dbnum, "catalog.dbnum")?;
-            let attributes = attributes.found.get(&pe.refno).ok_or_else(|| {
-                GenerationReadError::MissingRequiredData {
-                    capability: "catalog.attributes",
-                    refnos: vec![pe.refno],
-                }
-            })?;
             let db_type = db_types.get(&dbnum).cloned().ok_or_else(|| {
                 GenerationReadError::MissingRequiredData {
                     capability: "catalog.db_type",
@@ -293,7 +287,11 @@ impl CatalogGraphRead for SurrealVersionedReadSession {
                     .into_iter()
                     .map(RefnoEnum::from)
                     .collect(),
-                outbound: attributes.reference_edges(dbnum),
+                outbound: attributes
+                    .found
+                    .get(&pe.refno)
+                    .map(|attributes| attributes.reference_edges(dbnum))
+                    .unwrap_or_default(),
             };
             found.push((node.refno, node));
         }

@@ -23,7 +23,7 @@ prepare_repo() {
   git clone --depth 1 --branch "$branch" "$repo_url" "$target_dir"
 }
 
-prepare_repo "https://github.com/happyrust/rs-core.git" "dev-3.1" \
+prepare_repo "https://github.com/happyrust/rs-core.git" "codex/fix-refno-enum-cata-hash" \
   "$WORKSPACE_PARENT/rs-core"
 prepare_repo "https://github.com/happyrust/pdms-io.git" "dev-3.1" \
   "$WORKSPACE_PARENT/pdms-io-fork"

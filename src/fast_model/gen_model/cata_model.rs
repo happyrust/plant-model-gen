@@ -342,6 +342,23 @@ fn build_tubi_transform_from_segment(
     Some(t)
 }
 
+fn trim_elbo_axis_to_tangents(axis_map: &mut [CateAxisParam; 2]) {
+    let (Some(pa_dir), Some(pb_dir)) = (axis_map[0].dir.as_ref(), axis_map[1].dir.as_ref()) else {
+        return;
+    };
+    let torus = SCTorus {
+        paax_pt: axis_map[0].pt.0,
+        paax_dir: pa_dir.0,
+        pbax_pt: axis_map[1].pt.0,
+        pbax_dir: pb_dir.0,
+        pdia: axis_map[0].pbore.max(axis_map[1].pbore),
+    };
+    if let Some((pa, pb)) = torus.tangent_points() {
+        axis_map[0].pt.0 = pa;
+        axis_map[1].pt.0 = pb;
+    }
+}
+
 /// BRAN/HANG tubing 生成阶段的输出
 
 pub struct BranchTubiOutcome {
@@ -4747,9 +4764,13 @@ async fn gen_cata_geos_inner(
                     }
 
                     if let Some(axis_map) = raw_axis.map(|x| {
+                        let mut local_axis = [x[0].clone(), x[1].clone()];
+                        if arrive_type == "ELBO" {
+                            trim_elbo_axis_to_tangents(&mut local_axis);
+                        }
                         [
-                            x[0].transformed(&world_trans),
-                            x[1].transformed(&world_trans),
+                            local_axis[0].transformed(&world_trans),
+                            local_axis[1].transformed(&world_trans),
                         ]
                     }) {
                         debug_model!(

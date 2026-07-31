@@ -56,14 +56,9 @@ impl Default for ConcurrencyConfig {
 }
 
 impl ConcurrencyConfig {
-    /// 从 DbOption 创建配置
-    pub fn from_db_option(db_option: &DbOption) -> Self {
-        let cpu_cores = num_cpus::get();
-        Self {
-            max_concurrent: cpu_cores * 2,
-            batch_size: 100,
-            show_progress: false,
-        }
+    /// 从 DbOption 创建配置（当前不消费任何字段，保留签名以便未来接入配置）
+    pub fn from_db_option(_db_option: &DbOption) -> Self {
+        Self::default()
     }
 
     /// 创建自定义配置

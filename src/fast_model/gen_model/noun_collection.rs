@@ -64,6 +64,24 @@ impl GenerationTargets {
         )
     }
 
+    /// 合并两组目标（Mixed scope：根展开目标 ∪ 增量目标）。
+    /// 走 `new` 重新归一化，保证排序/去重/target_hash 口径与单一来源一致。
+    pub(crate) fn merge(&self, other: &Self) -> Self {
+        Self::new(
+            self.bran_hang_refnos
+                .iter()
+                .chain(&other.bran_hang_refnos)
+                .copied(),
+            self.loop_refnos.iter().chain(&other.loop_refnos).copied(),
+            self.cate_refnos.iter().chain(&other.cate_refnos).copied(),
+            self.prim_refnos.iter().chain(&other.prim_refnos).copied(),
+            self.delete_refnos
+                .iter()
+                .chain(&other.delete_refnos)
+                .copied(),
+        )
+    }
+
     pub(crate) fn target_hash(&self) -> &str {
         &self.target_hash
     }
@@ -369,6 +387,27 @@ mod tests {
         assert!(!targets.has_generation_targets());
         assert!(!targets.is_delete_only());
         assert!(targets.delete_refnos().is_empty());
+    }
+
+    #[test]
+    fn merge_unions_all_buckets_and_keeps_deletes() {
+        let bran = RefnoEnum::from("1/1");
+        let cate = RefnoEnum::from("1/2");
+        let prim = RefnoEnum::from("1/3");
+        let deleted = RefnoEnum::from("1/9");
+
+        let root_targets = GenerationTargets::new([bran], [], [cate], [], []);
+        let incr_targets = GenerationTargets::new([bran], [], [], [prim], [deleted]);
+        let merged = root_targets.merge(&incr_targets);
+
+        assert_eq!(merged.bran_hang_refnos(), [bran]);
+        assert_eq!(merged.cate_refnos(), [cate]);
+        assert_eq!(merged.prim_refnos(), [prim]);
+        assert_eq!(merged.delete_refnos(), [deleted]);
+        assert_eq!(
+            merged.target_hash(),
+            GenerationTargets::new([bran], [], [cate], [prim], [deleted]).target_hash()
+        );
     }
 
     #[test]

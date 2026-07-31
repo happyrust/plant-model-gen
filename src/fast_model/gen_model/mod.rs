@@ -5,6 +5,24 @@
 // 2. 代码冗余（90% 重复代码）
 // 3. 配置混乱（双重配置机制）
 // 4. 并发性能问题
+//
+// # 错误分层策略（run 级 vs 元素级）
+//
+// 生成管线对失败采用两级口径，边界以"错误根因属于谁"划分：
+//
+// - **基础设施/阶段级失败 → 整个 run 失败（fail-closed）**：预检查、
+//   pe_transform 失效、cata_hash_map 构建、tubi 生成、writer/mesh/boolean
+//   任一阶段报错都必须把 `Err` 传播到 `gen_all_geos_data*` 返回值。这些
+//   失败意味着"本应生成的内容没有生成"，若吞掉则 model_gen 水位照常推进、
+//   欠账被消费，缺失将永远不被重试。
+// - **元素级数据质量问题 → 记录并跳过（run 仍成功）**：单个元素 owner
+//   无效（E-REF-002）、几何全部转换失败（E-GEO-003）等源数据缺陷通过
+//   `model_error!` 落入 refno_errors 报告后跳过该元素。源数据不修复，
+//   重试也不会有不同结果，阻断整库生成只会放大故障面。
+//
+// 判断新错误属于哪一级：问"重跑一次（数据不变）结果会不同吗？"——会
+// （网络/DB/并发/资源类）就必须让 run 失败；不会（源数据自身缺陷）就
+// 记录 refno_errors 后跳过。
 
 /// E3D 调试宏
 #[macro_export]
@@ -31,8 +49,7 @@ pub mod cate_helpers; // Cate 工具函数
 pub mod cate_processor; // Cate 处理器
 pub mod cate_single; // Cate 单元件处理
 pub mod loop_processor; // Loop 处理器
-pub mod prim_processor;
-pub mod processor; // 通用处理器（消除冗余） // Prim 处理器
+pub mod prim_processor; // Prim 处理器
 
 // GenPipeline 主逻辑 (Phase 3 - 优化版本)
 pub mod gen_pipeline;
@@ -77,7 +94,6 @@ pub mod transform_rkyv_cache; // 变换 rkyv 磁盘缓存 // [foyer-removal] 桩
 pub use context::{GenerationReadContext, NounProcessContext};
 pub use models::{DbModelInstRefnos, NounCategory};
 pub use noun_collection::GenPipelineTargetCollection;
-pub use processor::NounProcessor;
 
 // Phase 2: 错误和配置
 pub use config::{BatchSize, Concurrency, GenPipelineConfig};

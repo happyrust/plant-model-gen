@@ -5355,10 +5355,17 @@ async fn execute_real_task(state: AppState, task_id: String) {
             config.excluded_nouns.clone().unwrap_or_default();
         db_option_ext.gen_pipeline_debug_limit_per_target_type = config.debug_limit_per_noun_type;
 
-        let gen_result: anyhow::Result<()> = gen_all_geos_data(vec![], &db_option_ext, None)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from);
+        let gen_result: anyhow::Result<()> =
+            match crate::web_server::generation_lock::acquire_web_generation_lock(
+                &db_option_ext,
+                "geometry-generation-task",
+            ) {
+                Ok(_mutation_lock) => gen_all_geos_data(vec![], &db_option_ext, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from),
+                Err(error) => Err(error),
+            };
         if let Err(e) = gen_result {
             let mut task_manager = state.task_manager.lock().await;
             if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
@@ -8915,10 +8922,30 @@ async fn execute_refno_model_generation(
     }
 
     // 重新获取 options (避免借用问题，虽然这里 clone 了)
-    let result: anyhow::Result<()> = gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None)
-        .await
-        .map(|_| ())
-        .map_err(anyhow::Error::from);
+    let result: anyhow::Result<()> =
+        match crate::web_server::generation_lock::acquire_web_generation_lock(
+            &db_option_ext,
+            "refno-model-generation",
+        ) {
+            Ok(_mutation_lock) => {
+                async {
+                    // 写入是 INSERT IGNORE：不先清理旧产物，几何变更后重生成会同时
+                    // 保留新旧 geo_relate 边（幽灵几何）。与 CLI --regen-model 对齐，
+                    // 生成前先做目标子树的 pre-cleanup（清理与生成同持一把生成锁）。
+                    crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(
+                        &parsed_refnos,
+                        false,
+                    )
+                    .await?;
+                    gen_all_geos_data(parsed_refnos.clone(), &db_option_ext, None)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                }
+                .await
+            }
+            Err(error) => Err(error),
+        };
 
     let duration = start_time.elapsed();
 
@@ -9394,6 +9421,18 @@ pub async fn api_show_by_refno(
     let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
 
     // 5. 调用生成函数
+    let _mutation_lock = crate::web_server::generation_lock::acquire_web_generation_lock(
+        &db_option_ext,
+        "show-by-refno",
+    )
+    .map_err(|error| {
+        let status = if crate::web_server::generation_lock::is_generation_busy(&error) {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, format!("{error:#}"))
+    })?;
     let result =
         crate::fast_model::gen_all_geos_data(generation_refnos.clone(), &db_option_ext, None).await;
 

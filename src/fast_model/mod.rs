@@ -92,8 +92,6 @@ pub mod unit_converter;
 
 pub mod aabb_tree;
 
-pub mod incremental;
-
 // aabb_cache 已废弃
 
 // #[cfg(feature = "sqlite-index")]

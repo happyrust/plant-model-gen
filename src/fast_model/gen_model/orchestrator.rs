@@ -40,13 +40,22 @@ enum GenerationScope {
     Manual { roots: Vec<RefnoEnum> },
     Debug { roots: Vec<RefnoEnum> },
     Incremental { log: IncrGeoUpdateLog },
+    /// manual/debug/incremental 同时出现时的合并 scope：roots 按 Manual 语义展开
+    /// 后代，增量日志按 Incremental 语义解析，两者生成目标取并集。
+    ///
+    /// 不能把并集降级为 Manual：`get_all_visible_refnos()` 不含 `delete_refnos`，
+    /// 降级会静默丢弃增量日志中的删除项，且增量 pre-cleanup 也随之丢失，
+    /// 旧产物残留但 run 照常报成功、推进 model_gen 水位。
+    Mixed {
+        roots: Vec<RefnoEnum>,
+        log: IncrGeoUpdateLog,
+    },
 }
 
 fn decide_generation_scope(
     manual_refnos: &[RefnoEnum],
     debug_roots: &[RefnoEnum],
     has_incr_log: bool,
-    incr_visible_roots: &[RefnoEnum],
     incr_updates: Option<&IncrGeoUpdateLog>,
 ) -> GenerationScope {
     let has_manual = !manual_refnos.is_empty();
@@ -73,9 +82,9 @@ fn decide_generation_scope(
         let mut merged: HashSet<RefnoEnum> = HashSet::new();
         merged.extend(manual_refnos.iter().copied());
         merged.extend(debug_roots.iter().copied());
-        merged.extend(incr_visible_roots.iter().copied());
-        return GenerationScope::Manual {
+        return GenerationScope::Mixed {
             roots: merged.into_iter().collect(),
+            log: incr_updates.cloned().unwrap_or_default(),
         };
     }
 
@@ -86,9 +95,12 @@ fn should_start_write_pipeline(contract: &GenerationContract) -> bool {
     !contract.dry_run()
 }
 
+/// A returned `GenModelResult` *is* the success signal: every failure inside the
+/// pipeline propagates as `Err`. Do not reintroduce a `success` flag — the old
+/// one was hardcoded to `true` on every path, so callers that branched on it
+/// were publishing model anchors for runs that had silently lost geometry.
 #[derive(Debug, Clone)]
 pub struct GenModelResult {
-    pub success: bool,
     pub authoritative_snapshot_id: u64,
     pub artifacts: Option<GenerationArtifactsSummary>,
     pub read_metrics: SessionMetricsSnapshot,
@@ -124,11 +136,33 @@ impl GenerationRunProvenance {
     }
 }
 
+fn read_metrics_strict() -> bool {
+    std::env::var("AIOS_STRICT_READ_METRICS")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn validated_read_metrics(
     generation_read: &GenerationReadContext,
 ) -> anyhow::Result<SessionMetricsSnapshot> {
     let metrics = generation_read.session.metrics();
-    metrics.assert_batch_first_hot_path()?;
+    // batch-first 是防 N+1 回归的性能门，不是结果正确性约束。此前在生产 run
+    // 收尾直接判失败：全部几何已生成落库，仅因读取计数超限整个 run 报错。
+    // 默认降级为显式告警；CI / 验证环境设 AIOS_STRICT_READ_METRICS=1 维持 fail-closed。
+    if let Err(error) = metrics.assert_batch_first_hot_path() {
+        if read_metrics_strict() {
+            return Err(error.into());
+        }
+        eprintln!(
+            "[gen_model] ⚠️ generation read 违反 batch-first 热路径约束（仅告警；设 AIOS_STRICT_READ_METRICS=1 可转为失败）: {error}"
+        );
+    }
     Ok(metrics)
 }
 
@@ -309,41 +343,44 @@ async fn gen_all_geos_data_inner(
 
     // 增量：先失效受影响子树的 pe_transform / 内存 cache，再进 precheck/生成。
     // 避免 owner/POS 变更后 lazy miss 命中陈旧 world；禁止整库 clear。
+    //
+    // 失效失败必须中止本次生成：继续跑只会让增量几何命中陈旧 world transform，
+    // 产出位置错误但外观正常的模型，并照常推进 model_gen 水位——这比直接失败
+    // 难发现得多，而 owner/POS 变更恰是最常见的增量场景。
     if db_option.use_surrealdb
         && let Some(log) = final_incr_updates.as_ref().filter(|l| l.count() > 0)
     {
         let change_roots: Vec<RefnoEnum> = log.get_all_visible_refnos().into_iter().collect();
         if !change_roots.is_empty() {
-            match crate::pe_transform_refresh::invalidate_pe_transform_for_root_refnos(
-                &change_roots,
-            )
-            .await
-            {
-                Ok(n) => {
-                    println!(
-                        "[gen_model] pe_transform 增量子树已失效: roots={} affected={}",
-                        change_roots.len(),
-                        n
-                    );
-                }
-                Err(e) => {
-                    log::warn!("[gen_model] pe_transform 增量子树失效失败（继续生成）: {e}");
-                }
-            }
+            let affected =
+                crate::pe_transform_refresh::invalidate_pe_transform_for_root_refnos(&change_roots)
+                    .await
+                    .map_err(|error| {
+                        GenPipelineError::Other(error.context(format!(
+                            "pe_transform 增量子树失效失败: roots={}",
+                            change_roots.len()
+                        )))
+                    })?;
+            println!(
+                "[gen_model] pe_transform 增量子树已失效: roots={} affected={}",
+                change_roots.len(),
+                affected
+            );
         }
         let deleted: Vec<RefnoEnum> = log.delete_refnos.iter().copied().collect();
         if !deleted.is_empty() {
-            match crate::pe_transform_store::clear_pe_transform_for_refnos(&deleted).await {
-                Ok(n) => {
-                    let _ = crate::fast_model::gen_model::transform_cache::clear_global_transform_cache_for_refnos(
-                        &deleted,
-                    );
-                    println!("[gen_model] pe_transform 已清理删除节点: keys={}", n);
-                }
-                Err(e) => {
-                    log::warn!("[gen_model] pe_transform 删除节点清理失败（继续生成）: {e}");
-                }
-            }
+            let cleared = crate::pe_transform_store::clear_pe_transform_for_refnos(&deleted)
+                .await
+                .map_err(|error| {
+                    GenPipelineError::Other(error.context(format!(
+                        "pe_transform 删除节点清理失败: refnos={}",
+                        deleted.len()
+                    )))
+                })?;
+            let _ = crate::fast_model::gen_model::transform_cache::clear_global_transform_cache_for_refnos(
+                &deleted,
+            );
+            println!("[gen_model] pe_transform 已清理删除节点: keys={}", cleared);
         }
     }
 
@@ -381,17 +418,14 @@ async fn gen_all_geos_data_inner(
             "[gen_model] pe_transform precheck mode={:?} (generation read=VersionedReadSession/L0)",
             pe_transform_mode
         );
-        match run_precheck(db_option, Some(precheck_config)).await {
-            Ok(stats) => {
-                log::info!("[gen_model] 预检查完成: {:?}", stats);
-            }
-
-            Err(e) => {
-                log::warn!("[gen_model] 预检查部分失败: {}", e);
-
-                // 不阻断流程，继续执行
-            }
-        }
+        // 软性缺口（db_meta 未加载等）由 run_precheck 内部降级为 Ok；能走到 Err 的
+        // 只剩硬失败，继续生成会产出错位或缺失的几何却仍推进 model_gen 水位。
+        let stats = run_precheck(db_option, Some(precheck_config))
+            .await
+            .map_err(|error| {
+                GenPipelineError::Other(error.context("模型生成预检查失败，已中止本次生成"))
+            })?;
+        log::info!("[gen_model] 预检查完成: {:?}", stats);
     } else {
         // 非 Surreal 运行仍需要 refno -> dbnum 元数据。
         let _ = db_meta().ensure_loaded();
@@ -441,7 +475,6 @@ async fn gen_all_geos_data_inner(
         &manual_refnos,
         &debug_roots,
         has_incr_log,
-        &incr_visible_roots,
         final_incr_updates.as_ref(),
     );
     if matches!(scope, GenerationScope::Incremental { .. }) && !has_incr_visible_roots {
@@ -450,15 +483,13 @@ async fn gen_all_geos_data_inner(
         );
     }
 
-    let input_source_cnt =
-        (!manual_refnos.is_empty() as u8) + (!debug_roots.is_empty() as u8) + (has_incr_log as u8);
-    if input_source_cnt >= 2 {
-        if let GenerationScope::Manual { roots } = &scope {
-            println!(
-                "[gen_model] 检测到混合输入(manual/debug/incr)，按 roots 并集执行：{} 个",
-                roots.len()
-            );
-        }
+    if let GenerationScope::Mixed { roots, log } = &scope {
+        println!(
+            "[gen_model] 检测到混合输入(manual/debug/incr)：roots 并集 {} 个 + 增量日志(visible={}, deletes={})，删除项与增量清理均保留",
+            roots.len(),
+            log.get_all_visible_refnos().len(),
+            log.delete_refnos.len()
+        );
     }
 
     perf.mark("gen_pipeline_generation");
@@ -530,6 +561,19 @@ async fn process_gen_pipeline(
             );
             resolve_incremental_generation_targets(&generation_read.hierarchy, &config, log)?
         }
+        GenerationScope::Mixed { roots, log } => {
+            println!(
+                "[gen_model] 当前 scope: Mixed roots={} incr_visible={} deletes={}",
+                roots.len(),
+                log.get_all_visible_refnos().len(),
+                log.delete_refnos.len()
+            );
+            let root_targets =
+                resolve_root_generation_targets(&generation_read.hierarchy, &config, roots)?;
+            let incr_targets =
+                resolve_incremental_generation_targets(&generation_read.hierarchy, &config, log)?;
+            root_targets.merge(&incr_targets)
+        }
     };
     println!(
         "[gen_model] GenerationTargets hash={} generation={} deletes={}",
@@ -575,7 +619,6 @@ async fn process_gen_pipeline(
         perf.mark("dry_run_complete");
         perf.end_current();
         return Ok(GenModelResult {
-            success: true,
             authoritative_snapshot_id,
             artifacts: None,
             read_metrics: validated_read_metrics(&generation_read)
@@ -583,8 +626,9 @@ async fn process_gen_pipeline(
             provenance,
         });
     }
+    // Mixed 含增量日志时同样需要增量清理：目标 + 删除项都要在写入前清掉旧产物。
     let incremental_cleanup_roots = match &scope {
-        GenerationScope::Incremental { .. } => targets
+        GenerationScope::Incremental { .. } | GenerationScope::Mixed { .. } => targets
             .bran_hang_refnos()
             .iter()
             .chain(targets.loop_refnos())
@@ -597,7 +641,9 @@ async fn process_gen_pipeline(
     };
     let is_boolean_scoped_generation = matches!(
         &scope,
-        GenerationScope::Debug { .. } | GenerationScope::Incremental { .. }
+        GenerationScope::Debug { .. }
+            | GenerationScope::Incremental { .. }
+            | GenerationScope::Mixed { .. }
     ) || db_option
         .inner
         .debug_model_refnos
@@ -610,9 +656,16 @@ async fn process_gen_pipeline(
 
     // 1️⃣ 生成/更新 inst_relate，并获取分类后的根 refno
     let use_surrealdb = db_option.use_surrealdb;
-    let defer_db_write = false;
+    // 这个开关已在解析层退役（`options::parse_defer_db_write` 恒返回 false，
+    // CLI `--defer-db-write` 只打印忽略提示），所以取值恒为 false。仍从
+    // db_option 读，避免和上面 init_model_tables 的判据各写各的。
+    let defer_db_write = db_option.defer_db_write;
 
-    if matches!(&scope, GenerationScope::Incremental { .. }) && !targets.has_generation_targets() {
+    if matches!(
+        &scope,
+        GenerationScope::Incremental { .. } | GenerationScope::Mixed { .. }
+    ) && !targets.has_generation_targets()
+    {
         println!(
             "[gen_model] 增量日志没有生成目标，进入统一空 producer/write pipeline 路径 (delete_only={})",
             targets.is_delete_only()
@@ -732,7 +785,6 @@ async fn process_gen_pipeline(
         perf.end_current();
         let artifact_summary = artifacts.summary().map_err(GenPipelineError::Other)?;
         return Ok(GenModelResult {
-            success: true,
             authoritative_snapshot_id,
             artifacts: Some(artifact_summary),
             read_metrics: validated_read_metrics(&generation_read)
@@ -762,112 +814,121 @@ async fn process_gen_pipeline(
     );
     perf.mark("mesh_generation");
 
-    // 2️⃣ 可选执行 mesh 生成（已由并行 mesh stage 完成，此处仅汇总结果）
-    if db_option.inner.gen_mesh {
-        let mesh_start = Instant::now();
+    // 2️⃣ 收集本轮全部生成 refnos（布尔 scope 与 Web Bundle 导出共用）。
+    // 注意：布尔/导出的门控不再嵌在 gen_mesh 分支里——此前 gen_mesh=false 时
+    // 布尔与导出被静默跳过，且 skipped_reason 恒写 "boolean operation disabled"，
+    // 与真实原因（缺 mesh 阶段）不符。
+    let cate = categorized.get_by_category(NounCategory::Cate);
+    let loops = categorized.get_by_category(NounCategory::LoopOwner);
+    let prims = categorized.get_by_category(NounCategory::Prim);
+    let mut all_refnos = Vec::with_capacity(cate.len() + loops.len() + prims.len());
+    all_refnos.extend(cate);
+    all_refnos.extend(loops);
+    all_refnos.extend(prims);
 
-        // 收集所有 refnos（后续 web bundle / aabb 等步骤仍需使用）
-        let cate = categorized.get_by_category(NounCategory::Cate);
-        let loops = categorized.get_by_category(NounCategory::LoopOwner);
-        let prims = categorized.get_by_category(NounCategory::Prim);
-        let mut all_refnos = Vec::with_capacity(cate.len() + loops.len() + prims.len());
-        all_refnos.extend(cate);
-        all_refnos.extend(loops);
-        all_refnos.extend(prims);
-        let mut ran_primary = false;
+    if gen_mesh {
+        println!("[gen_model] GenPipeline mesh 并行阶段已随 batch 内联完成");
+    }
 
-        ran_primary = gen_mesh;
-        if gen_mesh {
+    perf.mark("aabb_write");
+    println!("⏳ [3/5] AABB 写入...");
+
+    // 3️⃣ batch barrier 之后，inst_relate_aabb 已按 batch 写入完成
+    if use_surrealdb {
+        if generation_contract.skip_inst_relate_aabb() {
             println!(
-                "[gen_model] GenPipeline mesh 并行阶段完成，用时 {} ms",
-                mesh_start.elapsed().as_millis()
+                "[gen_model] GenPipeline已跳过 batch inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
             );
+        } else {
+            println!("[gen_model] GenPipeline batch inst_relate_aabb 写入已完成");
         }
+    }
 
-        perf.mark("aabb_write");
-        println!("⏳ [3/5] AABB 写入...");
+    perf.mark("boolean_operation");
+    println!("⏳ [4/5] 布尔运算...");
+    crate::perf_metrics::record_generate_progress(
+        "boolean_operation",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
 
-        // 3️⃣ batch barrier 之后，inst_relate_aabb 已按 batch 写入完成
-        if use_surrealdb {
-            let skip_aabb_write = generation_contract.skip_inst_relate_aabb();
-            if skip_aabb_write {
-                println!(
-                    "[gen_model] GenPipeline已跳过 batch inst_relate_aabb 写入（AIOS_SKIP_INST_RELATE_AABB=1）"
-                );
-            } else {
-                println!("[gen_model] GenPipeline batch inst_relate_aabb 写入已完成");
-            }
-        }
-
-        perf.mark("boolean_operation");
-        println!("⏳ [4/5] 布尔运算...");
-        crate::perf_metrics::record_generate_progress(
-            "boolean_operation",
-            None,
-            full_start.elapsed().as_millis() as u64,
+    // 4️⃣ 可选执行布尔运算（布尔桥依赖 mesh 阶段产物，gen_mesh=false 时显式跳过并如实上报）
+    if db_option.inner.apply_boolean_operation && !gen_mesh {
+        eprintln!(
+            "[gen_model] ⚠️ apply_boolean_operation=true 但 gen_mesh=false：布尔运算被跳过（布尔桥依赖 mesh 阶段产物），共 {} 个任务未执行",
+            boolean_task_count
+        );
+        boolean_execution_report = Some(BooleanBridgeReport {
+            total: boolean_task_count,
+            skipped: boolean_task_count,
+            skipped_reason: Some("gen_mesh disabled: boolean bridge requires mesh stage"),
+            ..BooleanBridgeReport::default()
+        });
+    } else if db_option.inner.apply_boolean_operation {
+        let bool_start = Instant::now();
+        println!("[gen_model] GenPipeline开始布尔运算（boolean worker）");
+        println!(
+            "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
+            db_option.boolean_pipeline_mode,
+            defer_db_write,
+            use_surrealdb,
+            db_option.enable_db_backfill
+        );
+        println!(
+            "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
+            bool_tasks.len(),
+            insert_batch_count
         );
 
-        // 4️⃣ 可选执行布尔运算
-        if db_option.inner.apply_boolean_operation {
-            let bool_start = Instant::now();
-            println!("[gen_model] GenPipeline开始布尔运算（boolean worker）");
-            println!(
-                "[gen_model] boolean_pipeline_mode={:?}, defer_db_write={}, use_surrealdb={}, enable_db_backfill={}",
-                db_option.boolean_pipeline_mode,
-                defer_db_write,
+        let report = base_model_writer
+            .run_boolean_bridge(BooleanBridgeRequest {
+                mode: db_option.boolean_pipeline_mode.clone(),
+                db_option: Arc::new(db_option.inner.clone()),
                 use_surrealdb,
-                db_option.enable_db_backfill
-            );
-            println!(
-                "[gen_model] 布尔任务统计: total={} (insert_batch_cnt={})",
-                bool_tasks.len(),
-                insert_batch_count
-            );
-
-            let report = base_model_writer
-                .run_boolean_bridge(BooleanBridgeRequest {
-                    mode: db_option.boolean_pipeline_mode.clone(),
-                    db_option: Arc::new(db_option.inner.clone()),
-                    use_surrealdb,
-                    defer_db_write,
-                    enable_db_backfill: db_option.enable_db_backfill,
-                    scope_refnos: if is_boolean_scoped_generation {
-                        all_refnos.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    bool_tasks: std::mem::take(&mut bool_tasks),
-                })
-                .await?;
-            println!(
-                "[gen_model] ModelWriter boolean_bridge 完成: total={} success={} failed={} skipped={} skipped_reason={:?}",
-                report.total, report.success, report.failed, report.skipped, report.skipped_reason
-            );
-            crate::perf_metrics::add_boolean_counters(report.success, report.failed);
-            if report.failed > 0 {
-                return Err(GenPipelineError::Other(anyhow::anyhow!(
-                    "boolean worker failed tasks: total={} failed={}",
-                    report.total,
-                    report.failed
-                )));
-            }
-            boolean_execution_report = Some(report);
-
-            println!(
-                "[gen_model] GenPipeline布尔运算完成，用时 {} ms",
-                bool_start.elapsed().as_millis()
-            );
-        }
-        perf.mark("web_bundle_export");
-        println!("⏳ [5/5] 导出...");
-        crate::perf_metrics::record_generate_progress(
-            "web_bundle_export",
-            None,
-            full_start.elapsed().as_millis() as u64,
+                defer_db_write,
+                enable_db_backfill: db_option.enable_db_backfill,
+                scope_refnos: if is_boolean_scoped_generation {
+                    all_refnos.clone()
+                } else {
+                    Vec::new()
+                },
+                bool_tasks: std::mem::take(&mut bool_tasks),
+            })
+            .await?;
+        println!(
+            "[gen_model] ModelWriter boolean_bridge 完成: total={} success={} failed={} skipped={} skipped_reason={:?}",
+            report.total, report.success, report.failed, report.skipped, report.skipped_reason
         );
+        crate::perf_metrics::add_boolean_counters(report.success, report.failed);
+        if report.failed > 0 {
+            return Err(GenPipelineError::Other(anyhow::anyhow!(
+                "boolean worker failed tasks: total={} failed={}",
+                report.total,
+                report.failed
+            )));
+        }
+        boolean_execution_report = Some(report);
 
-        // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)
-        if db_option.mesh_formats.contains(&MeshFormat::Glb) {
+        println!(
+            "[gen_model] GenPipeline布尔运算完成，用时 {} ms",
+            bool_start.elapsed().as_millis()
+        );
+    }
+    perf.mark("web_bundle_export");
+    println!("⏳ [5/5] 导出...");
+    crate::perf_metrics::record_generate_progress(
+        "web_bundle_export",
+        None,
+        full_start.elapsed().as_millis() as u64,
+    );
+
+    // 5️⃣ 生成 Web Bundle (GLB + JSON 数据包)；GLB 依赖 mesh 阶段产物
+    if db_option.mesh_formats.contains(&MeshFormat::Glb) {
+        if !gen_mesh {
+            println!(
+                "[gen_model] mesh_formats 含 Glb 但 gen_mesh=false，跳过 Web Bundle 导出（无 mesh 产物可打包）"
+            );
+        } else {
             let web_bundle_start = Instant::now();
             println!("[gen_model] 开始生成 Web Bundle (GLB + JSON 数据包)...");
             let mesh_dir = Path::new(
@@ -880,7 +941,9 @@ async fn process_gen_pipeline(
 
             // 输出到与 meshes 同级的 web_bundle 目录
             let output_dir = mesh_dir.parent().unwrap_or(mesh_dir).join("web_bundle");
-            if let Err(e) = export_prepack_lod_for_refnos(
+            // 导出物属于交付的一部分：失败必须上抛，否则 model_gen 水位会推进到
+            // 一个没有可加载 bundle 的 sesno 上。
+            export_prepack_lod_for_refnos(
                 &all_refnos,
                 &mesh_dir,
                 &output_dir,
@@ -894,15 +957,16 @@ async fn process_gen_pipeline(
                 LengthUnit::Millimeter,
             )
             .await
-            {
-                eprintln!("[gen_model] 生成 Web Bundle 失败: {}", e);
-            } else {
-                println!(
-                    "[gen_model] Web Bundle 生成完成，输出目录: {}, 用时 {} ms",
-                    output_dir.display(),
-                    web_bundle_start.elapsed().as_millis()
-                );
-            }
+            .map_err(|error| {
+                GenPipelineError::Other(
+                    error.context(format!("Web Bundle 导出失败: {}", output_dir.display())),
+                )
+            })?;
+            println!(
+                "[gen_model] Web Bundle 生成完成，输出目录: {}, 用时 {} ms",
+                output_dir.display(),
+                web_bundle_start.elapsed().as_millis()
+            );
         }
     }
     let boolean_execution_report =
@@ -982,7 +1046,8 @@ async fn process_gen_pipeline(
                 .unwrap_or("assets/meshes"),
         );
         if !dbnos.is_empty() {
-            if let Err(e) = export_instances_json_for_dbnos(
+            // 同 Web Bundle：instances.json 是交付物，导出失败不能算这次 run 成功。
+            export_instances_json_for_dbnos(
                 &dbnos,
                 mesh_dir,
                 &db_option.get_project_output_dir(),
@@ -990,9 +1055,11 @@ async fn process_gen_pipeline(
                 true,
             )
             .await
-            {
-                eprintln!("[instances] GenPipeline 导出失败: {}", e);
-            }
+            .map_err(|error| {
+                GenPipelineError::Other(
+                    error.context(format!("instances.json 导出失败: dbnums={dbnos:?}")),
+                )
+            })?;
         }
     }
 
@@ -1094,7 +1161,10 @@ async fn process_gen_pipeline(
             "default".to_string()
         };
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let profile_dir = std::path::PathBuf::from("output")
+        // 不能用 get_project_output_dir()：project_name 为空时它会 panic，而这里
+        // 已经回退成 "default"。输出根仍必须走配置（specs/016 自定义输出命名空间）。
+        let profile_dir = db_option
+            .get_output_root()
             .join(&project_name)
             .join("profile");
 
@@ -1154,7 +1224,6 @@ async fn process_gen_pipeline(
         artifact_summary.semantic_hash
     );
     Ok(GenModelResult {
-        success: true,
         authoritative_snapshot_id,
         artifacts: Some(artifact_summary),
         read_metrics,
@@ -1268,10 +1337,6 @@ pub async fn update_sqlite_spatial_index_from_cache(
     Ok(())
 }
 
-fn initialize_spatial_index() {
-    // No-op placeholder
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,28 +1350,43 @@ mod tests {
         log.prim_refnos.insert(incremental);
 
         assert!(matches!(
-            decide_generation_scope(&[], &[], false, &[], None),
+            decide_generation_scope(&[], &[], false, None),
             GenerationScope::Full
         ));
         assert!(matches!(
-            decide_generation_scope(&[manual], &[], false, &[], None),
+            decide_generation_scope(&[manual], &[], false, None),
             GenerationScope::Manual { roots } if roots == vec![manual]
         ));
         assert!(matches!(
-            decide_generation_scope(&[], &[debug], false, &[], None),
+            decide_generation_scope(&[], &[debug], false, None),
             GenerationScope::Debug { roots } if roots == vec![debug]
         ));
         assert!(matches!(
-            decide_generation_scope(&[], &[], true, &[incremental], Some(&log)),
+            decide_generation_scope(&[], &[], true, Some(&log)),
             GenerationScope::Incremental { .. }
         ));
 
-        let mixed = decide_generation_scope(&[manual], &[debug], true, &[incremental], Some(&log));
-        let GenerationScope::Manual { roots } = mixed else {
-            panic!("mixed scope must normalize to Manual roots");
+        let mixed = decide_generation_scope(&[manual], &[debug], true, Some(&log));
+        let GenerationScope::Mixed { roots, log: merged } = mixed else {
+            panic!("mixed scope must keep roots and incremental log");
         };
         let roots: HashSet<_> = roots.into_iter().collect();
-        assert_eq!(roots, HashSet::from([manual, debug, incremental]));
+        assert_eq!(roots, HashSet::from([manual, debug]));
+        assert!(merged.prim_refnos.contains(&incremental));
+    }
+
+    #[test]
+    fn mixed_scope_preserves_incremental_deletes() {
+        let manual = RefnoEnum::from("1/1");
+        let deleted = RefnoEnum::from("1/9");
+        let mut log = IncrGeoUpdateLog::default();
+        log.delete_refnos.insert(deleted);
+
+        let scope = decide_generation_scope(&[manual], &[], true, Some(&log));
+        let GenerationScope::Mixed { log: merged, .. } = scope else {
+            panic!("manual + incremental must resolve to Mixed scope");
+        };
+        assert!(merged.delete_refnos.contains(&deleted));
     }
 
     #[test]
@@ -1314,14 +1394,14 @@ mod tests {
         let mut log = IncrGeoUpdateLog::default();
         log.delete_refnos.insert(RefnoEnum::from("1/9"));
 
-        let scope = decide_generation_scope(&[], &[], true, &[], Some(&log));
+        let scope = decide_generation_scope(&[], &[], true, Some(&log));
         assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 
     #[test]
     fn empty_incremental_scope_does_not_fall_back_to_full() {
         let log = IncrGeoUpdateLog::default();
-        let scope = decide_generation_scope(&[], &[], true, &[], Some(&log));
+        let scope = decide_generation_scope(&[], &[], true, Some(&log));
         assert!(matches!(scope, GenerationScope::Incremental { .. }));
     }
 

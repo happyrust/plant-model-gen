@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use flume::{Receiver, Sender};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -253,39 +254,55 @@ async fn run_base_writer(
         init_report.stage,
         init_report.status
     );
+    // fail-fast：单 worker 失败后置 abort 标志，其余 worker 停止消费新批次并退出，
+    // receiver 随之关闭 → sink 发送失败 → 生成侧尽早停止。此前错误只在全部批次
+    // 消费完、join 时才暴露，大批量下会白跑很久。
+    let abort = Arc::new(AtomicBool::new(false));
     for worker_id in 0..worker_count {
         let receiver = receiver.clone();
         let semaphore = base_write_semaphore.clone();
         let result_sender = result_sender.clone();
         let model_writer = model_writer.clone();
         let artifacts = Arc::clone(&artifacts);
+        let abort = Arc::clone(&abort);
         handles.push(tokio::spawn(async move {
             while let Ok(batch) = receiver.recv_async().await {
-                let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
-                let base_start = Instant::now();
-                let write_report = model_writer.write_base_batch(&batch.shape_insts).await?;
-                // 专门的 pe_transform 落库阶段：用生成阶段已算出的 world_transform
-                // 就地写库，按需生成、无整库 BFS。
-                let pe_transform_report =
-                    model_writer.persist_pe_transform(&batch.shape_insts).await?;
-                artifacts.record_missing_neg_carriers(
-                    write_report.missing_neg_carriers.iter().copied(),
-                )?;
-                let base_ms = base_start.elapsed().as_millis();
-                drop(permit);
-                println!(
-                    "[batch_stage] batch={} stage=base worker={} wait_ms={} base_write_ms={} pe_transform={:?}/{} missing_neg_candidates={}",
-                    batch.batch_id,
-                    worker_id,
-                    wait_ms,
-                    base_ms,
-                    pe_transform_report.status,
-                    pe_transform_report.item_count,
-                    write_report.missing_neg_carriers.len()
-                );
-                result_sender
-                    .send_async((batch.batch_id, wait_ms, base_ms))
-                    .await?;
+                if abort.load(Ordering::Relaxed) {
+                    break;
+                }
+                let step: anyhow::Result<()> = async {
+                    let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
+                    let base_start = Instant::now();
+                    let write_report = model_writer.write_base_batch(&batch.shape_insts).await?;
+                    // 专门的 pe_transform 落库阶段：用生成阶段已算出的 world_transform
+                    // 就地写库，按需生成、无整库 BFS。
+                    let pe_transform_report =
+                        model_writer.persist_pe_transform(&batch.shape_insts).await?;
+                    artifacts.record_missing_neg_carriers(
+                        write_report.missing_neg_carriers.iter().copied(),
+                    )?;
+                    let base_ms = base_start.elapsed().as_millis();
+                    drop(permit);
+                    println!(
+                        "[batch_stage] batch={} stage=base worker={} wait_ms={} base_write_ms={} pe_transform={:?}/{} missing_neg_candidates={}",
+                        batch.batch_id,
+                        worker_id,
+                        wait_ms,
+                        base_ms,
+                        pe_transform_report.status,
+                        pe_transform_report.item_count,
+                        write_report.missing_neg_carriers.len()
+                    );
+                    result_sender
+                        .send_async((batch.batch_id, wait_ms, base_ms))
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = step {
+                    abort.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
             }
             Ok::<(), anyhow::Error>(())
         }));
@@ -330,6 +347,8 @@ async fn run_mesh_stage(
     let mut handles = Vec::new();
     let worker_count = worker_count.max(1);
     println!("[batch_stage] stage=mesh worker_pool={}", worker_count);
+    // 与 base writer 相同的 fail-fast 策略。
+    let abort = Arc::new(AtomicBool::new(false));
     for worker_id in 0..worker_count {
         let receiver = receiver.clone();
         let semaphore = mesh_compute_semaphore.clone();
@@ -339,61 +358,74 @@ async fn run_mesh_stage(
         let output_sender = output_sender.clone();
         let artifacts = Arc::clone(&artifacts);
         let db_option_inner = db_option.inner.clone();
+        let abort = Arc::clone(&abort);
         handles.push(tokio::spawn(async move {
             while let Ok(batch) = receiver.recv_async().await {
-                let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
-                let mesh_start = Instant::now();
-                let tasks = crate::fast_model::mesh_generate::extract_mesh_tasks(&batch.shape_insts);
-                let mesh_task_count = tasks.len();
-
-                let mut mesh_results = HashMap::new();
-                let mut mesh_cache_hits = 0usize;
-                let mut mesh_new_generated = 0usize;
-
-                if gen_mesh && !tasks.is_empty() {
-                    mesh_results = crate::fast_model::mesh_generate::generate_meshes_for_batch(
-                        &tasks,
-                        &db_option_inner,
-                        &deduper,
-                        &mesh_aabb_map,
-                        &mesh_pts_map,
-                    )
-                    .await;
-                    mesh_cache_hits = mesh_results
-                        .values()
-                        .filter(|mr| mr.meshed && !mr.bad && mr.pts_hashes.is_empty())
-                        .count();
-                    mesh_new_generated = mesh_results.len().saturating_sub(mesh_cache_hits);
+                if abort.load(Ordering::Relaxed) {
+                    break;
                 }
-                artifacts.record_mesh_results(batch.batch_id, &mesh_results)?;
+                let step: anyhow::Result<()> = async {
+                    let (permit, wait_ms) = acquire_with_wait(semaphore.clone()).await?;
+                    let mesh_start = Instant::now();
+                    let tasks =
+                        crate::fast_model::mesh_generate::extract_mesh_tasks(&batch.shape_insts);
+                    let mesh_task_count = tasks.len();
 
-                let mesh_ms = mesh_start.elapsed().as_millis();
-                drop(permit);
-                println!(
-                    "[batch_stage] batch={} stage=mesh worker={} wait_ms={} mesh_ms={} mesh_tasks={} mesh_cache_hit={} mesh_new_generated={}",
-                    batch.batch_id, worker_id, wait_ms, mesh_ms, mesh_task_count, mesh_cache_hits, mesh_new_generated
-                );
+                    let mut mesh_results = HashMap::new();
+                    let mut mesh_cache_hits = 0usize;
+                    let mut mesh_new_generated = 0usize;
 
-                let output_send_start = Instant::now();
-                output_sender
-                    .send_async(BatchMeshOutput {
-                        batch_id: batch.batch_id,
-                        shape_insts: batch.shape_insts,
-                        mesh_results,
-                        mesh_task_count,
-                        mesh_cache_hits,
-                        mesh_new_generated,
-                        mesh_ms,
-                        mesh_wait_ms: wait_ms,
-                        batch_started_at: batch.batch_started_at,
-                    })
-                    .await?;
-                let output_send_wait_ms = output_send_start.elapsed().as_millis();
-                if output_send_wait_ms > 0 {
+                    if gen_mesh && !tasks.is_empty() {
+                        mesh_results = crate::fast_model::mesh_generate::generate_meshes_for_batch(
+                            &tasks,
+                            &db_option_inner,
+                            &deduper,
+                            &mesh_aabb_map,
+                            &mesh_pts_map,
+                        )
+                        .await;
+                        mesh_cache_hits = mesh_results
+                            .values()
+                            .filter(|mr| mr.meshed && !mr.bad && mr.pts_hashes.is_empty())
+                            .count();
+                        mesh_new_generated = mesh_results.len().saturating_sub(mesh_cache_hits);
+                    }
+                    artifacts.record_mesh_results(batch.batch_id, &mesh_results)?;
+
+                    let mesh_ms = mesh_start.elapsed().as_millis();
+                    drop(permit);
                     println!(
-                        "[batch_stage] batch={} stage=mesh_output worker={} send_wait_ms={}",
-                        batch.batch_id, worker_id, output_send_wait_ms
+                        "[batch_stage] batch={} stage=mesh worker={} wait_ms={} mesh_ms={} mesh_tasks={} mesh_cache_hit={} mesh_new_generated={}",
+                        batch.batch_id, worker_id, wait_ms, mesh_ms, mesh_task_count, mesh_cache_hits, mesh_new_generated
                     );
+
+                    let output_send_start = Instant::now();
+                    output_sender
+                        .send_async(BatchMeshOutput {
+                            batch_id: batch.batch_id,
+                            shape_insts: batch.shape_insts,
+                            mesh_results,
+                            mesh_task_count,
+                            mesh_cache_hits,
+                            mesh_new_generated,
+                            mesh_ms,
+                            mesh_wait_ms: wait_ms,
+                            batch_started_at: batch.batch_started_at,
+                        })
+                        .await?;
+                    let output_send_wait_ms = output_send_start.elapsed().as_millis();
+                    if output_send_wait_ms > 0 {
+                        println!(
+                            "[batch_stage] batch={} stage=mesh_output worker={} send_wait_ms={}",
+                            batch.batch_id, worker_id, output_send_wait_ms
+                        );
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = step {
+                    abort.store(true, Ordering::Relaxed);
+                    return Err(error);
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -495,6 +527,8 @@ async fn run_inst_aabb_writer(
         "[batch_stage] stage=inst_aabb worker_pool={} skip_inst_relate_aabb={}",
         worker_count, skip_inst_relate_aabb
     );
+    // 与 base/mesh 阶段相同的 fail-fast 策略。
+    let abort = Arc::new(AtomicBool::new(false));
     for worker_id in 0..worker_count {
         let joined_receiver = joined_receiver.clone();
         let inst_aabb_semaphore = inst_aabb_semaphore.clone();
@@ -502,9 +536,13 @@ async fn run_inst_aabb_writer(
         let mesh_pts_map = mesh_pts_map.clone();
         let completion_sender = completion_sender.clone();
         let model_writer = model_writer.clone();
+        let abort = Arc::clone(&abort);
         handles.push(tokio::spawn(async move {
             while let Ok(batch) = joined_receiver.recv_async().await {
-                process_inst_aabb_batch(
+                if abort.load(Ordering::Relaxed) {
+                    break;
+                }
+                let step = process_inst_aabb_batch(
                     batch,
                     inst_aabb_semaphore.clone(),
                     mesh_aabb_map.clone(),
@@ -514,7 +552,11 @@ async fn run_inst_aabb_writer(
                     skip_inst_relate_aabb,
                     worker_id,
                 )
-                .await?;
+                .await;
+                if let Err(error) = step {
+                    abort.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
             }
             Ok::<(), anyhow::Error>(())
         }));

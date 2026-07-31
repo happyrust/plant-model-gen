@@ -338,6 +338,30 @@ pub async fn api_stream_generate(
             .into_response();
     }
 
+    // 整条流共用一把项目写入锁：流内会分批多次进生成管线，逐批抢锁既挡不住
+    // 交错，也会在中途失败留下半套模型。
+    let db_option_ext = crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
+    let mutation_lock = match crate::web_server::generation_lock::acquire_web_generation_lock(
+        &db_option_ext,
+        "stream-generate",
+    ) {
+        Ok(lock) => Arc::new(lock),
+        Err(error) => {
+            let event = StreamGenerateEvent::Error {
+                message: format!("无法开始流式生成: {error:#}"),
+            };
+            let single_event_stream = stream::once(async move {
+                let sse_event = Event::default().json_data(&event).unwrap_or_else(|_| {
+                    Event::default().data("{\"type\":\"error\",\"message\":\"序列化失败\"}")
+                });
+                Ok::<Event, Infallible>(sse_event)
+            });
+            return Sse::new(Box::pin(single_event_stream))
+                .keep_alive(KeepAlive::default())
+                .into_response();
+        }
+    };
+
     // 将请求处理逻辑封装到异步流中
     let event_stream = stream::unfold(
         (req, StreamGenerateState::Init),
@@ -405,6 +429,26 @@ pub async fn api_stream_generate(
                             return Some((event, (req, StreamGenerateState::Done)));
                         }
                     };
+
+                    // 2.1.1 强制重生成：写入是 INSERT IGNORE，若不先清理旧产物，
+                    // 几何变更后的重生成会同时保留新旧 geo_relate 边（幽灵几何），
+                    // force_regenerate 对已存在行实际是 no-op。与 CLI --regen-model
+                    // 对齐：先对请求根做子树 pre-cleanup（生成本身也会展开同一子树）。
+                    // 必须在负实体依赖预生成之前执行，避免误删刚生成的依赖产物。
+                    if req.force_regenerate && !expanded_geo.is_empty() {
+                        if let Err(e) =
+                            crate::fast_model::gen_model::pdms_inst::pre_cleanup_for_regen(
+                                &parsed_refnos,
+                                false,
+                            )
+                            .await
+                        {
+                            let event = StreamGenerateEvent::Error {
+                                message: format!("强制重生成前置清理失败: {e}"),
+                            };
+                            return Some((event, (req, StreamGenerateState::Done)));
+                        }
+                    }
 
                     // 2.2 若启用布尔运算：提前生成“深度负实体”依赖，避免后续布尔阶段缺少切割体网格
                     if req.apply_boolean {
@@ -807,7 +851,10 @@ pub async fn api_stream_generate(
             }
         },
     )
-    .map(|event| {
+    .map(move |event| {
+        // 闭包 move 住 Arc，锁随 SSE 流一起释放——客户端断开时流被 drop，
+        // 锁也就还回去了。
+        let _mutation_lock = &mutation_lock;
         let json = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
         Ok::<_, Infallible>(Event::default().data(json).event("message"))
     });

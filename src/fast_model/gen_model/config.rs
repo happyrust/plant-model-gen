@@ -180,7 +180,7 @@ fn env_flag(name: &str) -> bool {
 
 /// 类型安全的并发配置
 ///
-/// 保证并发数始终在有效范围内（2-8）
+/// 保证并发数始终在有效范围内（MIN-MAX）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Concurrency(NonZeroUsize);
 
@@ -188,8 +188,14 @@ impl Concurrency {
     /// 最小并发数
     pub const MIN: usize = 2;
 
-    /// 最大并发数
-    pub const MAX: usize = 8;
+    /// 最大并发数。
+    ///
+    /// 历史上限为 8：高核数服务器即便显式配置更高的
+    /// `gen_pipeline_max_concurrent` 也会被静默夹回，只留一条 log::warn。
+    /// 现放宽为 64 作为防误配置的护栏（例如把 batch_size 填错到并发上）；
+    /// 对 SurrealDB 的写入压力由 write pipeline 的
+    /// base_write/mesh_compute/inst_aabb 三级 semaphore 单独限流，与此处无关。
+    pub const MAX: usize = 64;
 
     /// 默认并发数
     pub const DEFAULT: usize = 4;
@@ -205,7 +211,7 @@ impl Concurrency {
     /// # Examples
     /// ```
     /// let concurrency = Concurrency::new(6)?; // Ok(6)
-    /// let concurrency = Concurrency::new(10)?; // Ok(8) - 自动限制
+    /// let concurrency = Concurrency::new(100)?; // Ok(MAX) - 自动限制
     /// let concurrency = Concurrency::new(0)?; // Err - 无效值
     /// ```
     pub fn new(n: usize) -> Result<Self> {

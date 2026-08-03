@@ -201,6 +201,25 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
 - T6.4 ZONE plan 哈希入 `initialization_runs`，供 Resume 判等。
 - **验证**：CLI 打印 deps epoch/hash 与 ZONE plan，两次运行同源应稳定一致。
 
+> **Phase 6 进度（2026-08-03）**：`zone_stream::plan` 的数据模型与哈希口径已落地并通过
+> `cargo check`；**装载与解析的实际接线未做**（要接 spec 002 的
+> `collect_design_subtree_outbound` 与 `CataClosureResolver`，以及 sidecar 的 `deps` 库）。
+>
+> 三个概念的边界在代码里写死了，混淆任一对都会破坏正确性：
+>
+> - `ZonePlan`：目标 dbnum（`BTreeMap` 保证升序）+ 每个 dbnum 内的 ZONE 稳定序。
+>   `plan_hash()` 覆盖 refno **及其顺序** —— 顺序变了就是另一个计划，因为
+>   「跳过 Verified ZONE」是按 refno 认的，顺序漂移会让跳过语义失真。
+>   构造时拒绝空 dbnum 与重复 refno。
+> - `DepsEpoch`：某个 dbnum 依赖并集装载完成的不可变证明，含逐库元素数。
+>   `assert_unchanged()` 在关键边界复核，不一致直接判不可恢复错误（R4）。
+> - `ZoneScopeSeal`：单个 ZONE **解析侧**的完整性证明，绑定具体 deps epoch。
+>   封存时硬性拒绝三种空范围：空子树、空 CATA 闭包（几何必然缺元件定义）、
+>   零 transform（世界矩阵缺失会让产物位置全错）。它只证明 ZONE 范围完整，
+>   不触碰 dbnum 级 `pe_owner` Ready（D6）。
+>
+> 哈希统一用 SHA-256 前 32 hex，且每段带长度前缀，避免 `["ab","c"]` 与 `["a","bc"]` 相撞。
+
 ### Phase 7 — 生成子进程绑定与产物回填（并行 worktree `zs-backfill`，依赖 D0-B）
 - T7.1 生成子进程的全局模型写库**绑定当前 slot**；磁盘产物写 `<runtime_dir>/zone-stream/<run_id>/` 私有目录；生成过程**不直接写目标 RocksDB**。
 - T7.2 `GenerationOutputBackfill` trait（首版：双 WS + SurrealQL 顺序回填）。搬运清单沿用 spec029 三组：源数据侧 / 模型产物侧 11 张 + `inst_info` / 值对表。

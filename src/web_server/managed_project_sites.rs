@@ -31,10 +31,13 @@ use sysinfo::{
 use tokio::process::Command;
 use tokio::task;
 
+use crate::zone_stream::reject_legacy_entry_for_zone_stream;
+
 use super::models::{
     AdminResourceSummary, AppendManagedSiteDbFileRequest, AppendManagedSiteDbFileResponse,
-    CreateManagedSiteRequest, DatabaseConfig, ManagedProjectSite, ManagedRemoteDeployRequest,
-    ManagedRemoteDeployStatus, ManagedRemoteTarget, ManagedRemoteTargetOs,
+    CreateManagedSiteRequest, DatabaseConfig, InitializationPipelineMode, ManagedProjectSite,
+    ManagedRemoteDeployRequest, ManagedRemoteDeployStatus, ManagedRemoteTarget,
+    ManagedRemoteTargetOs, DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
     ManagedRemoteTargetRequest, ManagedSiteActivitySummary, ManagedSiteDbMode,
     ManagedSiteDeployValidationCheck, ManagedSiteDeployValidationReport,
     ManagedSiteLogStreamSummary, ManagedSiteLogsResponse, ManagedSiteParseHealth,
@@ -101,7 +104,7 @@ const WAIT_PORT_FREE_ATTEMPTS: usize = 20;
 const PATH_SIZE_CACHE_TTL_MS: u64 = 60_000;
 
 // Schema 版本号：每次迁移 +1。
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 // ─── Global state (opt-in, interior mutability) ─────────────────────────────
 
@@ -1960,6 +1963,24 @@ fn db_mode_from_string(value: Option<String>, default: ManagedSiteDbMode) -> Man
     }
 }
 
+fn initialization_pipeline_mode_to_str(mode: InitializationPipelineMode) -> &'static str {
+    match mode {
+        InitializationPipelineMode::Legacy => "legacy",
+        InitializationPipelineMode::ZoneStream => "zone-stream",
+    }
+}
+
+/// 解析初始化流水模式（ADR-0016 D1）。
+///
+/// 与 [`db_mode_from_string`] 不同，这里**不接受未知值回退**：空值与缺列按历史站点视为
+/// `legacy`，任何无法识别的字面量都让站点加载/保存直接失败。口径与 TOML 侧同源，
+/// 避免两处对同一个字面量给出不同结论。
+fn initialization_pipeline_mode_from_string(
+    value: Option<&str>,
+) -> Result<InitializationPipelineMode, String> {
+    crate::options::parse_initialization_pipeline_mode(value).map_err(|err| err.to_string())
+}
+
 fn apply_site_db_mode_config(
     table: &mut toml::value::Table,
     site: &ManagedProjectSite,
@@ -2360,6 +2381,8 @@ fn write_site_files_with_parse_plan(
         "export_parquet": site.export_parquet,
         "pipeline_db_mode": managed_db_mode_to_str(site.pipeline_db_mode),
         "runtime_db_mode": managed_db_mode_to_str(site.runtime_db_mode),
+        "initialization_pipeline_mode": initialization_pipeline_mode_to_str(site.initialization_pipeline_mode),
+        "zone_stream_memory_budget_mib": site.zone_stream_memory_budget_mib,
         "db_port": site.db_port,
         "web_port": site.web_port,
         "entry_url": site.entry_url,
@@ -2669,6 +2692,22 @@ fn row_to_site(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedProjectSite> 
             row.get("runtime_db_mode").unwrap_or(None),
             ManagedSiteDbMode::Ws,
         ),
+        initialization_pipeline_mode: {
+            let raw: Option<String> = row.get("initialization_pipeline_mode").unwrap_or(None);
+            initialization_pipeline_mode_from_string(raw.as_deref()).map_err(|message| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, message)),
+                )
+            })?
+        },
+        zone_stream_memory_budget_mib: row
+            .get::<_, Option<i64>>("zone_stream_memory_budget_mib")
+            .unwrap_or(None)
+            .filter(|value| *value > 0)
+            .map(|value| value as u32)
+            .unwrap_or(DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB),
         config_path: row.get("config_path")?,
         runtime_dir: row.get("runtime_dir")?,
         db_data_path: row.get("db_data_path")?,
@@ -2742,6 +2781,8 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
             export_parquet INTEGER NOT NULL DEFAULT 1,
             pipeline_db_mode TEXT NOT NULL DEFAULT 'ws',
             runtime_db_mode TEXT NOT NULL DEFAULT 'ws',
+            initialization_pipeline_mode TEXT NOT NULL DEFAULT 'legacy',
+            zone_stream_memory_budget_mib INTEGER NOT NULL DEFAULT 4096,
             config_path TEXT NOT NULL,
             runtime_dir TEXT NOT NULL,
             db_data_path TEXT NOT NULL,
@@ -2973,6 +3014,17 @@ fn ensure_schema_with_conn(conn: &Connection) -> Result<()> {
         current_version = 9;
         conn.pragma_update(None, "user_version", current_version as i64)?;
     }
+    if current_version < 10 {
+        // spec 030：初始化流水模式与 ZoneStream 内存预算；历史站点一律落在 legacy/4096。
+        for column in [
+            "initialization_pipeline_mode",
+            "zone_stream_memory_budget_mib",
+        ] {
+            ensure_column_exists(conn, column)?;
+        }
+        current_version = 10;
+        conn.pragma_update(None, "user_version", current_version as i64)?;
+    }
     conn.execute(
         "DROP INDEX IF EXISTS idx_managed_project_sites_project_name",
         [],
@@ -3015,6 +3067,8 @@ fn ensure_column_exists(conn: &Connection, column: &str) -> Result<()> {
             "export_parquet" => "INTEGER NOT NULL DEFAULT 1",
             "pipeline_db_mode" => "TEXT NOT NULL DEFAULT 'ws'",
             "runtime_db_mode" => "TEXT NOT NULL DEFAULT 'ws'",
+            "initialization_pipeline_mode" => "TEXT NOT NULL DEFAULT 'legacy'",
+            "zone_stream_memory_budget_mib" => "INTEGER NOT NULL DEFAULT 4096",
             "projects_json" => "TEXT NOT NULL DEFAULT '[]'",
             _ => "TEXT",
         };
@@ -3083,8 +3137,8 @@ fn persist_site_with_conn(
                 status, parse_status, last_error, entry_url, db_user, db_password,
                 last_parse_started_at, last_parse_finished_at, last_parse_duration_ms,
                 created_at, updated_at, site_name, projects_json, auto_parse_related_dbnums,
-                cata_partial_parse
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)",
+                cata_partial_parse, initialization_pipeline_mode, zone_stream_memory_budget_mib
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49)",
             table = TABLE_NAME
         ),
         params![
@@ -3135,6 +3189,8 @@ fn persist_site_with_conn(
             projects_to_json(&site.projects).unwrap_or_else(|_| "[]".to_string()),
             if site.auto_parse_related_dbnums { 1i64 } else { 0i64 },
             if site.cata_partial_parse { 1i64 } else { 0i64 },
+            initialization_pipeline_mode_to_str(site.initialization_pipeline_mode),
+            site.zone_stream_memory_budget_mib as i64,
         ],
     )?;
     Ok(())
@@ -3996,6 +4052,11 @@ pub fn create_site(req: CreateManagedSiteRequest) -> Result<ManagedProjectSite> 
             .unwrap_or(generation_defaults.export_parquet),
         pipeline_db_mode: req.pipeline_db_mode.unwrap_or(ManagedSiteDbMode::Ws),
         runtime_db_mode: req.runtime_db_mode.unwrap_or(ManagedSiteDbMode::Ws),
+        initialization_pipeline_mode: req.initialization_pipeline_mode.unwrap_or_default(),
+        zone_stream_memory_budget_mib: req
+            .zone_stream_memory_budget_mib
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB),
         config_path: String::new(),
         runtime_dir: String::new(),
         db_data_path: String::new(),
@@ -5124,6 +5185,8 @@ async fn quick_create_deploy_config(
         export_parquet: None,
         pipeline_db_mode: Some(req.pipeline_db_mode.unwrap_or(ManagedSiteDbMode::Ws)),
         runtime_db_mode: Some(req.pipeline_db_mode.unwrap_or(ManagedSiteDbMode::Ws)),
+        initialization_pipeline_mode: None,
+        zone_stream_memory_budget_mib: None,
         db_port: None,
         web_port: req.web_port,
         auto_deploy: false,
@@ -5272,6 +5335,8 @@ async fn quick_deploy(
         export_parquet: None,
         pipeline_db_mode: req.pipeline_db_mode,
         runtime_db_mode: req.pipeline_db_mode,
+        initialization_pipeline_mode: None,
+        zone_stream_memory_budget_mib: None,
         db_port: None,
         web_port: req.web_port,
         auto_deploy: false,
@@ -5521,6 +5586,8 @@ fn build_preview_site(req: PreviewManagedSiteParsePlanRequest) -> Result<Managed
             export_parquet: generation_defaults.export_parquet,
             pipeline_db_mode: ManagedSiteDbMode::Ws,
             runtime_db_mode: ManagedSiteDbMode::Ws,
+            initialization_pipeline_mode: InitializationPipelineMode::Legacy,
+            zone_stream_memory_budget_mib: DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
             config_path: String::new(),
             runtime_dir: String::new(),
             db_data_path: String::new(),
@@ -5651,6 +5718,17 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         );
     }
 
+    // ADR-0016 D1：初始化开始后禁止切换初始化流水模式。
+    if let Some(next_mode) = req.initialization_pipeline_mode {
+        if next_mode != site.initialization_pipeline_mode && site_initialization_started(&site) {
+            bail!(
+                "初始化已开始的站点不能切换初始化流水模式（当前 {} → 请求 {}）。请新建目标数据目录/站点后再选择模式；当前不会改写配置。",
+                initialization_pipeline_mode_to_str(site.initialization_pipeline_mode),
+                initialization_pipeline_mode_to_str(next_mode)
+            );
+        }
+    }
+
     let old_site = site.clone();
     let old_project_name = site.project_name.clone();
     let mut project_name_changed = false;
@@ -5738,6 +5816,15 @@ pub fn update_site(site_id: &str, req: UpdateManagedSiteRequest) -> Result<Manag
         site.pipeline_db_mode = value;
     }
     site.runtime_db_mode = ManagedSiteDbMode::Ws;
+    if let Some(value) = req.initialization_pipeline_mode {
+        site.initialization_pipeline_mode = value;
+    }
+    if let Some(value) = req
+        .zone_stream_memory_budget_mib
+        .filter(|value| *value > 0)
+    {
+        site.zone_stream_memory_budget_mib = value;
+    }
     if let Some(value) = req.bind_host.filter(|value| !value.trim().is_empty()) {
         let value = value.trim().to_string();
         assert_bind_host_safe(&value)?;
@@ -8945,6 +9032,14 @@ fn site_versioned_change_requires_rebuild(site: &ManagedProjectSite) -> bool {
     )
 }
 
+/// 已解析或解析失败过的站点视为「初始化已开始」：ADR-0016 D1 禁止此后切换初始化流水模式。
+fn site_initialization_started(site: &ManagedProjectSite) -> bool {
+    matches!(
+        site.parse_status,
+        ManagedSiteParseStatus::Parsed | ManagedSiteParseStatus::Failed
+    )
+}
+
 /// 把 versioned 参数写回站点 DbOption.toml（保留其余字段）。
 fn apply_versioned_params_to_site_config(
     site: &ManagedProjectSite,
@@ -12107,6 +12202,8 @@ async fn run_parse_pipeline(site_id: String) -> Result<()> {
         }
     }
 
+    reject_legacy_entry_for_zone_stream(&site, "解析")?;
+
     let started_db_pid =
         ensure_site_db_started(&site, site.status.clone(), site.pipeline_db_mode).await?;
     let parse_result = spawn_parse_process(site_id.clone()).await;
@@ -12203,6 +12300,8 @@ async fn run_generation_pipeline(site_id: String, parse_first: bool) -> Result<(
         .await
         .context("读取站点状态失败 (join error)")??
         .ok_or_else(|| anyhow!("站点不存在"))?;
+
+        reject_legacy_entry_for_zone_stream(&site, "解析/生成")?;
 
         if site.parse_status != ManagedSiteParseStatus::Parsed {
             if parse_first {
@@ -12342,6 +12441,7 @@ async fn run_start_pipeline_inner(site_id: String, mark_running: bool) -> Result
     .context("读取站点状态失败 (join error)")??
     .ok_or_else(|| anyhow!("站点不存在"))?;
     if site.parse_status != ManagedSiteParseStatus::Parsed {
+        reject_legacy_entry_for_zone_stream(&site, "站点启动前的补解析")?;
         let parse_db_pid =
             ensure_site_db_started(&site, ManagedSiteStatus::Starting, site.pipeline_db_mode)
                 .await?;
@@ -15871,6 +15971,8 @@ mod tests {
             export_parquet: false,
             pipeline_db_mode: ManagedSiteDbMode::File,
             runtime_db_mode: ManagedSiteDbMode::Ws,
+            initialization_pipeline_mode: InitializationPipelineMode::Legacy,
+            zone_stream_memory_budget_mib: DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
             config_path: String::new(),
             runtime_dir: String::new(),
             db_data_path: String::new(),
@@ -15940,6 +16042,8 @@ mod tests {
             export_parquet: false,
             pipeline_db_mode: ManagedSiteDbMode::File,
             runtime_db_mode: ManagedSiteDbMode::Ws,
+            initialization_pipeline_mode: InitializationPipelineMode::Legacy,
+            zone_stream_memory_budget_mib: DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
             config_path: String::new(),
             runtime_dir: String::new(),
             db_data_path: String::new(),
@@ -16007,6 +16111,8 @@ mod tests {
             export_parquet: false,
             pipeline_db_mode: ManagedSiteDbMode::File,
             runtime_db_mode: ManagedSiteDbMode::File,
+            initialization_pipeline_mode: InitializationPipelineMode::Legacy,
+            zone_stream_memory_budget_mib: DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
             config_path: String::new(),
             runtime_dir: String::new(),
             db_data_path: String::new(),

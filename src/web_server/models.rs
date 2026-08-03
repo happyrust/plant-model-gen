@@ -870,6 +870,13 @@ fn default_runtime_db_mode() -> ManagedSiteDbMode {
     ManagedSiteDbMode::Ws
 }
 
+/// 初始化流水模式与内存预算的定义方是 [`crate::options`]（与 `ModelWriterMode` 等其它
+/// 模式开关同源，且不受 `web_server` feature 门控）；此处只做转出，供管理端模型复用。
+pub use crate::options::{
+    default_zone_stream_memory_budget_mib, InitializationPipelineMode,
+    DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
+};
+
 /// 工程角色：设计工程 / 元件库工程
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -993,6 +1000,13 @@ pub struct ManagedProjectSite {
     pub pipeline_db_mode: ManagedSiteDbMode,
     #[serde(default = "default_runtime_db_mode")]
     pub runtime_db_mode: ManagedSiteDbMode,
+    /// 初始化流水模式；缺省与所有历史站点均为 `legacy`。
+    #[serde(default)]
+    pub initialization_pipeline_mode: InitializationPipelineMode,
+    /// ZoneStream 的内存总预算（MiB）；仅在 `initialization_pipeline_mode = zone-stream` 时生效。
+    /// 不参与 contract hash（ADR-0016 D10），失败后调大预算仍可 Resume 同一 run。
+    #[serde(default = "default_zone_stream_memory_budget_mib")]
+    pub zone_stream_memory_budget_mib: u32,
     pub config_path: String,
     pub runtime_dir: String,
     pub db_data_path: String,
@@ -1111,6 +1125,12 @@ pub struct CreateManagedSiteRequest {
     pub pipeline_db_mode: Option<ManagedSiteDbMode>,
     #[serde(default)]
     pub runtime_db_mode: Option<ManagedSiteDbMode>,
+    /// 初始化流水模式；None = `legacy`。
+    #[serde(default)]
+    pub initialization_pipeline_mode: Option<InitializationPipelineMode>,
+    /// ZoneStream 内存总预算（MiB）；None = 4096。
+    #[serde(default)]
+    pub zone_stream_memory_budget_mib: Option<u32>,
     #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]
@@ -1192,6 +1212,13 @@ pub struct UpdateManagedSiteRequest {
     pub pipeline_db_mode: Option<ManagedSiteDbMode>,
     #[serde(default)]
     pub runtime_db_mode: Option<ManagedSiteDbMode>,
+    /// 初始化流水模式。None=不修改。
+    /// 初始化已开始（parse_status=Parsed/Failed）时改此值会被拒绝（ADR-0016 D1）。
+    #[serde(default)]
+    pub initialization_pipeline_mode: Option<InitializationPipelineMode>,
+    /// ZoneStream 内存总预算（MiB）。None=不修改；允许在 Resume 前调大。
+    #[serde(default)]
+    pub zone_stream_memory_budget_mib: Option<u32>,
     #[serde(default)]
     pub db_port: Option<u16>,
     #[serde(default)]

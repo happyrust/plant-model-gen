@@ -733,3 +733,7 @@ pub mod web_api;
 
 #[cfg(feature = "web_server")]
 pub mod web_server;
+
+/// ZoneStream 按 ZONE 双缓冲初始化编排（ADR-0016 / spec 030）。
+#[cfg(feature = "web_server")]
+pub mod zone_stream;

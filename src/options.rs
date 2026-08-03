@@ -372,6 +372,55 @@ impl Default for ModelWriterMode {
     }
 }
 
+/// 初始化流水模式（ADR-0016 D1 / spec 030）。
+///
+/// 与 `ModelWriterMode`（写后端）、`TransformReadBackend`（读后端）以及站点侧的
+/// `pipeline_db_mode`（file/ws 连接形态）完全正交，不复用其中任何一个开关。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InitializationPipelineMode {
+    /// 两段式串行：整 dbnum 解析完再整 dbnum 生成。
+    #[default]
+    Legacy,
+    /// 按完整 ZONE 双缓冲流水，解析下一 ZONE 与生成/回填当前 ZONE 重叠。
+    ZoneStream,
+}
+
+impl InitializationPipelineMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::ZoneStream => "zone-stream",
+        }
+    }
+}
+
+/// ZoneStream 的内存总预算（MiB），覆盖 mem sidecar、deps、两个 slot 与临时批次。
+pub const DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB: u32 = 4096;
+
+pub fn default_zone_stream_memory_budget_mib() -> u32 {
+    DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB
+}
+
+fn default_initialization_pipeline_mode() -> InitializationPipelineMode {
+    InitializationPipelineMode::Legacy
+}
+
+/// 解析初始化流水模式；未知值直接失败，不静默回退（ADR-0016 D1）。
+pub fn parse_initialization_pipeline_mode(
+    raw: Option<&str>,
+) -> anyhow::Result<InitializationPipelineMode> {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("legacy") => Ok(InitializationPipelineMode::Legacy),
+        Some("zone-stream" | "zone_stream" | "zonestream") => {
+            Ok(InitializationPipelineMode::ZoneStream)
+        }
+        Some(mode) => anyhow::bail!(
+            "未知 initialization_pipeline={mode}；仅支持 legacy 或 zone-stream，系统不会静默回退"
+        ),
+    }
+}
+
 impl ModelWriterMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -569,6 +618,15 @@ pub struct DbOptionExt {
     /// 模型写入后端：surreal 写库，drain-only 仅消费统计。
     #[serde(default = "default_model_writer_mode")]
     pub model_writer_mode: ModelWriterMode,
+
+    /// 初始化流水模式：legacy 两段式串行，zone-stream 按 ZONE 双缓冲（spec 030）。
+    #[serde(default = "default_initialization_pipeline_mode")]
+    pub initialization_pipeline_mode: InitializationPipelineMode,
+
+    /// ZoneStream 的内存总预算（MiB）；仅在 zone-stream 模式下生效。
+    /// 不参与 contract hash（ADR-0016 D10），失败后调大预算仍可 Resume 同一 run。
+    #[serde(default = "default_zone_stream_memory_budget_mib")]
+    pub zone_stream_memory_budget_mib: u32,
 
     /// pe_transform 刷新结果写入后端。
     #[serde(default = "default_transform_write_backend")]
@@ -845,6 +903,8 @@ impl From<DbOption> for DbOptionExt {
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::MemoryTasks,
             model_writer_mode: ModelWriterMode::Surreal,
+            initialization_pipeline_mode: InitializationPipelineMode::Legacy,
+            zone_stream_memory_budget_mib: DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB,
             transform_write_backend: TransformWriteBackend::Surreal,
             transform_read_backend: TransformReadBackend::Auto,
             transform_compare_backends: Vec::new(),
@@ -1087,6 +1147,27 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
             .and_then(|v| v.as_str()),
     )?;
 
+    let initialization_pipeline_mode = parse_initialization_pipeline_mode(
+        toml_value
+            .get("initialization_pipeline")
+            .or_else(|| toml_value.get("initialization_pipeline_mode"))
+            .and_then(|v| v.as_str()),
+    )?;
+
+    let zone_stream_memory_budget_mib = toml_value
+        .get("zone_stream_memory_budget_mib")
+        .and_then(|v| v.as_integer())
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                anyhow::anyhow!("zone_stream_memory_budget_mib={value} 超出取值范围（1..=u32::MAX）")
+            })
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_ZONE_STREAM_MEMORY_BUDGET_MIB);
+    if zone_stream_memory_budget_mib == 0 {
+        anyhow::bail!("zone_stream_memory_budget_mib 不能为 0；预算需覆盖 deps 与两个 slot");
+    }
+
     let transform_write_backend = parse_transform_write_backend(
         toml_value
             .get("transform_write_backend")
@@ -1209,6 +1290,8 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         defer_db_write,
         boolean_pipeline_mode,
         model_writer_mode,
+        initialization_pipeline_mode,
+        zone_stream_memory_budget_mib,
         transform_write_backend,
         transform_read_backend,
         transform_compare_backends,
@@ -1246,6 +1329,10 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         println!(
             "   - model_writer: {}",
             db_option_ext.model_writer_mode.as_str()
+        );
+        println!(
+            "   - initialization_pipeline: {}",
+            db_option_ext.initialization_pipeline_mode.as_str()
         );
         println!(
             "   - transform_write_backend: {}",

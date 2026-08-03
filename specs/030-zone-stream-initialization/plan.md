@@ -169,6 +169,22 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
 - T4.5 端口与 runtime 目录隔离，避免与并行 worktree/其他站点互杀。
 - **验证**：CLI 起一次 run，`ss/netstat` 确认仅 loopback；kill sidecar 后 Resume 能重建。
 
+> **Phase 4 进度（2026-08-03）**：T4.1 与 T4.2 的模块已落地并通过 `cargo check`，
+> 但**尚未接入 orchestrator**（要等 Phase 6 的 deps epoch 与 ZONE 规划才有调用点），
+> 因此当前对运行时零影响。
+>
+> - `zone_stream::sidecar`：动态 loopback 端口（内核分配，避免与站点管理的按端口杀进程逻辑
+>   相撞）、run-scoped namespace `zs_<run_id>`、每次运行随机口令、就绪等待带超时、
+>   pid 文件落在 `<runtime_dir>/zone-stream/<run_id>/` 供孤儿清理脚本发现、
+>   `shutdown()` 显式停 + `Drop` 兜底。
+> - `zone_stream::slot`：`SlotLease`（slot + 单调 generation）解决 slot 复用后的 ABA 问题 ——
+>   过期 lease 硬失败，不做跨 slot 回退查询（D4）；`advance` 只允许
+>   Parsing → Sealed → Generating → Backfilling 单向前进；`SlotPair::downstream_busy()`
+>   表达 D2 的「同一时刻至多一个 generator/backfill」。
+>
+> **未做**：T4.3 短命生成子进程、T4.4 与 specs/017 reaper 的正式对接（当前只有 pid 文件 +
+> Drop 兜底）、以及把两者接进编排循环。
+
 ### Phase 5 — 复合读 session 与精确路由（并行 worktree `zs-read-route`）
 - T5.1 `SurrealVersionedReadSession` 改为**持有显式 client**（`src/generation_read/surreal.rs`），去掉隐式全局连接依赖。
 - T5.2 新增复合 session：设计 PE/ATT/owner/transform → **当前 slot**；共享依赖 → **`deps`**；路由表为不可变 route map。

@@ -86,7 +86,14 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
 1. **单写者规则**：`managed_project_sites.rs`、`web_server/models.rs` 只允许主线 worktree 修改；并行 worktree 若需要挂接点，先由主线预留 trait/函数签名再消费。
 2. **合流方向单向**：并行分支 → 主线分支 → 主干。并行分支不得互相 merge。
 3. **rebase 节奏**：并行分支每完成一个 Phase 就 rebase 到主线分支最新，避免长尾冲突。
-4. **构建隔离**：每个 worktree 独立 `target/`（磁盘代价已知，换取并行编译不互锁）；共享 `.cargo` 配置。
+4. **构建目录是共享的，不是隔离的**（2026-08-03 实测更正）：环境变量
+   `CARGO_TARGET_DIR=D:\Rust\target` 全局生效，三个 worktree **共用同一个 target 目录**，
+   `.cargo/config.toml` 另有 `rustc-wrapper = "sccache"`。因此：
+   - **不要并行跑 cargo**：同一 target 目录上的两个 cargo 进程会互相阻塞在 cargo lock 上；
+     并行只体现在「编辑 + 思考」，编译必须串行。
+   - 在 worktree 之间来回构建会反复重编 `aios_database` 本体（外部依赖与 `pdms-io-fork`
+     由 sccache 复用），单次 `cargo check` 约 2 分钟、`cargo build --bin aios-database` 约 2.5 分钟。
+   - 若要真正的并行编译，需为每个 worktree 显式覆盖 `CARGO_TARGET_DIR`，代价是各自一份完整产物。
 5. **运行时隔离**：ZoneStream 会拉 surreal sidecar，各 worktree 必须用**不同 `db_port` 段**与不同 `runtime_dir`，否则会互相杀进程（参考 `stop_site_ws_db_for_exclusivity` 的按端口杀逻辑）。
 6. 开工前 `git worktree prune` 清掉 6 个 prunable 条目。
 
@@ -123,6 +130,25 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
 - T2.4 初始化开始后**禁止切换模式**（改配置返回明确错误，要求新建目标目录/站点）。
 - T2.5 编排入口分流：新增 `src/zone_stream/orchestrator.rs`，在 managed-site 编排层按模式跳转；**不改** `spawn_parse_process`(L9945) / `spawn_generation_process`(L10189) 内部逻辑。
 - **验证**：`cargo build --bin aios-database`；HTTP 建站点分别传 `legacy` / `zone-stream` / `bogus`，第三个应启动/保存失败。
+
+> **Phase 2 完成记录（2026-08-03，提交 `e2cdb02`）**
+>
+> 模式枚举落在 `src/options.rs`（与 `ModelWriterMode` 同源、不受 `web_server` feature 门控），
+> `web_server::models` 只做转出；SQLite 与 TOML 两侧共用同一个 `parse_initialization_pipeline_mode`，
+> 避免同一字面量在两处给出不同结论。SQLite schema 升到 v10。
+>
+> 已验证（`aios-database -c <config>` CLI，符合 AGENTS.md 不用 cargo test）：
+>
+> | 配置 | 结果 |
+> |---|---|
+> | `initialization_pipeline = "bogus"` | 启动失败，`Error: 未知 initialization_pipeline=bogus；仅支持 legacy 或 zone-stream，系统不会静默回退`，exit 1 |
+> | `initialization_pipeline = "zone-stream"` | 接受，启动日志打印 `initialization_pipeline: zone-stream` |
+> | `zone_stream_memory_budget_mib = 0` | 启动失败，`Error: zone_stream_memory_budget_mib 不能为 0；预算需覆盖 deps 与两个 slot` |
+> | 完全不配置 | `initialization_pipeline: legacy`，Legacy 默认未变 |
+>
+> **尚未验证**：站点侧 HTTP 建站/改站的三值行为，以及「初始化已开始禁止切模式」的拒绝路径。
+> 这两项需要管理端 API 起服务后走 HTTP，且与 Phase 3 的 `TaskType::ZoneStreamInitialization`
+> 及 409 映射同批验证更经济，故顺延到 Phase 3 出口。
 
 ### Phase 3 — 任务、状态机与运行记录（主线）
 - T3.1 `TaskType::ZoneStreamInitialization`（`web_server/models.rs` L82 枚举）：`POST /api/admin/tasks` = Start，`/cancel` = Stop，`/retry` = Resume。

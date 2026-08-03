@@ -12,6 +12,7 @@ pub mod search_api;
 pub mod spatial_query_api;
 pub mod upload_api;
 pub mod version_api;
+pub mod visible_insts_query;
 
 pub use collision_api::{CollisionApiState, create_collision_routes};
 pub use e3d_tree_api::{E3dTreeApiState, create_e3d_tree_routes};

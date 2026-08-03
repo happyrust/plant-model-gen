@@ -9,7 +9,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
 use surrealdb::types::SurrealValue;
@@ -1010,33 +1009,64 @@ fn legacy_project_output_root() -> std::path::PathBuf {
 }
 
 #[cfg_attr(not(feature = "parquet-export"), allow(dead_code))]
-fn resolve_local_dbnum_dir(dbnum: u32, required_file: &str) -> Option<std::path::PathBuf> {
+fn resolve_local_dbnum_file(dbnum: u32, required_file: &str) -> Option<std::path::PathBuf> {
     let project_output_root = configured_project_output_root();
     let legacy_project_output_root = legacy_project_output_root();
-    let mut candidates = vec![
-        project_output_root.join("parquet").join(dbnum.to_string()),
+    let mut parquet_roots = vec![
+        project_output_root.join("parquet"),
+        legacy_project_output_root.join("parquet"),
+        std::path::PathBuf::from("output/parquet"),
+    ];
+    parquet_roots.sort();
+    parquet_roots.dedup();
+
+    let table = required_file.strip_suffix(".parquet")?;
+    for root in &parquet_roots {
+        let manifest = root.join(format!("manifest_{dbnum}.json"));
+        let Ok(bytes) = std::fs::read(manifest) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(relative) = value
+            .pointer(&format!("/tables/{table}/file"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let relative_path = std::path::Path::new(relative);
+        if relative_path.is_relative()
+            && !relative_path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            let path = root.join(relative_path);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    let mut legacy_candidates = parquet_roots
+        .into_iter()
+        .map(|root| root.join(dbnum.to_string()).join(required_file))
+        .collect::<Vec<_>>();
+    legacy_candidates.push(
         project_output_root
             .join("instances")
-            .join(dbnum.to_string()),
-    ];
-    if legacy_project_output_root != project_output_root {
-        candidates.push(
-            legacy_project_output_root
-                .join("parquet")
-                .join(dbnum.to_string()),
-        );
-        candidates.push(
-            legacy_project_output_root
-                .join("instances")
-                .join(dbnum.to_string()),
-        );
-    }
-    candidates.push(std::path::PathBuf::from("output/parquet").join(dbnum.to_string()));
-    candidates.push(std::path::PathBuf::from("output/instances").join(dbnum.to_string()));
-
-    candidates
+            .join(dbnum.to_string())
+            .join(required_file),
+    );
+    legacy_candidates.push(
+        legacy_project_output_root
+            .join("instances")
+            .join(dbnum.to_string())
+            .join(required_file),
+    );
+    legacy_candidates
         .into_iter()
-        .find(|candidate| candidate.join(required_file).exists())
+        .find(|candidate| candidate.exists())
 }
 
 #[cfg(not(feature = "parquet-export"))]
@@ -1045,7 +1075,7 @@ fn filter_visible_candidates_from_parquet(
     _dbnum: u32,
     _bran_hang_load_roots: &HashSet<RefnoEnum>,
 ) -> Option<(Vec<RefnoEnum>, String)> {
-    // 未编译 parquet-export 时跳过 parquet 过滤，调用方回退 inst_relate 查询。
+    // parquet 是 visible-insts 唯一数据源，未编译 parquet-export 时该接口不可用（调用方返回 unavailable）。
     None
 }
 
@@ -1057,14 +1087,14 @@ fn filter_visible_candidates_from_parquet(
 ) -> Option<(Vec<RefnoEnum>, String)> {
     use polars::prelude::*;
 
-    let (path, source) = if let Some(dir) = resolve_local_dbnum_dir(dbnum, "geo_instances.parquet")
-    {
-        (dir.join("geo_instances.parquet"), "parquet_geo_instances")
-    } else if let Some(dir) = resolve_local_dbnum_dir(dbnum, "instances.parquet") {
-        (dir.join("instances.parquet"), "parquet_instances")
-    } else {
-        return None;
-    };
+    let (path, source) =
+        if let Some(path) = resolve_local_dbnum_file(dbnum, "geo_instances.parquet") {
+            (path, "parquet_geo_instances")
+        } else if let Some(path) = resolve_local_dbnum_file(dbnum, "instances.parquet") {
+            (path, "parquet_instances")
+        } else {
+            return None;
+        };
 
     let file = std::fs::File::open(&path).ok()?;
     let df = ParquetReader::new(file).finish().ok()?;
@@ -1212,11 +1242,13 @@ async fn get_visible_insts_inner(
 ) -> Result<Json<VisibleInstsResponse>, StatusCode> {
     let refno = parse_refno_path(&refno)?;
     // 1) 先拿“深度可见实例”（可能包含无几何的组节点）
-    // 层级查询统一走 indextree（TreeIndex）
+    // Task 2.1：交互路径走 pe_owner 子树图查询（成本随子树走），不再借道
+    // `query_compat` 的全库快照（P0）；离线生成管线仍用快照，两者语义等价。
     let mut candidates = if is_offline_world_refno(refno) {
         let mut out = Vec::new();
         for child in offline_world_children(refno).await {
-            match crate::fast_model::query_compat::query_deep_visible_inst_refnos(child.refno).await
+            match crate::web_api::visible_insts_query::query_deep_visible_inst_refnos(child.refno)
+                .await
             {
                 Ok(mut values) => out.append(&mut values),
                 Err(e) => {
@@ -1237,7 +1269,7 @@ async fn get_visible_insts_inner(
         out.dedup();
         out
     } else {
-        match crate::fast_model::query_compat::query_deep_visible_inst_refnos(refno).await {
+        match crate::web_api::visible_insts_query::query_deep_visible_inst_refnos(refno).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(Json(VisibleInstsResponse {
@@ -1275,9 +1307,10 @@ async fn get_visible_insts_inner(
             Err(_) => HashSet::new(),
         };
 
-    // 2) 优先用 instances_{dbnum}.json 做“可加载几何”过滤：与前端实际加载数据保持一致。
+    // 2) 用 parquet 做“可加载几何”过滤：与前端 DuckDB WASM 查询的是同一批 parquet 产物，
+    //    保证接口给出的可见范围就是前端真正加载得出来的实例。
     //    - 这可以避免 query_deep_visible_inst_refnos 返回“组节点/无几何节点”，导致前端 instances 缺失。
-    //    - 若文件不存在，再回退到 inst_relate 的几何实例查询做过滤。
+    //    - 不读 instances_{dbnum}.json、不回退 inst_relate：几何数据源统一收口到 parquet。
     fn parse_dbno(r: RefnoEnum) -> Option<u32> {
         crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(r)
             .ok()
@@ -1290,145 +1323,27 @@ async fn get_visible_insts_inner(
             })
     }
 
-    fn collect_component_refnos(v: &serde_json::Value, out: &mut HashSet<String>) {
-        // 兼容多种 compact JSON 格式：递归收集所有 key=="refno" 的字符串
-        match v {
-            serde_json::Value::Object(map) => {
-                for (k, val) in map {
-                    if k == "refno" {
-                        if let Some(s) = val.as_str() {
-                            out.insert(s.to_string());
-                        }
-                    }
-                    collect_component_refnos(val, out);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    collect_component_refnos(item, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // NOTE:
-    // - instances_{dbnum}.json 位于当前配置项目输出目录：<output_root>/<project_name>/instances/
-    // - 历史兼容：也支持旧路径 output/<project_name>/instances/ 与 output/instances/
-    // - 文件读取/解析成功时：即使结果为空，也不回退 inst_relate（避免 inst_relate 缺失时接口直接报错）
     let visible_dbnum = parse_dbno(refno);
-    let (refnos, file_ok) = if let Some(dbnum) = visible_dbnum {
-        let project_output_root = configured_project_output_root();
-        let legacy_project_output_root = legacy_project_output_root();
-        let instances_path_new = project_output_root
-            .join("instances")
-            .join(format!("instances_{dbnum}.json"));
-        let instances_path_legacy_project = legacy_project_output_root
-            .join("instances")
-            .join(format!("instances_{dbnum}.json"));
-        let instances_path_old = std::path::Path::new("output")
-            .join("instances")
-            .join(format!("instances_{dbnum}.json"));
-
-        let bytes = fs::read(&instances_path_new)
-            .or_else(|_| fs::read(&instances_path_legacy_project))
-            .or_else(|_| fs::read(&instances_path_old));
-        if let Ok(bytes) = bytes {
-            match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(json) => {
-                    let mut available = HashSet::<String>::new();
-                    collect_component_refnos(&json, &mut available);
-
-                    let mut out = Vec::new();
-                    for r in candidates.iter().copied() {
-                        let key = r.to_string();
-                        let matched = if bran_hang_load_roots.contains(&r) {
-                            true
-                        } else if available.contains(&key) {
-                            true
-                        } else if key.contains('/') {
-                            available.contains(&key.replace('/', "_"))
-                        } else {
-                            false
-                        };
-                        if matched {
-                            out.push(r);
-                        }
-                    }
-
-                    out.sort();
-                    out.dedup();
-                    (out, true)
-                }
-                Err(_) => (Vec::new(), false),
-            }
-        } else {
-            (Vec::new(), false)
-        }
-    } else {
-        (Vec::new(), false)
-    };
-
-    // 文件读取/解析成功时：直接使用文件过滤结果（允许为空）
-    // 文件缺失/解析失败：优先使用同一 output_root 下的 parquet 过滤，再回退 inst_relate 几何实例过滤。
-    let (refnos, source) = if file_ok {
-        (refnos, "instances_json".to_string())
-    } else if let Some(dbnum) = visible_dbnum {
-        if let Some((parquet_refnos, parquet_source)) =
-            filter_visible_candidates_from_parquet(&candidates, dbnum, &bran_hang_load_roots)
-        {
-            (parquet_refnos, parquet_source)
-        } else {
-            match crate::fast_model::export_model::model_exporter::query_geometry_instances(
-                &candidates,
-                true,  // enable_holes：这里只用于过滤是否存在几何实例
-                false, // verbose
-            )
-            .await
-            {
-                Ok(v) => {
-                    let mut out = v.into_iter().map(|q| q.refno).collect::<Vec<_>>();
-                    out.extend(bran_hang_load_roots.iter().copied());
-                    out.sort();
-                    out.dedup();
-                    (out, "surreal_geometry".to_string())
-                }
-                Err(e) => {
-                    return Ok(Json(VisibleInstsResponse {
-                        success: false,
-                        refno,
-                        refnos: vec![],
-                        error_message: Some(format!("query_geometry_instances failed: {e}")),
-                        debug: None,
-                    }));
-                }
-            }
-        }
-    } else {
-        match crate::fast_model::export_model::model_exporter::query_geometry_instances(
-            &candidates,
-            true,  // enable_holes：这里只用于过滤是否存在几何实例
-            false, // verbose
-        )
-        .await
-        {
-            Ok(v) => {
-                let mut out = v.into_iter().map(|q| q.refno).collect::<Vec<_>>();
-                out.extend(bran_hang_load_roots.iter().copied());
-                out.sort();
-                out.dedup();
-                (out, "surreal_geometry".to_string())
-            }
-            Err(e) => {
-                return Ok(Json(VisibleInstsResponse {
-                    success: false,
-                    refno,
-                    refnos: vec![],
-                    error_message: Some(format!("query_geometry_instances failed: {e}")),
-                    debug: None,
-                }));
-            }
-        }
+    let Some((refnos, source)) = visible_dbnum.and_then(|dbnum| {
+        filter_visible_candidates_from_parquet(&candidates, dbnum, &bran_hang_load_roots)
+    }) else {
+        let dbnum_hint = visible_dbnum
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        return Ok(Json(VisibleInstsResponse {
+            success: false,
+            refno,
+            refnos: vec![],
+            error_message: Some(format!(
+                "visible-insts 数据源不可用：dbnum={dbnum_hint} 的 parquet（geo_instances/instances）未找到或解析失败"
+            )),
+            debug: Some(VisibleInstsDebug {
+                candidates_count,
+                filtered_count: candidates_count,
+                visible_count: 0,
+                source: "unavailable".to_string(),
+            }),
+        }));
     };
     let visible_count = refnos.len();
 

@@ -1,0 +1,139 @@
+# ams7997 历史回溯验证站点
+#
+# 用途：把 dbnum 7997 全量灌进一个**全新的 versioned 数据目录**，
+# 再跑增量制造第二个 sesno，用于验证 pe_owner 图遍历在 VERSION 下的历史回溯
+# （去 pe.children 计划的 Phase 0 第二项，改用真实工程数据）。
+#
+# 隔离约定：
+# - 数据目录 D:/backup-dbs/ams7997-versioned.db 全新创建，不触碰 ams.db / acp7320-perf.db；
+# - 端口 8033 与既有 8020/8030/8032 均不冲突；
+# - web_server 用 3101，避免与 3100 抢占。
+# 实例启动：db-data/run_ams7997_versioned.ps1
+
+# ====== rs-core 同步管线 ======
+total_sync = true
+replace_dbs = false
+incr_sync = false
+sync_history = false
+enable_log = true
+sync_graph_db = true
+sync_tidb = false
+sync_live = false
+enable_index = false
+sync_chunk_size = 10_0000
+# 新站点固定使用版本化主库；不可对既有非版本化数据目录原地开启。
+versioned_storage = true
+version_retention = "0"
+
+# ====== 项目设置 ======
+project_path = "D:/AVEVA/Projects/E3D2.1"
+admin_allowed_project_roots = ["D:/AVEVA/Projects"]
+included_projects = ["AvevaMarineSample"]
+
+mdb_name = "ALL"
+project_name = "AvevaMarineSample"
+project_code = '1516'
+surreal_ns = '1516'
+module = "DESI"
+
+# ====== 只解析 7997，且不生成模型（本站点只要 pe/att/pe_owner 用于模型树） ======
+included_db_files = ["ams7997_0001"]
+manual_db_nums = [7997]
+
+gen_model = false
+gen_mesh = false
+replace_mesh = false
+save_db = true
+defer_db_write = false
+gen_db_meta_only = false
+apply_boolean_operation = false
+build_cate_relate = false
+meshes_path = "./assets/meshes"
+gen_history_model = false
+
+# ====== 空间计算（本站点不需要） ======
+gen_spatial_tree = false
+load_spatial_tree = false
+save_spatial_tree_to_db = false
+enable_sqlite_rtree = false
+
+# ====== 同步管线辅助配置 ======
+only_sync_sys = false
+rebuild_ssc_tree = false
+
+# ====== TiDB（未启用，占位） ======
+ip = "127.0.0.1"
+user = "root"
+password = ""
+port = "3306"
+sql_threads_number = 50
+batch_insert_sql_cnt = 100
+
+# ====== SurrealDB 连接认证（rs-core init_surreal 使用） ======
+surreal_ip = "localhost"
+surreal_port = 8033
+surreal_user = "root"
+surreal_password = "root"
+pe_chunk = 300
+att_chunk = 200
+
+# ====== MQTT ======
+mqtt_host = "127.0.0.1"
+mqtt_port = 1883
+
+# ====== 部署配置 ======
+location = "sjz"
+location_dbs = [251181]
+file_server_host = "http://localhost:8082/assets/archives"
+remote_file_server_hosts = []
+surreal_script_dir = "../rs-core/resource/surreal"
+admin_enable_quick_deploy_test = false
+
+# ====== 调试选项 ======
+need_sync_refno_basic = false
+reset_mdb_project = false
+only_update_dbinfo = false
+debug_print_world_transform = false
+only_rebuild_pdms_element = false
+debug_refno_types = ["CATA", "LOOP", "PRIM"]
+
+# ====== puhua 数据库（未启用，占位） ======
+puhua_database_ip = ""
+puhua_database_user = ""
+puhua_database_password = ""
+
+# ====== 房间关键词 ======
+room_key_word = ["-RM"]
+
+# ====== Web Server（模型树回溯用；与 plant3d-web 代理端口区分开） ======
+[web_server]
+port = 3101
+bind_host = "127.0.0.1"
+auto_start_surreal = false
+surreal_bin = "surreal"
+surreal_data_path = "D:/backup-dbs/ams7997-versioned.db"
+surreal_bind = "127.0.0.1:8033"
+surreal_user = "root"
+surreal_password = "root"
+litefs_enabled = false
+litefs_status_url = "http://localhost:20203/status"
+
+# ====== SurrealDB 连接配置 (PE/属性/输入数据) ======
+[surrealdb]
+mode = "ws"
+ip = "127.0.0.1"
+port = 8033
+user = "root"
+password = "root"
+path = "D:/backup-dbs/ams7997-versioned.db"
+
+# ====== 校审接口认证（本地验证关闭） ======
+[review_auth]
+enabled = false
+debug_project_id = "debug-project"
+debug_user_id = "debug-user"
+debug_role = "sj"
+
+[platform_auth]
+enabled = true
+debug_token = ""

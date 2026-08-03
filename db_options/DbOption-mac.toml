@@ -95,8 +95,6 @@ v_ip = "localhost"
 v_port = 8020
 v_user = "root"
 v_password = "root"
-surreal_user = "root"
-surreal_password = "root"
 pe_chunk = 300
 att_chunk = 200
 

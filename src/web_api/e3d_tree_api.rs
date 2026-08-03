@@ -172,7 +172,7 @@ pub struct TreeVersionInfo {
     pub resolved_sesno: u32,
     /// true = 精确命中锚点；false = 回退到「最近不大于」锚点
     pub exact: bool,
-    /// 实际层级数据源："pe_owner" | "pe_children_fallback"
+    /// 实际层级数据源："pe_owner" | "pe_owner_unavailable"
     pub source: String,
 }
 
@@ -185,12 +185,12 @@ pub struct ResolvedTreeVersion {
     pub exact: bool,
     /// RFC3339 时刻字符串，可直接拼进 `VERSION d'<...>'`
     pub anchored_at: String,
-    /// pe_owner 历史可信起点（`pe_owner_version_meta`）；缺失 = 一律回退 pe.children
+    /// pe_owner 历史覆盖起点；缺失或更早的历史明确拒绝，不读取 pe.children。
     pub maintained_since_sesno: Option<u32>,
 }
 
 impl ResolvedTreeVersion {
-    /// 数据源选择（FR-008）：可信分界之后走 pe_owner 边，否则回退 pe.children。
+    /// 该版本是否位于 pe_owner 的可信覆盖范围。
     pub fn use_pe_owner(&self) -> bool {
         self.maintained_since_sesno
             .map(|since| self.resolved_sesno >= since)
@@ -201,7 +201,7 @@ impl ResolvedTreeVersion {
         if self.use_pe_owner() {
             "pe_owner"
         } else {
-            "pe_children_fallback"
+            "pe_owner_unavailable"
         }
     }
 
@@ -344,7 +344,7 @@ struct VersionedPeRow {
 
 /// 版本模式：查询 t 时刻的直接子节点 refnos（顺序 = 该版本同胞顺序）。
 ///
-/// 数据源选择（FR-008）：可信分界内走 pe_owner 图遍历；否则回退 pe.children 字段。
+/// 可信覆盖范围内走 pe_owner 图遍历；范围外明确返回不支持。
 /// 注意：**禁止 `pe_owner:[..]..` id 区间扫 + VERSION**（research C3：语法接受但
 /// 静默返回当前态）；`ORDER BY id` 必须在 VERSION 之前（反之为解析错误）。
 async fn query_children_refnos_versioned(
@@ -352,26 +352,20 @@ async fn query_children_refnos_versioned(
     ver: &ResolvedTreeVersion,
 ) -> Result<Vec<RefnoEnum>, TreeVersionError> {
     let parent_key = parent.to_pe_key();
-    if ver.use_pe_owner() {
-        let sql = format!(
-            "SELECT VALUE in FROM {parent_key}<-pe_owner ORDER BY id {};",
-            ver.version_clause()
-        );
-        project_primary_db()
-            .query_take::<Vec<RefnoEnum>>(&sql, 0)
-            .await
-            .map_err(|e| classify_version_query_error(&e.to_string()))
-    } else {
-        let sql = format!(
-            "SELECT VALUE children FROM {parent_key} {};",
-            ver.version_clause()
-        );
-        let rows = project_primary_db()
-            .query_take::<Vec<Option<Vec<RefnoEnum>>>>(&sql, 0)
-            .await
-            .map_err(|e| classify_version_query_error(&e.to_string()))?;
-        Ok(rows.into_iter().flatten().next().unwrap_or_default())
+    if !ver.use_pe_owner() {
+        return Err(TreeVersionError::VersionUnsupported(format!(
+            "dbnum={} sesno={} 早于 pe_owner 覆盖起点，且 pe.children 已停止作为层级数据源",
+            ver.dbnum, ver.resolved_sesno
+        )));
     }
+    let sql = format!(
+        "SELECT VALUE in FROM {parent_key}<-pe_owner ORDER BY id {};",
+        ver.version_clause()
+    );
+    project_primary_db()
+        .query_take::<Vec<RefnoEnum>>(&sql, 0)
+        .await
+        .map_err(|e| classify_version_query_error(&e.to_string()))
 }
 
 /// 版本模式：批量点查 t 时刻的 PE 展示属性；t 时刻不存在的记录不返回行。

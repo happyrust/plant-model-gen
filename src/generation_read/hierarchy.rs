@@ -37,6 +37,35 @@ pub struct HierarchyQuery {
     pub prune_on_match: bool,
 }
 
+/// 由已加载的元素集合推导层级边。
+///
+/// ordinal 取 `children` 的原始下标（先 enumerate 再过滤），与后端
+/// `load_hierarchy_rows` 的口径一致。指向本次未加载的 child 会被跳过——
+/// 部分 CATA 闭包里这类链接是目录引用，不是层级节点。
+fn hierarchy_rows_from_elements(elements: &[ElementSnapshot]) -> Vec<HierarchyRow> {
+    let known = elements
+        .iter()
+        .map(|element| element.refno)
+        .collect::<BTreeSet<_>>();
+    elements
+        .iter()
+        .flat_map(|element| {
+            element
+                .children
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, child)| known.contains(child))
+                .map(move |(ordinal, child)| HierarchyRow {
+                    dbnum: element.dbnum,
+                    parent: element.refno,
+                    child,
+                    ordinal: ordinal as u32,
+                })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct HierarchySnapshot {
     snapshot_id: u64,
@@ -56,10 +85,11 @@ impl HierarchySnapshot {
             dbnums: dbnums.iter().copied().collect(),
             ..ElementQuery::default()
         };
-        let (elements, rows) = tokio::try_join!(
-            session.query_elements(&query),
-            session.load_hierarchy_rows(dbnums)
-        )?;
+        // 一次扫描就够：层级边完全由 element.children 决定。此处不能再调
+        // `load_hierarchy_rows`——它内部会用同一个 ElementQuery 把 `pe` 重扫一遍，
+        // 并发跑还会让峰值内存也翻倍。
+        let elements = session.query_elements(&query).await?;
+        let rows = hierarchy_rows_from_elements(&elements);
         Self::from_parts(session.manifest().authoritative_snapshot_id, elements, rows)
     }
 
@@ -119,28 +149,9 @@ impl HierarchySnapshot {
             }
         }
 
-        let rows = elements
-            .values()
-            .flat_map(|element| {
-                element
-                    .children
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter(|(_, child)| elements.contains_key(child))
-                    .map(move |(ordinal, child)| HierarchyRow {
-                        dbnum: element.dbnum,
-                        parent: element.refno,
-                        child,
-                        ordinal: ordinal as u32,
-                    })
-            })
-            .collect();
-        Self::from_parts(
-            session.manifest().authoritative_snapshot_id,
-            elements.into_values().collect(),
-            rows,
-        )
+        let elements = elements.into_values().collect::<Vec<_>>();
+        let rows = hierarchy_rows_from_elements(&elements);
+        Self::from_parts(session.manifest().authoritative_snapshot_id, elements, rows)
     }
 
     pub fn from_parts(
@@ -358,17 +369,34 @@ impl HierarchySnapshot {
     }
 
     fn validate_acyclic(&self) -> GenerationReadResult<()> {
+        // 共享一个「已确认无环」集合，让每条 owner 链只被走一次：全量层级下
+        // 逐节点新建 HashSet 会退化成 O(N·depth) 次插入外加 N 次分配。
+        let mut acyclic: HashSet<RefnoEnum> = HashSet::with_capacity(self.nodes.len());
+        let mut chain: Vec<RefnoEnum> = Vec::new();
+        let mut on_chain: HashSet<RefnoEnum> = HashSet::new();
         for refno in self.nodes.keys() {
+            if acyclic.contains(refno) {
+                continue;
+            }
+            chain.clear();
+            on_chain.clear();
             let mut current = *refno;
-            let mut visited = HashSet::new();
-            while let Some(parent) = self.parent_of(current) {
-                if !visited.insert(parent) {
+            loop {
+                if acyclic.contains(&current) {
+                    break;
+                }
+                if !on_chain.insert(current) {
                     return Err(GenerationReadError::InvalidHierarchy(format!(
-                        "检测到 owner 环，起点={refno} 重复节点={parent}"
+                        "检测到 owner 环，起点={refno} 重复节点={current}"
                     )));
                 }
-                current = parent;
+                chain.push(current);
+                match self.parent_of(current) {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
             }
+            acyclic.extend(chain.iter().copied());
         }
         Ok(())
     }

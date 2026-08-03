@@ -1122,6 +1122,13 @@ async fn main() -> anyhow::Result<()> {
                         .num_args(1..),
                 )
                 .arg(
+                    Arg::new("include-design-subtree")
+                        .long("include-design-subtree")
+                        .help("同时把种子所在 DESI 库的子树 + owner 祖先链写进 manifest，使解析期一并按需裁剪设计库（默认关：manifest 只含 CATA 库，行为与历史一致）")
+                        .action(clap::ArgAction::SetTrue)
+                        .requires("seed-refnos"),
+                )
+                .arg(
                     Arg::new("out")
                         .long("out")
                         .help("覆盖 manifest 输出路径（默认 <output>/<项目>/scene_tree/cata_closure.json）")
@@ -3100,6 +3107,8 @@ async fn main() -> anyhow::Result<()> {
             .get_many::<String>("seed-refnos")
             .map(|vals| vals.cloned().collect());
         #[cfg(feature = "sqlite-index")]
+        let include_design_subtree = closure_matches.get_flag("include-design-subtree");
+        #[cfg(feature = "sqlite-index")]
         {
             // 前置闭包 pass（spec 002 Q8）：独立于 sync，产出 cata_closure.json 供解析消费。
             let closure_started = std::time::Instant::now();
@@ -3109,6 +3118,7 @@ async fn main() -> anyhow::Result<()> {
                     rescan_index,
                     &seed_strs,
                     out_override,
+                    include_design_subtree,
                 )
                 .await?
             } else {

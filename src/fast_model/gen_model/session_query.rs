@@ -5,34 +5,110 @@ use aios_core::{NamedAttrMap, RefnoEnum, Transform};
 
 use super::context::GenerationReadContext;
 
+async fn load_attributes_on_demand(
+    read: &GenerationReadContext,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<BTreeMap<RefnoEnum, crate::generation_read::AttributeSet>> {
+    let loaded = read.session.load_attribute_sets(refnos).await?;
+    match loaded.require_all("generation.attributes") {
+        Ok(found) => Ok(found),
+        Err(error) => {
+            #[cfg(all(feature = "sqlite-index", feature = "surreal-save"))]
+            if matches!(
+                &error,
+                crate::generation_read::GenerationReadError::MissingRequiredData { .. }
+            ) && crate::data_interface::cata_closure::cata_closure_sync_mode()
+                == crate::data_interface::cata_closure::CataClosureSyncMode::Manifest
+            {
+                let _guard = read.runtime_attribute_load_lock.lock().await;
+                let mut found = refnos
+                    .iter()
+                    .filter_map(|refno| {
+                        read.runtime_attributes
+                            .get(refno)
+                            .map(|attributes| (*refno, attributes.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let missing = refnos
+                    .iter()
+                    .copied()
+                    .filter(|refno| !found.contains_key(refno))
+                    .collect::<Vec<_>>();
+                let outcome =
+                    crate::data_interface::cata_closure::ensure_cata_refnos_parsed(
+                        &missing.iter().map(|refno| refno.refno()).collect::<Vec<_>>(),
+                    )
+                    .await?;
+                for refno in missing {
+                    let named = outcome.attributes.get(&refno.refno()).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "按需解析后仍缺少 CATA 属性: {} (parsed={}, missing={})",
+                            refno,
+                            outcome.parsed,
+                            outcome.missing
+                        )
+                    })?;
+                    let attributes = crate::generation_read::AttributeSet::from_named_attr_map(
+                        refno,
+                        named,
+                    );
+                    read.runtime_attributes.insert(refno, attributes.clone());
+                    found.insert(refno, attributes);
+                }
+                return Ok(found);
+            }
+            Err(error.into())
+        }
+    }
+}
+
 pub async fn get_named_attmap(
     read: &GenerationReadContext,
     refno: RefnoEnum,
 ) -> anyhow::Result<NamedAttrMap> {
-    read.attributes
-        .get(&refno)
-        .cloned()
-        .map(|attributes| attributes.to_named_attr_map())
-        .ok_or_else(|| anyhow::anyhow!("attribute cache missing refno={refno}"))
+    if let Some(attributes) = read.attributes.get(&refno) {
+        return Ok(attributes.to_named_attr_map());
+    }
+    if let Some(attributes) = read.runtime_attributes.get(&refno) {
+        return Ok(attributes.to_named_attr_map());
+    }
+    Ok(load_attributes_on_demand(read, &[refno])
+        .await?
+        .remove(&refno)
+        .expect("require_all checked refno")
+        .to_named_attr_map())
 }
 
 pub async fn get_named_attmaps(
     read: &GenerationReadContext,
     refnos: &[RefnoEnum],
 ) -> anyhow::Result<BTreeMap<RefnoEnum, NamedAttrMap>> {
-    Ok(crate::generation_read::BatchLookup::from_found(
-        refnos,
-        refnos.iter().filter_map(|refno| {
+    let mut found = refnos
+        .iter()
+        .filter_map(|refno| {
             read.attributes
                 .get(refno)
                 .cloned()
+                .or_else(|| {
+                    read.runtime_attributes
+                        .get(refno)
+                        .map(|attributes| attributes.clone())
+                })
                 .map(|attributes| (*refno, attributes))
-        }),
-    )
-    .require_all("generation.attributes")?
-    .into_iter()
-    .map(|(refno, attributes)| (refno, attributes.to_named_attr_map()))
-    .collect())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let missing = refnos
+        .iter()
+        .copied()
+        .filter(|refno| !found.contains_key(refno))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        found.extend(load_attributes_on_demand(read, &missing).await?);
+    }
+    Ok(found
+        .into_iter()
+        .map(|(refno, attributes)| (refno, attributes.to_named_attr_map()))
+        .collect())
 }
 
 pub async fn get_world_transforms(
@@ -58,8 +134,10 @@ pub async fn get_world_transforms(
             super::transform_cache::get_world_transforms_cache_first_batch(None, &missing).await?,
         );
     }
-    Ok(crate::generation_read::BatchLookup::from_found(refnos, found)
-        .require_all("generation.transforms")?)
+    Ok(
+        crate::generation_read::BatchLookup::from_found(refnos, found)
+            .require_all("generation.transforms")?,
+    )
 }
 
 pub async fn get_world_transform(

@@ -94,7 +94,7 @@ pub async fn save_pes(
     /// 键：db_num（数据库号）
     /// 值：Vec<String> - 简化后的 PE JSON 数据
     ///
-    /// 简化数据包含字段：id, noun, children, name, owner
+    /// 简化数据包含字段：id, noun, child_count, name, owner
     /// 这些数据会写入 pe_{dbnum} 分表中
     #[cfg(feature = "surreal-save")]
     let mut pe_simple_by_dbnum: HashMap<i32, Vec<String>> = HashMap::new();
@@ -109,7 +109,10 @@ pub async fn save_pes(
             let att_map = total_attr_map.get(&refno).unwrap();
 
             #[cfg(feature = "surreal-save")]
-            let pe_data = att_map.pe(db_num);
+            let mut pe_data = att_map.pe(db_num);
+            if pe_data.owner.is_none() {
+                pe_data.owner = RefnoEnum::from(refno);
+            }
 
             #[cfg(feature = "surreal-save")]
             {
@@ -118,34 +121,15 @@ pub async fn save_pes(
                 // u64 哈希可能超出 Surreal int/i64 范围）。与下方 ele_reuse_relate 边同源，
                 // 但 pe 行字段由增量路径持续维护（边只在 full 解析时重建）。
                 let cata_hash = att_map.cal_cata_hash();
-                // 将 children 字段注入到 JSON（Surreal 对象字面量）中；若无子节点则为空数组
-                let children_links = if let Some(children) = db_basic.children_map.get(&refno) {
-                    if children.is_empty() {
-                        String::from("")
-                    } else {
-                        children.iter().map(|c| c.to_pe_key()).join(", ")
-                    }
-                } else {
-                    String::from("")
-                };
+                let child_count = db_basic
+                    .children_map
+                    .get(&refno)
+                    .map(Vec::len)
+                    .unwrap_or_default();
 
                 if json.ends_with('}') {
-                    // 在末尾大括号前追加 children 字段
-                    // 若已有其它字段，添加逗号分隔；这里直接在最后一个 '}' 之前插入
                     json.pop();
-                    if json.ends_with('}') || json.contains(':') {
-                        if !children_links.is_empty() {
-                            json.push_str(&format!(", children: [{}]}}", children_links));
-                        } else {
-                            json.push_str(", children: []}");
-                        }
-                    } else {
-                        if !children_links.is_empty() {
-                            json.push_str(&format!("children: [{}]}}", children_links));
-                        } else {
-                            json.push_str("children: []}");
-                        }
-                    }
+                    json.push_str(&format!(", child_count: {child_count}}}"));
                 }
                 if let Some(hash) = cata_hash {
                     if json.ends_with('}') {
@@ -155,7 +139,7 @@ pub async fn save_pes(
                 }
                 insert_jsons.push(json);
 
-                // 生成简化版 PE 数据：只包含 id、noun、children、name、owner
+                // 生成简化版 PE 数据；层级子边只存 pe_owner。
                 // 使用传入的 db_num 参数作为分表标识
                 let owner_key = if pe_data.owner.is_none() {
                     "NONE".to_string()
@@ -164,10 +148,10 @@ pub async fn save_pes(
                 };
 
                 let simple_json = format!(
-                    "{{id: {}, noun: '{}', children: [{}], name: '{}', owner: {}}}",
+                    "{{id: {}, noun: '{}', child_count: {}, name: '{}', owner: {}}}",
                     refno.to_pe_key(),
                     pe_data.noun.as_str(),
-                    children_links,
+                    child_count,
                     pe_data
                         .name
                         .as_str()
@@ -360,24 +344,6 @@ pub async fn save_pes(
     Ok(())
 }
 
-#[cfg(all(test, feature = "surreal-save"))]
-#[tokio::test]
-#[ignore = "requires initialized SurrealDB test data and mutates shared test state"]
-async fn test_query_pe_with_children() -> anyhow::Result<()> {
-    // 初始化 SurrealDB 连接
-    let _ = aios_core::init_test_surreal().await;
-    // 查询任意一条 pe 记录，验证 children 反序列化
-    let sql = "SELECT * FROM pe LIMIT 1";
-    let mut response = project_primary_db().query(sql).await?;
-    let result: Vec<SPdmsElement> = response.take(0).unwrap_or_default();
-    if let Some(pe) = result.get(0) {
-        println!("refno={:?}, children={:?}", pe.refno(), pe.children);
-    } else {
-        println!("没有查询到 pe 记录，无法验证 children 字段");
-    }
-    Ok(())
-}
-
 #[cfg(feature = "sql")]
 pub async fn save_pes_mysql(
     db_basic: &DbBasicData,
@@ -436,55 +402,7 @@ pub async fn save_pes_mysql(
     }
 }
 
-//使用insert relations 去保存图数据关联关系
-//
-// specs/023 T007：每个 owner 先删后插，保证同库重解析/重灌幂等
-// （撞 id 且值不同直接报错、`INSERT IGNORE RELATION` 语法不存在——research.md C6/C7）。
-// 批内元素为**完整 SQL 语句**（DELETE / INSERT RELATION），sink 直接拼接执行；
-// 单个 owner 的语句不跨批，保证删-插顺序。
-#[cfg(feature = "surreal-save")]
-pub async fn save_pe_relates(db_basic: &DbBasicData, output: flume::Sender<SenderJsonsData>) {
-    const ROWS_PER_INSERT: usize = 500;
-    const STMTS_PER_BATCH: usize = 200;
-    let mut stmts: Vec<String> = vec![];
-    for kv in &db_basic.children_map {
-        let owner = kv.0;
-        let children = kv.1;
-        if children.is_empty() {
-            continue;
-        }
-        let op = owner.to_pe_key();
-        stmts.push(format!("DELETE {op}<-pe_owner;"));
-        for (chunk_idx, chunk) in children.chunks(ROWS_PER_INSERT).enumerate() {
-            let rows = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, child)| {
-                    let order = chunk_idx * ROWS_PER_INSERT + i;
-                    format!(
-                        "{{ id: pe_owner:[{op}, {order}], in: {}, out: {op} }}",
-                        child.to_pe_key()
-                    )
-                })
-                .collect::<Vec<String>>()
-                .join(",");
-            stmts.push(format!("INSERT RELATION INTO pe_owner [{rows}];"));
-        }
-        if stmts.len() >= STMTS_PER_BATCH {
-            output
-                .send(SenderJsonsData::PERelateJson(std::mem::take(&mut stmts)))
-                .expect("send pe_relates error");
-        }
-    }
-    if !stmts.is_empty() {
-        output
-            .send(SenderJsonsData::PERelateJson(std::mem::take(&mut stmts)))
-            .expect("send pe_relates error");
-    }
-}
-
-#[cfg(not(feature = "surreal-save"))]
-pub async fn save_pe_relates(db_basic: &DbBasicData, output: flume::Sender<SenderJsonsData>) {
-    let _ = db_basic;
-    let _ = output;
-}
+// NOTE: `save_pe_relates`（按整文件 children_map 重建 pe_owner 边的旧写入口）已删除。
+// 新写入链只经 full scope 的 `persist_hierarchy`（串行固化）与 partial/closure 的按写入集
+// scoped 固化来维护 pe_owner 边；旧函数语义与“pe_owner 为唯一层级源”不变量矛盾，
+// 且已无任何调用方，留着易被误用。

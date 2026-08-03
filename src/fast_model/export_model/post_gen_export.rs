@@ -66,15 +66,12 @@ async fn export_parquet_after_generation_impl(
     db_option_ext: &DbOptionExt,
     dbnums_hint: Option<Vec<u32>>,
 ) -> Result<PostGenerationParquetExportReport> {
-    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Instant;
 
-    use aios_core::pdms_types::RefnoEnum;
-
     use crate::data_interface::db_meta_manager::db_meta;
     use crate::fast_model::export_model::export_dbnum_instances_parquet::{
-        export_dbnum_instances_parquet, query_distinct_dbnums_from_inst_relate,
+        export_dbnum_instances_parquet_latest, query_distinct_dbnums_from_inst_relate,
     };
 
     let mut dbnums = dbnums_hint
@@ -191,12 +188,6 @@ async fn export_parquet_after_generation_impl(
 
     let base_output_dir = db_option_ext.get_project_output_dir().join("parquet");
     let db_option = Arc::new(db_option_ext.inner.clone());
-    let parquet_root_refno = db_option_ext
-        .inner
-        .debug_model_refnos
-        .as_ref()
-        .and_then(|values| values.first())
-        .and_then(|value| RefnoEnum::from_str(&value.replace('_', "/")).ok());
     let export_started = Instant::now();
 
     for (dbnum_idx, dbnum) in dbnums.iter().enumerate() {
@@ -211,31 +202,15 @@ async fn export_parquet_after_generation_impl(
             )),
             export_started.elapsed().as_millis() as u64,
         );
-        let output_dir = if parquet_root_refno.is_none() {
-            let (_, artifact_dir) = crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet_latest(
-                *dbnum,
-                &base_output_dir,
-                db_option.clone(),
-                true,
-                None,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
-            artifact_dir
-        } else {
-            let output_dir = base_output_dir.join(dbnum.to_string());
-            export_dbnum_instances_parquet(
-                *dbnum,
-                &output_dir,
-                db_option.clone(),
-                true,
-                None,
-                parquet_root_refno,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
-            output_dir
-        };
+        let (_, output_dir) = export_dbnum_instances_parquet_latest(
+            *dbnum,
+            &base_output_dir,
+            db_option.clone(),
+            true,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Parquet 导出 dbnum={} 失败: {}", dbnum, e))?;
 
         #[cfg(feature = "sqlite-index")]
         {

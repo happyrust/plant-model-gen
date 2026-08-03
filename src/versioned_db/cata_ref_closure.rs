@@ -222,8 +222,11 @@ mod tests {
         let mut g: HashMap<RefU64, Vec<RefU64>> = HashMap::new();
         g.insert(r("300_1"), vec![r("200_1")]);
         g.insert(r("200_1"), vec![r("100_1"), r("100_2")]);
-        let out =
-            expand_reverse_closure(&[r("300_1")], &ReverseClosureLimits::default(), graph_lookup(&g));
+        let out = expand_reverse_closure(
+            &[r("300_1")],
+            &ReverseClosureLimits::default(),
+            graph_lookup(&g),
+        );
         assert_eq!(out.instances, vec![r("100_1"), r("100_2"), r("200_1")]);
         assert_eq!(out.depth_reached, 2);
         assert!(!out.truncated_depth && !out.truncated_size);
@@ -234,8 +237,11 @@ mod tests {
         let mut g: HashMap<RefU64, Vec<RefU64>> = HashMap::new();
         g.insert(r("1_1"), vec![r("1_2")]);
         g.insert(r("1_2"), vec![r("1_1")]);
-        let out =
-            expand_reverse_closure(&[r("1_1")], &ReverseClosureLimits::default(), graph_lookup(&g));
+        let out = expand_reverse_closure(
+            &[r("1_1")],
+            &ReverseClosureLimits::default(),
+            graph_lookup(&g),
+        );
         assert_eq!(out.instances, vec![r("1_2")]);
         assert!(!out.truncated_depth);
     }
@@ -246,7 +252,10 @@ mod tests {
         g.insert(r("5_1"), vec![r("5_2")]);
         g.insert(r("5_2"), vec![r("5_3")]);
         g.insert(r("5_3"), vec![r("5_4")]);
-        let limits = ReverseClosureLimits { max_depth: 1, ..Default::default() };
+        let limits = ReverseClosureLimits {
+            max_depth: 1,
+            ..Default::default()
+        };
         let out = expand_reverse_closure(&[r("5_1")], &limits, graph_lookup(&g));
         assert_eq!(out.instances, vec![r("5_2")]);
         assert!(out.truncated_depth);
@@ -257,7 +266,10 @@ mod tests {
     fn size_limit_flags_superset_downgrade() {
         let mut g: HashMap<RefU64, Vec<RefU64>> = HashMap::new();
         g.insert(r("9_1"), vec![r("9_2"), r("9_3"), r("9_4"), r("9_5")]);
-        let limits = ReverseClosureLimits { max_instances: 2, ..Default::default() };
+        let limits = ReverseClosureLimits {
+            max_instances: 2,
+            ..Default::default()
+        };
         let out = expand_reverse_closure(&[r("9_1")], &limits, graph_lookup(&g));
         assert!(out.truncated_size);
         assert!(out.instances.len() <= 2);

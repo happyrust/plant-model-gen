@@ -871,16 +871,11 @@ fn current_ele_for_persist(operation: &EleOperationData) -> Option<&EleData> {
     }
 }
 
-fn inject_children_into_pe_json(mut json: String, children: &[RefU64]) -> String {
-    let children_links = children
-        .iter()
-        .map(|child| child.to_pe_key())
-        .collect::<Vec<_>>()
-        .join(", ");
+fn inject_child_count_into_pe_json(mut json: String, child_count: usize) -> String {
     if json.ends_with('}') {
         json.pop();
         let sep = if json.contains(':') { ", " } else { "" };
-        json.push_str(&format!("{sep}children: [{children_links}]}}"));
+        json.push_str(&format!("{sep}child_count: {child_count}}}"));
     }
     json
 }
@@ -982,6 +977,9 @@ async fn persist_pdms_increment_grouped(
         return Ok(stats);
     }
 
+    // 增量不会重写完整 seed；在任何 PE/pe_owner 变更前令旧 seed 永久失效。
+    crate::versioned_db::pe_graph_seed::mark_not_ready(report.dbnum).await?;
+
     stats.session_count = grouped.len();
 
     // ADR-0011 P1：反向索引 schema 代码内 ensure（幂等 DDL，非版本化数据；覆盖所有入口路径）。
@@ -1043,10 +1041,13 @@ async fn persist_pdms_increment_grouped(
                 report.dbnum,
                 &att,
             ));
-            let pe_data = att.pe(report.dbnum as i32);
-            let pe_json = inject_children_into_pe_json(
+            let mut pe_data = att.pe(report.dbnum as i32);
+            if pe_data.owner.is_none() {
+                pe_data.owner = RefnoEnum::from(refno);
+            }
+            let pe_json = inject_child_count_into_pe_json(
                 pe_data.gen_sur_json(Some(refno.to_pe_key())),
-                ele.children.as_slice(),
+                ele.children.len(),
             );
             let pe_json = inject_cata_hash_into_pe_json(pe_json, att.cal_cata_hash());
             mutation_sqls.push(format!("UPSERT {} CONTENT {};", refno.to_pe_key(), pe_json));

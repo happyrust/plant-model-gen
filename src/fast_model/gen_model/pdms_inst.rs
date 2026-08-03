@@ -39,6 +39,16 @@ use crate::fast_model::shared::aabb_apply_transform;
 const MAX_FAILED_SQL_DUMPS_PER_RUN: usize = 20;
 static FAILED_SQL_DUMP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// pre_cleanup 单个 range chunk 遇事务冲突时的最大尝试次数。
+const CLEANUP_TX_MAX_ATTEMPTS: usize = 8;
+
+/// SurrealDB 判定为“可重试”的事务冲突错误。
+fn is_tx_conflict(msg: &str) -> bool {
+    msg.contains("Transaction conflict")
+        || msg.contains("Resource busy")
+        || msg.contains("This transaction can be retried")
+}
+
 /// 本次运行的 failed_sql 转储计数（spec 004 任务指标采集用）。
 pub fn failed_sql_dump_count() -> usize {
     FAILED_SQL_DUMP_COUNT.load(Ordering::Relaxed)
@@ -793,6 +803,33 @@ async fn pre_cleanup_ref0_range_for_refnos(all_refnos: &[RefnoEnum]) -> anyhow::
     Ok(())
 }
 
+/// regen 清理会 DELETE / 区间 SELECT 这些模型表。SurrealDB 对不存在的表**报错**
+/// （实测 `DELETE [t:[…]]` → "The table 't' does not exist"），而不是当作空集，
+/// 于是全新库（内存库、刚建的站点）第一次 `--regen-model` 会被清理阶段直接拦下。
+/// 空库里"没有旧产物要清"与"清干净了"语义等价，这里先幂等建表把两者对齐。
+async fn ensure_model_tables_defined() -> anyhow::Result<()> {
+    const MODEL_TABLES: [&str; 11] = [
+        "inst_relate",
+        "inst_relate_aabb",
+        "inst_relate_bool",
+        "inst_relate_cata_bool",
+        "refno_relations",
+        "neg_relate",
+        "ngmr_relate",
+        "geo_relate",
+        "tubi_relate",
+        "tubi_info",
+        "inst_geo",
+    ];
+    let sql = MODEL_TABLES
+        .iter()
+        .map(|t| format!("DEFINE TABLE IF NOT EXISTS {t};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    project_primary_db().query_response(&sql).await?.check()?;
+    Ok(())
+}
+
 async fn pre_cleanup_for_regen_inner(
     seed_refnos: &[RefnoEnum],
     hierarchy: Option<&crate::generation_read::HierarchySnapshot>,
@@ -800,6 +837,14 @@ async fn pre_cleanup_for_regen_inner(
 ) -> anyhow::Result<()> {
     if seed_refnos.is_empty() {
         return Ok(());
+    }
+
+    ensure_model_tables_defined().await?;
+
+    // 整库范围的 seed 已由调用方收敛为目标 dbnum 的全部 SITE；其 ref0
+    // 就是需要清理的模型 id 范围，不必先加载整棵 pe_owner 层级。
+    if whole_dbnum_fast_path {
+        return pre_cleanup_ref0_range_for_refnos(seed_refnos).await;
     }
 
     const CHUNK_SIZE: usize = 200;
@@ -863,10 +908,6 @@ async fn pre_cleanup_for_regen_inner(
 
     // O6：整库范围（--regen-model 无子 refno 过滤）→ 按 ref0（dbnum）区间批量清理，
     // 替代 O(元素数) 的逐 refno 删除；仅整库范围启用，保证不误删同库其它 ZONE。
-    if whole_dbnum_fast_path {
-        return pre_cleanup_ref0_range_for_refnos(&all_refnos).await;
-    }
-
     let t = Instant::now();
 
     // 使用 SurrealDB 3.1 array record id range 作为模型产物主清理路径。
@@ -911,31 +952,59 @@ async fn pre_cleanup_for_regen_inner(
                 // O2：5 张精确 id 表整块批量点删（每表一条列表删），替代每 refno 5 条单删。
                 cleanup_sql.push_str(&build_delete_exact_model_records_sql(&chunk_vec));
 
-                let mut geo_hashes = Vec::new();
-                if !geo_query_sql.trim().is_empty() {
-                    let mut resp = project_primary_db().query_response(&geo_query_sql).await?;
-                    for stmt_idx in 0..chunk_vec.len() {
-                        let rows: Vec<String> = resp.take(stmt_idx)?;
-                        geo_hashes.extend(rows);
+                // 内存库 MVCC 会把“并发删除同一批非空表”判成写冲突。清理是幂等的，
+                // 整块退避重试即可，不必为此牺牲并发度。
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+
+                    let once = async {
+                        let mut geo_hashes = Vec::new();
+                        if !geo_query_sql.trim().is_empty() {
+                            let mut resp =
+                                project_primary_db().query_response(&geo_query_sql).await?;
+                            for stmt_idx in 0..chunk_vec.len() {
+                                let rows: Vec<String> = resp.take(stmt_idx)?;
+                                geo_hashes.extend(rows);
+                            }
+                        }
+
+                        let hashes = geo_hashes
+                            .iter()
+                            .filter_map(|s| parse_inst_geo_hash(s))
+                            .collect::<Vec<_>>();
+                        if !hashes.is_empty() {
+                            delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await?;
+                        }
+
+                        if !cleanup_sql.trim().is_empty() {
+                            project_primary_db()
+                                .query_response(&cleanup_sql)
+                                .await?
+                                .check()?;
+                        }
+
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+
+                    match once {
+                        Ok(()) => return Ok::<(), anyhow::Error>(()),
+                        Err(e) => {
+                            if attempt >= CLEANUP_TX_MAX_ATTEMPTS || !is_tx_conflict(&e.to_string())
+                            {
+                                return Err(e);
+                            }
+                            let backoff_ms =
+                                (50u64.saturating_mul(1u64 << (attempt - 1))).min(2000);
+                            eprintln!(
+                                "[pre_cleanup_for_regen] range chunk 事务冲突，{}ms 后重试 {}/{}",
+                                backoff_ms, attempt, CLEANUP_TX_MAX_ATTEMPTS
+                            );
+                            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        }
                     }
                 }
-
-                let hashes = geo_hashes
-                    .iter()
-                    .filter_map(|s| parse_inst_geo_hash(s))
-                    .collect::<Vec<_>>();
-                if !hashes.is_empty() {
-                    delete_inst_geo_by_hashes(&hashes, CHUNK_SIZE).await?;
-                }
-
-                if !cleanup_sql.trim().is_empty() {
-                    project_primary_db()
-                        .query_response(&cleanup_sql)
-                        .await?
-                        .check()?;
-                }
-
-                Ok::<(), anyhow::Error>(())
             })
         })
         .buffer_unordered(limit_concurrency);
@@ -2234,12 +2303,6 @@ impl TransactionBatcher {
                         Err(anyhow::anyhow!("transaction block statement errors:\n{msg}"))
                     }
                 }};
-            }
-
-            fn is_tx_conflict(msg: &str) -> bool {
-                msg.contains("Transaction conflict")
-                    || msg.contains("Resource busy")
-                    || msg.contains("This transaction can be retried")
             }
 
             // 注意：不要对 project_primary_db() 做 clone 再 query。

@@ -148,7 +148,14 @@ pub fn update_db_meta_info_json(output_dir: &Path, update: DbFileMetaUpdate) -> 
             };
             for ref0 in ref0s {
                 if let Some(ref0_u64) = ref0.as_u64() {
-                    rebuilt_ref0_map.insert(ref0_u64.to_string(), json!(dbnum));
+                    let key = ref0_u64.to_string();
+                    if let Some(previous) = rebuilt_ref0_map.insert(key.clone(), json!(dbnum)) {
+                        anyhow::ensure!(
+                            previous.as_u64() == Some(dbnum as u64),
+                            "ref0={key} 同时归属于 dbnum={} 和 dbnum={dbnum}",
+                            previous
+                        );
+                    }
                 }
             }
         }

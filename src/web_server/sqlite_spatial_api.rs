@@ -20,10 +20,11 @@ use glam::Vec3;
 use parry3d::bounding_volume::{Aabb, BoundingVolume};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::fast_model::gen_model::model_record_id::model_refno_range;
 use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
@@ -31,6 +32,13 @@ use crate::sqlite_index::{SqliteAabbIndex, i64_to_refno_str, refno_str_to_i64};
 const DEFAULT_DISTANCE: f32 = 0.0;
 const DEFAULT_MAX_HITS: usize = 5000;
 const HARD_MAX_HITS: usize = 10_000;
+/// RTree 单次查询最多收集的候选数量。
+///
+/// 大半径落在密集区时命中量没有天然上限，这里兜住内存；
+/// 触顶时通过 `truncated_candidates` 显式告诉前端结果不完整。
+const CANDIDATE_HARD_CAP: usize = 200_000;
+/// 过滤后最多保留、参与排序与分页的结果数量。
+const RESULT_HARD_CAP: usize = 100_000;
 const DEFAULT_CLEARANCE_RADIUS_MM: f32 = 5_000.0;
 const MAX_CLEARANCE_RADIUS_MM: f32 = 100_000.0;
 const DEFAULT_CLEARANCE_MAX_PER_GROUP: usize = 1;
@@ -57,14 +65,54 @@ fn test_guard() -> &'static Mutex<()> {
     TEST_GUARD.get_or_init(|| Mutex::new(()))
 }
 
+/// 测试用的结果集上限覆盖。触顶行为与具体上限无关，但真实上限是 10 万条，
+/// 让每个用例都造那么多行只会让测试变慢。
+#[cfg(test)]
+static TEST_RESULT_CAP_OVERRIDE: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_result_cap_override() -> &'static Mutex<Option<usize>> {
+    TEST_RESULT_CAP_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn result_hard_cap() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(cap) = *test_result_cap_override().lock().unwrap() {
+            return cap;
+        }
+    }
+    RESULT_HARD_CAP
+}
+
+static INDEX_CACHE: OnceLock<Mutex<HashMap<PathBuf, &'static CachedIndex>>> = OnceLock::new();
+
+/// 按索引路径缓存已打开的索引句柄。
+///
+/// 打开索引会执行 `init_schema()`（建表 + 若干 ALTER TABLE 迁移），
+/// 每个请求都跑一遍既浪费又会让泄漏的句柄无限增长，因此按路径只初始化一次。
+/// 路径可通过环境变量或测试覆盖切换，所以缓存以路径为键而非单例。
 fn get_cached_index() -> Result<&'static CachedIndex, String> {
     let path = sqlite_index_path();
+    let cache = INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| "spatial index cache poisoned".to_string())?;
+
+    if let Some(cached) = guard.get(&path) {
+        return Ok(*cached);
+    }
+
     let idx =
         SqliteAabbIndex::open(&path).map_err(|e| format!("open sqlite index failed: {}", e))?;
     idx.init_schema()
         .map_err(|e| format!("init sqlite schema failed: {}", e))?;
 
-    let cached = Box::leak(Box::new(CachedIndex { idx, path }));
+    let cached: &'static CachedIndex = Box::leak(Box::new(CachedIndex {
+        idx,
+        path: path.clone(),
+    }));
+    guard.insert(path, cached);
     Ok(cached)
 }
 
@@ -72,7 +120,7 @@ fn get_cached_index() -> Result<&'static CachedIndex, String> {
 // 请求/响应结构体
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SqliteSpatialQueryParams {
     /// bbox | refno | position | bran_centerline
     pub mode: Option<String>,
@@ -108,6 +156,14 @@ pub struct SqliteSpatialQueryParams {
     pub include_negative: Option<bool>,
     /// 查询形状："cube"（默认）| "sphere"（球体，会对结果做距离二次过滤）
     pub shape: Option<String>,
+    /// 关键字过滤：对 refno / noun / name 做大小写不敏感包含匹配（分页前生效）
+    pub keyword: Option<String>,
+    /// 排序方式："distance"（默认，按最近距离）| "name"（按名称）| "spec_distance"（先专业后距离）
+    pub sort: Option<String>,
+    /// 内部字段：refnos 端点需要一次拿到完整命中集合，用它放开每页数量上限。
+    /// 不参与查询串反序列化，客户端无法设置。
+    #[serde(skip)]
+    pub per_page_cap_override: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +182,21 @@ pub struct SpatialQueryResult {
     /// 是否还有更多结果；兼容旧字段名
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// RTree 候选集是否触顶被截断
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_candidates: Option<bool>,
+    /// 过滤后的结果集是否触顶被截断
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_results: Option<bool>,
+    /// 本次扫描的候选数量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_count: Option<usize>,
+    /// 候选数量上限
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_cap: Option<usize>,
+    /// 结果数量上限
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_cap: Option<usize>,
     /// 本次查询完整命中数量
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_count: Option<usize>,
@@ -147,7 +218,21 @@ pub struct SpatialQueryResult {
     /// 本次查询结果可用的过滤选项
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter_options: Option<SpatialQueryFilterOptions>,
+    /// 完整命中集合按专业分组的计数（不受分页影响）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<SpatialQuerySpecGroup>>,
     pub error: Option<String>,
+}
+
+/// 某个专业在完整命中集合中的计数。
+///
+/// 与 `filter_options.spec_values` 不同：过滤选项是面向「还能怎么筛」的候选面板，
+/// 统计的是应用 noun / spec / keyword 过滤之前的候选集；
+/// 这里统计的是过滤之后的真实命中，用于结果区的分组计数。
+#[derive(Debug, Serialize, Clone)]
+pub struct SpatialQuerySpecGroup {
+    pub spec_value: i64,
+    pub count: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -170,11 +255,14 @@ pub struct SpatialQuerySpecValueFilterOption {
     pub count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SpatialQueryResultItem {
     pub refno: String,
     pub noun: String,
     pub spec_value: i64,
+    /// 构件名称；索引未回填名称时为 None，由前端回退显示 refno。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub aabb: Option<AabbDto>,
     pub distance: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -618,6 +706,124 @@ fn parse_spec_value_filter(spec_values: &Option<String>) -> Option<Vec<i64>> {
     })
 }
 
+fn parse_keyword_filter(keyword: &Option<String>) -> Option<String> {
+    keyword
+        .as_ref()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+/// 关键字匹配：refno / noun / name 任一命中即算命中（大小写不敏感）。
+///
+/// 必须在分页之前调用，否则关键字只会作用于当前页，跨页搜索会漏结果。
+fn matches_keyword(needle: &str, refno: &str, noun: &str, name: Option<&str>) -> bool {
+    refno.to_lowercase().contains(needle)
+        || noun.to_lowercase().contains(needle)
+        || name.is_some_and(|value| value.to_lowercase().contains(needle))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpatialSortBy {
+    Distance,
+    Name,
+    SpecThenDistance,
+}
+
+fn parse_sort_by(sort: &Option<String>) -> SpatialSortBy {
+    match sort.as_deref().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "name" => SpatialSortBy::Name,
+        "spec_distance" | "spec_then_distance" => SpatialSortBy::SpecThenDistance,
+        _ => SpatialSortBy::Distance,
+    }
+}
+
+fn compare_distance(a: Option<f32>, b: Option<f32>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(da), Some(db)) => da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn display_name(item: &SpatialQueryResultItem) -> &str {
+    item.name.as_deref().unwrap_or(&item.refno)
+}
+
+/// 两条结果之间的排序比较，越小越靠前。排序必须发生在分页之前，
+/// 否则前端只能对当前页重排，跨页顺序就是错的。
+///
+/// 取舍与排序共用这一套口径：结果集触顶时靠它决定「保留哪些」，出参时再靠它决定
+/// 「怎么排」。两处一旦分叉，留下来的就不是排在前面的那批。
+fn compare_spatial_items(
+    a: &SpatialQueryResultItem,
+    a_db_rank: u8,
+    b: &SpatialQueryResultItem,
+    b_db_rank: u8,
+    sort_by: SpatialSortBy,
+) -> std::cmp::Ordering {
+    let primary = match sort_by {
+        SpatialSortBy::Distance => compare_distance(a.distance, b.distance),
+        SpatialSortBy::Name => display_name(a).cmp(display_name(b)),
+        SpatialSortBy::SpecThenDistance => a
+            .spec_value
+            .cmp(&b.spec_value)
+            .then_with(|| compare_distance(a.distance, b.distance)),
+    };
+
+    primary
+        .then_with(|| a_db_rank.cmp(&b_db_rank))
+        .then_with(|| a.refno.cmp(&b.refno))
+}
+
+/// 堆里的一条结果，`Ord` 直接委托给 `compare_spatial_items`，越小越靠前。
+///
+/// 装进最大堆之后，堆一满就弹出「当前最差的一条」，于是留下的始终是当前排序口径下
+/// 最好的 `RESULT_HARD_CAP` 条。`db_rank` 在入堆时算一次而不是每次比较都算。
+struct RankedResult {
+    item: SpatialQueryResultItem,
+    db_rank: u8,
+    sort_by: SpatialSortBy,
+}
+
+impl Ord for RankedResult {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_spatial_items(
+            &self.item,
+            self.db_rank,
+            &other.item,
+            other.db_rank,
+            self.sort_by,
+        )
+    }
+}
+
+impl PartialOrd for RankedResult {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RankedResult {}
+
+/// 统计完整命中集合的专业分组计数。
+fn build_spec_groups(results: &[SpatialQueryResultItem]) -> Vec<SpatialQuerySpecGroup> {
+    let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+    for item in results {
+        *counts.entry(item.spec_value).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(spec_value, count)| SpatialQuerySpecGroup { spec_value, count })
+        .collect()
+}
+
 fn negative_nouns() -> &'static HashSet<String> {
     static NEGATIVE_NOUNS: OnceLock<HashSet<String>> = OnceLock::new();
     NEGATIVE_NOUNS.get_or_init(|| {
@@ -643,6 +849,11 @@ fn error_spatial_query_result(
         radius: None,
         shape: None,
         truncated: None,
+        truncated_candidates: None,
+        truncated_results: None,
+        candidate_count: None,
+        candidate_cap: None,
+        result_cap: None,
         total_count: None,
         returned_count: None,
         page: None,
@@ -650,6 +861,7 @@ fn error_spatial_query_result(
         has_more: None,
         query_bbox,
         filter_options: None,
+        groups: None,
         error: Some(error.into()),
     }
 }
@@ -702,12 +914,21 @@ fn build_filter_options_from_counts(
 
 fn resolve_pagination(params: &SqliteSpatialQueryParams) -> (usize, usize) {
     let page = params.page.unwrap_or(1).max(1);
+    let cap = params.per_page_cap_override.unwrap_or(HARD_MAX_HITS);
     let raw_per_page = params
         .per_page
         .or(params.max_results)
         .unwrap_or(DEFAULT_MAX_HITS);
-    let per_page = raw_per_page.clamp(1, HARD_MAX_HITS);
+    let per_page = raw_per_page.clamp(1, cap);
     (page, per_page)
+}
+
+/// 一次扫描的规模与截断情况，用于让前端知道结果是否完整。
+#[derive(Debug, Default, Clone, Copy)]
+struct SpatialScanMeta {
+    candidate_count: usize,
+    truncated_candidates: bool,
+    truncated_results: bool,
 }
 
 fn success_spatial_query_result(
@@ -717,6 +938,8 @@ fn success_spatial_query_result(
     per_page: usize,
     query_bbox: Option<AabbDto>,
     filter_options: Option<SpatialQueryFilterOptions>,
+    groups: Option<Vec<SpatialQuerySpecGroup>>,
+    meta: SpatialScanMeta,
 ) -> SpatialQueryResult {
     let returned_count = results.len();
     let end = page
@@ -732,6 +955,11 @@ fn success_spatial_query_result(
         radius: None,
         shape: None,
         truncated: Some(has_more),
+        truncated_candidates: Some(meta.truncated_candidates),
+        truncated_results: Some(meta.truncated_results),
+        candidate_count: Some(meta.candidate_count),
+        candidate_cap: Some(CANDIDATE_HARD_CAP),
+        result_cap: Some(result_hard_cap()),
         total_count: Some(total_count),
         returned_count: Some(returned_count),
         page: Some(page),
@@ -739,6 +967,7 @@ fn success_spatial_query_result(
         has_more: Some(has_more),
         query_bbox,
         filter_options,
+        groups,
         error: None,
     }
 }
@@ -1689,10 +1918,11 @@ pub async fn api_sqlite_spatial_nearby(
     let result =
         tokio::task::spawn_blocking(move || do_spatial_query(params, fallback_refno_ids, None))
             .await;
-    let query_result = match result {
+    let mut query_result = match result {
         Ok(r) => r,
         Err(e) => error_spatial_query_result(format!("internal error: {}", e), None),
     };
+    hydrate_missing_result_names(&mut query_result).await;
 
     Json(with_nearby_metadata(
         query_result,
@@ -2003,7 +2233,7 @@ fn do_nearest_clearance_query(
                 .iter()
                 .map(centerline_segment_aabb)
                 .collect::<Vec<_>>();
-            query_ids_for_regions(cached, &segment_aabbs, radius)
+            query_ids_for_regions(&conn, &segment_aabbs, radius)
                 .map(|(ids, bbox)| (ids, bbox.expect("non-empty centerline query has bbox")))
         }
     };
@@ -2411,6 +2641,11 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
         radius: None,
         shape: None,
         truncated: Some(false),
+        truncated_candidates: Some(false),
+        truncated_results: Some(false),
+        candidate_count: Some(0),
+        candidate_cap: Some(CANDIDATE_HARD_CAP),
+        result_cap: Some(RESULT_HARD_CAP),
         total_count: Some(0),
         returned_count: Some(0),
         page: Some(page),
@@ -2420,6 +2655,7 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
         filter_options: Some(empty_filter_options(
             params.include_negative.unwrap_or(false),
         )),
+        groups: Some(vec![]),
         error: None,
     }
 }
@@ -2483,11 +2719,21 @@ fn preferred_db_rank(item: &SpatialQueryResultItem, preferred_db_prefix: &Option
     }
 }
 
+/// 只取 id 的区域查询，供最近净距链路复用同一个连接。
 fn query_ids_for_regions(
-    cached: &CachedIndex,
+    conn: &Connection,
     target_aabbs: &[Aabb],
     distance: f32,
 ) -> Result<(Vec<i64>, Option<Aabb>), String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id FROM aabb_index \
+             WHERE min_x <= ?2 AND max_x >= ?1 \
+               AND min_y <= ?4 AND max_y >= ?3 \
+               AND min_z <= ?6 AND max_z >= ?5",
+        )
+        .map_err(|e| format!("prepare region stmt failed: {e}"))?;
+
     let mut ids = HashSet::new();
     let mut query_union: Option<Aabb> = None;
 
@@ -2499,23 +2745,177 @@ fn query_ids_for_regions(
             query_union = Some(query_aabb.clone());
         }
 
-        let hits = cached
-            .idx
-            .query_intersect(
+        let rows = stmt
+            .query_map(
+                (
+                    query_aabb.mins.x as f64,
+                    query_aabb.maxs.x as f64,
+                    query_aabb.mins.y as f64,
+                    query_aabb.maxs.y as f64,
+                    query_aabb.mins.z as f64,
+                    query_aabb.maxs.z as f64,
+                ),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("query_intersect failed: {e}"))?;
+        for row in rows {
+            ids.insert(row.map_err(|e| format!("query_intersect row failed: {e}"))?);
+        }
+    }
+
+    let mut ids = ids.into_iter().collect::<Vec<_>>();
+    ids.sort_unstable();
+    Ok((ids, query_union))
+}
+
+/// 一个候选构件：RTree 命中 + items 属性，一次 JOIN 取齐。
+struct CandidateRow {
+    id: i64,
+    noun: String,
+    spec_value: i64,
+    name: Option<String>,
+    aabb: Aabb,
+}
+
+struct CandidateScan {
+    rows: Vec<CandidateRow>,
+    query_union: Option<Aabb>,
+    /// RTree 实际命中的候选数量（去重后）
+    candidate_count: usize,
+    /// 是否因为达到候选上限而提前停止
+    truncated: bool,
+}
+
+/// 候选行的取数口径：几何与属性一条 JOIN 取齐。按区域相交和按 id 两种过滤共用。
+const CANDIDATE_SELECT: &str = "SELECT a.id, i.noun, i.spec_value, i.name, \
+     a.min_x, a.min_y, a.min_z, a.max_x, a.max_y, a.max_z \
+     FROM aabb_index a LEFT JOIN items i ON i.id = a.id";
+
+/// 按区域相交取候选。
+const CANDIDATE_SQL_BY_REGION: &str = "SELECT a.id, i.noun, i.spec_value, i.name, \
+     a.min_x, a.min_y, a.min_z, a.max_x, a.max_y, a.max_z \
+     FROM aabb_index a LEFT JOIN items i ON i.id = a.id \
+     WHERE a.min_x <= ?2 AND a.max_x >= ?1 \
+       AND a.min_y <= ?4 AND a.max_y >= ?3 \
+       AND a.min_z <= ?6 AND a.max_z >= ?5";
+
+/// 解析一行候选。
+///
+/// `items` 是 LEFT JOIN 进来的，所以 noun / spec_value / name 都可能是 NULL，
+/// 用 `Option<T>` 接住再给默认值。但**列类型不对必须冒泡成错误**——早先这里
+/// 一律 `unwrap_or`，读失败会变成 NaN 包围盒，而 NaN 既过不了球体过滤的比较
+/// （`NaN > x` 恒为 false），排序时 `partial_cmp` 又返回 None 被当成相等，
+/// 于是坏数据会静默停在结果里的不确定位置。
+fn candidate_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateRow> {
+    Ok(CandidateRow {
+        id: row.get(0)?,
+        noun: row
+            .get::<_, Option<String>>(1)?
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+        spec_value: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+        name: row
+            .get::<_, Option<String>>(3)?
+            .filter(|value| !value.trim().is_empty()),
+        aabb: aabb_from_row(
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        ),
+    })
+}
+
+/// 按 id 批量取候选，供显式目标列表复用同一条 JOIN。
+///
+/// SQLite 默认最多 999 个绑定变量，所以分批拼 IN 列表。
+fn fetch_candidates_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<CandidateRow>, String> {
+    const ID_CHUNK: usize = 500;
+
+    let mut rows = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("{CANDIDATE_SELECT} WHERE a.id IN ({placeholders})");
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|e| format!("prepare candidate-by-id stmt failed: {e}"))?;
+        let mut hits = stmt
+            .query(rusqlite::params_from_iter(chunk.iter()))
+            .map_err(|e| format!("candidate-by-id query failed: {e}"))?;
+        while let Some(row) = hits
+            .next()
+            .map_err(|e| format!("candidate-by-id row failed: {e}"))?
+        {
+            rows.push(candidate_row_from(row).map_err(|e| format!("read candidate failed: {e}"))?);
+        }
+    }
+    Ok(rows)
+}
+
+/// 取回查询区域内的候选构件。
+///
+/// 用一条 JOIN 同时拿到几何与属性：早先的实现先取 id 列表，再对每个 id 分别查
+/// items 和 aabb_index，5000 个候选就是一万次往返。
+/// 连接在整个扫描期间复用，语句只准备一次。
+fn scan_candidates_for_regions(
+    conn: &Connection,
+    target_aabbs: &[Aabb],
+    distance: f32,
+) -> Result<CandidateScan, String> {
+    let mut stmt = conn
+        .prepare_cached(CANDIDATE_SQL_BY_REGION)
+        .map_err(|e| format!("prepare candidate stmt failed: {}", e))?;
+
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut rows: Vec<CandidateRow> = Vec::new();
+    let mut query_union: Option<Aabb> = None;
+    let mut truncated = false;
+
+    'regions: for target in target_aabbs {
+        let query_aabb = expand_aabb((*target).clone(), distance);
+        if let Some(current) = &mut query_union {
+            current.merge(&query_aabb);
+        } else {
+            query_union = Some(query_aabb.clone());
+        }
+
+        let mut hits = stmt
+            .query((
                 query_aabb.mins.x as f64,
                 query_aabb.maxs.x as f64,
                 query_aabb.mins.y as f64,
                 query_aabb.maxs.y as f64,
                 query_aabb.mins.z as f64,
                 query_aabb.maxs.z as f64,
-            )
-            .map_err(|e| format!("query_intersect failed: {}", e))?;
-        ids.extend(hits);
+            ))
+            .map_err(|e| format!("candidate query failed: {}", e))?;
+
+        while let Some(row) = hits
+            .next()
+            .map_err(|e| format!("candidate row failed: {}", e))?
+        {
+            let id: i64 = row.get(0).map_err(|e| format!("read id failed: {}", e))?;
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > CANDIDATE_HARD_CAP {
+                truncated = true;
+                break 'regions;
+            }
+
+            rows.push(candidate_row_from(row).map_err(|e| format!("read candidate failed: {e}"))?);
+        }
     }
 
-    let mut ids = ids.into_iter().collect::<Vec<_>>();
-    ids.sort_unstable();
-    Ok((ids, query_union))
+    rows.sort_unstable_by_key(|row| row.id);
+
+    Ok(CandidateScan {
+        candidate_count: rows.len(),
+        rows,
+        query_union,
+        truncated,
+    })
 }
 
 enum QueryTargetGeometry {
@@ -2547,10 +2947,6 @@ fn query_by_target_geometry(
     self_id: Option<i64>,
 ) -> SpatialQueryResult {
     let (page, per_page) = resolve_pagination(&params);
-    let noun_filter = parse_noun_filter(&params.nouns);
-    let spec_value_filter = parse_spec_value_filter(&params.spec_values);
-    let include_negative = params.include_negative.unwrap_or(false);
-    let preferred_db_prefix = refno_db_prefix(params.refno.as_deref());
 
     let query_regions = match &target_geometry {
         QueryTargetGeometry::Aabbs(target_aabbs) => target_aabbs.clone(),
@@ -2560,69 +2956,104 @@ fn query_by_target_geometry(
             .collect::<Vec<_>>(),
     };
 
-    if query_regions.is_empty() {
-        return success_spatial_query_result(
-            vec![],
-            0,
-            page,
-            per_page,
-            None,
-            Some(empty_filter_options(include_negative)),
-        );
-    }
-
     // 球体模式：使用候选 AABB 到目标 AABB/点的最小距离做二次过滤。
-    let mode = parse_mode(&params);
     let is_sphere = params
         .shape
         .as_deref()
-        .unwrap_or(default_shape_for_mode(mode))
+        .unwrap_or(default_shape_for_mode(parse_mode(&params)))
         .eq_ignore_ascii_case("sphere");
-    let (ids, query_aabb) = match query_ids_for_regions(cached, &query_regions, search_distance) {
-        Ok(v) => v,
-        Err(e) => {
-            return error_spatial_query_result(e, None);
-        }
-    };
-    let query_bbox_dto = query_aabb.as_ref().map(aabb_to_dto);
 
-    // 打开连接获取 noun 和 aabb 信息（使用 prepared statements 批量查询）
+    let key = scan_cache_key(
+        &cached.path,
+        &params,
+        &query_regions,
+        search_distance,
+        self_id,
+        is_sphere,
+    );
+
+    // 扫描与取页共用一个连接：扫描可能命中缓存而不执行，但取页每次都要读属性。
     let conn = match Connection::open(&cached.path) {
         Ok(c) => c,
         Err(e) => {
-            return error_spatial_query_result(
-                format!("open sqlite connection failed: {}", e),
-                query_bbox_dto.clone(),
-            );
+            return error_spatial_query_result(format!("open sqlite connection failed: {}", e), None);
         }
     };
 
-    let mut stmt_item = match conn.prepare("SELECT noun, spec_value FROM items WHERE id = ?1") {
-        Ok(s) => s,
-        Err(e) => {
-            return error_spatial_query_result(
-                format!("prepare item stmt failed: {}", e),
-                query_bbox_dto.clone(),
-            );
-        }
-    };
-    let mut stmt_aabb = match conn
-        .prepare("SELECT min_x, min_y, min_z, max_x, max_y, max_z FROM aabb_index WHERE id = ?1")
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return error_spatial_query_result(
-                format!("prepare aabb stmt failed: {}", e),
-                query_bbox_dto.clone(),
-            );
-        }
-    };
+    let outcome = cached_scan_outcome(key, || {
+        scan_spatial_results(
+            &params,
+            &conn,
+            &target_geometry,
+            &query_regions,
+            search_distance,
+            self_id,
+            is_sphere,
+        )
+    });
 
-    let mut results: Vec<SpatialQueryResultItem> = Vec::with_capacity(ids.len().min(1024));
+    match outcome {
+        Ok(outcome) => paginate_scan_outcome(&outcome, page, per_page),
+        Err(error_result) => error_result,
+    }
+}
+
+/// 扫描并排序全量命中，不做分页。
+#[allow(clippy::too_many_arguments)]
+fn scan_spatial_results(
+    params: &SqliteSpatialQueryParams,
+    conn: &Connection,
+    target_geometry: &QueryTargetGeometry,
+    query_regions: &[Aabb],
+    search_distance: f32,
+    self_id: Option<i64>,
+    is_sphere: bool,
+) -> Result<SpatialScanOutcome, SpatialQueryResult> {
+    let noun_filter = parse_noun_filter(&params.nouns);
+    let spec_value_filter = parse_spec_value_filter(&params.spec_values);
+    let keyword_filter = parse_keyword_filter(&params.keyword);
+    let sort_by = parse_sort_by(&params.sort);
+    let include_negative = params.include_negative.unwrap_or(false);
+    let preferred_db_prefix = refno_db_prefix(params.refno.as_deref());
+
+    if query_regions.is_empty() {
+        return Ok(SpatialScanOutcome {
+            results: vec![],
+            groups: vec![],
+            filter_options: empty_filter_options(include_negative),
+            query_bbox: None,
+            meta: SpatialScanMeta::default(),
+        });
+    }
+
+    let scan = match scan_candidates_for_regions(conn, query_regions, search_distance) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(error_spatial_query_result(e, None));
+        }
+    };
+    let query_bbox_dto = scan.query_union.as_ref().map(aabb_to_dto);
+
+    // 结果集用「容量受限的最大堆」而不是「先到先得 + break」来收。
+    //
+    // 候选是按 id 顺序遍历的（RTree 命中之后按 id 排过序），先到先得会在触顶时留下
+    // id 靠前的一批，而不是排序口径下最靠前的一批——用户要「最近的」，拿到的却是
+    // 「id 小的里面比较近的」。堆按 `compare_spatial_items` 取舍，触顶时留下的
+    // 就是真正排在前面的那 `RESULT_HARD_CAP` 条。
+    let mut heap: BinaryHeap<RankedResult> = BinaryHeap::with_capacity(1024);
     let mut noun_option_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut spec_value_option_counts: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut truncated_results = false;
 
-    for id in ids {
+    for candidate in scan.rows {
+        let CandidateRow {
+            id,
+            noun,
+            spec_value,
+            name,
+            aabb: candidate_aabb,
+        } = candidate;
+
         // include_self 过滤
         if let Some(self_id) = self_id {
             if id == self_id {
@@ -2630,54 +3061,23 @@ fn query_by_target_geometry(
             }
         }
 
-        let item_row: Option<(String, i64)> = stmt_item
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1).unwrap_or(0))))
-            .optional()
-            .unwrap_or(None);
-        let (noun, spec_value) = item_row.unwrap_or_else(|| ("UNKNOWN".to_string(), 0));
-
         if !include_negative && is_negative_noun(&noun) {
             continue;
         }
 
-        let aabb_row: Option<(f32, f32, f32, f32, f32, f32)> = stmt_aabb
-            .query_row([id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })
-            .optional()
-            .unwrap_or(None);
-
-        // 计算候选 AABB 到目标 AABB/点的最小距离，避免长模型因中心点较远被误排除。
-        let distance = if let Some((minx, miny, minz, maxx, maxy, maxz)) = aabb_row {
-            let candidate_aabb = aabb_from_row(minx, miny, minz, maxx, maxy, maxz);
-            let min_distance = match &target_geometry {
-                QueryTargetGeometry::Aabbs(target_aabbs) => {
-                    min_distance_to_targets(&candidate_aabb, target_aabbs)
-                }
-                QueryTargetGeometry::BranCenterline(centerline) => {
-                    min_distance_to_centerline(&candidate_aabb, centerline)
-                }
-            };
-
-            if is_sphere && min_distance > search_distance {
-                continue;
+        // 用候选 AABB 到目标 AABB/点的最小距离，避免长模型因中心点较远被误排除。
+        let min_distance = match target_geometry {
+            QueryTargetGeometry::Aabbs(target_aabbs) => {
+                min_distance_to_targets(&candidate_aabb, target_aabbs)
             }
-
-            Some(min_distance)
-        } else {
-            None
+            QueryTargetGeometry::BranCenterline(centerline) => {
+                min_distance_to_centerline(&candidate_aabb, centerline)
+            }
         };
-
-        let aabb = aabb_row.map(|(minx, miny, minz, maxx, maxy, maxz)| {
-            aabb_dto_from_row(minx, miny, minz, maxx, maxy, maxz)
-        });
+        if is_sphere && min_distance > search_distance {
+            continue;
+        }
+        let distance = Some(min_distance);
 
         record_filter_option(
             &mut noun_option_counts,
@@ -2699,41 +3099,44 @@ fn query_by_target_geometry(
             }
         }
 
-        let refno = i64_to_refno_str(id as i64);
-        results.push(SpatialQueryResultItem {
+        let refno = i64_to_refno_str(id);
+
+        if let Some(ref needle) = keyword_filter {
+            if !matches_keyword(needle, &refno, &noun, name.as_deref()) {
+                continue;
+            }
+        }
+
+        let item = SpatialQueryResultItem {
             refno,
             noun,
             spec_value,
-            aabb,
+            name,
+            aabb: Some(aabb_to_dto(&candidate_aabb)),
             distance,
             within_radius: distance.map(|value| value <= search_distance),
+        };
+        let db_rank = preferred_db_rank(&item, &preferred_db_prefix);
+        heap.push(RankedResult {
+            item,
+            db_rank,
+            sort_by,
         });
+        if heap.len() > result_hard_cap() {
+            heap.pop();
+            truncated_results = true;
+        }
     }
 
-    // 按真实最小距离从近到远排序；距离相同按 refno 稳定排序。
-    results.sort_by(|a, b| match (a.distance, b.distance) {
-        (Some(da), Some(db)) => da
-            .partial_cmp(&db)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                preferred_db_rank(a, &preferred_db_prefix)
-                    .cmp(&preferred_db_rank(b, &preferred_db_prefix))
-            })
-            .then_with(|| a.refno.cmp(&b.refno)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => preferred_db_rank(a, &preferred_db_prefix)
-            .cmp(&preferred_db_rank(b, &preferred_db_prefix))
-            .then_with(|| a.refno.cmp(&b.refno)),
-    });
+    // into_sorted_vec 按 `Ord` 升序输出，与取舍口径同源，不需要再排一次。
+    let results: Vec<SpatialQueryResultItem> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.item)
+        .collect();
 
-    let total_count = results.len();
-    let offset = page.saturating_sub(1).saturating_mul(per_page);
-    let page_results = if offset >= total_count {
-        Vec::new()
-    } else {
-        results.into_iter().skip(offset).take(per_page).collect()
-    };
+    // 分组计数取自完整命中集合，与分页无关，否则前端只能按当前页算出偏小的计数。
+    let groups = build_spec_groups(&results);
 
     let filter_options = build_filter_options_from_counts(
         noun_option_counts,
@@ -2741,14 +3144,811 @@ fn query_by_target_geometry(
         include_negative,
     );
 
+    Ok(SpatialScanOutcome {
+        results,
+        groups,
+        filter_options,
+        query_bbox: query_bbox_dto,
+        meta: SpatialScanMeta {
+            candidate_count: scan.candidate_count,
+            truncated_candidates: scan.truncated,
+            truncated_results,
+        },
+    })
+}
+
+/// 一次完整扫描的产物：已排序的全量命中 + 分组 + 过滤面板 + 规模信息。
+///
+/// 不含分页，翻页时可以直接复用。
+struct SpatialScanOutcome {
+    results: Vec<SpatialQueryResultItem>,
+    groups: Vec<SpatialQuerySpecGroup>,
+    filter_options: SpatialQueryFilterOptions,
+    query_bbox: Option<AabbDto>,
+    meta: SpatialScanMeta,
+}
+
+struct ScanCacheEntry {
+    outcome: Arc<SpatialScanOutcome>,
+    created: Instant,
+}
+
+static SCAN_CACHE: OnceLock<Mutex<HashMap<String, ScanCacheEntry>>> = OnceLock::new();
+const SCAN_CACHE_TTL: Duration = Duration::from_secs(60);
+const SCAN_CACHE_MAX_ENTRIES: usize = 8;
+
+/// 当前索引版本对应的缓存键前缀。索引一被改写，所有旧键都不再匹配。
+fn scan_cache_generation_prefix() -> String {
+    format!("g{}|", crate::sqlite_index::index_generation())
+}
+
+/// 扫描结果的缓存键：除分页外，一切影响结果的输入。
+///
+/// 查询区域可能多达上千个（BRAN 中心线逐段），所以按位哈希而不是拼进字符串。
+///
+/// 开头的索引版本号让重建索引、回填名称这类写入自动使旧快照失效——否则用户点完
+/// 「回填名称」，翻页还会在 TTL 内继续读到没有名称的那份快照。
+///
+/// `preferred_db_prefix` 也要进键：它只由 `params.refno` 决定，而 `refno` 本身没有
+/// 进键（`self_id` 在 `include_self=true` 时是 None），否则两个包围盒完全相同、
+/// 分属不同库的 refno 会共用快照，同距离时的「同库优先」排序会串。
+fn scan_cache_key(
+    index_path: &Path,
+    params: &SqliteSpatialQueryParams,
+    regions: &[Aabb],
+    search_distance: f32,
+    self_id: Option<i64>,
+    is_sphere: bool,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for region in regions {
+        for value in [
+            region.mins.x,
+            region.mins.y,
+            region.mins.z,
+            region.maxs.x,
+            region.maxs.y,
+            region.maxs.z,
+        ] {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+
+    format!(
+        "{}{}|{:x}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        scan_cache_generation_prefix(),
+        index_path.display(),
+        hasher.finish(),
+        search_distance.to_bits(),
+        self_id.unwrap_or(0),
+        is_sphere,
+        params.nouns.as_deref().unwrap_or(""),
+        params.spec_values.as_deref().unwrap_or(""),
+        params.keyword.as_deref().unwrap_or(""),
+        params.sort.as_deref().unwrap_or(""),
+        params.include_negative.unwrap_or(false),
+        params.include_self.unwrap_or(true),
+        refno_db_prefix(params.refno.as_deref()).unwrap_or_default(),
+    )
+}
+
+/// 取缓存的扫描结果；未命中或已过期则重新扫描并写回。
+///
+/// 索引被改写时靠键里的版本号失效，所以翻页不会读到改动前的快照。
+fn cached_scan_outcome(
+    key: String,
+    scan: impl FnOnce() -> Result<SpatialScanOutcome, SpatialQueryResult>,
+) -> Result<Arc<SpatialScanOutcome>, SpatialQueryResult> {
+    let cache = SCAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(entry) = guard.get(&key) {
+            if entry.created.elapsed() < SCAN_CACHE_TTL {
+                return Ok(Arc::clone(&entry.outcome));
+            }
+        }
+    }
+
+    let outcome = Arc::new(scan()?);
+    let generation_prefix = scan_cache_generation_prefix();
+
+    if let Ok(mut guard) = cache.lock() {
+        // 上个版本的快照已经不可能再命中，顺手丢掉，不要占着名额和内存。
+        guard.retain(|entry_key, entry| {
+            entry.created.elapsed() < SCAN_CACHE_TTL && entry_key.starts_with(&generation_prefix)
+        });
+        while guard.len() >= SCAN_CACHE_MAX_ENTRIES {
+            let oldest = guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => {
+                    guard.remove(&key);
+                }
+                None => break,
+            }
+        }
+        guard.insert(
+            key,
+            ScanCacheEntry {
+                outcome: Arc::clone(&outcome),
+                created: Instant::now(),
+            },
+        );
+    }
+
+    Ok(outcome)
+}
+
+fn paginate_scan_outcome(
+    outcome: &SpatialScanOutcome,
+    page: usize,
+    per_page: usize,
+) -> SpatialQueryResult {
+    let total_count = outcome.results.len();
+    let offset = page.saturating_sub(1).saturating_mul(per_page);
+    let page_results = outcome
+        .results
+        .iter()
+        .skip(offset)
+        .take(per_page)
+        .cloned()
+        .collect();
+
     success_spatial_query_result(
         page_results,
         total_count,
         page,
         per_page,
-        query_bbox_dto,
-        Some(filter_options),
+        outcome.query_bbox.clone(),
+        Some(outcome.filter_options.clone()),
+        Some(outcome.groups.clone()),
+        outcome.meta,
     )
+}
+
+// ============================================================================
+// 构件名称：索引回填 + 查询时兜底
+// ============================================================================
+
+/// 一次向模型库解析的名称数量上限，避免单批请求过大。
+const NAME_RESOLVE_CHUNK: usize = 2_000;
+/// 单次回填任务处理的 item 数量上限。
+const NAME_BACKFILL_BATCH_LIMIT: usize = 200_000;
+
+fn refno_enum_from_index_id(id: i64) -> Option<RefnoEnum> {
+    RefnoEnum::from_str(&i64_to_refno_str(id).replace('_', "/")).ok()
+}
+
+/// 从模型库批量解析 index id → 构件名称。
+///
+/// 空间索引只存几何与 noun/spec_value，名称来自 pe 表，因此需要单独解析。
+async fn resolve_names_for_ids(ids: &[i64]) -> HashMap<i64, String> {
+    let mut resolved = HashMap::new();
+
+    for chunk in ids.chunks(NAME_RESOLVE_CHUNK) {
+        let refnos: Vec<RefnoEnum> = chunk.iter().copied().filter_map(refno_enum_from_index_id).collect();
+        if refnos.is_empty() {
+            continue;
+        }
+
+        match crate::fast_model::query_provider::get_pes_batch(&refnos).await {
+            Ok(pes) => {
+                for pe in pes {
+                    let name = pe.name.trim().to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if let Some(id) = refno_str_to_i64(&refno_enum_to_output_refno(&pe.refno)) {
+                        resolved.insert(id, name);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[spatial] 解析构件名称失败: {e}");
+            }
+        }
+    }
+
+    resolved
+}
+
+/// 为当前页中尚未回填名称的结果项补齐名称。
+///
+/// 名称回填任务尚未执行时，这一步保证前端仍能显示名称而不是裸 refno；
+/// 只作用于当前页，代价固定在 per_page 量级。
+async fn hydrate_missing_result_names(result: &mut SpatialQueryResult) {
+    let Some(items) = result.results.as_mut() else {
+        return;
+    };
+
+    let missing_ids: Vec<i64> = items
+        .iter()
+        .filter(|item| item.name.is_none())
+        .filter_map(|item| refno_str_to_i64(&item.refno))
+        .collect();
+    if missing_ids.is_empty() {
+        return;
+    }
+
+    let names = resolve_names_for_ids(&missing_ids).await;
+    if names.is_empty() {
+        return;
+    }
+
+    for item in items.iter_mut() {
+        if item.name.is_some() {
+            continue;
+        }
+        if let Some(name) = refno_str_to_i64(&item.refno).and_then(|id| names.get(&id)) {
+            item.name = Some(name.clone());
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpatialNameBackfillResult {
+    pub success: bool,
+    /// 本次写入名称的数量
+    pub updated: usize,
+    /// 回填后仍缺名称的数量
+    pub still_missing: usize,
+    /// 索引中已有名称的数量
+    pub named: usize,
+    /// 索引元素总数
+    pub total: usize,
+    pub error: Option<String>,
+}
+
+fn name_backfill_error(message: impl Into<String>) -> SpatialNameBackfillResult {
+    SpatialNameBackfillResult {
+        success: false,
+        updated: 0,
+        still_missing: 0,
+        named: 0,
+        total: 0,
+        error: Some(message.into()),
+    }
+}
+
+/// POST /api/sqlite-spatial/backfill-names
+///
+/// 把模型库中的构件名称回填进空间索引，使 name 可以参与服务端关键字过滤。
+/// 可重复执行：每次只处理尚未命名的条目。
+pub async fn api_sqlite_spatial_backfill_names() -> Json<SpatialNameBackfillResult> {
+    let cached = match get_cached_index() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(name_backfill_error(format!(
+                "{}. 请先运行 import-spatial-index 构建索引。",
+                e
+            )));
+        }
+    };
+
+    let pending = match cached.idx.ids_missing_names(NAME_BACKFILL_BATCH_LIMIT) {
+        Ok(ids) => ids,
+        Err(e) => return Json(name_backfill_error(format!("读取待回填 id 失败: {}", e))),
+    };
+
+    let names = resolve_names_for_ids(&pending).await;
+    let updates: Vec<(i64, String)> = names.into_iter().collect();
+    let updated = match cached.idx.update_item_names(updates) {
+        Ok(count) => count,
+        Err(e) => return Json(name_backfill_error(format!("写入名称失败: {}", e))),
+    };
+
+    let (named, total) = cached.idx.name_coverage().unwrap_or((0, 0));
+
+    Json(SpatialNameBackfillResult {
+        success: true,
+        updated,
+        still_missing: total.saturating_sub(named),
+        named,
+        total,
+        error: None,
+    })
+}
+
+// ============================================================================
+// Handler：POST /api/space/nearest-points
+// ============================================================================
+
+const NEAREST_POINTS_DEFAULT_RADIUS_MM: f32 = 5_000.0;
+const NEAREST_POINTS_MAX_RADIUS_MM: f32 = 100_000.0;
+const NEAREST_POINTS_DEFAULT_MAX_RESULTS: usize = 20;
+const NEAREST_POINTS_MAX_RESULTS: usize = 500;
+const NEAREST_POINTS_MAX_EXPLICIT_TARGETS: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct NearestPointsRequest {
+    /// 源构件 refno（"dbnum_refno" 或 "dbnum/refno"）
+    pub source_refno: String,
+    /// 显式目标列表；给了就只算这些，忽略 target_nouns / radius 搜索
+    #[serde(default)]
+    pub target_refnos: Option<Vec<String>>,
+    /// 按 noun 搜索目标（与 target_refnos 二选一）
+    #[serde(default)]
+    pub target_nouns: Option<Vec<String>>,
+    /// 搜索半径（mm），仅在按 noun 搜索时生效
+    #[serde(default)]
+    pub radius: Option<f32>,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// 是否把源自身算进结果（默认 false）
+    #[serde(default)]
+    pub include_self: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NearestPointsSource {
+    pub refno: String,
+    pub noun: String,
+    /// 实际使用的源几何："bran_centerline"（真实中心线）| "aabb"（包围盒）
+    pub kind: String,
+    pub aabb: Option<AabbDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_count: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NearestPointsItem {
+    pub refno: String,
+    pub noun: String,
+    pub spec_value: i64,
+    pub distance_mm: f32,
+    pub intersects: bool,
+    /// 距离口径："centerline_aabb" | "aabb_aabb"
+    pub method: String,
+    pub source_point: Vec3Dto,
+    pub target_point: Vec3Dto,
+    pub vector: Vec3DeltaDto,
+    pub aabb: AabbDto,
+    /// 源为 BRAN 中心线时，命中的那一段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_segment_refno: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NearestPointsResponse {
+    pub success: bool,
+    pub unit: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<NearestPointsSource>,
+    pub results: Vec<NearestPointsItem>,
+    /// 参与计算的目标候选数量（noun 搜索时是半径内的命中数）
+    pub candidate_count: usize,
+    /// 候选集是否因触顶被截断；为真时结果可能不含最近的目标
+    pub truncated_candidates: bool,
+    pub candidate_cap: usize,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+fn nearest_points_error(message: impl Into<String>) -> NearestPointsResponse {
+    NearestPointsResponse {
+        success: false,
+        unit: "mm",
+        source: None,
+        results: Vec::new(),
+        candidate_count: 0,
+        truncated_candidates: false,
+        candidate_cap: CANDIDATE_HARD_CAP,
+        warnings: Vec::new(),
+        error: Some(message.into()),
+    }
+}
+
+/// 两个轴对齐包围盒之间的最近点对。
+///
+/// 逐轴独立求解：分离的轴各取相对的那一面，重叠的轴取重叠区间中点，
+/// 于是两点在该轴上重合、对距离没有贡献，得到的正是最小间距的一对点。
+fn aabb_pair_nearest_points(a: &Aabb, b: &Aabb) -> (Vec3, Vec3) {
+    let axis = |a_min: f32, a_max: f32, b_min: f32, b_max: f32| -> (f32, f32) {
+        if a_max < b_min {
+            (a_max, b_min)
+        } else if b_max < a_min {
+            (a_min, b_max)
+        } else {
+            let overlap = (a_min.max(b_min) + a_max.min(b_max)) * 0.5;
+            (overlap, overlap)
+        }
+    };
+
+    let (sx, tx) = axis(a.mins.x, a.maxs.x, b.mins.x, b.maxs.x);
+    let (sy, ty) = axis(a.mins.y, a.maxs.y, b.mins.y, b.maxs.y);
+    let (sz, tz) = axis(a.mins.z, a.maxs.z, b.mins.z, b.maxs.z);
+
+    (Vec3::new(sx, sy, sz), Vec3::new(tx, ty, tz))
+}
+
+fn resolve_nearest_points_radius(radius: Option<f32>) -> Result<f32, String> {
+    let value = radius.unwrap_or(NEAREST_POINTS_DEFAULT_RADIUS_MM);
+    if !value.is_finite() || value <= 0.0 || value > NEAREST_POINTS_MAX_RADIUS_MM {
+        return Err(format!(
+            "invalid radius (must be 0 < radius <= {} mm)",
+            NEAREST_POINTS_MAX_RADIUS_MM
+        ));
+    }
+    Ok(value)
+}
+
+/// POST /api/space/nearest-points
+///
+/// 通用最近点：给定源构件与一组目标（显式 refno 列表，或 noun + 半径），
+/// 返回每个目标与源之间的最近点对、向量与距离，供前端直接画标注。
+///
+/// 与 `/nearest-clearance` 的区别：那个只在源是 BRAN 中心线时才给出端点，
+/// 且目标只能按预置分组搜；这里任意源、任意目标都会返回端点。
+pub async fn api_space_nearest_points(
+    axum::Json(request): axum::Json<NearestPointsRequest>,
+) -> Json<NearestPointsResponse> {
+    let source_refno = request.source_refno.trim().to_string();
+    if source_refno.is_empty() {
+        return Json(nearest_points_error("missing source_refno"));
+    }
+    let Some(source_id) = refno_str_to_i64(&source_refno.replace('/', "_")) else {
+        return Json(nearest_points_error(
+            "invalid source_refno format (expected dbnum_refno or dbnum/refno)",
+        ));
+    };
+
+    let radius = match resolve_nearest_points_radius(request.radius) {
+        Ok(value) => value,
+        Err(e) => return Json(nearest_points_error(e)),
+    };
+
+    let cached = match get_cached_index() {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(nearest_points_error(format!(
+                "{}. 请先运行 import-spatial-index 构建索引。",
+                e
+            )));
+        }
+    };
+    let conn = match Connection::open(&cached.path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(nearest_points_error(format!(
+                "open sqlite connection failed: {}",
+                e
+            )));
+        }
+    };
+
+    let source_noun = conn
+        .query_row(
+            "SELECT noun FROM items WHERE id = ?1",
+            [source_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten()
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
+    let source_aabb = match query_aabb_row(&conn, source_id) {
+        Ok(Some((minx, miny, minz, maxx, maxy, maxz))) => {
+            aabb_from_row(minx, miny, minz, maxx, maxy, maxz)
+        }
+        Ok(None) => return Json(nearest_points_error("source_refno not found in aabb_index")),
+        Err(e) => {
+            return Json(nearest_points_error(format!(
+                "query source aabb failed: {}",
+                e
+            )));
+        }
+    };
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // BRAN 用真实中心线，其余退回包围盒；中心线取不到时降级并说明原因。
+    //
+    // 中心线在这里只是可选的精度升级，任何失败都必须降级而不是让请求失败。
+    // 取中心线要走模型库，链路里存在 unwrap（例如配置缺失），因此放进独立任务，
+    // 让 panic 变成 JoinError 而不是打断当前请求。
+    let centerline = if source_noun.eq_ignore_ascii_case("BRAN") {
+        match parse_refno_enum_for_source(&source_refno) {
+            Ok(branch_refno) => {
+                let fetched =
+                    tokio::spawn(async move { fetch_bran_centerline_segments(branch_refno).await })
+                        .await;
+                match fetched {
+                    Ok(Ok(segments)) if !segments.is_empty() => Some(segments),
+                    Ok(Ok(_)) => {
+                        warnings.push("BRAN 中心线为空，已退回包围盒口径".to_string());
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        warnings.push(format!("BRAN 中心线获取失败，已退回包围盒口径: {e}"));
+                        None
+                    }
+                    Err(e) => {
+                        warnings
+                            .push(format!("BRAN 中心线获取异常，已退回包围盒口径: {e}"));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warnings.push(format!("BRAN refno 解析失败，已退回包围盒口径: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let include_self = request.include_self.unwrap_or(false);
+    let max_results = request
+        .max_results
+        .unwrap_or(NEAREST_POINTS_DEFAULT_MAX_RESULTS)
+        .clamp(1, NEAREST_POINTS_MAX_RESULTS);
+
+    // 目标集合：显式列表优先，否则按 noun + 半径搜。
+    // 目标候选一次取齐几何与属性，不再逐个 refno 往返查 items / aabb_index。
+    let explicit_targets = request
+        .target_refnos
+        .as_ref()
+        .is_some_and(|list| !list.is_empty());
+    let (candidates, truncated_candidates) = match request.target_refnos.as_ref() {
+        Some(list) if !list.is_empty() => {
+            if list.len() > NEAREST_POINTS_MAX_EXPLICIT_TARGETS {
+                warnings.push(format!(
+                    "target_refnos 超过 {} 条，已截断",
+                    NEAREST_POINTS_MAX_EXPLICIT_TARGETS
+                ));
+            }
+            let ids: Vec<i64> = list
+                .iter()
+                .take(NEAREST_POINTS_MAX_EXPLICIT_TARGETS)
+                .filter_map(|refno| refno_str_to_i64(&refno.trim().replace('/', "_")))
+                .collect();
+            match fetch_candidates_by_ids(&conn, &ids) {
+                Ok(rows) => (rows, false),
+                Err(e) => return Json(nearest_points_error(e)),
+            }
+        }
+        _ => {
+            let regions = match &centerline {
+                Some(segments) => segments.iter().map(centerline_segment_aabb).collect(),
+                None => vec![source_aabb.clone()],
+            };
+            match scan_candidates_for_regions(&conn, &regions, radius) {
+                Ok(scan) => {
+                    if scan.truncated {
+                        warnings.push(format!(
+                            "半径内候选超过 {} 条，已截断；结果可能不含最近的目标，请缩小半径或改用显式 target_refnos",
+                            CANDIDATE_HARD_CAP
+                        ));
+                    }
+                    (scan.rows, scan.truncated)
+                }
+                Err(e) => return Json(nearest_points_error(e)),
+            }
+        }
+    };
+    let candidate_count = candidates.len();
+
+    let noun_filter: Option<HashSet<String>> = request.target_nouns.as_ref().map(|nouns| {
+        nouns
+            .iter()
+            .map(|noun| noun.trim().to_uppercase())
+            .filter(|noun| !noun.is_empty())
+            .collect()
+    });
+
+    let mut results: Vec<NearestPointsItem> = Vec::new();
+    for candidate in candidates {
+        let CandidateRow {
+            id: target_id,
+            noun,
+            spec_value,
+            aabb: target_aabb,
+            ..
+        } = candidate;
+
+        if !include_self && target_id == source_id {
+            continue;
+        }
+
+        if let Some(filter) = &noun_filter {
+            if !filter.is_empty() && !filter.contains(&noun.to_uppercase()) {
+                continue;
+            }
+        }
+
+        let (source_point, target_point, distance_mm, intersects, method, segment_refno) =
+            match &centerline {
+                Some(segments) => match centerline_aabb_nearest(&target_aabb, segments) {
+                    Some(nearest) => (
+                        nearest.source_point,
+                        nearest.target_point,
+                        nearest.distance_mm,
+                        nearest.intersects,
+                        "centerline_aabb",
+                        Some(nearest.source_segment_refno.clone()),
+                    ),
+                    None => continue,
+                },
+                None => {
+                    let (sp, tp) = aabb_pair_nearest_points(&source_aabb, &target_aabb);
+                    let distance = aabb_min_distance(&source_aabb, &target_aabb);
+                    (sp, tp, distance, distance <= 0.0, "aabb_aabb", None)
+                }
+            };
+
+        // 半径只用于「按 noun 搜目标」；显式点名的目标一律计算，
+        // 否则「A 到 B 有多远」会因为超出默认半径而静默丢结果。
+        if !explicit_targets && distance_mm > radius {
+            continue;
+        }
+
+        let vector = target_point - source_point;
+        results.push(NearestPointsItem {
+            refno: i64_to_refno_str(target_id),
+            noun,
+            spec_value,
+            distance_mm,
+            intersects,
+            method: method.to_string(),
+            source_point: vec3_to_dto(source_point),
+            target_point: vec3_to_dto(target_point),
+            vector: Vec3DeltaDto {
+                dx: vector.x,
+                dy: vector.y,
+                dz: vector.z,
+            },
+            aabb: aabb_to_dto(&target_aabb),
+            source_segment_refno: segment_refno,
+        });
+    }
+
+    results.sort_by(|a, b| {
+        a.distance_mm
+            .partial_cmp(&b.distance_mm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.refno.cmp(&b.refno))
+    });
+    if results.len() > max_results {
+        results.truncate(max_results);
+    }
+
+    Json(NearestPointsResponse {
+        success: true,
+        unit: "mm",
+        source: Some(NearestPointsSource {
+            refno: i64_to_refno_str(source_id),
+            noun: source_noun,
+            kind: if centerline.is_some() {
+                "bran_centerline".to_string()
+            } else {
+                "aabb".to_string()
+            },
+            aabb: Some(aabb_to_dto(&source_aabb)),
+            segment_count: centerline.as_ref().map(|segments| segments.len()),
+        }),
+        results,
+        candidate_count,
+        truncated_candidates,
+        candidate_cap: CANDIDATE_HARD_CAP,
+        warnings,
+        error: None,
+    })
+}
+
+// ============================================================================
+// Handler：GET /api/sqlite-spatial/nearby/refnos
+// ============================================================================
+
+/// refnos 端点一次返回的 refno 数量硬上限。
+///
+/// 与结果集上限对齐：扫描阶段本来就最多保留这么多条，报更大的数只会误导调用方。
+const REFNOS_HARD_CAP: usize = RESULT_HARD_CAP;
+
+#[derive(Debug, Serialize)]
+pub struct SpatialNearbyRefnosResult {
+    pub success: bool,
+    /// 完整命中集合（未分页）
+    pub refnos: Vec<String>,
+    /// 按 dbnum 分组的命中集合，供前端直接按库批量加载
+    pub by_dbnum: BTreeMap<u32, Vec<String>>,
+    /// 按专业分组的命中集合，供「加载本专业 / 仅显示本专业」覆盖全集
+    pub by_spec_value: BTreeMap<i64, Vec<String>>,
+    pub total_count: usize,
+    /// 是否因为超过硬上限而被截断
+    pub truncated: bool,
+    pub cap: usize,
+    pub error: Option<String>,
+}
+
+fn nearby_refnos_error(message: impl Into<String>) -> SpatialNearbyRefnosResult {
+    SpatialNearbyRefnosResult {
+        success: false,
+        refnos: Vec::new(),
+        by_dbnum: BTreeMap::new(),
+        by_spec_value: BTreeMap::new(),
+        total_count: 0,
+        truncated: false,
+        cap: REFNOS_HARD_CAP,
+        error: Some(message.into()),
+    }
+}
+
+/// GET /api/sqlite-spatial/nearby/refnos
+///
+/// 与 `/nearby` 使用完全相同的查询与过滤参数，但一次返回完整命中集合且只含 refno。
+/// 「全部显示 / 隔离结果 / 加载全部筛选结果」这类批量操作需要整个结果集，
+/// 分页接口只能给到当前页，会让批量操作实际只作用于一页。
+pub async fn api_sqlite_spatial_nearby_refnos(
+    Query(params): Query<SqliteSpatialQueryParams>,
+) -> Json<SpatialNearbyRefnosResult> {
+    let plan = match prepare_nearby_query(params) {
+        Ok(plan) => plan,
+        Err(e) => return Json(nearby_refnos_error(e)),
+    };
+
+    let mut params = plan.params;
+    params.page = Some(1);
+    params.per_page = Some(REFNOS_HARD_CAP);
+    params.per_page_cap_override = Some(REFNOS_HARD_CAP);
+
+    let fallback_refno_ids = match query_refno_visible_inst_ids_for_fallback(&params).await {
+        Ok(ids) => ids,
+        Err(e) => return Json(nearby_refnos_error(e)),
+    };
+
+    let result =
+        tokio::task::spawn_blocking(move || do_spatial_query(params, fallback_refno_ids, None))
+            .await;
+    let query_result = match result {
+        Ok(r) => r,
+        Err(e) => return Json(nearby_refnos_error(format!("internal error: {}", e))),
+    };
+
+    if !query_result.success {
+        return Json(nearby_refnos_error(
+            query_result.error.unwrap_or_else(|| "空间查询失败".to_string()),
+        ));
+    }
+
+    // 扫描阶段自己也会在候选/结果上限处截断，光比对数量看不出来。
+    let capped = query_result.truncated_candidates.unwrap_or(false)
+        || query_result.truncated_results.unwrap_or(false);
+    let items = query_result.results.unwrap_or_default();
+    let total_count = query_result.total_count.unwrap_or(items.len());
+    let mut by_dbnum: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut by_spec_value: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+    let mut refnos = Vec::with_capacity(items.len());
+
+    for item in items {
+        if let Some(id) = refno_str_to_i64(&item.refno) {
+            by_dbnum
+                .entry(dbnum_from_refno_id(id))
+                .or_default()
+                .push(item.refno.clone());
+        }
+        by_spec_value
+            .entry(item.spec_value)
+            .or_default()
+            .push(item.refno.clone());
+        refnos.push(item.refno);
+    }
+
+    Json(SpatialNearbyRefnosResult {
+        success: true,
+        truncated: capped || total_count > refnos.len(),
+        total_count,
+        refnos,
+        by_dbnum,
+        by_spec_value,
+        cap: REFNOS_HARD_CAP,
+        error: None,
+    })
 }
 
 // ============================================================================
@@ -2832,6 +4032,13 @@ mod tests {
 
     fn clear_test_index_path() {
         *test_index_override().lock().unwrap() = None;
+    }
+
+    fn with_test_result_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+        *test_result_cap_override().lock().unwrap() = Some(cap);
+        let result = f();
+        *test_result_cap_override().lock().unwrap() = None;
+        result
     }
 
     fn rid(dbnum: u32, refno: u32) -> i64 {
@@ -3035,11 +4242,6 @@ mod tests {
     fn base_spatial_bbox_params() -> SqliteSpatialQueryParams {
         SqliteSpatialQueryParams {
             mode: Some("bbox".to_string()),
-            refno: None,
-            x: None,
-            y: None,
-            z: None,
-            radius: None,
             distance: Some(0.0),
             minx: Some(-0.5),
             miny: Some(-0.5),
@@ -3047,15 +4249,149 @@ mod tests {
             maxx: Some(3.5),
             maxy: Some(1.5),
             maxz: Some(1.5),
-            max_results: None,
-            page: None,
-            per_page: None,
-            nouns: None,
-            spec_values: None,
-            include_self: None,
-            include_negative: None,
-            shape: None,
+            ..Default::default()
         }
+    }
+
+    /// 结果集触顶时，保留的必须是排序口径下最靠前的那批，而不是 id 最小的那批。
+    ///
+    /// 索引里刻意让 id 顺序与距离顺序完全相反：id 越大离查询点越近。早先的实现按
+    /// id 顺序先到先得、攒满就 break，于是留下的恰好全是最远的那些。
+    #[test]
+    fn truncated_results_keep_nearest_not_lowest_ids() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+
+        // refno 1 在 x=1000（最远），refno 10 在 x=100（最近）
+        let rows = (1..=10u32)
+            .map(|n| {
+                let x = f64::from(11 - n) * 100.0;
+                (
+                    rid(1, n),
+                    "PIPE".to_string(),
+                    0i64,
+                    x,
+                    x + 10.0,
+                    0.0,
+                    10.0,
+                    0.0,
+                    10.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        idx.insert_aabbs_with_items_and_spec_values(rows).unwrap();
+
+        let resp = with_test_index(&db, || {
+            with_test_result_cap(3, || {
+                let params = SqliteSpatialQueryParams {
+                    mode: Some("position".to_string()),
+                    x: Some(0.0),
+                    y: Some(5.0),
+                    z: Some(5.0),
+                    radius: Some(5000.0),
+                    per_page: Some(10),
+                    ..Default::default()
+                };
+                do_spatial_query(params, None, None)
+            })
+        });
+
+        assert!(resp.success, "error: {:?}", resp.error);
+        assert_eq!(resp.truncated_results, Some(true));
+
+        let items = resp.results.unwrap();
+        let refnos: Vec<&str> = items.iter().map(|item| item.refno.as_str()).collect();
+        assert_eq!(refnos, vec!["1_10", "1_9", "1_8"]);
+
+        // 被丢弃的最近一项在 x=400，留下的三条都必须比它近
+        let farthest_kept = items.last().unwrap().distance.unwrap();
+        assert!(
+            farthest_kept < 400.0,
+            "触顶时保留的不是最近的那批: {:?}",
+            items.iter().map(|i| i.distance).collect::<Vec<_>>()
+        );
+    }
+
+    /// 显式目标列表走批量 JOIN 取数：一次拿齐几何与属性，不再逐个 refno 往返。
+    ///
+    /// 同时钉住 LEFT JOIN 语义：只有几何、`items` 里没有对应行的条目要以
+    /// UNKNOWN / 0 回退，而不是整行丢掉，也不是变成 NaN 包围盒。
+    #[test]
+    fn fetch_candidates_by_ids_batches_and_tolerates_missing_items() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![(
+            rid(1, 2),
+            "PIPE".to_string(),
+            7,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+        )])
+        .unwrap();
+        // 只写几何、不写 items，构造 LEFT JOIN 右侧为空的一行
+        idx.insert_many(vec![(rid(1, 3), 5.0, 6.0, 0.0, 1.0, 0.0, 1.0)])
+            .unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let mut rows =
+            fetch_candidates_by_ids(&conn, &[rid(1, 2), rid(1, 3), rid(1, 999)]).unwrap();
+        rows.sort_unstable_by_key(|row| row.id);
+
+        assert_eq!(rows.len(), 2, "索引里不存在的 id 不应产生行");
+        assert_eq!(rows[0].noun, "PIPE");
+        assert_eq!(rows[0].spec_value, 7);
+        assert!(rows[0].aabb.mins.x.is_finite());
+        assert_eq!(rows[1].noun, "UNKNOWN");
+        assert_eq!(rows[1].spec_value, 0);
+        assert_eq!(rows[1].name, None);
+        assert!(
+            rows[1].aabb.mins.x.is_finite(),
+            "缺 items 行不应让包围盒变成 NaN"
+        );
+    }
+
+    /// 回填名称之后再查，必须立刻看到新名称，不能在 TTL 内继续读改动前的快照。
+    #[test]
+    fn name_backfill_invalidates_paged_scan_snapshot() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![(
+            rid(1, 2),
+            "PIPE".to_string(),
+            0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+        )])
+        .unwrap();
+
+        let before =
+            with_test_index(&db, || do_spatial_query(base_spatial_bbox_params(), None, None));
+        assert_eq!(before.results.unwrap()[0].name, None);
+
+        idx.update_item_names(vec![(rid(1, 2), "/100-P-0001".to_string())])
+            .unwrap();
+
+        let after =
+            with_test_index(&db, || do_spatial_query(base_spatial_bbox_params(), None, None));
+        assert_eq!(
+            after.results.unwrap()[0].name.as_deref(),
+            Some("/100-P-0001"),
+            "回填后的查询命中了改动前的快照"
+        );
     }
 
     #[test]
@@ -3094,11 +4430,6 @@ mod tests {
         let resp = with_test_index(&db, || {
             let params = SqliteSpatialQueryParams {
                 mode: Some("bbox".to_string()),
-                refno: None,
-                x: None,
-                y: None,
-                z: None,
-                radius: None,
                 distance: Some(0.0),
                 minx: Some(-0.5),
                 miny: Some(-0.5),
@@ -3106,14 +4437,7 @@ mod tests {
                 maxx: Some(1.5),
                 maxy: Some(1.5),
                 maxz: Some(1.5),
-                max_results: None,
-                page: None,
-                per_page: None,
-                nouns: None,
-                spec_values: None,
-                include_self: None,
-                include_negative: None,
-                shape: None,
+                ..Default::default()
             };
             do_spatial_query(params, None, None)
         });
@@ -3149,11 +4473,6 @@ mod tests {
         let resp = with_test_index(&db, || {
             let params = SqliteSpatialQueryParams {
                 mode: Some("bbox".to_string()),
-                refno: None,
-                x: None,
-                y: None,
-                z: None,
-                radius: None,
                 distance: Some(0.0),
                 minx: Some(-0.5),
                 miny: Some(-0.5),
@@ -3161,14 +4480,7 @@ mod tests {
                 maxx: Some(1.5),
                 maxy: Some(1.5),
                 maxz: Some(1.5),
-                max_results: None,
-                page: None,
-                per_page: None,
-                nouns: None,
-                spec_values: None,
-                include_self: None,
-                include_negative: None,
-                shape: None,
+                ..Default::default()
             };
             do_spatial_query(params, None, None)
         });
@@ -3213,26 +4525,11 @@ mod tests {
         let resp = with_test_index(&db, || {
             let params = SqliteSpatialQueryParams {
                 mode: Some("position".to_string()),
-                refno: None,
                 x: Some(0.0),
                 y: Some(0.0),
                 z: Some(0.0),
                 radius: Some(10.0),
-                distance: None,
-                minx: None,
-                miny: None,
-                minz: None,
-                maxx: None,
-                maxy: None,
-                maxz: None,
-                max_results: None,
-                page: None,
-                per_page: None,
-                nouns: None,
-                spec_values: None,
-                include_self: None,
-                include_negative: None,
-                shape: None,
+                ..Default::default()
             };
             do_spatial_query(params, None, None)
         });
@@ -3290,25 +4587,9 @@ mod tests {
             let params = SqliteSpatialQueryParams {
                 mode: Some("refno".to_string()),
                 refno: Some("1_1".to_string()),
-                x: None,
-                y: None,
-                z: None,
-                radius: None,
                 distance: Some(5.0),
-                minx: None,
-                miny: None,
-                minz: None,
-                maxx: None,
-                maxy: None,
-                maxz: None,
-                max_results: None,
-                page: None,
-                per_page: None,
-                nouns: None,
-                spec_values: None,
                 include_self: Some(false),
-                include_negative: None,
-                shape: None,
+                ..Default::default()
             };
             do_spatial_query(params, None, None)
         });
@@ -3367,6 +4648,372 @@ mod tests {
         assert_eq!(filter_options.nouns[0].value, "PIPE");
         assert!(!filter_options.nouns[0].is_negative);
         assert!(filter_options.nouns.iter().all(|item| item.value != "NBOX"));
+    }
+
+    #[test]
+    fn keyword_filter_matches_name_before_pagination() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                1,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "PIPE".to_string(),
+                1,
+                2.0,
+                3.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+        idx.update_item_names(vec![
+            (rid(1, 1), "/100-P-001".to_string()),
+            (rid(1, 2), "/200-V-002".to_string()),
+        ])
+        .unwrap();
+
+        // 关键字必须在分页之前生效：每页只留 1 条时，命中项仍应出现在第 1 页。
+        let resp = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                keyword: Some("200-v".to_string()),
+                per_page: Some(1),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+
+        assert!(resp.success);
+        assert_eq!(resp.total_count, Some(1));
+        let items = resp.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_2");
+        assert_eq!(items[0].name.as_deref(), Some("/200-V-002"));
+    }
+
+    #[test]
+    fn sort_and_spec_groups_are_global_not_page_scoped() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        // 距离从近到远：1_1 < 1_2 < 1_3；专业分别为 2 / 1 / 1
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                2,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "PIPE".to_string(),
+                1,
+                2.0,
+                2.5,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 3),
+                "PIPE".to_string(),
+                1,
+                3.0,
+                3.4,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+        idx.update_item_names(vec![
+            (rid(1, 1), "C-THIRD".to_string()),
+            (rid(1, 2), "A-FIRST".to_string()),
+            (rid(1, 3), "B-SECOND".to_string()),
+        ])
+        .unwrap();
+
+        let by_distance = with_test_index(&db, || {
+            do_spatial_query(base_spatial_bbox_params(), None, None)
+        });
+        let order: Vec<String> = by_distance
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.refno)
+            .collect();
+        assert_eq!(order, vec!["1_1", "1_2", "1_3"]);
+
+        let by_name = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                sort: Some("name".to_string()),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+        let order: Vec<String> = by_name
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.refno)
+            .collect();
+        assert_eq!(order, vec!["1_2", "1_3", "1_1"]);
+
+        let by_spec = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                sort: Some("spec_distance".to_string()),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+        let order: Vec<String> = by_spec
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| item.refno)
+            .collect();
+        assert_eq!(order, vec!["1_2", "1_3", "1_1"]);
+
+        // 只取第 1 页 1 条，分组计数仍应覆盖全部 3 条命中。
+        let paged = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                per_page: Some(1),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+        assert_eq!(paged.returned_count, Some(1));
+        assert_eq!(paged.total_count, Some(3));
+        let groups = paged.groups.unwrap_or_default();
+        let counts: Vec<(i64, usize)> = groups
+            .into_iter()
+            .map(|group| (group.spec_value, group.count))
+            .collect();
+        assert_eq!(counts, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn response_reports_candidate_scale_and_truncation_flags() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                1,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "NBOX".to_string(),
+                1,
+                2.0,
+                3.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        let resp = with_test_index(&db, || {
+            do_spatial_query(base_spatial_bbox_params(), None, None)
+        });
+
+        // 候选计数是 RTree 命中量，负实体在过滤阶段才被剔除，所以是 2 而不是 1
+        assert_eq!(resp.candidate_count, Some(2));
+        assert_eq!(resp.candidate_cap, Some(CANDIDATE_HARD_CAP));
+        assert_eq!(resp.result_cap, Some(RESULT_HARD_CAP));
+        assert_eq!(resp.truncated_candidates, Some(false));
+        assert_eq!(resp.truncated_results, Some(false));
+        assert_eq!(resp.total_count, Some(1));
+    }
+
+    #[test]
+    fn paging_reuses_scan_snapshot_and_keeps_slices_disjoint() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(
+            (1..=5)
+                .map(|n| {
+                    let offset = f64::from(n) * 0.5;
+                    (
+                        rid(1, n as u32),
+                        "PIPE".to_string(),
+                        1,
+                        offset,
+                        offset + 0.1,
+                        0.0,
+                        1.0,
+                        0.0,
+                        1.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let page = |page_no: usize| {
+            with_test_index(&db, || {
+                let params = SqliteSpatialQueryParams {
+                    page: Some(page_no),
+                    per_page: Some(2),
+                    ..base_spatial_bbox_params()
+                };
+                do_spatial_query(params, None, None)
+            })
+        };
+
+        let first = page(1);
+        let second = page(2);
+        let third = page(3);
+
+        assert_eq!(first.total_count, Some(5));
+        assert_eq!(second.total_count, Some(5));
+        assert_eq!(first.has_more, Some(true));
+        assert_eq!(third.has_more, Some(false));
+
+        let refnos = |resp: SpatialQueryResult| {
+            resp.results
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| item.refno)
+                .collect::<Vec<_>>()
+        };
+        let first = refnos(first);
+        let second = refnos(second);
+        let third = refnos(third);
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(third.len(), 1);
+        // 三页拼起来正好覆盖全集且互不重叠，说明翻页读的是同一份快照
+        let mut combined = [first, second, third].concat();
+        combined.sort();
+        assert_eq!(combined, vec!["1_1", "1_2", "1_3", "1_4", "1_5"]);
+    }
+
+    #[test]
+    fn aabb_pair_nearest_points_matches_min_distance() {
+        // 三轴全分离：最近点各取相对的角
+        let a = Aabb::new([0.0, 0.0, 0.0].into(), [1.0, 1.0, 1.0].into());
+        let b = Aabb::new([4.0, 5.0, 6.0].into(), [5.0, 6.0, 7.0].into());
+        let (sp, tp) = aabb_pair_nearest_points(&a, &b);
+        assert_eq!((sp.x, sp.y, sp.z), (1.0, 1.0, 1.0));
+        assert_eq!((tp.x, tp.y, tp.z), (4.0, 5.0, 6.0));
+        assert!(((tp - sp).length() - aabb_min_distance(&a, &b)).abs() < 1.0e-4);
+
+        // 只在 X 轴分离：Y/Z 重叠，两点在这两轴上重合，距离退化成 X 间距
+        let a = Aabb::new([0.0, 0.0, 0.0].into(), [1.0, 10.0, 10.0].into());
+        let b = Aabb::new([3.0, 2.0, 2.0].into(), [4.0, 8.0, 8.0].into());
+        let (sp, tp) = aabb_pair_nearest_points(&a, &b);
+        assert_eq!(sp.x, 1.0);
+        assert_eq!(tp.x, 3.0);
+        assert_eq!(sp.y, tp.y);
+        assert_eq!(sp.z, tp.z);
+        assert!(((tp - sp).length() - 2.0).abs() < 1.0e-4);
+        assert!(((tp - sp).length() - aabb_min_distance(&a, &b)).abs() < 1.0e-4);
+
+        // 相交：距离为 0，两点重合
+        let a = Aabb::new([0.0, 0.0, 0.0].into(), [5.0, 5.0, 5.0].into());
+        let b = Aabb::new([4.0, 4.0, 4.0].into(), [9.0, 9.0, 9.0].into());
+        let (sp, tp) = aabb_pair_nearest_points(&a, &b);
+        assert!((tp - sp).length() < 1.0e-6);
+        assert!(aabb_min_distance(&a, &b) < 1.0e-6);
+
+        // 顺序无关：交换两个盒子，距离一致、端点互换
+        let (sp2, tp2) = aabb_pair_nearest_points(&b, &a);
+        assert!((sp2 - tp).length() < 1.0e-6);
+        assert!((tp2 - sp).length() < 1.0e-6);
+    }
+
+    #[test]
+    fn keyword_filter_matches_refno_and_noun() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("spatial_index.sqlite");
+        let idx = SqliteAabbIndex::open(&db).unwrap();
+        idx.init_schema().unwrap();
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            (
+                rid(1, 1),
+                "PIPE".to_string(),
+                1,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+            (
+                rid(1, 2),
+                "EQUI".to_string(),
+                1,
+                2.0,
+                3.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            ),
+        ])
+        .unwrap();
+
+        // 索引尚未回填名称时，关键字仍应能匹配 noun。
+        let by_noun = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                keyword: Some("equi".to_string()),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+        let items = by_noun.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_2");
+        assert!(items[0].name.is_none());
+
+        let by_refno = with_test_index(&db, || {
+            let params = SqliteSpatialQueryParams {
+                keyword: Some("1_1".to_string()),
+                ..base_spatial_bbox_params()
+            };
+            do_spatial_query(params, None, None)
+        });
+        let items = by_refno.results.unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].refno, "1_1");
     }
 
     #[test]

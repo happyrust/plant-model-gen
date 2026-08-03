@@ -807,7 +807,7 @@ pub(crate) async fn build_pe_owner_evidence(
     use serde::Deserialize;
     use surrealdb::types::SurrealValue;
 
-    /// 抽查样本上限（对齐 audit_pe_owner_vs_children.surql [2] 的口径，收敛为轻量在线探测）
+    /// 元数据是主门；该抽样只用于尽早发现 child_count/pe_owner 漂移。
     const SAMPLE_LIMIT: usize = 200;
 
     #[derive(Debug, Deserialize, SurrealValue)]
@@ -833,9 +833,9 @@ pub(crate) async fn build_pe_owner_evidence(
             Err(error) => probe_error = Some(format!("meta query failed: {error:#}")),
         }
         if probe_error.is_none() {
-            // 抽样有子 parent，对比边计数与 children 长度（一次请求两条语句）
+            // PE 不再存 children；抽样 child_count 与 pe_owner 实际边数。
             let sql = format!(
-                "LET $s = (SELECT id, array::len(children ?? []) AS child_cnt, count(<-pe_owner) AS edge_cnt FROM pe WHERE dbnum = {dbnum} AND array::len(children ?? []) > 0 LIMIT {SAMPLE_LIMIT});\n\
+                "LET $s = (SELECT id, child_count ?? 0 AS child_cnt, count(<-pe_owner) AS edge_cnt FROM pe WHERE dbnum = {dbnum} AND child_count > 0 LIMIT {SAMPLE_LIMIT});\n\
                  RETURN {{ sampled: $s.len(), mismatched: $s.filter(|$r| $r.child_cnt != $r.edge_cnt).len() }};"
             );
             match project_primary_db()
@@ -917,14 +917,18 @@ async fn compute_catalogue_reverse_shadow(
         return serde_json::json!({"mode": "disabled", "reason": "AIOS_DISABLE_CATA_REVERSE_SHADOW"});
     }
 
-    let committed: std::collections::BTreeSet<u32> =
-        persist_stats.anchors.iter().map(|anchor| anchor.dbnum).collect();
+    let committed: std::collections::BTreeSet<u32> = persist_stats
+        .anchors
+        .iter()
+        .map(|anchor| anchor.dbnum)
+        .collect();
     let limits = cata_ref_closure::ReverseClosureLimits::default();
     let mut per_dbnum = Vec::new();
 
     for dbnum in committed {
         // 项目级 ready 门是 P3 的严格要求；shadow 阶段按 per-dbnum ready 放行（只观测）。
-        let ready = matches!(cata_ref_index::read_state(dbnum).await, Ok(Some(state)) if state.ready);
+        let ready =
+            matches!(cata_ref_index::read_state(dbnum).await, Ok(Some(state)) if state.ready);
         if !ready {
             per_dbnum.push(serde_json::json!({"dbnum": dbnum, "skipped": "index_not_ready"}));
             continue;
@@ -944,8 +948,12 @@ async fn compute_catalogue_reverse_shadow(
 
         match cata_ref_closure::expand_catalogue_reverse_targets(&seeds, None, &limits).await {
             Ok(result) => {
-                let sample: Vec<String> =
-                    result.instances.iter().take(20).map(|r| r.to_string()).collect();
+                let sample: Vec<String> = result
+                    .instances
+                    .iter()
+                    .take(20)
+                    .map(|r| r.to_string())
+                    .collect();
                 if !result.instances.is_empty() {
                     println!(
                         "🔎 [P2 shadow] dbnum={dbnum} 目录反向闭包: {} seed → {} 引用实例 (depth={}, size_trunc={}) —— 仅观测，未并入生成目标",

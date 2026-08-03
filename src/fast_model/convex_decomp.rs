@@ -228,11 +228,33 @@ async fn load_runtime_from_file(path: &Path) -> Result<ConvexRuntime> {
         let data = std::fs::read(&path)
             .with_context(|| format!("读取凸分解文件失败: {}", path.display()))?;
         let file: ConvexDecompositionFileV1 =
-            rkyv::from_bytes::<ConvexDecompositionFileV1, rkyv::rancor::Error>(&data)
-                .map_err(|e| anyhow!("rkyv 反序列化失败: {:?}", e))?;
+            match rkyv::from_bytes::<ConvexDecompositionFileV1, rkyv::rancor::Error>(&data) {
+                Ok(file) => file,
+                Err(e) => {
+                    // rkyv 布局/校验变更后旧缓存无法解码：不做兼容，删坏文件当 miss 重建
+                    // （调用方遇 Err 会回退按需生成/覆盖，删除可避免坏文件长期滞留）。
+                    log::warn!(
+                        "[convex_decomp] 缓存解码失败，删除坏文件: {} ({e:?})",
+                        path.display()
+                    );
+                    let _ = std::fs::remove_file(&path);
+                    return Err(anyhow!(
+                        "凸分解缓存解码失败已删除，将按 miss 重建: {}",
+                        path.display()
+                    ));
+                }
+            };
         if file.version != CONVEX_DECOMP_FILE_VERSION {
+            // 版本不匹配同样按“坏即删重建”处理，避免旧版本文件长期滞留阻塞重建。
+            log::warn!(
+                "[convex_decomp] 缓存版本不匹配，删除旧文件: {} version={} expected={}",
+                path.display(),
+                file.version,
+                CONVEX_DECOMP_FILE_VERSION
+            );
+            let _ = std::fs::remove_file(&path);
             return Err(anyhow!(
-                "凸分解文件版本不匹配: path={} version={} expected={}",
+                "凸分解文件版本不匹配已删除: path={} version={} expected={}",
                 path.display(),
                 file.version,
                 CONVEX_DECOMP_FILE_VERSION

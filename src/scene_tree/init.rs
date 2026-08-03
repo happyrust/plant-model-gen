@@ -245,7 +245,7 @@ async fn build_tree_from_world(
     build_tree_from_world_pe_owner(world_refno).await
 }
 
-/// pe_owner 主路径：逐层批查（children 边优先 / pe.children 字段回退，chunk 500），
+/// pe_owner 主路径：逐层批查（chunk 500），
 /// noun 走批量 meta 点查；visited 防脏数据成环。scene_node 无同胞顺序语义，
 /// 层内子顺序不影响结果。
 async fn build_tree_from_world_pe_owner(

@@ -289,7 +289,10 @@ pub fn bind_versioned_dir_marker(
 ) -> anyhow::Result<()> {
     use std::path::Path;
 
-    let marker_path = format!("{}.plant3d-versioned.json", data_path.trim_end_matches(['/', '\\']));
+    let marker_path = format!(
+        "{}.plant3d-versioned.json",
+        data_path.trim_end_matches(['/', '\\'])
+    );
     let marker_path = Path::new(&marker_path);
     let dir = Path::new(data_path);
     let dir_has_data = dir.exists()

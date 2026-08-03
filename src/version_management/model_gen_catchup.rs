@@ -118,6 +118,10 @@ pub(crate) async fn catch_up_model_generation_with_lock(
         let mut generation_options = db_option_ext.clone();
         generation_options.inner.manual_db_nums = Some(vec![dbnum]);
         let update_log = result.coverage.merged_update_log.clone();
+        // 刻意用调用方的原始 options 而不是上面收窄到单库的 generation_options：
+        // 生成目标限定在本 dbnum，读取切面要覆盖全部已锚定的 dbnum，这样
+        // read_at 取的是全项目最新的数据锚点时刻、manifest 也记全观测水位。
+        // 换成 &generation_options 会把两者一起收窄到单库。
         let generation_read_spec =
             crate::generation_read::resolve_anchored_generation_read_spec(db_option_ext).await?;
         let cleanup_read_spec = crate::generation_read::resolve_cleanup_read_spec(
@@ -225,7 +229,9 @@ pub(crate) async fn catch_up_model_generation_with_lock(
                 )
                 .await
                 {
-                    Ok(generation) if generation.success => {
+                    // `Ok` is the only success signal; the pipeline propagates
+                    // every failure as `Err`.
+                    Ok(_) => {
                         let export = crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
                             &generation_options,
                             Some(vec![dbnum]),
@@ -234,7 +240,6 @@ pub(crate) async fn catch_up_model_generation_with_lock(
                         result.parquet_export = Some(serde_json::to_value(export)?);
                         true
                     }
-                    Ok(_) => false,
                     Err(error) => return Err(error.into()),
                 }
             };

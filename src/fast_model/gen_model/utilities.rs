@@ -10,7 +10,7 @@ use aios_core::parsed_data::geo_params_data::CateGeoParam::{BoxImplied, TubeImpl
 use aios_core::pdms_types::{BRAN_COMPONENT_NOUN_NAMES, CataHashRefnoKV, USE_CATE_NOUN_NAMES};
 use aios_core::prim_geo::tubing::TubiSize;
 use aios_core::tool::db_tool::db1_hash;
-use aios_core::tree_query::{TreeIndex, TreeQuery, TreeQueryFilter};
+use aios_core::tree_query::TreeQueryFilter;
 use aios_core::{RefU64, RefnoEnum};
 use anyhow::Result;
 use dashmap::DashMap;
@@ -146,6 +146,10 @@ fn insert_cata_hash_refno_by_values(
     if is_bran_or_hang(noun_hash) {
         return;
     }
+    // 带有效 cata_hash 的元素必然是元件引用件（cal_cata_hash 基于 SPRE/CATR 计算成功），
+    // 直接入组 —— 否则 BRAN 子管件（ELBO/VALV/OLET/ATTA 等，不在 USE_CATE_NOUN_NAMES
+    // 白名单内）会被整体滤掉，导致 BRAN 管线 unique_cata=0、管件实例从不生成。
+    // 无有效 hash 的退化路径（refno key）仍按 CATE noun 白名单收口，避免容器节点混入。
     let has_valid_hash = cata_hash.is_some_and(|hash| hash != 0);
     if !has_valid_hash && !is_cate_noun(noun_hash) {
         return;
@@ -162,48 +166,6 @@ fn insert_cata_hash_refno_by_values(
         ptset: None,
     });
     entry.group_refnos.push(refno);
-}
-
-fn insert_cata_hash_refno(
-    map: &DashMap<String, CataHashRefnoKV>,
-    meta: &aios_core::tree_query::TreeNodeMeta,
-) {
-    // 带有效 cata_hash 的元素必然是元件引用件（cal_cata_hash 基于 SPRE/CATR 计算成功），
-    // 直接入组 —— 否则 BRAN 子管件（ELBO/VALV/OLET/ATTA 等，不在 USE_CATE_NOUN_NAMES
-    // 白名单内）会被整体滤掉，导致 BRAN 管线 unique_cata=0、管件实例从不生成。
-    // 无有效 hash 的退化路径（refno key）仍按 CATE noun 白名单收口，避免容器节点混入。
-    let refno = RefnoEnum::from(meta.refno);
-    insert_cata_hash_refno_by_values(map, refno, meta.noun, meta.cata_hash);
-}
-
-async fn build_cata_hash_map_from_tree_index(
-    index: &TreeIndex,
-    refnos: &[RefnoEnum],
-) -> Result<DashMap<String, CataHashRefnoKV>> {
-    let mut visited: HashSet<RefU64> = HashSet::new();
-    let result_map: DashMap<String, CataHashRefnoKV> = DashMap::new();
-
-    for refno in refnos {
-        let root = refno.refno();
-        if visited.insert(root) {
-            if let Some(meta) = index.node_meta(root) {
-                insert_cata_hash_refno(&result_map, &meta);
-            }
-        }
-        let children = index
-            .query_children(root, TreeQueryFilter::default())
-            .await?;
-        for child in children {
-            if !visited.insert(child) {
-                continue;
-            }
-            if let Some(meta) = index.node_meta(child) {
-                insert_cata_hash_refno(&result_map, &meta);
-            }
-        }
-    }
-
-    Ok(result_map)
 }
 
 /// 可能持有 cata_hash 的 noun 集合（元件引用件 + BRAN 子管件）。
@@ -245,8 +207,7 @@ async fn insert_cata_hash_refno_from_snapshot(
     insert_cata_hash_refno_by_values(map, refno, noun_hash, cata_hash);
 }
 
-/// 基于 pe_owner 快照（按 dbnum）构建 cata_hash 分组：roots 自身 + 直接子节点，
-/// 与 tree 路径 `build_cata_hash_map_from_tree_index` 同构。
+/// 基于 pe_owner 快照（按 dbnum）构建 cata_hash 分组：roots 自身 + 直接子节点。
 async fn build_cata_hash_map_from_snapshot_by_dbnum(
     dbnum: u32,
     refnos: &[RefnoEnum],
@@ -421,9 +382,6 @@ pub async fn build_cata_hash_map_from_session(
 mod tests {
     use super::*;
     use aios_core::RefU64;
-    use aios_core::tool::db_tool::db1_hash;
-    use aios_core::tree_query::{TreeFile, TreeIndex, TreeNodeMeta};
-    use indextree::Arena;
 
     #[tokio::test]
     async fn test_query_tubi_size_none() {
@@ -436,40 +394,5 @@ mod tests {
         if let Ok(size) = result {
             assert!(matches!(size, TubiSize::None));
         }
-    }
-
-    #[tokio::test]
-    async fn test_build_cata_hash_map_from_tree_index() {
-        let mut arena = Arena::new();
-        let root_refno = RefU64::from_two_nums(1, 0);
-        let root_id = arena.new_node(TreeNodeMeta {
-            refno: root_refno,
-            owner: root_refno,
-            noun: db1_hash("SITE"),
-            cata_hash: None,
-        });
-        let child_refno = RefU64::from_two_nums(1, 1);
-        let child_id = arena.new_node(TreeNodeMeta {
-            refno: child_refno,
-            owner: root_refno,
-            noun: db1_hash("EQUI"),
-            cata_hash: Some(123456),
-        });
-        root_id.append(child_id, &mut arena);
-
-        let tree = TreeFile {
-            dbnum: 1,
-            root_refno,
-            arena,
-        };
-        let index = TreeIndex::from_tree_file(tree);
-
-        let refnos = vec![RefnoEnum::from(root_refno)];
-        let map = build_cata_hash_map_from_tree_index(&index, &refnos)
-            .await
-            .expect("build cata map");
-        let entry = map.get("123456").expect("missing 123456");
-        assert_eq!(entry.group_refnos.len(), 1);
-        assert_eq!(entry.group_refnos[0], RefnoEnum::from(child_refno));
     }
 }

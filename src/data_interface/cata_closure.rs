@@ -86,10 +86,12 @@ fn open_db_session(project: &str, path: &Path) -> Result<DbSession> {
 /// 用已打开会话解析一批 refno（不重读文件 / 不重建索引）。
 ///
 /// `attmap_sink`：可选保留完整属性表（T007 惰性兜底落库需要；闭包发现 pass 传 `None` 省内存）。
+/// 带上会话所属 `dbnum` 一起传：单元素解析不像整库解析那样从文件头注入 dbnum，
+/// 而落库用的 `gen_sur_json` 对缺失是直接 expect 崩溃，必须在落 sink 前补。
 async fn parse_refnos_with_session(
     session: &DbSession,
     refnos: &[RefU64],
-    mut attmap_sink: Option<&mut HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)>>,
+    mut attmap_sink: Option<(u32, &mut HashMap<RefU64, (NamedAttrMap, Vec<RefU64>)>)>,
 ) -> Result<HashMap<RefU64, ParsedCataEle>> {
     use parse_pdms_db::parse::parse_ele_data_with_info_sync;
 
@@ -115,8 +117,10 @@ async fn parse_refnos_with_session(
                     .copied()
                     .filter(|r| is_valid_ref0(r.get_0()))
                     .collect();
-                if let Some(sink) = attmap_sink.as_deref_mut() {
-                    sink.insert(refno, (merged_attmap.clone(), children.clone()));
+                if let Some((dbnum, sink)) = attmap_sink.as_mut() {
+                    let mut att = merged_attmap.clone();
+                    att.set_dbnum(*dbnum);
+                    sink.insert(refno, (att, children.clone()));
                 }
                 let noun_name = merged_attmap.get_type_str().trim().to_uppercase();
                 out.insert(
@@ -431,7 +435,7 @@ impl<'a, L: CataDbLocator> CataClosureResolver<'a, L> {
                 }
                 let session = self.sessions.get(&dbnum).expect("session just ensured");
                 let attmap_sink = if self.retain_attmaps {
-                    Some(&mut self.attmaps)
+                    Some((dbnum, &mut self.attmaps))
                 } else {
                     None
                 };
@@ -1023,27 +1027,51 @@ pub async fn run_cata_closure_pass_from_config(
 // refno 级按需入口（如：单个 BRAN）— 设计子树部分解析播种 + CATA 闭包
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 设计子树扫描结果。
+#[derive(Debug, Default, Clone)]
+pub struct DesignSubtreeScope {
+    /// 子树内全部元素的出向 `RefU64`，作为后续 CATA 闭包种子。
+    pub seeds: Vec<RefU64>,
+    /// 实际解析到的设计元素，按 dbnum 分组（含 `include_owner_chain` 补上的祖先）。
+    ///
+    /// 这一份就是「DESI 侧按需解析白名单」：写进 manifest 后，
+    /// [`apply_sync_filter`] 会同样裁剪 DESI 库的 refno 全集。
+    pub elements_by_dbnum: BTreeMap<u32, BTreeSet<RefU64>>,
+}
+
+impl DesignSubtreeScope {
+    pub fn element_count(&self) -> usize {
+        self.elements_by_dbnum.values().map(|s| s.len()).sum()
+    }
+}
+
 /// 设计侧子树出向引用收集（按需播种）。
 ///
 /// 给定设计元素根 refno（如 BRAN / PIPE / ZONE），在其所属 DESI 库内沿
 /// `children` 做子树 BFS（`parse_db_refnos` 部分解析，**不整库解析**），
 /// 收集子树内全部元素的出向 `RefU64` 作为后续 CATA 闭包种子。
 ///
-/// 返回 `(种子集合, 子树元素数)`。跨库 children（如有）由 locator 定位后同样纳入。
+/// `include_owner_chain`：额外沿 `owner` 向上补齐祖先（SITE/ZONE/PIPE …）。
+/// 只做 DESI 按需解析时必须打开，否则树与世界矩阵会缺上层节点；
+/// 祖先的出向引用**不**计入 CATA 种子，闭包结果保持与关闭时一致。
+///
+/// 跨库 children（如有）由 locator 定位后同样纳入。
 #[cfg(feature = "sqlite-index")]
 pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
     locator: &L,
     roots: &[RefU64],
-) -> Result<(Vec<RefU64>, usize)> {
+    include_owner_chain: bool,
+) -> Result<DesignSubtreeScope> {
     let mut sessions: HashMap<u32, DbSession> = HashMap::new();
     let mut visited: HashSet<RefU64> = HashSet::new();
     let mut seeds: HashSet<RefU64> = HashSet::new();
+    let mut elements_by_dbnum: BTreeMap<u32, BTreeSet<RefU64>> = BTreeMap::new();
     let mut frontier: Vec<RefU64> = roots
         .iter()
         .copied()
         .filter(|r| is_valid_ref0(r.get_0()))
         .collect();
-    let mut parsed_count = 0usize;
+    let mut owner_frontier: Vec<RefU64> = Vec::new();
 
     while !frontier.is_empty() {
         let mut by_db: HashMap<u32, Vec<RefU64>> = HashMap::new();
@@ -1062,34 +1090,94 @@ pub async fn collect_design_subtree_outbound<L: CataDbLocator>(
             }
         }
         for (dbnum, refs) in by_db {
-            if !sessions.contains_key(&dbnum) {
-                let Some((project, path)) = locator.file_of(dbnum) else {
-                    log::warn!(
-                        "[cata_closure] 设计子树 BFS：dbnum {} 无文件映射，跳过",
-                        dbnum
-                    );
-                    continue;
-                };
-                match open_db_session(&project, &path) {
-                    Ok(s) => {
-                        sessions.insert(dbnum, s);
-                    }
-                    Err(e) => {
-                        log::warn!("[cata_closure] 打开设计库失败 dbnum={}: {}", dbnum, e);
-                        continue;
-                    }
-                }
-            }
-            let session = sessions.get(&dbnum).expect("session 已插入");
+            let Some(session) = ensure_db_session(locator, &mut sessions, dbnum) else {
+                continue;
+            };
             let parsed = parse_refnos_with_session(session, &refs, None).await?;
-            parsed_count += parsed.len();
-            for ele in parsed.values() {
+            let bucket = elements_by_dbnum.entry(dbnum).or_default();
+            for (refno, ele) in &parsed {
+                bucket.insert(*refno);
                 seeds.extend(ele.outbound.iter().copied());
                 frontier.extend(ele.children.iter().copied());
+                if include_owner_chain && is_valid_ref0(ele.owner.get_0()) {
+                    owner_frontier.push(ele.owner);
+                }
             }
         }
     }
-    Ok((seeds.into_iter().collect(), parsed_count))
+
+    // 同库设计引用：BRAN 的 HREF/TREF 这类出向引用指回设计库本身（连接的邻接元素）。
+    // 它们只作为 CATA 种子会被 db_type 收口丢弃，但生成期确实要读——补进白名单，
+    // 只补元素自身，不展开 children，避免顺着邻接一路吃掉整个设计库。
+    if include_owner_chain {
+        for seed in &seeds {
+            let Some(dbnum) = locator.dbnum_of_ref0(seed.get_0()) else {
+                continue;
+            };
+            let is_design = locator
+                .db_type_of(dbnum)
+                .map(|t| t.eq_ignore_ascii_case("DESI"))
+                .unwrap_or(false);
+            if is_design {
+                owner_frontier.push(*seed);
+            }
+        }
+    }
+
+    // owner 祖先链 + 同库设计引用：逐级向上，只补元素本身，不外扩 children / 不贡献 CATA 种子。
+    while let Some(refno) = owner_frontier.pop() {
+        if !visited.insert(refno) {
+            continue;
+        }
+        let Some(dbnum) = locator.dbnum_of_ref0(refno.get_0()) else {
+            log::warn!(
+                "[cata_closure] owner 链：ref0 {} 无 dbnum 映射，祖先链在此截断",
+                refno.get_0()
+            );
+            continue;
+        };
+        let Some(session) = ensure_db_session(locator, &mut sessions, dbnum) else {
+            continue;
+        };
+        let parsed = parse_refnos_with_session(session, &[refno], None).await?;
+        let bucket = elements_by_dbnum.entry(dbnum).or_default();
+        for (parsed_refno, ele) in &parsed {
+            bucket.insert(*parsed_refno);
+            if is_valid_ref0(ele.owner.get_0()) {
+                owner_frontier.push(ele.owner);
+            }
+        }
+    }
+
+    Ok(DesignSubtreeScope {
+        seeds: seeds.into_iter().collect(),
+        elements_by_dbnum,
+    })
+}
+
+/// 按 dbnum 取（必要时打开）读取会话；定位或打开失败只告警并返回 `None`。
+#[cfg(feature = "sqlite-index")]
+fn ensure_db_session<'a, L: CataDbLocator>(
+    locator: &L,
+    sessions: &'a mut HashMap<u32, DbSession>,
+    dbnum: u32,
+) -> Option<&'a DbSession> {
+    if !sessions.contains_key(&dbnum) {
+        let Some((project, path)) = locator.file_of(dbnum) else {
+            log::warn!("[cata_closure] dbnum {} 无文件映射，跳过", dbnum);
+            return None;
+        };
+        match open_db_session(&project, &path) {
+            Ok(s) => {
+                sessions.insert(dbnum, s);
+            }
+            Err(e) => {
+                log::warn!("[cata_closure] 打开设计库失败 dbnum={}: {}", dbnum, e);
+                return None;
+            }
+        }
+    }
+    sessions.get(&dbnum)
 }
 
 /// refno 级按需闭包 pass：以给定设计元素（如单个 BRAN）的子树出向引用为种子，
@@ -1101,19 +1189,19 @@ pub async fn run_cata_closure_pass_for_refnos(
     cfg: CataClosureConfig,
     out_path: &Path,
 ) -> Result<CataClosureManifest> {
-    let (seeds, subtree_count) = collect_design_subtree_outbound(index, seed_roots).await?;
+    let scope = collect_design_subtree_outbound(index, seed_roots, false).await?;
     log::info!(
         "[cata_closure] 设计子树元素 {} 个 → 收集种子 {} 个",
-        subtree_count,
-        seeds.len()
+        scope.element_count(),
+        scope.seeds.len()
     );
-    let seed_count = seeds.len();
+    let seed_count = scope.seeds.len();
     let exclude_dbnums = seed_roots
         .iter()
         .filter_map(|root| index.dbnum_of_ref0(root.get_0()))
         .collect::<HashSet<_>>();
     let mut resolver = CataClosureResolver::new(index, cfg.excluding_dbnums(exclude_dbnums));
-    resolver.seed(seeds);
+    resolver.seed(scope.seeds);
     let mut manifest = resolver.resolve().await?;
     manifest.seed_count = seed_count;
     manifest.save_json(out_path)?;
@@ -1137,11 +1225,17 @@ pub async fn run_cata_closure_pass_for_refnos(
 /// `output/<工程>/scene_tree/cata_closure.json`（与 sync `load_sync_filter` 的读取
 /// 口径同源 —— sync 按解析循环的工程名找 manifest，而非配置 `project_name`；
 /// 与 T007 惰性兜底的 merge 行为一致，多次调用为增量并集）。
+///
+/// `include_design_subtree`：把种子所在 DESI 库的子树 + owner 祖先链也写进 manifest。
+/// 因为 [`apply_sync_filter`] 的裁剪分支不看 db_type，只要 manifest 里有该 dbnum，
+/// 解析期就会按这份白名单裁剪 DESI 库 —— 即「只解析这个 BRAN 用得到的设计元素」。
+/// 默认关：关闭时 manifest 内容与历史完全一致（只含 CATA 库）。
 #[cfg(feature = "sqlite-index")]
 pub async fn run_cata_closure_pass_for_refno_strs_from_config(
     rescan_index: bool,
     seed_refno_strs: &[String],
     out_override: Option<PathBuf>,
+    include_design_subtree: bool,
 ) -> Result<CataClosureManifest> {
     let seed_roots: Vec<RefU64> = seed_refno_strs
         .iter()
@@ -1161,13 +1255,15 @@ pub async fn run_cata_closure_pass_for_refno_strs_from_config(
         tokio::task::spawn_blocking(move || InMemoryDbLocator::load_from_index(&path)).await??
     };
 
-    let (seeds, subtree_count) = collect_design_subtree_outbound(&locator, &seed_roots).await?;
+    let scope =
+        collect_design_subtree_outbound(&locator, &seed_roots, include_design_subtree).await?;
     log::info!(
         "[cata_closure] 设计子树元素 {} 个 → 收集种子 {} 个",
-        subtree_count,
-        seeds.len()
+        scope.element_count(),
+        scope.seeds.len()
     );
-    let seed_count = seeds.len();
+    let seed_count = scope.seeds.len();
+    let design_elements = scope.elements_by_dbnum.clone();
     let exclude_dbnums = seed_roots
         .iter()
         .filter_map(|root| locator.dbnum_of_ref0(root.get_0()))
@@ -1176,9 +1272,22 @@ pub async fn run_cata_closure_pass_for_refno_strs_from_config(
         &locator,
         CataClosureConfig::precise().excluding_dbnums(exclude_dbnums),
     );
-    resolver.seed(seeds);
+    resolver.seed(scope.seeds);
     let mut manifest = resolver.resolve().await?;
     manifest.seed_count = seed_count;
+
+    // DESI 侧按需白名单：闭包 resolver 刻意排除了种子所在设计库，这里显式补回去。
+    if include_design_subtree {
+        for (dbnum, refs) in &design_elements {
+            let bucket = manifest.by_dbnum.entry(*dbnum).or_default();
+            bucket.extend(refs.iter().copied());
+        }
+        println!(
+            "🧩 DESI 按需白名单：{} 个设计库 / {} 个元素写入 manifest（解析期将据此裁剪 DESI）",
+            design_elements.len(),
+            design_elements.values().map(|s| s.len()).sum::<usize>()
+        );
+    }
 
     match out_override {
         Some(out) => {
@@ -1294,6 +1403,8 @@ pub struct LazyFallbackOutcome {
     pub parsed: usize,
     /// 闭包过程中无法定位/解析的引用数。
     pub missing: usize,
+    /// 本次小闭包直接解析得到的属性，供同一模型生成会话立即使用。
+    pub attributes: HashMap<RefU64, NamedAttrMap>,
 }
 
 /// 惰性兜底全局互斥：并发 miss 串行化，避免重复建索引/重复解析同一批元素
@@ -1305,7 +1416,8 @@ static LAZY_CATA_FALLBACK_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
 /// T007 运行期惰性兜底：对未解析的 CATA refno 跑**小闭包**并即时落库。
 ///
 /// 流程：seeds → [`InMemoryDbLocator`]（db_index.sqlite）→ [`CataClosureResolver`]
-/// （保留属性表）→ `INSERT IGNORE` 写 `pe` + `ATT_{noun}` + `ATT_UDA` → 闭包结果
+/// （保留属性表）→ `INSERT IGNORE` 写 `pe` + `ATT_{noun}` + `ATT_UDA` + `pe_owner`
+/// → 闭包结果
 /// merge 进各工程 `cata_closure.json`（增量 delta，Q8）。
 ///
 /// 调用方约定：命中"pe 缺失"再调用（如 `get_named_attmap` 失败路径），成功后重试原查询；
@@ -1341,37 +1453,59 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
     let delta = resolver.resolve().await?;
     let retained = resolver.take_attmaps();
 
-    // 3. 落库：pe（带 children/refno 链接）+ ATT_{noun} + ATT_UDA，全部 INSERT IGNORE 幂等。
+    // 3. 落库：pe + ATT_{noun} + ATT_UDA + pe_owner。
+    // children 已废弃；层级只固化到 pe_owner。
     const INSERT_CHUNK: usize = 500;
+    // owner 边可以跨库（如 SITE 与其下 ZONE 分属不同 DESI 库）。判断某条边该不该落库要看
+    // 子节点是否在本轮闭包里，而不是是否与父节点同库——按 dbnum 分桶判断会把跨库边整条丢掉，
+    // 结果是 pe 行在库里、模型树却接不到 SITE。
+    let parsed_refnos: BTreeSet<RefU64> = delta
+        .by_dbnum
+        .values()
+        .flat_map(|refs| refs.iter().copied())
+        .collect();
     let mut parsed = 0usize;
     for (dbnum, refs) in &delta.by_dbnum {
+        let db_type = locator.db_type_of(*dbnum).unwrap_or_default();
+        let file_name = locator
+            .file_of(*dbnum)
+            .and_then(|(_, path)| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let dbnum_info_sql = refs
+            .iter()
+            .map(|refno| refno.get_0())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|ref0| {
+                format!(
+                    "UPSERT dbnum_info_table:{ref0} SET dbnum = {dbnum}, \
+                     db_type = $db_type, file_name = $file_name;"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        project_primary_db()
+            .query(dbnum_info_sql)
+            .bind(("db_type", db_type))
+            .bind(("file_name", file_name))
+            .await?
+            .check()?;
+
         let mut pe_jsons: Vec<String> = Vec::new();
         let mut att_by_table: HashMap<String, Vec<String>> = HashMap::new();
         let mut uda_jsons: Vec<String> = Vec::new();
 
         for refno in refs {
-            let Some((att, children)) = retained.get(refno) else {
+            let Some((att, _)) = retained.get(refno) else {
                 continue;
             };
-            // pe 行（与 versioned_db::pe::save_pes 同构：gen_sur_json + children 注入）。
+            // pe 行（children 已废弃，层级统一写 pe_owner）。
             let pe_data = att.pe(*dbnum as i32);
-            let mut json = pe_data.gen_sur_json(Some(refno.to_pe_key()));
-            let children_links = if children.is_empty() {
-                String::new()
-            } else {
-                children
-                    .iter()
-                    .map(|c| c.to_pe_key())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            if json.ends_with('}') {
-                json.pop();
-                let needs_comma = json.ends_with('}') || json.contains(':');
-                let sep = if needs_comma { ", " } else { "" };
-                json.push_str(&format!("{}children: [{}]}}", sep, children_links));
-            }
-            pe_jsons.push(json);
+            pe_jsons.push(pe_data.gen_sur_json(Some(refno.to_pe_key())));
 
             // ATT_{noun} / ATT_UDA 行。
             let table = att.get_type_str().to_string();
@@ -1399,6 +1533,27 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
         for chunk in uda_jsons.chunks(INSERT_CHUNK) {
             let sql = format!("INSERT IGNORE INTO ATT_UDA [{}]", chunk.join(","));
             project_primary_db().query(&sql).await?;
+        }
+        let mut pe_owner_sql = Vec::new();
+        for parent in refs {
+            let Some((_, children)) = retained.get(parent) else {
+                continue;
+            };
+            let parent_key = parent.to_pe_key();
+            for (order, child) in children.iter().enumerate() {
+                if !parsed_refnos.contains(child) {
+                    continue;
+                }
+                let child_key = child.to_pe_key();
+                pe_owner_sql.push(format!(
+                    "DELETE pe_owner:[{parent_key}, {order}]; \
+                     INSERT RELATION INTO pe_owner {{ id: pe_owner:[{parent_key}, {order}], \
+                     in: {child_key}, out: {parent_key} }};"
+                ));
+            }
+        }
+        for chunk in pe_owner_sql.chunks(200) {
+            project_primary_db().query(chunk.join("\n")).await?.check()?;
         }
     }
 
@@ -1435,6 +1590,10 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
     Ok(LazyFallbackOutcome {
         parsed,
         missing: delta.missing,
+        attributes: retained
+            .into_iter()
+            .map(|(refno, (attributes, _))| (refno, attributes))
+            .collect(),
     })
 }
 

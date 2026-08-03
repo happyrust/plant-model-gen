@@ -1,7 +1,24 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "sqlite-index")]
 use rusqlite::{Connection, Result, params};
+
+/// 索引内容版本号。
+///
+/// 上层（如空间查询的分页快照缓存）会把结果缓存起来复用，但没有别的办法察觉
+/// 索引在背后被改写。任何写入路径 bump 一次，缓存把它放进键里就能自然失效。
+static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 当前索引内容版本号。
+pub fn index_generation() -> u64 {
+    INDEX_GENERATION.load(Ordering::Relaxed)
+}
+
+/// 声明索引内容已被改写。
+pub fn bump_index_generation() {
+    INDEX_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
 
 // Minimal SQLite-based AABB index using the SQLite RTree virtual table.
 // This module is feature-gated behind `sqlite-index` and can be integrated
@@ -42,7 +59,8 @@ impl SqliteAabbIndex {
                 id INTEGER PRIMARY KEY,
                 noun TEXT,
                 spec_value INTEGER NOT NULL DEFAULT 0,
-                dbnum INTEGER
+                dbnum INTEGER,
+                name TEXT
             );
             -- 3D AABB RTree: id, [min_x, max_x], [min_y, max_y], [min_z, max_z]
             CREATE VIRTUAL TABLE IF NOT EXISTS aabb_index USING rtree(
@@ -57,7 +75,59 @@ impl SqliteAabbIndex {
             [],
         );
         let _ = conn.execute("ALTER TABLE items ADD COLUMN dbnum INTEGER", []);
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN name TEXT", []);
         Ok(())
+    }
+
+    /// 批量写入 items.name（构件名称），用于名称回填任务。
+    ///
+    /// AABB 刷新链路只产出几何与 noun/spec_value，名称来自模型库，
+    /// 因此名称通过独立的回填步骤写入，不影响既有的索引重建流程。
+    pub fn update_item_names<I>(&self, iter: I) -> Result<usize>
+    where
+        I: IntoIterator<Item = (i64, String)>,
+    {
+        let mut conn = Connection::open(&self.path)?;
+        Self::configure(&conn)?;
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare("UPDATE items SET name = ?2 WHERE id = ?1")?;
+            for (id, name) in iter {
+                count += stmt.execute(params![id, name])?;
+            }
+        }
+        tx.commit()?;
+        if count > 0 {
+            bump_index_generation();
+        }
+        Ok(count)
+    }
+
+    /// 取出尚未回填名称的 item id（用于增量回填）。
+    pub fn ids_missing_names(&self, limit: usize) -> Result<Vec<i64>> {
+        let conn = Connection::open(&self.path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM items WHERE name IS NULL OR name = '' ORDER BY id LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| row.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for r in rows {
+            ids.push(r?);
+        }
+        Ok(ids)
+    }
+
+    /// 统计名称回填进度：(已命名数量, 总数量)。
+    pub fn name_coverage(&self) -> Result<(usize, usize)> {
+        let conn = Connection::open(&self.path)?;
+        let named: i64 = conn.query_row(
+            "SELECT COUNT(1) FROM items WHERE name IS NOT NULL AND name != ''",
+            [],
+            |row| row.get(0),
+        )?;
+        let total: i64 = conn.query_row("SELECT COUNT(1) FROM items", [], |row| row.get(0))?;
+        Ok((named as usize, total as usize))
     }
 
     // Batch insert/replace AABBs: (id, min_x, max_x, min_y, max_y, min_z, max_z)
@@ -258,6 +328,7 @@ impl SqliteAabbIndex {
         }
 
         tx.commit()?;
+        bump_index_generation();
         Ok(count)
     }
 }

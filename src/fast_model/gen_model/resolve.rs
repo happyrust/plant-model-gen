@@ -618,7 +618,10 @@ async fn cata_context_from_session(
     }
     context.insert("RS_DES_REFNO".to_string(), desi_refno.to_string());
 
-    let cat_refno = desi_att.get_foreign_refno("CATR");
+    // 必须与 scom_ref 用同一套口径：规格驱动的管件只挂 SPRE、没有 CATR，若这里只读裸
+    // CATR，整块元件库上下文（RPRO_*/ODES/OPAR/ADES/APAR）会缺失，而求值器对未知符号
+    // 是静默取 0 的，最终表现为尺寸退化、CSG 校验失败而非报错。
+    let cat_refno = resolve_catalog_ref_from_session(read, desi_att).await;
     if let Some(cat_refno) = cat_refno {
         let cata_attmap = session_query::get_named_attmap(read, cat_refno).await?;
         context.insert("RS_CATR_REFNO".to_string(), cat_refno.to_string());

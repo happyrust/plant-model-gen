@@ -453,13 +453,10 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
                 generate_ms,
             );
         }
-        let gen_result = match gen_result {
-            Ok(result) => result,
-            Err(error) => {
-                crate::perf_metrics::finalize_task_metrics(false);
-                return Err(error.into());
-            }
-        };
+        if let Err(error) = gen_result {
+            crate::perf_metrics::finalize_task_metrics(false);
+            return Err(error.into());
+        }
 
         let parquet_report =
             crate::fast_model::export_model::post_gen_export::export_parquet_after_generation_if_enabled(
@@ -476,7 +473,6 @@ pub async fn run_cli(db_option_ext: options::DbOptionExt) -> anyhow::Result<()> 
         }
         crate::versioned_db::version_commit::publish_model_gen_anchors_after_generation(
             &db_option_ext,
-            gen_result.success,
             "full-generation",
             true,
         )

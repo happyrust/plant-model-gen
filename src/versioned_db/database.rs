@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::fs::{File, create_dir_all};
 use tokio::io::AsyncReadExt;
@@ -57,7 +57,13 @@ use crate::data_interface::tidb_manager::AiosDBManager;
 use crate::tables::*;
 use crate::versioned_db::db_meta_info;
 use crate::versioned_db::pe::*;
+use crate::versioned_db::pe_graph_seed::{self, PeGraphSeedBuilder, PeGraphSeedV1};
 use aios_core::tree_query::TreeNodeMeta;
+
+struct PendingFullParseIntegrity {
+    tree_dir: PathBuf,
+    seed: PeGraphSeedV1,
+}
 
 pub enum SenderJsonsData {
     PEJson(Vec<String>),
@@ -126,6 +132,16 @@ async fn timed_primary_query(kind: &'static str, sql: &str, rows: usize) {
         panic!("[sync-write] {kind} statement failed: {error}");
     }
     record_sync_write(kind, rows, t0.elapsed().as_millis() as u64);
+}
+
+/// 全量解析的 SurrealDB 写入 worker 数（`AIOS_SYNC_WRITE_WORKERS`，默认 16）。
+///
+/// 内存引擎（`surreal start … memory`）用乐观 MVCC，16 路并发批量写会稳定撞
+/// `Transaction conflict`；调试用的一次性内存库把它降到 1 即可串行化。
+/// RocksDB / 外部 ws 站点不设该变量，行为与历史一致。
+#[inline]
+fn resolve_sync_write_workers() -> usize {
+    env_usize("AIOS_SYNC_WRITE_WORKERS").unwrap_or(16).max(1)
 }
 
 #[inline]
@@ -690,41 +706,93 @@ DEFINE FUNCTION OVERWRITE fn::model_sesno_version_hit($dbnum: number, $sesno: nu
 ///
 /// specs/027 规定数据历史从首次增量开始：初始化/全量解析完成后，模型可发布
 /// `model_gen` 基线，但 `source='full'` 只作为 legacy 读兼容，禁止继续写入。
-async fn record_full_parse_integrity(pending: &[(u32, u32, String)]) -> anyhow::Result<()> {
-    for (dbnum, sesno, _) in pending {
-        // specs/023 T008：full 重灌以先删后插覆盖了全部 owner 的边，
-        // 当前态 pe_owner 完整；该元数据不再绑定或暗示 full 数据锚点。
-        #[cfg(feature = "surreal-save")]
-        if let Err(e) = crate::versioned_db::pe_owner_meta::upsert_maintained_since(
-            *dbnum,
-            *sesno,
+async fn record_full_parse_integrity(
+    pending: Vec<PendingFullParseIntegrity>,
+) -> anyhow::Result<()> {
+    for item in pending {
+        let dbnum = item.seed.dbnum;
+        let sesno = item.seed.sesno;
+
+        let t_persist = std::time::Instant::now();
+        pe_graph_seed::persist_hierarchy(&item.seed)
+            .await
+            .with_context(|| format!("dbnum={dbnum} 固化 PE/pe_owner 层级失败"))?;
+        let persist_ms = t_persist.elapsed().as_millis();
+
+        let t_audit = std::time::Instant::now();
+        let integrity = pe_graph_seed::audit_persistent(&item.seed)
+            .await
+            .with_context(|| format!("dbnum={dbnum} PE/pe_owner 全量完整性审计失败"))?;
+        let audit_ms = t_audit.elapsed().as_millis();
+
+        let t_meta = std::time::Instant::now();
+        crate::versioned_db::pe_owner_meta::publish_bulk_ready(
+            dbnum,
+            sesno,
             crate::versioned_db::pe_owner_meta::META_SOURCE_FULL_RELOAD,
+            integrity.node_count,
+            integrity.edge_count,
+            &integrity.hierarchy_hash,
         )
         .await
-        {
-            log::warn!(
-                "pe_owner_version_meta(full_reload) 写入失败(dbnum={dbnum} sesno={sesno}): {e}"
+        .with_context(|| format!("dbnum={dbnum} 发布 pe_owner Ready 失败"))?;
+        let publish_meta_ms = t_meta.elapsed().as_millis();
+
+        // 悬空 owner（owner 不在物化集内，基本是脏数据）计数 >0 时：持久层已 Ready
+        // （上面已发布），但跳过种子文件发布——seed 保持 NotReady，kv-mem 对该 dbnum
+        // 自然回退持久库，不影响生成正确性（ADR 悬空 owner 发布策略）。
+        let (dangling_count, dangling_samples) = pe_graph_seed::dangling_owners(&item.seed, 8);
+        if dangling_count > 0 {
+            warn!(
+                "[pe_graph_seed] dbnum={dbnum} sesno={sesno} 检测到 {dangling_count} 个悬空 owner，\
+                 跳过种子发布（持久层已 Ready）；样例(refno,owner)={dangling_samples:?} \
+                 persist_ms={persist_ms} audit_ms={audit_ms} publish_meta_ms={publish_meta_ms}"
             );
+            continue;
         }
+
+        let tree_dir = item.tree_dir;
+        let t_seed = std::time::Instant::now();
+        let write_result = tokio::task::spawn_blocking(move || {
+            pe_graph_seed::write_seed_file(&tree_dir, &item.seed)
+                .map(|published| (tree_dir, published))
+        })
+        .await;
+        let seed_write_ms = t_seed.elapsed().as_millis();
+        let (tree_dir, published) = match write_result {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                warn!(
+                    "[pe_graph_seed] dbnum={dbnum} sesno={sesno} 写文件失败，保持 NotReady: {error}"
+                );
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    "[pe_graph_seed] dbnum={dbnum} sesno={sesno} 写任务失败，保持 NotReady: {error}"
+                );
+                continue;
+            }
+        };
+        let t_pub = std::time::Instant::now();
+        if let Err(error) = pe_graph_seed::publish_ready(&published).await {
+            warn!(
+                "[pe_graph_seed] dbnum={dbnum} sesno={sesno} 发布 Ready 失败，文件保留为孤儿: {error}"
+            );
+            continue;
+        }
+        let publish_ms = t_pub.elapsed().as_millis();
+        pe_graph_seed::cleanup_stale_after_ready(&tree_dir, &published);
+        info!(
+            "[pe_graph_seed] dbnum={dbnum} sesno={sesno} nodes={} edges={} \
+             persist_ms={persist_ms} audit_ms={audit_ms} publish_meta_ms={publish_meta_ms} \
+             seed_write_ms={seed_write_ms} publish_ms={publish_ms} -> {}",
+            published.node_count,
+            published.edge_count,
+            published.path.display()
+        );
     }
     Ok(())
-}
-
-fn full_sync_source_evidence(path: &Path) -> String {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return format!("{}|metadata=unavailable", path.display());
-    };
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!(
-        "{}|len={}|modified_ns={modified_nanos}",
-        path.display(),
-        metadata.len()
-    )
 }
 
 /// 初始化project database
@@ -1303,7 +1371,7 @@ where
 
     // 启动数据库写入任务
     let mut insert_handles = FuturesUnordered::new();
-    for i in 0..16 {
+    for i in 0..resolve_sync_write_workers() {
         let receiver: flume::Receiver<SenderJsonsData> = receiver.clone();
         #[cfg(feature = "sql")]
         let pool = AiosDBManager::get_project_pool().await.unwrap().clone();
@@ -1537,7 +1605,7 @@ where
         crate::data_interface::cata_closure::load_sync_filter(project.as_str(), &db_types_clone);
     let mut parsed_artifacts = Vec::new();
     // specs/027：全量解析只在写库 worker join 后维护当前态完整性元数据，不写数据锚点。
-    let mut full_parse_integrity: Vec<(u32, u32, String)> = Vec::new();
+    let mut full_parse_integrity: Vec<PendingFullParseIntegrity> = Vec::new();
     // spec 004：解析阶段总耗时计时起点。
     let sync_stage_started = Instant::now();
 
@@ -1729,6 +1797,7 @@ where
             .iter()
             .map(|entry| *entry.key())
             .collect();
+        let full_refno_count = all_refnos.len();
         // CATA 闭包部分解析（spec 002 T006b）：manifest 命中则裁剪 refno 全集，否则整库回退。
         let all_refnos = crate::data_interface::cata_closure::apply_sync_filter(
             cata_filter.as_ref(),
@@ -1736,11 +1805,22 @@ where
             dbnum,
             all_refnos,
         );
+        let is_full_scope = all_refnos.len() == full_refno_count;
         let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
 
         let db_basic = Arc::new(db_basic);
         if is_save_db {
-            save_pe_relates(&db_basic, sender.clone()).await;
+            pe_graph_seed::mark_not_ready(dbnum)
+                .await
+                .with_context(|| format!("dbnum={dbnum} 失效旧 PE 图种子失败"))?;
+            if is_full_scope {
+                crate::versioned_db::pe_owner_meta::mark_bulk_not_ready(
+                    dbnum,
+                    crate::versioned_db::pe_owner_meta::META_SOURCE_FULL_RELOAD,
+                )
+                .await
+                .with_context(|| format!("dbnum={dbnum} 标记 pe_owner NotReady 失败"))?;
+            }
         }
         // 解析时不应该受 debug_model_refnos 影响，只用于模型生成调试
         // 如果需要调试解析过程，应该使用独立的 debug_parse_refnos 配置
@@ -1753,6 +1833,7 @@ where
         }
         let debug_refnos = Arc::new(debug_refnos);
         let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
+        let mut seed_builder = PeGraphSeedBuilder::new();
 
         let chunk_stage_start = Instant::now();
         let mut total_cnt = 0;
@@ -1810,6 +1891,7 @@ where
                             noun,
                             cata_hash,
                         });
+                        seed_builder.absorb(refno, att);
                     }
                     let should_save = !is_debug && is_save_db;
                     if should_save {
@@ -1949,9 +2031,35 @@ where
             )
         })?;
 
-        // 登记本轮解析完成的 dbnum，供写库 worker join 后维护当前态完整性元数据。
-        if is_save_db && sesno > 0 {
-            full_parse_integrity.push((dbnum, sesno as u32, full_sync_source_evidence(&path)));
+        if is_save_db && is_full_scope {
+            // Q6：落库全量解析必须有有效 sesno。get_latest_sesno 失败会回退 sesno=0，
+            // 会污染 pe_owner 水位（maintained_since/verified）与种子文件名的水位语义，
+            // 使后续版本化查询的水位门槛形同虚设——直接判定该文件解析失败。
+            anyhow::ensure!(
+                sesno > 0,
+                "dbnum={dbnum} 全量解析读取 latest_sesno 失败(sesno=0)，拒绝发布层级与种子；请检查源文件 session page"
+            );
+            anyhow::ensure!(
+                !seed_builder.is_empty(),
+                "dbnum={dbnum} 完整解析未生成任何 PE，拒绝发布层级"
+            );
+            full_parse_integrity.push(PendingFullParseIntegrity {
+                tree_dir: output_dir.clone(),
+                seed: std::mem::take(&mut seed_builder).finish(
+                    dbnum,
+                    sesno as u32,
+                    &file_name,
+                    &db_basic.children_map,
+                ),
+            });
+        } else if is_save_db {
+            // Q3：partial/closure 裁剪解析按写入集 scoped 固化 pe_owner 边
+            // （不发 Ready、不碰 bulk_state；partial 只标 seed NotReady）。
+            let written: std::collections::BTreeSet<u64> =
+                all_refnos.iter().map(|refno| refno.0).collect();
+            pe_graph_seed::persist_partial_hierarchy(dbnum, &written, &db_basic.children_map)
+                .await
+                .with_context(|| format!("dbnum={dbnum} partial 解析 scoped 固化 pe_owner 边失败"))?;
         }
 
         parsed_artifacts.push(ParsedDbArtifact {
@@ -1995,7 +2103,7 @@ where
     while let Some(result) = insert_handles.next().await {
         result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
-    record_full_parse_integrity(&full_parse_integrity).await?;
+    record_full_parse_integrity(full_parse_integrity).await?;
     validate_parse_scene_tree_artifacts(&parsed_artifacts)?;
     crate::perf_metrics::finish_parse_stage(
         parse_failed_sql_count(),
@@ -2091,7 +2199,7 @@ pub async fn sync_total_async_threaded(
     // let (sender, receiver) = flume::bounded(CHUNK_SIZE);
     let (sender, receiver) = flume::unbounded();
     let mut insert_handles = FuturesUnordered::new();
-    for i in 0..16 {
+    for i in 0..resolve_sync_write_workers() {
         let receiver: flume::Receiver<SenderJsonsData> = receiver.clone();
         #[cfg(feature = "sql")]
         let pool = AiosDBManager::get_project_pool().await.unwrap().clone();
@@ -2310,7 +2418,7 @@ pub async fn sync_total_async_threaded(
     // 解析任务返回本轮成功解析的 (dbnum, latest_sesno)，供收尾维护完整性元数据。
     let full_parse_integrity = tokio::spawn(async move {
         let mut parsed_artifacts = Vec::new();
-        let mut full_parse_integrity: Vec<(u32, u32, String)> = Vec::new();
+        let mut full_parse_integrity: Vec<PendingFullParseIntegrity> = Vec::new();
         // spec 004：解析阶段总耗时计时起点。
         let sync_stage_started = Instant::now();
         //todo 按照文件大小排序，只有小于多少的能开启多线程，模型一大就不合适了
@@ -2473,6 +2581,7 @@ pub async fn sync_total_async_threaded(
                     .iter()
                     .map(|entry| *entry.key())
                     .collect();
+                let full_refno_count = all_refnos.len();
                 if all_refnos.is_empty() {
                     // 这里为空会导致后续 parse_file_with_chunk 全部跳过，从而不会触发 save_pes / Meili 索引。
                     println!(
@@ -2488,6 +2597,7 @@ pub async fn sync_total_async_threaded(
                     dbnum,
                     all_refnos,
                 );
+                let is_full_scope = all_refnos.len() == full_refno_count;
                 let db_basic_parse_ms = db_basic_stage_start.elapsed().as_millis();
                 let total_chunks = std::cmp::max(1, (all_refnos.len() + chunk_size - 1) / chunk_size);
                 println!(
@@ -2518,7 +2628,17 @@ pub async fn sync_total_async_threaded(
 
                 let db_basic = Arc::new(db_basic);
                 if is_save_db {
-                    save_pe_relates(&db_basic, sender_clone.clone()).await;
+                    pe_graph_seed::mark_not_ready(dbnum)
+                        .await
+                        .with_context(|| format!("dbnum={dbnum} 失效旧 PE 图种子失败"))?;
+                    if is_full_scope {
+                        crate::versioned_db::pe_owner_meta::mark_bulk_not_ready(
+                            dbnum,
+                            crate::versioned_db::pe_owner_meta::META_SOURCE_FULL_RELOAD,
+                        )
+                        .await
+                        .with_context(|| format!("dbnum={dbnum} 标记 pe_owner NotReady 失败"))?;
+                    }
                 }
                 // 解析时不应该受 debug_model_refnos 影响，只用于模型生成调试
                 let debug_refnos: Vec<RefU64> = Vec::new(); // 暂时禁用解析调试模式
@@ -2534,6 +2654,7 @@ pub async fn sync_total_async_threaded(
 
 
                 let mut tree_nodes: HashMap<RefU64, TreeNodeMeta> = HashMap::new();
+                let mut seed_builder = PeGraphSeedBuilder::new();
                 let mut total_cnt = 0;
                 let chunk_stage_start = Instant::now();
                 let chunk_concurrency = resolve_indextree_chunk_concurrency(is_save_db);
@@ -2628,6 +2749,7 @@ pub async fn sync_total_async_threaded(
                                     noun,
                                     cata_hash,
                                 });
+                                seed_builder.absorb(refno, att);
                             }
                             let should_save = !is_debug && is_save_db;
                             if should_save {
@@ -2832,13 +2954,37 @@ pub async fn sync_total_async_threaded(
                     })?;
                 }
 
-                // 登记本轮解析完成的 dbnum，供写库 worker join 后维护当前态完整性元数据。
-                if is_save_db && sesno > 0 {
-                    full_parse_integrity.push((
-                        dbnum,
-                        sesno as u32,
-                        full_sync_source_evidence(&path),
-                    ));
+                if is_save_db && is_full_scope {
+                    // Q6：落库全量解析必须有有效 sesno。get_latest_sesno 失败会回退
+                    // sesno=0，会污染 pe_owner 水位（maintained_since/verified）与种子
+                    // 文件名的水位语义，使后续版本化查询的水位门槛形同虚设——直接判失败。
+                    anyhow::ensure!(
+                        sesno > 0,
+                        "dbnum={dbnum} 全量解析读取 latest_sesno 失败(sesno=0)，拒绝发布层级与种子；请检查源文件 session page"
+                    );
+                    anyhow::ensure!(
+                        !seed_builder.is_empty(),
+                        "dbnum={dbnum} 完整解析未生成任何 PE，拒绝发布层级"
+                    );
+                    full_parse_integrity.push(PendingFullParseIntegrity {
+                        tree_dir: output_dir.clone(),
+                        seed: std::mem::take(&mut seed_builder).finish(
+                            dbnum,
+                            sesno as u32,
+                            &file_name,
+                            &db_basic.children_map,
+                        ),
+                    });
+                } else if is_save_db {
+                    // Q3：partial/closure 裁剪解析按写入集 scoped 固化 pe_owner 边
+                    // （不发 Ready、不碰 bulk_state；partial 只标 seed NotReady）。
+                    let written: std::collections::BTreeSet<u64> =
+                        all_refnos.iter().map(|refno| refno.0).collect();
+                    pe_graph_seed::persist_partial_hierarchy(dbnum, &written, &db_basic.children_map)
+                        .await
+                        .with_context(|| {
+                            format!("dbnum={dbnum} partial 解析 scoped 固化 pe_owner 边失败")
+                        })?;
                 }
                 let db_meta_update_ms = db_meta_stage_start.elapsed().as_millis();
 
@@ -2901,7 +3047,7 @@ pub async fn sync_total_async_threaded(
     while let Some(result) = insert_handles.next().await {
         result.map_err(|e| anyhow::anyhow!("全量写入 worker 失败: {e}"))?;
     }
-    record_full_parse_integrity(&full_parse_integrity).await?;
+    record_full_parse_integrity(full_parse_integrity).await?;
     // all_handles.push(parse_handle);
     // futures::future::join_all(take(&mut all_handles)).await;
     // futures::future::join_all(&mut [parse_handle]).await;
@@ -3303,5 +3449,9 @@ pub async fn parse_single_db_file(
 
     // specs/022 R1：本路径只更新 db_meta，不向 Surreal 写入 PE/ATT，
     // 因此不写 sesno_version_anchor；数据历史由首次增量的 pre-apply baseline 起版。
+    //
+    // 同理这里也**不**落 pe 图 rkyv 种子（Task 2.4）：种子要与主库 pe 表同进同退，
+    // 这条路径没写 pe，落了种子会让生成侧拿到主库不存在的层级（有层级没属性）。
+    // Task 2.5 的「rkyv 缺失 → 后台解析兜底」会另行决定这条路径的产出归属。
     Ok(())
 }

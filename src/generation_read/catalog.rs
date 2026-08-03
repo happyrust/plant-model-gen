@@ -38,12 +38,12 @@ impl Default for CatalogResolverConfig {
                 .map(str::to_string)
                 .collect(),
             precise_children_nouns: [
-                "FULL", "TOPD", "TMPL", "PBOR", "CYLI", "GMSE", "NGMS", "PTSE", "PSTR",
-                "SPRO", "DTSE",
+                "FULL", "TOPD", "TMPL", "PBOR", "CYLI", "GMSE", "NGMS", "PTSE", "PSTR", "SPRO",
+                "DTSE",
             ]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         }
     }
 }

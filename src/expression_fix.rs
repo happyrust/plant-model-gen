@@ -387,6 +387,50 @@ pub fn eval_enhanced_expression(expr: &str, context: &CataContext, unit: &str) -
 mod tests {
     use super::*;
 
+    fn context_from(pairs: &[(&str, &str)]) -> CataContext {
+        let map = DashMap::new();
+        for (key, value) in pairs {
+            map.insert((*key).to_string(), (*value).to_string());
+        }
+        CataContext {
+            context: map,
+            is_tubi: false,
+            ..Default::default()
+        }
+    }
+
+    /// 求值器对未知符号是静默取 0，而不是报错。
+    ///
+    /// 这是 ZONE 漏产的放大机制：`cata_context_from_session` 早先只读裸 `CATR`，
+    /// 规格驱动管件（只挂 SPRE）拿不到 owner / CREF 侧的元件库参数，尺寸静默退化成 0，
+    /// 最终以 `E-GEO-INVALID` 被跳过，而不是报「数据缺失」。
+    /// （`RPRO_*` 另有一条前置改写链路，不在本用例覆盖范围内。）
+    #[test]
+    fn test_missing_catalogue_symbol_degrades_to_zero_silently() {
+        let context = context_from(&[]);
+
+        for expr in ["OPAR1", "ODES1", "APAR1"] {
+            let result = eval_str_to_f64(expr, &context, "DIST");
+            assert_eq!(
+                result.unwrap(),
+                0.0,
+                "缺失的元件库符号 '{expr}' 当前会静默归零；若此断言失败，说明求值器已改为报错，\
+                 请同步更新依赖静默归零的调用方"
+            );
+        }
+    }
+
+    /// `PARAM n` 会被求值器截掉尾部 `M`、按 `PARA{n}` 查表，因此它与 `RPRO_*` / `OPAR{n}`
+    /// 不同：即使元件库上下文整块缺失，它仍从 `scom_info.params` 拿得到值。
+    /// 这解释了为何漏产表现为「部分零」（如 `scale=Vec3(26.7, 26.7, 0.0)`）而不是全零。
+    #[test]
+    fn test_param_n_resolves_through_para_key() {
+        let context = context_from(&[("PARA2", "30.0")]);
+
+        assert_eq!(eval_str_to_f64("PARAM 2", &context, "DIST").unwrap(), 30.0);
+        assert_eq!(eval_str_to_f64("PARA2", &context, "DIST").unwrap(), 30.0);
+    }
+
     #[test]
     fn test_preprocess_attrib_expression() {
         // 测试ATTRIB PARA[数字]格式 - 函数名应为小写，变量名保持大写

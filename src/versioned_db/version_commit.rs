@@ -808,7 +808,7 @@ pub async fn current_dbnum_sesnos(dbnums: &[u32]) -> anyhow::Result<BTreeMap<u32
         .join(",");
     let sql = format!(
         "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table \
-         WHERE dbnum IN [{ids}] GROUP BY dbnum;"
+         WHERE dbnum IN [{ids}] AND sesno != NONE GROUP BY dbnum;"
     );
     let mut response = project_primary_db().query(sql).await?.check()?;
     let rows: Vec<CurrentSesnoRow> = response.take(0)?;
@@ -826,7 +826,8 @@ pub async fn current_dbnum_sesnos(dbnums: &[u32]) -> anyhow::Result<BTreeMap<u32
 }
 
 async fn all_current_dbnum_sesnos() -> anyhow::Result<BTreeMap<u32, u32>> {
-    let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table GROUP BY dbnum;";
+    let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table \
+               WHERE sesno != NONE GROUP BY dbnum;";
     let mut response = project_primary_db().query(sql).await?.check()?;
     let rows: Vec<CurrentSesnoRow> = response.take(0)?;
     let mut out = BTreeMap::new();
@@ -844,15 +845,15 @@ async fn all_current_dbnum_sesnos() -> anyhow::Result<BTreeMap<u32, u32>> {
 
 /// 在一次完整/手动模型生成及其后处理全部成功后，为参与 dbnum 发布 `model_gen` 锚点。
 ///
+/// 只允许在生成返回 `Ok` 的路径上调用；失败必须在到达这里之前上抛。
+///
 /// 增量管线不能使用本函数：它必须按本次已提交 data anchor 的实际结束 sesno 发布。
 pub async fn publish_model_gen_anchors_after_generation(
     db_option: &crate::options::DbOptionExt,
-    generation_success: bool,
     stage: &str,
     allow_all_when_unscoped: bool,
 ) -> anyhow::Result<Vec<ModelGenAnchor>> {
-    if !generation_success
-        || !db_option.use_surrealdb
+    if !db_option.use_surrealdb
         || !db_option.model_writer_mode.writes_to_surreal()
         || db_option.gen_model_dry_run
     {
@@ -1006,7 +1007,8 @@ pub async fn committed_watermark(dbnum: u32) -> anyhow::Result<u32> {
     let sql = format!(
         "math::max(array::flatten([SELECT VALUE sesno FROM sesno_version_anchor \
              WHERE dbnum = {dbnum} AND source IN ['full', 'incremental_baseline', 'incremental']]));\n\
-         math::max(array::flatten([SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {dbnum}]));"
+         math::max(array::flatten([SELECT VALUE sesno FROM dbnum_info_table \
+             WHERE dbnum = {dbnum} AND sesno != NONE]));"
     );
     // 两条兼容查询需要逐语句处理“表不存在”；提前 check() 会在 take() 的
     // 兼容分支执行前直接返回错误，使旧站点无法回退到 dbnum_info_table。

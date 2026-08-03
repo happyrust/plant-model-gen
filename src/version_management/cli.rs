@@ -293,7 +293,7 @@ pub fn model_version_command() -> Command {
         .subcommand(
             Command::new("rebuild-pe-owner")
                 .about(
-                    "specs/023: rebuild pe_owner edges for a dbnum from current pe.children, then mark pe_owner_version_meta (source=rebuild_cli)",
+                    "specs/023: rebuild pe_owner edges for a dbnum from current pe.owner (reverse-mapped, no pe.children), then mark pe_owner_version_meta (source=rebuild_cli)",
                 )
                 .arg(required_u32("dbnum"))
                 .arg(
@@ -1149,14 +1149,16 @@ async fn ensure_model_unit_store_connection() -> anyhow::Result<()> {
 
 /// specs/023 T018 / M3-T8：存量 versioned 站点重建 pe_owner 边。
 ///
-/// 候选 owner 由 **pe 表 cursor 分页**枚举（`WHERE dbnum AND id > <last> ORDER BY id`，
-/// 与 pe_owner_snapshot 的分页形态一致）——M3/T8 起不再依赖 scene_tree/*.tree
-/// （旧 TreeIndex 枚举的"tree 与库内同源新鲜"前提在增量常态化后不成立，修 §0-4）。
-/// children 取值以 pe 行 `children` 字段为准（权威来源，批量点查）。
+/// **成员关系以 `pe.owner` 为唯一权威源反推**（Q2：彻底不再读 `pe.children`）：
+/// cursor 分页枚举本 dbnum 全部节点的 `(id, owner)`，按 owner 反向分组得到每个 owner
+/// 的成员集合；`owner==自身` 或 owner 不在本 dbnum 物化集内 → 视为根、不建边。
 ///
-/// verify-and-skip 重建（T021 实测教训，逻辑自旧实现原样保留）：
+/// 同胞顺序（与种子构建器同一约定）：已有边的孩子保留其现存 ordinal，新增孩子按 refno
+/// 升序填补空位；`child_count` 由反推成员数重算；遗留 `children` 字段顺带清 NONE。
+///
+/// verify-and-skip 重建（T021 实测教训，逻辑保留）：
 /// - 先把现存边全量读入内存（ORDER BY id 分页；无排序的 START/LIMIT 页序不稳定会漏读/重读）；
-/// - 与权威 pe.children 对比，**只重写不一致的 owner**（幂等重跑零写放大）；
+/// - 与反推出的目标 `(ordinal, child)` 序列对比，**只重写不一致的 owner**（幂等重跑零写放大）；
 /// - 每 owner 先删后插；删段与插段分批 flush（versioned 引擎"同请求删边→重插同 id"
 ///   撞 unique_pe_owner 的边界见 sesno_increment.rs 注释）；
 /// - flush 失败走逐语句慢路径：内容一致的唯一索引冲突视为幂等成功，内容不同的
@@ -1165,14 +1167,14 @@ async fn ensure_model_unit_store_connection() -> anyhow::Result<()> {
 /// - 成功后 UPSERT `pe_owner_version_meta`（source=rebuild_cli，值=dbnum_info_table
 ///   该 dbnum latest sesno；查不到 sesno 拒绝写 meta）。
 async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()> {
-    use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
     use surrealdb::types::SurrealValue;
 
     #[derive(Debug, serde::Deserialize, SurrealValue)]
-    struct PeChildrenRow {
+    struct PeNodeRow {
         id: RefnoEnum,
         #[serde(default)]
-        children: Option<Vec<RefnoEnum>>,
+        owner: Option<RefnoEnum>,
     }
 
     let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
@@ -1208,6 +1210,17 @@ async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()>
     let mut owners_skipped = 0usize;
     let mut owners_rewritten = 0usize;
     let mut stale_edge_deleted = 0usize;
+    let mut audit_nodes = std::collections::BTreeMap::new();
+    let mut audit_edges = Vec::new();
+
+    if !dry_run {
+        crate::versioned_db::pe_graph_seed::mark_not_ready(dbnum).await?;
+        crate::versioned_db::pe_owner_meta::mark_bulk_not_ready(
+            dbnum,
+            crate::versioned_db::pe_owner_meta::META_SOURCE_REBUILD_CLI,
+        )
+        .await?;
+    }
 
     // 2) 现存边全量读入（分页 VALUE 投影；ord 取 id 第二段）。
     // 分页必须 ORDER BY id：无排序的 START/LIMIT 页序不稳定会漏读/重读，
@@ -1405,81 +1418,159 @@ async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()>
         Ok(())
     }
 
-    // 3) pe cursor 分页枚举候选 owner（M3/T8：替代 TreeIndex 枚举）+ verify-and-skip 重建
+    // 3) 枚举本 dbnum 全部节点（只读 id, owner；不再读 children），以 pe.owner 反推成员关系
     const ENUM_PAGE: usize = 500;
     let mut candidate_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut last_key: Option<String> = None;
-    loop {
-        let page_sql = match &last_key {
-            Some(key) => format!(
-                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {ENUM_PAGE};"
-            ),
-            None => format!(
-                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {ENUM_PAGE};"
-            ),
-        };
-        let ids: Vec<RefnoEnum> = project_primary_db()
-            .query_take(&page_sql, 0)
-            .await
-            .map_err(|e| anyhow::anyhow!("pe 候选分页失败(last={last_key:?}): {e}"))?;
-        if ids.is_empty() {
-            break;
+    let mut node_owner: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    {
+        let mut last_key: Option<String> = None;
+        loop {
+            let page_sql = match &last_key {
+                Some(key) => format!(
+                    "SELECT id, owner FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {ENUM_PAGE};"
+                ),
+                None => format!(
+                    "SELECT id, owner FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {ENUM_PAGE};"
+                ),
+            };
+            let rows: Vec<PeNodeRow> = project_primary_db()
+                .query_take(&page_sql, 0)
+                .await
+                .map_err(|e| anyhow::anyhow!("pe 节点分页失败(last={last_key:?}): {e}"))?;
+            let fetched = rows.len();
+            if fetched == 0 {
+                break;
+            }
+            last_key = rows.last().map(|r| r.id.to_pe_key());
+            for row in &rows {
+                let refno = row.id.refno().0;
+                let normalized_owner = row.owner.as_ref().map(|o| o.refno().0).unwrap_or(refno);
+                candidate_set.insert(refno);
+                node_owner.insert(refno, normalized_owner);
+            }
+            if fetched < ENUM_PAGE {
+                break;
+            }
         }
-        last_key = ids.last().map(|r| r.to_pe_key());
-        candidate_set.extend(ids.iter().map(|r| r.refno().0));
+    }
+    nodes_processed = node_owner.len();
 
-        // 本页批量读 children（页大小即 chunk 大小）
-        let keys = ids
-            .iter()
-            .map(|r| r.to_pe_key())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rows: Vec<PeChildrenRow> = project_primary_db()
-            .query_take(&format!("SELECT id, children FROM [{keys}];"), 0)
-            .await
-            .map_err(|e| anyhow::anyhow!("批量读取 pe.children 失败: {e}"))?;
+    // 3a) 由 owner 反推 children_by_owner（owner==自身 或 owner 不在物化集内 → 根，不建边）。
+    let mut children_by_owner: std::collections::BTreeMap<u64, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for (&refno, &owner) in &node_owner {
+        if owner != refno && candidate_set.contains(&owner) {
+            children_by_owner.entry(owner).or_default().push(refno);
+        }
+    }
 
-        // Phase 1（本页）：先删；Phase 2（本页）：后插——仅针对不一致 owner
+    // 3b) 更新每个节点 owner/child_count（由反推重算）并清空遗留 children 字段。
+    {
+        let mut update_stmts: Vec<String> = Vec::new();
+        for (&refno, &owner) in &node_owner {
+            let child_count = children_by_owner.get(&refno).map(Vec::len).unwrap_or(0);
+            audit_nodes.insert(refno, (owner, child_count as u32));
+            update_stmts.push(format!(
+                "UPDATE {} SET owner = {}, child_count = {}, children = NONE;",
+                RefU64(refno).to_pe_key(),
+                RefU64(owner).to_pe_key(),
+                child_count,
+            ));
+        }
+        for batch in update_stmts.chunks(batch_size) {
+            let mut stmts = batch.to_vec();
+            flush(&mut stmts, dry_run).await?;
+        }
+    }
+
+    // 3c) 逐 owner 计算目标 (ordinal, child) 序列并 verify-and-skip 重建边。
+    // 处理集合 = 有成员的 owner ∪ 本 dbnum 内仍有现存边的 owner（后者可能已失去全部
+    // 成员，其残留边需删除；跨 dbnum 的幽灵 owner 留给步骤 4）。
+    {
+        let mut owners_to_process: std::collections::BTreeSet<u64> =
+            children_by_owner.keys().copied().collect();
+        for owner in existing.keys() {
+            if candidate_set.contains(owner) {
+                owners_to_process.insert(*owner);
+            }
+        }
+
         let mut delete_stmts: Vec<String> = Vec::new();
         let mut insert_stmts: Vec<String> = Vec::new();
-        for row in &rows {
-            nodes_processed += 1;
-            let owner_u64 = row.id.refno().0;
-            let children = row.children.clone().unwrap_or_default();
-            let desired: Vec<u64> = children.iter().map(|c| c.refno().0).collect();
-            let current: Vec<u64> = existing
-                .get(&owner_u64)
-                .map(|m| m.values().copied().collect())
-                .unwrap_or_default();
-            if !children.is_empty() {
+        for owner in owners_to_process {
+            let members: Vec<u64> = children_by_owner.get(&owner).cloned().unwrap_or_default();
+            if !members.is_empty() {
                 owners_with_children += 1;
             }
-            if desired == current {
+
+            // 已有边的孩子保留原 ordinal，新增孩子按 refno 升序填补空位（与种子构建器同一约定）。
+            let existing_ord: std::collections::HashMap<u64, u32> = existing
+                .get(&owner)
+                .map(|m| m.iter().map(|(&ord, &child)| (child, ord as u32)).collect())
+                .unwrap_or_default();
+            let mut order_of: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
+            let mut used: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for &child in &members {
+                if let Some(&ord) = existing_ord.get(&child) {
+                    order_of.insert(child, ord);
+                    used.insert(ord);
+                }
+            }
+            let mut new_children: Vec<u64> = members
+                .iter()
+                .copied()
+                .filter(|c| !order_of.contains_key(c))
+                .collect();
+            new_children.sort_unstable();
+            let mut next_order = 0u32;
+            for child in new_children {
+                while used.contains(&next_order) {
+                    next_order += 1;
+                }
+                order_of.insert(child, next_order);
+                used.insert(next_order);
+                next_order += 1;
+            }
+            let mut ordered: Vec<(u32, u64)> = order_of
+                .into_iter()
+                .map(|(child, ord)| (ord, child))
+                .collect();
+            ordered.sort_unstable();
+
+            for &(ord, child) in &ordered {
+                audit_edges.push((owner, ord, child));
+            }
+
+            let current_pairs: Vec<(u32, u64)> = existing
+                .get(&owner)
+                .map(|m| m.iter().map(|(&ord, &child)| (ord as u32, child)).collect())
+                .unwrap_or_default();
+            if ordered == current_pairs {
                 owners_skipped += 1;
                 continue;
             }
             owners_rewritten += 1;
-            let owner_key = row.id.to_pe_key();
-            if !current.is_empty() {
+            edges_inserted += ordered.len();
+            let owner_key = RefU64(owner).to_pe_key();
+            if !current_pairs.is_empty() {
                 delete_stmts.push(format!("DELETE {owner_key}<-pe_owner;"));
+                delete_stmts.push(format!(
+                    "DELETE pe_owner:[{owner_key}, 0]..=[{owner_key}, 4294967295];"
+                ));
             }
-            if !children.is_empty() {
-                edges_inserted += children.len();
-                for (chunk_idx, ch) in children.chunks(RELATION_ROWS_PER_INSERT).enumerate() {
-                    let rows_sql = ch
-                        .iter()
-                        .enumerate()
-                        .map(|(i, child)| {
-                            let order = chunk_idx * RELATION_ROWS_PER_INSERT + i;
-                            format!(
-                                "{{ id: pe_owner:[{owner_key}, {order}], in: {}, out: {owner_key} }}",
-                                child.to_pe_key()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    insert_stmts.push(format!("INSERT RELATION INTO pe_owner [{rows_sql}];"));
-                }
+            for ch in ordered.chunks(RELATION_ROWS_PER_INSERT) {
+                let rows_sql = ch
+                    .iter()
+                    .map(|(ord, child)| {
+                        format!(
+                            "{{ id: pe_owner:[{owner_key}, {ord}], in: {}, out: {owner_key} }}",
+                            RefU64(*child).to_pe_key()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                insert_stmts.push(format!("INSERT RELATION INTO pe_owner [{rows_sql}];"));
             }
         }
         for batch in delete_stmts.chunks(batch_size) {
@@ -1489,10 +1580,6 @@ async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()>
         for batch in insert_stmts.chunks(batch_size) {
             let mut stmts = batch.to_vec();
             flush(&mut stmts, dry_run).await?;
-        }
-
-        if ids.len() < ENUM_PAGE {
-            break;
         }
     }
 
@@ -1529,12 +1616,23 @@ async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()>
         }
     }
 
-    // 5) 固化可信分界（dry-run 不写）
+    // 5) 固化可信分界与本次全量审计摘要（dry-run 不写）
     if !dry_run {
-        crate::versioned_db::pe_owner_meta::upsert_maintained_since(
+        audit_edges.sort_unstable();
+        let integrity = crate::versioned_db::pe_graph_seed::audit_expected(
+            dbnum,
+            &audit_nodes,
+            &audit_edges,
+        )
+        .await
+        .context("重建后 PE/pe_owner 持久化审计失败，保持 NotReady")?;
+        crate::versioned_db::pe_owner_meta::publish_bulk_ready(
             dbnum,
             latest_sesno as u32,
             crate::versioned_db::pe_owner_meta::META_SOURCE_REBUILD_CLI,
+            integrity.node_count,
+            integrity.edge_count,
+            &integrity.hierarchy_hash,
         )
         .await
         .map_err(|e| {

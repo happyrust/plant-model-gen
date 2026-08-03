@@ -8,22 +8,14 @@
 //!   （边 id = `pe_owner:[<owner>, <order>]`，`ORDER BY id` 保同胞顺序，specs/023 契约）
 //! - descendants（子孙收集）：`<root>.{..N+collect}<-pe_owner<-pe`
 //!   （递归 idiom，BFS 邻近序 + visited 去重防环；引擎递归上限 256，`recursion_limits` 实测）
-//! - ancestors（祖先链）：`<node>.{..N+collect}->pe_owner->pe`，边缺失回退
-//!   `<node>.{..N+collect}(.owner)`（owner 记录链接递归，不依赖边完整性）
-//! - 批量子节点（BFS/剪枝用，无序）：`SELECT VALUE {{ p: id, kids: <-pe_owner<-pe, ch: children }} FROM [...]`
+//! - ancestors（祖先链）：`<node>.{..N+collect}(.owner)`（owner 记录链接递归）
+//! - 批量子节点：按 `pe_owner.order` 查询并分组
 //!
 //! 铁律：
 //! - **禁止 `pe_owner:[..]..[..]` id 区间扫**（specs/023 research C3：VERSION 下静默返回当前态，
 //!   latest 同样统一图遍历，不开这个口子）；
 //! - **禁止 WHERE 全表扫做层级查询**（noun 枚举/计数是表级统计，不属层级查询，见文件尾注释）；
-//! - 边缺失（存量站点未重灌/未 rebuild-pe-owner）一律回退 `pe.children` 字段点查，
-//!   与版本路径 FR-008 双源结构同构。
-//!
-//! **前置条件（D5）**：递归主路径（`query_descendants`）在"部分节点有边、部分没有"的
-//! 混合态下会在缺边节点处静默截断子树——回退判定只看根级结果是否为空。因此站点切换
-//! 到本原语前必须通过 `scripts/smoke/pe_owner_children_audit.ps1` 审计（不绿先
-//! `model-version rebuild-pe-owner`）；逐层 BFS 类接口（`children_batch` /
-//! `collect_target_refnos_*`）为每节点独立回退，不受此限。
+//! - 不读取 `pe.children`；存量站点必须先执行 `model-version rebuild-pe-owner`。
 //!
 //! 本模块 M0 阶段纯新增；M1/M2 起逐域替换旧 `.tree` 消费面。
 
@@ -67,14 +59,10 @@ struct PeMetaRow {
 }
 
 #[derive(Debug, Deserialize, SurrealValue)]
-struct KidsRow {
-    p: RefnoEnum,
-    /// 边路径子节点（无序，仅用于集合语义的 BFS 展开）
-    #[serde(default)]
-    kids: Vec<RefnoEnum>,
-    /// pe.children 字段回退
-    #[serde(default)]
-    ch: Option<Vec<RefnoEnum>>,
+struct EdgeRow {
+    child: RefnoEnum,
+    parent: RefnoEnum,
+    ordinal: i64,
 }
 
 #[derive(Debug, Deserialize, SurrealValue)]
@@ -82,8 +70,6 @@ struct CountRow {
     p: RefnoEnum,
     #[serde(default)]
     n: Option<i64>,
-    #[serde(default)]
-    ch: Option<Vec<RefnoEnum>>,
 }
 
 /// pe_owner 图查询原语层。
@@ -109,21 +95,10 @@ impl PeOwnerTreeStore {
 
     /// 查询直接子节点（同胞顺序 = 边 id `[owner, order]` 升序）。
     ///
-    /// 边缺失回退 `pe.children` 字段（同时天然覆盖"确无子节点"情形）。
     pub async fn query_children(parent: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
         let parent_key = parent.to_pe_key();
         let sql = format!("SELECT VALUE in FROM {parent_key}<-pe_owner ORDER BY id;");
-        let kids: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await?;
-        if !kids.is_empty() {
-            return Ok(kids);
-        }
-        Self::children_field_fallback(parent).await
-    }
-
-    async fn children_field_fallback(parent: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
-        let sql = format!("SELECT VALUE children FROM {};", parent.to_pe_key());
-        let rows: Vec<Option<Vec<RefnoEnum>>> = project_primary_db().query_take(&sql, 0).await?;
-        Ok(rows.into_iter().flatten().next().unwrap_or_default())
+        Ok(project_primary_db().query_take(&sql, 0).await?)
     }
 
     /// 查询直接子节点并按 noun 过滤（保持同胞顺序）。
@@ -150,7 +125,6 @@ impl PeOwnerTreeStore {
 
     /// 批量统计直接子节点数量（children_count 展示用）。
     ///
-    /// 边计数优先（`count(<-pe_owner)`），为 0 时回退 `pe.children` 长度。
     pub async fn query_children_counts(
         refnos: &[RefnoEnum],
     ) -> anyhow::Result<HashMap<RefnoEnum, usize>> {
@@ -161,18 +135,10 @@ impl PeOwnerTreeStore {
                 .map(|r| r.to_pe_key())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "SELECT VALUE {{ p: id, n: count(<-pe_owner), ch: children }} FROM [{keys}];"
-            );
+            let sql = format!("SELECT VALUE {{ p: id, n: count(<-pe_owner) }} FROM [{keys}];");
             let rows: Vec<CountRow> = project_primary_db().query_take(&sql, 0).await?;
             for row in rows {
-                let edge_cnt = row.n.unwrap_or(0).max(0) as usize;
-                let cnt = if edge_cnt > 0 {
-                    edge_cnt
-                } else {
-                    row.ch.map(|c| c.len()).unwrap_or(0)
-                };
-                out.insert(row.p, cnt);
+                out.insert(row.p, row.n.unwrap_or(0).max(0) as usize);
             }
         }
         Ok(out)
@@ -226,8 +192,7 @@ impl PeOwnerTreeStore {
 
     /// 查询全部子孙（不含自身），BFS 邻近序。
     ///
-    /// 主路径：单条递归 idiom `<root>.{..N+collect}<-pe_owner<-pe`；
-    /// 边缺失回退：`pe.children` 字段逐层 BFS 批查（chunk 500）。
+    /// 单条递归 idiom `<root>.{..N+collect}<-pe_owner<-pe`。
     pub async fn query_descendants(
         root: RefnoEnum,
         max_depth: Option<usize>,
@@ -237,18 +202,7 @@ impl PeOwnerTreeStore {
             .clamp(1, MAX_RECURSE_DEPTH);
         let root_key = root.to_pe_key();
         let sql = format!("RETURN {root_key}.{{..{depth}+collect}}<-pe_owner<-pe;");
-        let via_edges: Vec<RefnoEnum> = project_primary_db()
-            .query_take(&sql, 0)
-            .await
-            .unwrap_or_default();
-        if !via_edges.is_empty() {
-            return Ok(via_edges);
-        }
-        // 区分"确无子孙"与"边缺失"：children 字段非空才进入回退 BFS。
-        if Self::children_field_fallback(root).await?.is_empty() {
-            return Ok(Vec::new());
-        }
-        Self::descendants_via_children_field(&[root], Some(depth)).await
+        Ok(project_primary_db().query_take(&sql, 0).await?)
     }
 
     /// 查询子孙并按 noun 过滤（不含自身）。
@@ -301,36 +255,7 @@ impl PeOwnerTreeStore {
             .collect())
     }
 
-    /// `pe.children` 字段逐层 BFS（边缺失回退路径；集合语义、跨层去重）。
-    async fn descendants_via_children_field(
-        roots: &[RefnoEnum],
-        max_depth: Option<usize>,
-    ) -> anyhow::Result<Vec<RefnoEnum>> {
-        let depth_cap = max_depth.unwrap_or(MAX_RECURSE_DEPTH);
-        let mut visited: HashSet<RefnoEnum> = roots.iter().copied().collect();
-        let mut frontier: Vec<RefnoEnum> = roots.to_vec();
-        let mut out: Vec<RefnoEnum> = Vec::new();
-        let mut level = 0usize;
-        while !frontier.is_empty() && level < depth_cap {
-            level += 1;
-            let kids_map = Self::children_batch(&frontier).await?;
-            let mut next: Vec<RefnoEnum> = Vec::new();
-            for parent in &frontier {
-                if let Some(kids) = kids_map.get(parent) {
-                    for &kid in kids {
-                        if visited.insert(kid) {
-                            out.push(kid);
-                            next.push(kid);
-                        }
-                    }
-                }
-            }
-            frontier = next;
-        }
-        Ok(out)
-    }
-
-    /// 批量取直接子节点（无序集合语义）：边优先、`pe.children` 字段回退，chunk 500。
+    /// 批量取直接子节点，按 `pe_owner.order` 保持同胞顺序。
     pub async fn children_batch(
         parents: &[RefnoEnum],
     ) -> anyhow::Result<HashMap<RefnoEnum, Vec<RefnoEnum>>> {
@@ -341,17 +266,17 @@ impl PeOwnerTreeStore {
                 .map(|r| r.to_pe_key())
                 .collect::<Vec<_>>()
                 .join(", ");
+            for parent in chunk {
+                out.entry(*parent).or_default();
+            }
             let sql = format!(
-                "SELECT VALUE {{ p: id, kids: <-pe_owner<-pe, ch: children }} FROM [{keys}];"
+                "SELECT id, in AS child, out AS parent, record::id(id)[1] AS ordinal \
+                 FROM [{keys}]<-pe_owner ORDER BY out, id;"
             );
-            let rows: Vec<KidsRow> = project_primary_db().query_take(&sql, 0).await?;
+            let rows: Vec<EdgeRow> = project_primary_db().query_take(&sql, 0).await?;
             for row in rows {
-                let kids = if !row.kids.is_empty() {
-                    row.kids
-                } else {
-                    row.ch.unwrap_or_default()
-                };
-                out.insert(row.p, kids);
+                anyhow::ensure!(row.ordinal >= 0, "pe_owner ordinal 不能为负数");
+                out.entry(row.parent).or_default().push(row.child);
             }
         }
         Ok(out)

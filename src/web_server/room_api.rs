@@ -1492,6 +1492,22 @@ async fn execute_room_regenerate(
     db_option_clone.apply_boolean_operation = request.apply_boolean_operation;
     db_option_clone.manual_db_nums = Some(vec![request.db_num]);
 
+    // 锁一直持有到函数结束：阶段 3 的房间关系重建同样是写路径，而且它内部
+    // 还会经 pregen_room_panels_into_model_cache 再次进生成管线。
+    let _mutation_lock = match crate::web_server::generation_lock::acquire_web_generation_lock(
+        &db_option_ext,
+        "room-regenerate",
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            unsafe {
+                std::env::remove_var("FORCE_REPLACE_MESH");
+            }
+            finalize_task_failed(&state, &task_id, format!("模型生成失败: {error:#}")).await;
+            return;
+        }
+    };
+
     match gen_all_geos_data(all_refnos, &db_option_clone, None).await {
         Ok(_) => {
             info!("✅ 模型生成完成");

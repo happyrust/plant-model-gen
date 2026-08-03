@@ -93,9 +93,19 @@ impl ElementRead for SurrealVersionedReadSession {
         }
         let requested = refnos.iter().copied().collect::<BTreeSet<_>>();
         let rows = self.load_pe_rows_by_refnos(&requested).await?;
+        let dbnums = rows
+            .iter()
+            .map(|pe| checked_u32(pe.dbnum, "element.dbnum"))
+            .collect::<GenerationReadResult<BTreeSet<_>>>()?;
+        self.ensure_hierarchy_coverage(&dbnums).await?;
+        let parents = rows.iter().map(|pe| pe.refno).collect::<BTreeSet<_>>();
+        let children = self.load_children_by_parents(&parents).await?;
         let found = rows
             .into_iter()
-            .map(element_from_pe)
+            .map(|pe| {
+                let pe_children = children.get(&pe.refno).cloned().unwrap_or_default();
+                element_from_pe(pe, pe_children)
+            })
             .collect::<GenerationReadResult<Vec<_>>>()?;
         self.record(
             "element.load",
@@ -115,9 +125,19 @@ impl ElementRead for SurrealVersionedReadSession {
     ) -> GenerationReadResult<Vec<ElementSnapshot>> {
         let started = Instant::now();
         let rows = self.load_pe_rows_by_query(query).await?;
+        let dbnums = rows
+            .iter()
+            .map(|pe| checked_u32(pe.dbnum, "element.dbnum"))
+            .collect::<GenerationReadResult<BTreeSet<_>>>()?;
+        self.ensure_hierarchy_coverage(&dbnums).await?;
+        let parents = rows.iter().map(|pe| pe.refno).collect::<BTreeSet<_>>();
+        let children = self.load_children_by_parents(&parents).await?;
         let elements = rows
             .into_iter()
-            .map(element_from_pe)
+            .map(|pe| {
+                let pe_children = children.get(&pe.refno).cloned().unwrap_or_default();
+                element_from_pe(pe, pe_children)
+            })
             .collect::<GenerationReadResult<Vec<_>>>()?;
         self.record(
             "element.query",
@@ -213,28 +233,28 @@ impl HierarchyRead for SurrealVersionedReadSession {
         if dbnums.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_hierarchy_coverage(&dbnums.iter().copied().collect())
+            .await?;
         let query = ElementQuery {
             dbnums: dbnums.iter().copied().collect(),
             ..ElementQuery::default()
         };
         let pe_rows = self.load_pe_rows_by_query(&query).await?;
-        let known = pe_rows.iter().map(|pe| pe.refno).collect::<BTreeSet<_>>();
+        let mut known = BTreeMap::new();
+        for pe in &pe_rows {
+            known.insert(pe.refno, checked_u32(pe.dbnum, "hierarchy.dbnum")?);
+        }
+        let parents = known.keys().copied().collect::<BTreeSet<_>>();
         let mut rows = Vec::new();
-        for pe in pe_rows {
-            let dbnum = checked_u32(pe.dbnum, "hierarchy.dbnum")?;
-            for (ordinal, child) in pe.children.unwrap_or_default().into_iter().enumerate() {
-                let child = RefnoEnum::from(child);
-                // A partial CATA closure can contain links to records which were
-                // intentionally not materialized. They are catalog references,
-                // not hierarchy nodes in this generation manifest.
-                if known.contains(&child) {
-                    rows.push(HierarchyRow {
-                        dbnum,
-                        parent: pe.refno,
-                        child,
-                        ordinal: ordinal as u32,
-                    });
-                }
+        for edge in self.load_hierarchy_edges(&parents).await? {
+            if let (Some(dbnum), true) = (known.get(&edge.parent), known.contains_key(&edge.child))
+            {
+                rows.push(HierarchyRow {
+                    dbnum: *dbnum,
+                    parent: edge.parent,
+                    child: edge.child,
+                    ordinal: edge.order,
+                });
             }
         }
         self.record(
@@ -264,7 +284,11 @@ impl CatalogGraphRead for SurrealVersionedReadSession {
             .iter()
             .filter_map(|pe| u32::try_from(pe.dbnum).ok())
             .collect::<BTreeSet<_>>();
+        // CATA 允许 refno 级闭包按需落库；其层级边由同一闭包直接写入 pe_owner，
+        // 不能要求整个目录 dbnum 先通过全量 bulk-ready 审计。
         let db_types = self.load_db_types(&requested_dbnums).await?;
+        let parents = pe_rows.iter().map(|pe| pe.refno).collect::<BTreeSet<_>>();
+        let children = self.load_children_by_parents(&parents).await?;
         let mut found = Vec::with_capacity(pe_rows.len());
 
         for pe in pe_rows {
@@ -281,12 +305,7 @@ impl CatalogGraphRead for SurrealVersionedReadSession {
                 db_type,
                 noun: pe.noun,
                 owner: pe.owner,
-                children: pe
-                    .children
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(RefnoEnum::from)
-                    .collect(),
+                children: children.get(&pe.refno).cloned().unwrap_or_default(),
                 outbound: attributes
                     .found
                     .get(&pe.refno)
@@ -377,6 +396,107 @@ impl TransformRead for SurrealVersionedReadSession {
 }
 
 impl SurrealVersionedReadSession {
+    async fn ensure_hierarchy_coverage(
+        &self,
+        dbnums: &BTreeSet<u32>,
+    ) -> GenerationReadResult<()> {
+        for dbnum in dbnums {
+            let maintained_since =
+                crate::versioned_db::pe_owner_meta::get_maintained_since(*dbnum)
+                    .await
+                    .map_err(|error| backend_error("hierarchy.ready", error))?
+                    .ok_or_else(|| {
+                        backend_error(
+                            "hierarchy.ready",
+                            format!("dbnum={dbnum} pe_owner 尚未通过全量完整性审计"),
+                        )
+                    })?;
+            if !self.version_suffix.is_empty() {
+                let requested_sesno = self
+                    .manifest
+                    .versions
+                    .get(dbnum)
+                    .map(|version| version.sesno)
+                    .ok_or_else(|| {
+                        GenerationReadError::InvalidManifest(format!(
+                            "层级读取缺少 dbnum={dbnum} 版本水位"
+                        ))
+                    })?;
+                if requested_sesno < maintained_since {
+                    return Err(GenerationReadError::UnsupportedReadAt {
+                        backend: "surreal-main/pe_owner",
+                        read_at: format!(
+                            "dbnum={dbnum}, sesno={requested_sesno}, maintained_since={maintained_since}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_hierarchy_edges(
+        &self,
+        parents: &BTreeSet<RefnoEnum>,
+    ) -> GenerationReadResult<Vec<HierarchyEdgeRow>> {
+        let mut edges = Vec::new();
+        for chunk in parents
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .chunks(QUERY_CHUNK_SIZE)
+        {
+            let keys = chunk
+                .iter()
+                .map(RefnoEnum::to_pe_key)
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, in AS child, out AS parent, record::id(id)[1] AS ordinal \
+                 FROM [{keys}]<-pe_owner ORDER BY out, id{};",
+                self.version_suffix
+            );
+            let mut response = project_primary_db()
+                .query(sql)
+                .await
+                .map_err(|error| backend_error("hierarchy.edges", error))?
+                .check()
+                .map_err(|error| backend_error("hierarchy.edges", error))?;
+            let rows: Vec<HierarchyEdgeDbRow> = response
+                .take(0)
+                .map_err(|error| backend_error("hierarchy.edges.decode", error))?;
+            for row in rows {
+                let order =
+                    u32::try_from(row.ordinal).map_err(|_| GenerationReadError::BackendQuery {
+                        backend: "surreal-main",
+                        operation: "hierarchy.order",
+                        message: format!("value {} is outside u32", row.ordinal),
+                    })?;
+                edges.push(HierarchyEdgeRow {
+                    parent: row.parent,
+                    child: row.child,
+                    order,
+                });
+            }
+        }
+        Ok(edges)
+    }
+
+    async fn load_children_by_parents(
+        &self,
+        parents: &BTreeSet<RefnoEnum>,
+    ) -> GenerationReadResult<BTreeMap<RefnoEnum, Vec<RefnoEnum>>> {
+        let mut children = parents
+            .iter()
+            .copied()
+            .map(|parent| (parent, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for edge in self.load_hierarchy_edges(parents).await? {
+            children.entry(edge.parent).or_default().push(edge.child);
+        }
+        Ok(children)
+    }
+
     async fn load_pe_rows_by_refnos(
         &self,
         refnos: &BTreeSet<RefnoEnum>,
@@ -428,9 +548,9 @@ impl SurrealVersionedReadSession {
         }
         if let Some(has_children) = query.has_children {
             let predicate = if has_children {
-                "array::len(children) > 0"
+                "child_count > 0"
             } else {
-                "array::len(children) = 0"
+                "child_count = 0 OR child_count = NONE"
             };
             clauses.push(predicate.to_string());
         }
@@ -531,13 +651,23 @@ struct DbTypeRow {
     db_type: String,
 }
 
-fn element_from_pe(pe: SPdmsElement) -> GenerationReadResult<ElementSnapshot> {
-    let children = pe
-        .children
-        .unwrap_or_default()
-        .into_iter()
-        .map(RefnoEnum::from)
-        .collect::<Vec<_>>();
+#[derive(Debug, Deserialize, SurrealValue)]
+struct HierarchyEdgeDbRow {
+    child: RefnoEnum,
+    parent: RefnoEnum,
+    ordinal: i64,
+}
+
+struct HierarchyEdgeRow {
+    child: RefnoEnum,
+    parent: RefnoEnum,
+    order: u32,
+}
+
+fn element_from_pe(
+    pe: SPdmsElement,
+    children: Vec<RefnoEnum>,
+) -> GenerationReadResult<ElementSnapshot> {
     Ok(ElementSnapshot {
         refno: pe.refno,
         dbnum: checked_u32(pe.dbnum, "element.dbnum")?,
@@ -574,16 +704,34 @@ fn main_table_version_suffix(read_at: Option<&str>) -> GenerationReadResult<Stri
     Ok(format!(" VERSION d'{read_at}'"))
 }
 
+/// Decide whether a backend message means the requested `VERSION AT` instant
+/// fell below the storage GC floor.
+///
+/// A bare "invalid argument" is the generic Surreal/RocksDB parameter error.
+/// Classifying it as expired history reports a retention problem for what is
+/// actually a broken query, and sends the caller into a pointless source
+/// rescan, so the generic wordings only count alongside a versioning context.
+fn is_history_expired(lower: &str) -> bool {
+    const GC_FLOOR_MARKERS: [&str; 3] = [
+        "full_history_ts_low",
+        "below the garbage collection",
+        "smaller than full_history_ts",
+    ];
+    if GC_FLOOR_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    let generic_marker = lower.contains("invalidargument")
+        || lower.contains("invalid argument")
+        || lower.contains("retention");
+    let versioned_context = lower.contains("version")
+        || lower.contains("history")
+        || lower.contains("garbage collection");
+    generic_marker && versioned_context
+}
+
 fn backend_error(operation: &'static str, error: impl std::fmt::Display) -> GenerationReadError {
     let message = error.to_string();
-    let lower = message.to_ascii_lowercase();
-    let history_expired = lower.contains("invalidargument")
-        || lower.contains("invalid argument")
-        || lower.contains("below the garbage collection")
-        || lower.contains("full_history_ts_low")
-        || lower.contains("retention")
-            && (lower.contains("version") || lower.contains("history") || lower.contains("gc"));
-    if history_expired {
+    if is_history_expired(&message.to_ascii_lowercase()) {
         return GenerationReadError::HistoryExpired { operation, message };
     }
     GenerationReadError::BackendQuery {

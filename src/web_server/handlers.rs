@@ -8952,18 +8952,30 @@ async fn execute_refno_model_generation(
     // 处理结果
     match result {
         Ok(_) => {
-            // 成功 - 导出 bundle
+            // 成功 - 按配置导出 Parquet / 兼容 bundle
             let bundle_output_dir = PathBuf::from(format!("output/tasks/{}", task_id));
 
             // 更新进度：开始导出
             {
                 let mut task_manager = state.task_manager.lock().await;
                 if let Some(task) = task_manager.active_tasks.get_mut(&task_id) {
-                    task.update_progress("导出模型包".to_string(), 2, 3, 75.0);
-                    task.add_log(
-                        LogLevel::Info,
-                        "开始导出模型包 (GLB + instances.json + manifest.json)".to_string(),
+                    task.update_progress(
+                        if config.export_json {
+                            "导出模型包"
+                        } else {
+                            "导出 Parquet"
+                        }
+                        .to_string(),
+                        2,
+                        3,
+                        75.0,
                     );
+                    if config.export_json {
+                        task.add_log(
+                            LogLevel::Info,
+                            "开始导出模型包 (GLB + instances.json + manifest.json)".to_string(),
+                        );
+                    }
                     persist_task_progress(task);
                 }
             }
@@ -9054,22 +9066,30 @@ async fn execute_refno_model_generation(
                         persist_task_progress(&task);
                         task_manager.task_history.push(task);
                     }
+                    try_start_next_pending(state.clone());
                     return;
                 }
             }
 
-            let bundle_result = crate::web_server::instance_export::export_model_bundle_with_dbno(
-                &parsed_refnos,
-                &task_id,
-                &bundle_output_dir,
-                mesh_dir,
-                dbno,
-            )
-            .await;
+            let bundle_result = if config.export_json {
+                crate::web_server::instance_export::export_model_bundle_with_dbno(
+                    &parsed_refnos,
+                    &task_id,
+                    &bundle_output_dir,
+                    mesh_dir,
+                    dbno,
+                )
+                .await
+                .map(Some)
+            } else {
+                Ok(None)
+            };
 
             match bundle_result {
                 Ok(bundle_path) => {
-                    let bundle_url = format!("/files/output/tasks/{}/", task_id);
+                    let bundle_url = bundle_path
+                        .as_ref()
+                        .map(|_| format!("/files/output/tasks/{}/", task_id));
 
                     let mut task_manager = state.task_manager.lock().await;
                     if let Some(mut task) = task_manager.active_tasks.remove(&task_id) {
@@ -9086,15 +9106,20 @@ async fn execute_refno_model_generation(
                                 parsed_refnos.len()
                             ),
                         );
-                        task.add_log(LogLevel::Info, format!("Bundle 路径: {}", bundle_url));
+                        if let Some(bundle_url) = bundle_url {
+                            task.add_log(LogLevel::Info, format!("Bundle 路径: {}", bundle_url));
 
-                        // Store bundle_url in task metadata
-                        if task.metadata.is_none() {
-                            task.metadata = Some(serde_json::json!({}));
-                        }
-                        if let Some(metadata) = task.metadata.as_mut() {
-                            if let Some(obj) = metadata.as_object_mut() {
-                                obj.insert("bundle_url".to_string(), serde_json::json!(bundle_url));
+                            // Store bundle_url in task metadata
+                            if task.metadata.is_none() {
+                                task.metadata = Some(serde_json::json!({}));
+                            }
+                            if let Some(metadata) = task.metadata.as_mut() {
+                                if let Some(obj) = metadata.as_object_mut() {
+                                    obj.insert(
+                                        "bundle_url".to_string(),
+                                        serde_json::json!(bundle_url),
+                                    );
+                                }
                             }
                         }
 

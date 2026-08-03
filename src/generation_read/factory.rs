@@ -201,7 +201,8 @@ pub async fn resolve_input_version_manifest(
 ) -> GenerationReadResult<InputVersionManifest> {
     use aios_core::project_primary_db;
 
-    let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table GROUP BY dbnum;\n\
+    let sql = "SELECT dbnum, math::max(sesno) AS sesno FROM dbnum_info_table \
+               WHERE sesno != NONE GROUP BY dbnum;\n\
                SELECT dbnum, math::max(sesno) AS sesno FROM sesno_version_anchor \
                WHERE source IN ['full', 'incremental_baseline', 'incremental'] GROUP BY dbnum;";
     let backend_error =

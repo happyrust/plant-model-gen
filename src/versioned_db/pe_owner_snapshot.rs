@@ -1,7 +1,7 @@
 //! specs/023 M2/T6（D2 决策）：per-run 内存层级快照——生成/导出管线的 pe_owner 数据源。
 //!
 //! 与 `.tree`（TreeIndex）的本质差别：
-//! - **数据永远来自 SurrealDB pe 表**（`children` 字段序 = 同胞序，增量提交后即最新）；
+//! - 节点元数据来自 `pe`，子层级只来自 `pe_owner`；
 //! - 进程内按 dbnum 缓存一次加载，但**每次生成 run 开始必须显式失效**
 //!   （`invalidate_pe_snapshots()`，由 `gen_all_geos_data` 入口调用）——
 //!   这是本迁移要修的 §0-2/§0-3 缺陷（TreeIndex 永不失效 → 增量后静默漏元素），
@@ -9,8 +9,7 @@
 //!
 //! 查询语义逐条对齐 rs-core `tree_query::TreeIndex`（BFS 输出过滤 / prune_on_match /
 //! include_self / max_depth、ancestors root→parent、children 过滤），保证消费面切换后
-//! 结果 diff=0；额外加 visited 防环（`pe.children` 是数据字段，理论上可能脏成环，
-//! arena 结构性无环的保证在这里不存在）。
+//! 结果 diff=0；额外加 visited 防脏数据环。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -22,6 +21,8 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use surrealdb::types::SurrealValue;
+
+use crate::versioned_db::pe_owner_tree::PeOwnerTreeStore;
 
 /// 读分页大小（cursor 分页，非写 chunk 口径）；可用 `AIOS_PE_SNAPSHOT_PAGE_SIZE` 覆盖。
 fn snapshot_page_size() -> usize {
@@ -37,8 +38,11 @@ pub struct PeSnapshotNode {
     pub owner: RefU64,
     pub noun_hash: u32,
     pub cata_hash: Option<u64>,
-    /// pe.children 字段原序（同胞顺序权威来源）
+    /// 已知子节点，按 `pe_owner.order` 排列。
     pub children: Vec<RefU64>,
+    /// 子节点总数，含本次未解析因而不在 `children` 里的。`is_leaf` 只看它，
+    /// 否则 CATA 闭包裁剪解析时种子路径会把「有子但没解析」误判成叶子。
+    pub child_count: usize,
 }
 
 /// 单 dbnum 的内存层级快照（加载后只读，全部查询为纯内存同步操作）。
@@ -59,7 +63,7 @@ struct PeSnapshotRow {
     #[serde(default)]
     cata_hash: Option<String>,
     #[serde(default)]
-    children: Option<Vec<RefnoEnum>>,
+    child_count: Option<i64>,
 }
 
 fn filter_matches(
@@ -112,9 +116,7 @@ impl PeDbnumSnapshot {
     }
 
     fn is_leaf(&self, refno: RefU64) -> bool {
-        self.node(refno)
-            .map(|n| n.children.is_empty())
-            .unwrap_or(true)
+        self.node(refno).map(|n| n.child_count == 0).unwrap_or(true)
     }
 
     /// 与 `TreeIndex::node_meta` 同构（noun 为 db1_hash）。
@@ -127,7 +129,7 @@ impl PeDbnumSnapshot {
         })
     }
 
-    /// 直接子节点（pe.children 字段序），带 filter——对齐 `TreeIndex::collect_children`。
+    /// 直接子节点（pe_owner.order 序），带 filter——对齐 `TreeIndex::collect_children`。
     pub fn collect_children(&self, parent: RefU64, filter: &TreeQueryFilter) -> Vec<RefU64> {
         let Some(node) = self.node(parent) else {
             return Vec::new();
@@ -190,7 +192,7 @@ impl PeDbnumSnapshot {
             };
             let is_root = depth == 0;
             let has_geo = is_geo_noun_hash(node.noun_hash);
-            let is_leaf = node.children.is_empty();
+            let is_leaf = node.child_count == 0;
             let matched = !(is_root && !options.include_self)
                 && filter_matches(&options.filter, &meta, has_geo, is_leaf);
             if matched {
@@ -288,9 +290,14 @@ pub async fn get_or_load_pe_snapshot(dbnum: u32) -> anyhow::Result<Arc<PeDbnumSn
         .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
         .clone();
     let snap = cell
-        .get_or_try_init(|| async { load_snapshot_from_db(dbnum).await.map(Arc::new) })
+        .get_or_try_init(|| async { load_snapshot(dbnum).await.map(Arc::new) })
         .await?;
     Ok(snap.clone())
+}
+
+/// 当前阶段只从持久库构建快照；rkyv 只在解析侧生成，尚不接入消费端。
+async fn load_snapshot(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
+    load_snapshot_from_db(dbnum).await
 }
 
 /// 同步取已加载快照（供 sync 闭包/循环使用；调用前须先 preload）。
@@ -322,6 +329,7 @@ pub fn invalidate_pe_snapshot(dbnum: u32) {
 }
 
 async fn load_snapshot_from_db(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
+    crate::versioned_db::pe_owner_meta::require_bulk_ready(dbnum).await?;
     let started = std::time::Instant::now();
     let page = snapshot_page_size();
     let mut nodes: HashMap<RefU64, PeSnapshotNode> = HashMap::new();
@@ -331,11 +339,11 @@ async fn load_snapshot_from_db(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
         // cursor 分页（record id 天然有序）；避免 START offset 分页在大表上的 O(N²) 扫描。
         let sql = match &cursor {
             Some(last_key) => format!(
-                "SELECT id, owner, noun, cata_hash, children FROM pe \
+                "SELECT id, owner, noun, cata_hash, child_count FROM pe \
                  WHERE dbnum = {dbnum} AND id > {last_key} ORDER BY id LIMIT {page};"
             ),
             None => format!(
-                "SELECT id, owner, noun, cata_hash, children FROM pe \
+                "SELECT id, owner, noun, cata_hash, child_count FROM pe \
                  WHERE dbnum = {dbnum} ORDER BY id LIMIT {page};"
             ),
         };
@@ -348,6 +356,8 @@ async fn load_snapshot_from_db(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
         for row in rows {
             let refno = row.id.refno();
             let noun = row.noun.unwrap_or_default();
+            let child_count = row.child_count.unwrap_or_default();
+            anyhow::ensure!(child_count >= 0, "pe.child_count 不能为负数");
             nodes.insert(
                 refno,
                 PeSnapshotNode {
@@ -355,17 +365,20 @@ async fn load_snapshot_from_db(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
                     // db1_hash 同时注册 hash→name 反查（db1_dehash 依赖）
                     noun_hash: db1_hash(&noun),
                     cata_hash: row.cata_hash.and_then(|s| s.parse::<u64>().ok()),
-                    children: row
-                        .children
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| c.refno())
-                        .collect(),
+                    child_count: child_count as usize,
+                    children: Vec::new(),
                 },
             );
         }
         if fetched < page {
             break;
+        }
+    }
+
+    let parents: Vec<RefnoEnum> = nodes.keys().map(|refno| RefnoEnum::from(*refno)).collect();
+    for (parent, children) in PeOwnerTreeStore::children_batch(&parents).await? {
+        if let Some(node) = nodes.get_mut(&parent.refno()) {
+            node.children = children.into_iter().map(|child| child.refno()).collect();
         }
     }
 
@@ -375,7 +388,7 @@ async fn load_snapshot_from_db(dbnum: u32) -> anyhow::Result<PeDbnumSnapshot> {
         .collect();
 
     log::info!(
-        "[pe_snapshot] dbnum={} 加载完成: nodes={} roots={} elapsed_ms={}",
+        "[pe_snapshot] dbnum={} 加载完成: nodes={} roots={} elapsed_ms={} source=db",
         dbnum,
         nodes.len(),
         roots.len(),

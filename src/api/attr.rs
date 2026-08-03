@@ -153,6 +153,11 @@ pub fn convert_row_to_attmap(row: &MySqlRow, type_hash: i32, column_names: &[&st
                         row.try_get::<Vec<u8>, _>(t).map(|v| {
                             // 从数据库取到的 Vec<u8> 通常是不保证对齐的，必须先放入 AlignedVec
                             // 才能被 rkyv_bytes_unchecked 正确处理转化为 Vec<f64>
+                            //
+                            // WARNING(遗留 MySQL/sql 路径，默认 review 构建未编译)：此处用 rkyv
+                            // `from_bytes_unchecked` 读库内 DOUBLEVEC 字节。rkyv 0.8 的全局特性
+                            // (aligned/little_endian/pointer_width_64) 变更后旧字节可能静默脏读；
+                            // 若将来重新启用 `sql` 特性，请改用带 bytecheck 的 `rkyv::from_bytes`。
                             let mut aligned = rkyv::util::AlignedVec::with_capacity(v.len());
                             aligned.extend_from_slice(&v);
                             let v: Vec<f64> = unsafe { rkyv::from_bytes_unchecked(&aligned) }.unwrap_or_default();

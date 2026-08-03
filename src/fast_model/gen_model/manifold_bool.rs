@@ -231,29 +231,9 @@ fn load_manifold(id: &str, mat: DMat4, more_precision: bool) -> anyhow::Result<M
         let manifold =
             ManifoldRust::from_vertices_indices(&vertices, &unit_mesh.indices, mat, more_precision);
 
-        // 复用下面的"空/哨兵"校验逻辑
+        // 复用下面的"空/哨兵/退化"校验逻辑
 
-        let mesh = manifold.get_mesh();
-
-        if mesh.indices.is_empty() {
-            return Err(anyhow::anyhow!("单位 Manifold mesh 为空：id={}", id));
-        }
-
-        if let Some(aabb) = mesh.cal_aabb() {
-            let ext_mag = aabb.extents().magnitude();
-
-            if ext_mag.is_finite() && ext_mag < 1e-6 {
-                return Err(anyhow::anyhow!(
-                    "单位 Manifold mesh 可能为空（哨兵 cube）：id={} ext_mag={:.3e}",
-                    id,
-                    ext_mag
-                ));
-            }
-        } else {
-            return Err(anyhow::anyhow!("单位 Manifold mesh AABB 无效：id={}", id));
-        }
-
-        return Ok(manifold);
+        return validate_manifold_result(manifold, id);
     }
 
     // file 模式下，布尔执行前先尝试把本地 GLB 的 AABB 预热到 rkyv/内存缓存。
@@ -506,6 +486,12 @@ pub(crate) fn load_manifold_from_geo_param(
     validate_manifold_result(manifold, &geo_hash.to_string())
 }
 
+/// 单轴跨度小于此值（mm）即视为零体积退化体。
+///
+/// Manifold C++ 侧对零体积输入做布尔会直接崩进程（无 Rust panic、日志截断），
+/// 因此这类几何必须在进入布尔前就被拒收。取 1e-4mm 远小于任何真实构件厚度。
+const DEGENERATE_EXTENT_MM: f32 = 1e-4;
+
 /// 校验 Manifold 结果是否有效
 
 #[inline]
@@ -525,6 +511,21 @@ fn validate_manifold_result(manifold: ManifoldRust, id: &str) -> anyhow::Result<
                 "Manifold mesh 可能为空（哨兵 cube）: id={} ext_mag={:.3e}",
                 id,
                 ext_mag
+            ));
+        }
+
+        // 单轴塌陷（PHEI=0 的零长度焊缝 → 高 0 的圆柱）总跨度依然可观，
+        // 只看 magnitude 会放行，必须逐轴判。
+        let extents = aabb.extents();
+        let min_ext = extents.x.min(extents.y).min(extents.z);
+
+        if !min_ext.is_finite() || min_ext < DEGENERATE_EXTENT_MM {
+            return Err(anyhow::anyhow!(
+                "Manifold mesh 退化为零体积（单轴塌陷）: id={} extents=({:.4},{:.4},{:.4})",
+                id,
+                extents.x,
+                extents.y,
+                extents.z
             ));
         }
     } else {
@@ -551,6 +552,7 @@ fn is_source_level_manifold_error(err: &anyhow::Error) -> bool {
     msg.contains("Manifold mesh 为空")
         || msg.contains("Manifold mesh AABB 无效")
         || msg.contains("哨兵 cube")
+        || msg.contains("退化为零体积")
         || msg.contains("No such file or directory")
         || msg.contains("(os error 2)")
 }

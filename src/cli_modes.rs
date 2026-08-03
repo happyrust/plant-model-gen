@@ -1880,12 +1880,10 @@ fn start_generate_progress_heartbeat(
 
 async fn publish_model_gen_anchors_after_generation(
     db_option_ext: &DbOptionExt,
-    gen_result: &aios_database::fast_model::gen_model::GenModelResult,
     stage: &str,
 ) -> Result<Vec<aios_database::versioned_db::version_commit::ModelGenAnchor>> {
     aios_database::versioned_db::version_commit::publish_model_gen_anchors_after_generation(
         db_option_ext,
-        gen_result.success,
         stage,
         false,
     )
@@ -1964,8 +1962,7 @@ pub async fn run_generate_model(
     }
     aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
-    publish_model_gen_anchors_after_generation(&db_option_override, &gen_result, "generate")
-        .await?;
+    publish_model_gen_anchors_after_generation(&db_option_override, "generate").await?;
     println!("✅ 模型增量生成完成");
     Ok(gen_result)
 }
@@ -2076,7 +2073,7 @@ pub async fn run_regen_model(
     }
     aios_database::perf_metrics::finish_generate_stage_from_db(generate_ms).await;
     let gen_result = gen_result?;
-    publish_model_gen_anchors_after_generation(&db_option_override, &gen_result, "regen").await?;
+    publish_model_gen_anchors_after_generation(&db_option_override, "regen").await?;
     println!("✅ 模型重新生成完成");
     Ok(gen_result)
 }

@@ -7,7 +7,9 @@ use crate::fast_model::gen_model::resolve::resolve_desi_comp_with_session;
 use crate::fast_model::gen_model::{GenerationReadContext, session_query};
 use crate::fast_model::{debug_model, debug_model_debug, resolve_desi_comp};
 use aios_core::parsed_data::CateGeomsInfo;
-use aios_core::prim_geo::category::{CateCsgShape, try_convert_cate_geo_to_csg_shape};
+use aios_core::prim_geo::category::{
+    CateCsgShape, derive_implied_extent_from_axis_map, try_convert_cate_geo_to_csg_shape,
+};
 use aios_core::prim_geo::profile::create_profile_geos;
 use aios_core::{NamedAttrMap, RefnoEnum};
 use dashmap::DashMap;
@@ -230,6 +232,12 @@ async fn gen_cata_single_geoms_inner(
     let mut geo_count = 0;
     for (idx, geom) in geometries.iter().enumerate() {
         debug_model!("Processing geometry[{}]: {:?}", idx, geom);
+        // L*/S* 圆柱族兜底:显式范围/口径表达式为空时,由构件 p-point 跨距推导(E3D 隐含语义)
+        let geom = {
+            let mut g = geom.clone();
+            derive_implied_extent_from_axis_map(&mut g, &axis_map);
+            g
+        };
         match try_convert_cate_geo_to_csg_shape(&geom) {
             Some(cate_shape) => {
                 debug_model!("Successfully converted geometry[{}] to csg shape", idx);
@@ -254,6 +262,11 @@ async fn gen_cata_single_geoms_inner(
     let mut ngeo_count = 0;
     for (idx, geom) in n_geometries.iter().enumerate() {
         debug_model!("Processing n_geometry[{}]: {:?}", idx, geom);
+        let geom = {
+            let mut g = geom.clone();
+            derive_implied_extent_from_axis_map(&mut g, &axis_map);
+            g
+        };
         match try_convert_cate_geo_to_csg_shape(&geom) {
             Some(mut cate_shape) => {
                 debug_model!("Successfully converted n_geometry[{}] to csg shape", idx);

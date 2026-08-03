@@ -127,10 +127,28 @@ fn is_dependency_ref_attr(name: &str) -> bool {
 fn is_transform_attr(name: &str) -> bool {
     matches!(
         name,
-        "POS" | "POSL" | "POSS" | "POSE" | "NPOS" | "CPOS" | "PPOS" |
-        "ORI" | "PORI" | "YDIR" | "ZDIR" |
-        "ADIR" | "RDIR" | "LDIR" | "HDIR" | "TDIR" |
-        "PAXI" | "PZAXI" | "PLAX" | "BANG" | "HPOS" | "TPOS"
+        "POS"
+            | "POSL"
+            | "POSS"
+            | "POSE"
+            | "NPOS"
+            | "CPOS"
+            | "PPOS"
+            | "ORI"
+            | "PORI"
+            | "YDIR"
+            | "ZDIR"
+            | "ADIR"
+            | "RDIR"
+            | "LDIR"
+            | "HDIR"
+            | "TDIR"
+            | "PAXI"
+            | "PZAXI"
+            | "PLAX"
+            | "BANG"
+            | "HPOS"
+            | "TPOS"
     )
 }
 
@@ -260,8 +278,18 @@ mod tests {
     #[test]
     fn transform_catalogue_topology_and_dimensions_trigger_generation() {
         for name in [
-            "POS", "ORI", "OWNER", "children", "att.CATR", "SPRE", "DIAM", "XLEN", "HREF", "DDPR",
-            "PRTREF", "att.PRTREF",
+            "POS",
+            "ORI",
+            "OWNER",
+            "children",
+            "att.CATR",
+            "SPRE",
+            "DIAM",
+            "XLEN",
+            "HREF",
+            "DDPR",
+            "PRTREF",
+            "att.PRTREF",
         ] {
             assert!(attribute_affects_model(name), "{name}");
         }
@@ -322,11 +350,53 @@ mod tests {
         // 关键不变量：effect.affects_model() 必须与扁平 attribute_affects_model 完全一致，
         // 保证三态判定（以及增量管线的 trigger/neutral）行为零回归。
         let names = [
-            "NAME", "DESC", "PURP", "FUNCTION", "OWNER", "CHILDREN", "NOUN", "TYPE", "POS", "ORI",
-            "CATR", "SPRE", "SPCO", "SCOM", "PRTREF", "HREF", "TREF", "NGMR", "TMPL", "DPRO",
-            "DTRE", "HEIG", "DIAM", "RADI", "XLEN", "PARA", "PARAM", "PDIA", "PZAXI", "YDIR",
-            "ZDIR", "BANG", "LEAV", "CTYP", "JFRE", "NEG", "BOOL", "OBST", "LEVE", "PX", "PY",
-            "PZ", "att.CATR", "att.NAME", "ZZUNKNOWN", "SOMETHINGELSE", "",
+            "NAME",
+            "DESC",
+            "PURP",
+            "FUNCTION",
+            "OWNER",
+            "CHILDREN",
+            "NOUN",
+            "TYPE",
+            "POS",
+            "ORI",
+            "CATR",
+            "SPRE",
+            "SPCO",
+            "SCOM",
+            "PRTREF",
+            "HREF",
+            "TREF",
+            "NGMR",
+            "TMPL",
+            "DPRO",
+            "DTRE",
+            "HEIG",
+            "DIAM",
+            "RADI",
+            "XLEN",
+            "PARA",
+            "PARAM",
+            "PDIA",
+            "PZAXI",
+            "YDIR",
+            "ZDIR",
+            "BANG",
+            "LEAV",
+            "CTYP",
+            "JFRE",
+            "NEG",
+            "BOOL",
+            "OBST",
+            "LEVE",
+            "PX",
+            "PY",
+            "PZ",
+            "att.CATR",
+            "att.NAME",
+            "ZZUNKNOWN",
+            "SOMETHINGELSE",
+            "",
         ];
         for name in names {
             let effect = classify_attribute_model_effect(name);

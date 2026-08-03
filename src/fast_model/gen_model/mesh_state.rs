@@ -27,6 +27,10 @@ impl MeshAssetStore {
         if matches!(geo_hash, 1 | 2 | 3) {
             return true;
         }
+        self.path(geo_hash).is_some()
+    }
+
+    fn path(&self, geo_hash: u64) -> Option<PathBuf> {
         let hash = geo_hash.to_string();
         let lod_dir = self.base_dir.join(format!("lod_{}", self.default_lod));
         [
@@ -34,8 +38,8 @@ impl MeshAssetStore {
             lod_dir.join(format!("{}.glb", hash)),
             self.base_dir.join(format!("{}.glb", hash)),
         ]
-        .iter()
-        .any(|path| path.is_file())
+        .into_iter()
+        .find(|path| path.is_file())
     }
 }
 
@@ -61,17 +65,31 @@ pub fn get_cached_or_local_aabb(geo_hash: u64) -> Option<Aabb> {
 }
 
 pub fn get_cached_or_local_aabb_in_dir(mesh_dir: &Path, geo_hash: u64) -> Option<Aabb> {
-    if !mesh_file_exists_in_dir(mesh_dir, geo_hash) {
+    let store = MeshAssetStore::new(mesh_dir);
+    if !store.contains(geo_hash) {
         return None;
     }
     let key = geo_hash.to_string();
-    let cached_aabb = EXIST_MESH_GEO_HASHES.get(&key)?;
-    let cached = *cached_aabb;
-    if is_valid_cached_aabb(&cached) {
-        Some(cached)
-    } else {
-        None
+    if let Some(cached_aabb) = EXIST_MESH_GEO_HASHES.get(&key) {
+        let cached = *cached_aabb;
+        if is_valid_cached_aabb(&cached) {
+            return Some(cached);
+        }
     }
+
+    let mesh = crate::fast_model::export_model::import_glb::import_glb_to_mesh(
+        &store.path(geo_hash)?,
+    )
+    .ok()?;
+    let mut aabb = Aabb::new_invalid();
+    for vertex in mesh.vertices {
+        aabb.take_point(vertex.into());
+    }
+    if !is_valid_cached_aabb(&aabb) {
+        return None;
+    }
+    EXIST_MESH_GEO_HASHES.insert(key, aabb);
+    Some(aabb)
 }
 
 pub fn prime_cached_aabb_for_mesh_ids<'a>(mesh_ids: impl IntoIterator<Item = &'a str>) {

@@ -1556,6 +1556,11 @@ async fn gen_cata_geos_inner(
 
                 }
 
+                // 组内代表是否产出过实体几何：成员路径的 is_solid 必须与代表实际结果一致，
+                // 不能写死 true（否则代表 shape 全部无效时成员会成为“有实例、零几何”的假实体）。
+                // 非 cata 路径（process_cata=false）不经代表生成，维持原 is_solid=true 语义。
+                let mut group_has_solid = !process_cata;
+
                 // inst_info 不存在：需要生成元件库几何（并产出 inst_info/inst_geo/geo_relate 等）。
 
                 if process_cata && (force_regen_cata || !target_exist_inst) {
@@ -3434,6 +3439,7 @@ async fn gen_cata_geos_inner(
                                 );
 
                                 log_cata_refno_generated(&ele_refno, &geos_info, "generated");
+                                group_has_solid |= geos_info.is_solid;
                                 shape_insts_data.insert_info(ele_refno, geos_info.clone());
 
                                 shape_insts_data
@@ -3442,13 +3448,19 @@ async fn gen_cata_geos_inner(
 
                             } else {
 
+                                // shape 全部无效/为空：仍写入 info（is_solid=false），保证 inst_relate/ptset
+                                // 可查（ATTA 等无实体名词及退化目录几何依赖），并与组员路径对称，
+                                // 避免“代表缺席、成员空壳”的覆盖统计失真。
                                 debug_model_debug!(
 
-                                    "[WARN] geos_data.insts is empty, NOT inserting for ele_refno={}",
+                                    "[WARN] geos_data.insts is empty, inserting hollow info for ele_refno={}",
 
                                     ele_refno
 
                                 );
+
+                                log_cata_refno_generated(&ele_refno, &geos_info, "generated_empty");
+                                shape_insts_data.insert_info(ele_refno, geos_info.clone());
 
                             }
 
@@ -3616,7 +3628,8 @@ async fn gen_cata_geos_inner(
 
                         ptset_map: cur_ptset_map,
 
-                        is_solid: true,
+                        // 与组代表的实际产出保持一致：代表几何全部无效时成员不得标记为实体
+                        is_solid: group_has_solid,
 
                         tubi: tubi_data,
 

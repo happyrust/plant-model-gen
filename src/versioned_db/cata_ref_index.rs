@@ -339,8 +339,7 @@ struct CountRow {
 /// 的标量投影——后者在 fork/标准引擎间行为不一（标准引擎仍返回 `[{count}]`），
 /// 用带字段的结构体反序列化两侧都稳。
 pub async fn count_index_rows(dbnum: u32) -> anyhow::Result<usize> {
-    let sql =
-        format!("SELECT count() FROM cata_ref_index WHERE source_dbnum = {dbnum} GROUP ALL;");
+    let sql = format!("SELECT count() FROM cata_ref_index WHERE source_dbnum = {dbnum} GROUP ALL;");
     let rows: Vec<CountRow> = project_primary_db().query_take(&sql, 0).await?;
     Ok(rows
         .into_iter()

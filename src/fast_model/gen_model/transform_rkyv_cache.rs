@@ -167,8 +167,25 @@ pub(crate) fn load_dbnum_cache_if_fresh(
     };
 
     let file: TransformCacheFileV1 =
-        rkyv::from_bytes::<TransformCacheFileV1, rkyv::rancor::Error>(&data)
-            .map_err(|e| anyhow::anyhow!("transform rkyv 反序列化失败: {:?}", e))?;
+        match rkyv::from_bytes::<TransformCacheFileV1, rkyv::rancor::Error>(&data) {
+            Ok(file) => file,
+            Err(e) => {
+                // rkyv 布局/校验变更后旧缓存无法解码：不做兼容，删坏文件当 miss 重建。
+                log::warn!(
+                    "[transform_rkyv_cache] 缓存解码失败，删除坏文件并重建: {} ({e:?})",
+                    path.display()
+                );
+                if let Err(rm) = std::fs::remove_file(&path) {
+                    if rm.kind() != ErrorKind::NotFound {
+                        log::warn!(
+                            "[transform_rkyv_cache] 删除坏缓存失败: {} ({rm})",
+                            path.display()
+                        );
+                    }
+                }
+                return Ok(None);
+            }
+        };
 
     let expected_source = source_version_for_dbnum(dbnum);
     if file.version != TRANSFORM_CACHE_VERSION

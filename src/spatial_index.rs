@@ -57,6 +57,7 @@ impl SqliteSpatialIndex {
         let conn = Connection::open(self.inner.path())?;
         conn.execute("DELETE FROM aabb_index", [])?;
         conn.execute("DELETE FROM items", [])?;
+        crate::sqlite_index::bump_index_generation();
         Ok(())
     }
 

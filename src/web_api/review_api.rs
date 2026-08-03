@@ -7,7 +7,7 @@
 
 use axum::{
     Router,
-    extract::{Json, Multipart, Path, Query, Request, State},
+    extract::{Json, Multipart, Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -296,6 +296,9 @@ pub struct ReviewAttachment {
     pub url: String,
     pub size: Option<i64>,
     pub mime_type: Option<String>,
+    /// 上传时间（毫秒时间戳）；旧数据可能缺失
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_at: Option<i64>,
 }
 
 /// 提资单
@@ -753,6 +756,51 @@ fn attachment_from_value(value: &Value) -> ReviewAttachment {
         mime_type: map
             .and_then(|entry| entry.get("mime_type").or_else(|| entry.get("mimeType")))
             .and_then(value_to_string),
+        uploaded_at: map
+            .and_then(|entry| entry.get("uploaded_at").or_else(|| entry.get("uploadedAt")))
+            .and_then(value_to_timestamp_millis),
+    }
+}
+
+/// 校审附件允许的扩展名白名单（与前端 FileUploadSection acceptTypes 保持一致）
+const REVIEW_ATTACHMENT_ALLOWED_EXTENSIONS: &[&str] = &[
+    "pdf", "dwg", "dxf", "xls", "xlsx", "csv", "doc", "docx", "png", "jpg", "jpeg",
+];
+
+/// 单文件大小上限（50MB）
+const REVIEW_ATTACHMENT_MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+
+/// 请求体上限（50MB 文件 + multipart 报文开销余量）
+pub(crate) const REVIEW_ATTACHMENT_BODY_LIMIT_BYTES: usize = 52 * 1024 * 1024;
+
+fn mime_type_for_extension(ext: &str) -> Option<String> {
+    let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let mime = match normalized.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "dwg" => "image/vnd.dwg",
+        "dxf" => "image/vnd.dxf",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// 对可在线预览的格式做文件头（magic bytes）校验，防止伪装文件借在线预览执行。
+/// 返回 false 表示声明的扩展名与实际内容不匹配。
+fn attachment_content_matches_extension(ext: &str, data: &[u8]) -> bool {
+    match ext {
+        "pdf" => data.starts_with(b"%PDF-"),
+        "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        "jpg" | "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+        // 其余格式（Office/CAD/CSV）不做内容校验，仅下载查看，不参与在线预览
+        _ => true,
     }
 }
 
@@ -765,6 +813,10 @@ pub(crate) async fn query_review_attachments_by_form_id(
         download_url: Option<String>,
         description: Option<String>,
         file_ext: Option<String>,
+        file_name: Option<String>,
+        file_size: Option<i64>,
+        mime_type: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
     }
 
     let db = fresh_review_db().await?;
@@ -772,7 +824,8 @@ pub(crate) async fn query_review_attachments_by_form_id(
         "review.attachments.by_form_id",
         db.query(
             r#"
-            SELECT file_id, download_url, description, file_ext
+            SELECT file_id, download_url, description, file_ext,
+                   file_name, file_size, mime_type, created_at
             FROM review_attachment
             WHERE form_id = $form_id
             "#,
@@ -785,27 +838,33 @@ pub(crate) async fn query_review_attachments_by_form_id(
     Ok(rows
         .into_iter()
         .map(|row| {
-            let description = row.description.unwrap_or_default();
-            let normalized_name = description.trim();
+            let display_name = row
+                .file_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    row.description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("未命名附件")
+                .to_string();
+            let ext_mime = row.file_ext.as_deref().and_then(mime_type_for_extension);
             ReviewAttachment {
                 id: row.file_id.unwrap_or_default(),
-                name: if normalized_name.is_empty() {
-                    "未命名附件".to_string()
-                } else {
-                    normalized_name.to_string()
-                },
+                name: display_name,
                 url: row.download_url.unwrap_or_default(),
-                size: None,
-                mime_type: row.file_ext.and_then(|ext| {
-                    let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
-                    match normalized.as_str() {
-                        "png" => Some("image/png".to_string()),
-                        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
-                        "gif" => Some("image/gif".to_string()),
-                        "pdf" => Some("application/pdf".to_string()),
-                        _ => None,
-                    }
-                }),
+                size: row.file_size,
+                mime_type: row
+                    .mime_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .or(ext_mime),
+                uploaded_at: row.created_at.as_ref().map(|dt| dt.timestamp_millis()),
             }
         })
         .filter(|attachment| !attachment.id.trim().is_empty() || !attachment.url.trim().is_empty())
@@ -1207,7 +1266,7 @@ struct TaskRecordContext {
     approver_id: String,
 }
 
-async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
+async fn lookup_task_record_context(id: &str) -> anyhow::Result<Option<TaskRecordContext>> {
     #[derive(Debug, Deserialize, SurrealValue)]
     struct TaskContextRow {
         form_id: Option<String>,
@@ -1218,7 +1277,7 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
         approver_id: Option<String>,
     }
 
-    let db = fresh_review_db().await.ok()?;
+    let db = fresh_review_db().await?;
     let mut resp = await_review_query(
         "review.tasks.context",
         db.query(
@@ -1226,21 +1285,24 @@ async fn lookup_task_record_context(id: &str) -> Option<TaskRecordContext> {
         )
         .bind(("id", id.to_string())),
     )
-    .await
-        .ok()?;
+    .await?;
     let rows: Vec<TaskContextRow> = resp.take(0).unwrap_or_default();
-    let row = rows.into_iter().next()?;
-    let form_id = normalize_optional_string(row.form_id)?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(form_id) = normalize_optional_string(row.form_id) else {
+        return Ok(None);
+    };
     let current_node =
         normalize_optional_string(row.current_node).unwrap_or_else(default_current_node);
-    Some(TaskRecordContext {
+    Ok(Some(TaskRecordContext {
         form_id,
         current_node,
         requester_id: normalize_optional_string(row.requester_id).unwrap_or_default(),
         checker_id: normalize_optional_string(row.checker_id).unwrap_or_default(),
         reviewer_id: normalize_optional_string(row.reviewer_id).unwrap_or_default(),
         approver_id: normalize_optional_string(row.approver_id).unwrap_or_default(),
-    })
+    }))
 }
 
 fn current_node_owner_for_task_row<'a>(
@@ -1320,6 +1382,98 @@ fn format_owner_mismatch_error(
          浏览器侧的 /tasks/{{id}}/{{submit,return,approve,reject}} 不适用于外部驱动场景。",
         operator_user, node_name, current_node, owner_source, owner_id, owner_source
     )
+}
+
+/// 任务写操作的操作者授权。
+///
+/// 背景：`review_auth_middleware` 只做认证不做授权；`submit_to_next_node` /
+/// `return_to_node` / 附件上传各自内联了操作者校验，但任务本身的增删改、
+/// start-review、cancel 这些旁路写操作此前完全不校验操作者，等于“持任意有效
+/// token 即可改他人单子”。这里统一补上。
+///
+/// 授权策略（必须兼容双驱动模式，不能把外部 PMS 驱动的正常调用挡掉）：
+/// - 内部模式：task 配置了节点负责人时，要求 `claims.user_id` 为**当前节点负责人**
+///   或**发起人**（requester）之一；
+/// - 外部驱动模式：task 的 requester/checker/approver/reviewer **全部为空**
+///   （PMS 不在 plant3d 侧维护 owner 命名空间，owner 由 PMS 每次 sync 显式声明），
+///   本侧无从判定 owner，放行以保持与现状一致，授权由 PMS 侧负责；
+/// - task 不存在或已删除 → Err(404)。
+async fn authorize_task_write(
+    id: &str,
+    claims: &TokenClaims,
+) -> Result<TaskRow, (StatusCode, String)> {
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+    let db = fresh_review_db().await.map_err(|e| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("连接校审数据库超时: {}", e),
+        )
+    })?;
+    let mut resp = await_review_query(
+        "review.tasks.authorize.get",
+        db.query(get_sql).bind(("id", id.to_string())),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询任务失败: {}", e),
+        )
+    })?;
+    let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+    let task = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("任务不存在或已删除: {}", id)))?;
+
+    let current_node = task
+        .current_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sj")
+        .to_string();
+    let (owner_ref, _owner_source) = current_node_owner_for_task_row(&task, &current_node);
+    let owner_id = owner_ref.to_string();
+
+    let field = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or("").to_string();
+    let requester = field(&task.requester_id);
+    let checker = field(&task.checker_id);
+    let approver = field(&task.approver_id);
+    let reviewer = field(&task.reviewer_id);
+
+    // 外部驱动模式：本侧没有任何 owner 可判定，放行（授权在 PMS 侧）。
+    let any_owner_configured = [&requester, &checker, &approver, &reviewer]
+        .iter()
+        .any(|s| !s.is_empty());
+    if !any_owner_configured {
+        return Ok(task);
+    }
+
+    let actor = claims.user_id.trim();
+    if !actor.is_empty() && (actor == owner_id || actor == requester) {
+        Ok(task)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "权限不足：用户 {} 既不是任务发起人（{}）也不是当前节点「{}」负责人（{}），无权执行该写操作。\
+                 外部驱动（PMS 嵌入态）请改用 POST /api/review/workflow/sync 推进。",
+                if actor.is_empty() { "<空>" } else { actor },
+                if requester.is_empty() {
+                    "<空>"
+                } else {
+                    requester.as_str()
+                },
+                current_node,
+                if owner_id.is_empty() {
+                    "<空>"
+                } else {
+                    owner_id.as_str()
+                },
+            ),
+        ))
+    }
 }
 
 fn current_node_owner_for_task_context<'a>(
@@ -1496,6 +1650,8 @@ fn plan_dimension_document_version(
 async fn lookup_task_form_id(id: &str) -> Option<String> {
     lookup_task_record_context(id)
         .await
+        .ok()
+        .flatten()
         .map(|context| context.form_id)
 }
 
@@ -1505,27 +1661,12 @@ async fn lookup_task_form_id(id: &str) -> Option<String> {
 
 pub fn create_review_api_routes() -> Router {
     use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, review_auth_middleware};
+    use axum::extract::DefaultBodyLimit;
     use axum::middleware;
-    async fn ensure_review_db_context(
-        request: Request,
-        next: axum::middleware::Next,
-    ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-        if let Err(error) = crate::web_api::review_db::ensure_review_primary_db_context().await {
-            let db_option = aios_core::get_db_option();
-            warn!(
-                "review api primary db context ensure failed: ns={}, db={}, error={}",
-                db_option.surreal_ns, db_option.project_name, error
-            );
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "code": 504,
-                    "message": format!("校审数据库上下文切换失败: {}", error),
-                })),
-            ));
-        }
-        Ok(next.run(request).await)
-    }
+
+    // 注意：这里不再挂 ensure_review_primary_db_context 前置中间件。
+    // 各 handler 已统一使用 fresh_review_db() 建立独立连接；继续在每个请求前
+    // 触碰可能已锁死的全局 ws 连接正是历史上 /api/review/* 整体 504 的直接诱因。
 
     Router::new()
         // 提资单 CRUD
@@ -1578,8 +1719,12 @@ pub fn create_review_api_routes() -> Router {
             "/api/review/annotations/{annotation_id}/severity",
             patch(update_annotation_severity),
         )
-        // 附件 API
-        .route("/api/review/attachments", post(upload_attachment))
+        // 附件 API（上传路由单独放宽 body 限制：50MB 文件 + multipart 开销）
+        .route(
+            "/api/review/attachments",
+            post(upload_attachment)
+                .layer(DefaultBodyLimit::max(REVIEW_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/api/review/attachments/{attachment_id}",
             delete(delete_attachment),
@@ -1602,7 +1747,68 @@ pub fn create_review_api_routes() -> Router {
             REVIEW_AUTH_CONFIG.clone(),
             review_auth_middleware,
         ))
-        .layer(middleware::from_fn(ensure_review_db_context))
+        // 健康探针：注册在 .layer() 之后，绕过 JWT 与业务中间件，供部署探针 / PMS 预检使用。
+        // 不改变 /api/health 的站点存活语义，只回答“校审数据库当前是否可查询”。
+        .route("/api/review/health", get(review_health))
+}
+
+/// GET /api/review/health - 校审数据库健康探针
+///
+/// 使用独立连接执行最小查询；不经过 JWT / 校审中间件。
+async fn review_health() -> Response {
+    let started = std::time::Instant::now();
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.health] connect failed elapsed_ms={} error={}",
+                started.elapsed().as_millis(),
+                error
+            );
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "database": "unreachable",
+                    "operation": "review.health.connect",
+                    "elapsedMs": started.elapsed().as_millis() as u64,
+                    "message": format!("校审数据库连接失败: {}", error),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match await_review_query("review.health.probe", db.query("RETURN 1")).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "database": "healthy",
+                "elapsedMs": started.elapsed().as_millis() as u64,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.health] probe failed elapsed_ms={} error={}",
+                started.elapsed().as_millis(),
+                error
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "database": "unhealthy",
+                    "operation": "review.health.probe",
+                    "elapsedMs": started.elapsed().as_millis() as u64,
+                    "message": format!("校审数据库查询失败: {}", error),
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ============================================================================
@@ -2194,10 +2400,25 @@ async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
 
 /// PATCH /api/review/tasks/:id - 更新任务
 async fn update_task(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
     let started = std::time::Instant::now();
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.update_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(TaskResponse {
+                success: false,
+                task: None,
+                error_message: Some(message),
+            }),
+        );
+    }
     info!(
         "[REVIEW_API.update_task] start task_id={} fields_set=[title={} description={} priority={} components={} due_date={} attachments={}]",
         id,
@@ -2335,9 +2556,26 @@ async fn update_task(
 }
 
 /// DELETE /api/review/tasks/:id - 软删除任务（与 PMS 入站删除一致；不向 PMS 回调）
-async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
+async fn delete_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     let started = std::time::Instant::now();
     info!("[REVIEW_API.delete_task] start task_id={}", id);
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.delete_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
     let form_id = lookup_task_form_id(&id).await;
 
     let soft_sql = r#"
@@ -2417,7 +2655,26 @@ async fn delete_task(Path(id): Path<String>) -> impl IntoResponse {
 // ============================================================================
 
 /// POST /api/review/tasks/:id/start-review - 开始审核（兼容旧 API，映射到 jd 节点）
-async fn start_review(Path(id): Path<String>) -> impl IntoResponse {
+async fn start_review(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // 堵旁门：start-review 会把任务从 sj 推进到 jd，此前不校验操作者，等于绕过
+    // submit_to_next_node 的节点负责人校验直接推进状态机。这里补上同源授权。
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.start_review] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
     update_task_status(id, "in_review".to_string(), Some("jd".to_string()), None).await
 }
 
@@ -2463,9 +2720,24 @@ async fn reject_task(
 
 /// POST /api/review/tasks/:id/cancel - 取消任务
 async fn cancel_task(
+    Extension(claims): Extension<TokenClaims>,
     Path(id): Path<String>,
     Json(request): Json<ReviewActionRequest>,
 ) -> impl IntoResponse {
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.cancel_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
     update_task_status(id, "cancelled".to_string(), None, request.reason).await
 }
 
@@ -2818,22 +3090,43 @@ async fn create_record(
 ) -> impl IntoResponse {
     info!("Creating confirmed record for task: {}", request.task_id);
 
-    let Some(task_context) = lookup_task_record_context(&request.task_id).await else {
-        warn!(
-            "Failed to resolve task context for confirmed record: task_id={}",
-            request.task_id
-        );
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ConfirmedRecordResponse {
-                success: false,
-                record: None,
-                records: None,
-                error_message: Some(
-                    "保存记录失败：未找到当前校审任务，无法解析 form_id 与流程节点".to_string(),
-                ),
-            }),
-        );
+    let task_context = match lookup_task_record_context(&request.task_id).await {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+            warn!(
+                "Failed to resolve task context for confirmed record: task_id={}",
+                request.task_id
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(
+                        "保存记录失败：未找到当前校审任务，无法解析 form_id 与流程节点".to_string(),
+                    ),
+                }),
+            );
+        }
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.records.create] task context failed: task_id={}, error={}",
+                request.task_id, error
+            );
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!(
+                        "review.records.create.task_context: 连接校审数据库超时: {}",
+                        error
+                    )),
+                }),
+            );
+        }
     };
 
     let operator_id = claims.user_id.trim().to_string();
@@ -5407,8 +5700,106 @@ pub struct AttachmentUploadResponse {
     pub error_message: Option<String>,
 }
 
+/// 附件接口统一错误响应：结构化 JSON，带操作名、耗时和 formId/taskId 便于诊断。
+fn attachment_error_response(
+    status: StatusCode,
+    message: String,
+    operation: &'static str,
+    started: std::time::Instant,
+    form_id: Option<&str>,
+    task_id: Option<&str>,
+) -> Response {
+    warn!(
+        "[REVIEW_API.attachment] FAIL op={} status={} elapsed_ms={} form_id={:?} task_id={:?} reason={}",
+        operation,
+        status.as_u16(),
+        started.elapsed().as_millis(),
+        form_id,
+        task_id,
+        message
+    );
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "error_message": message,
+            "operation": operation,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+            "formId": form_id,
+            "taskId": task_id,
+        })),
+    )
+        .into_response()
+}
+
+/// 上传/删除共用的任务上下文行（权限判断 + 附件投影维护）
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AttachmentTaskContextRow {
+    logical_id: Option<String>,
+    form_id: Option<String>,
+    components: Option<Vec<ReviewComponent>>,
+    requester_id: Option<String>,
+    current_node: Option<String>,
+    attachments: Option<Vec<ReviewAttachment>>,
+}
+
+const ATTACHMENT_TASK_CONTEXT_BY_ID_SQL: &str = "SELECT record::id(id) AS logical_id, form_id, components, requester_id, current_node, attachments \
+     FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+
+const ATTACHMENT_TASK_CONTEXT_BY_FORM_SQL: &str = "SELECT record::id(id) AS logical_id, form_id, components, requester_id, current_node, attachments \
+     FROM review_tasks WHERE form_id = $form_id AND (deleted IS NONE OR deleted = false) ORDER BY created_at ASC LIMIT 1";
+
+/// 已有任务的附件编辑权限：仅任务发起人在 sj（设计）节点可上传/删除。
+/// 返回 None 表示允许；Some(message) 表示拒绝原因。
+fn attachment_edit_denied_reason(
+    claims: &TokenClaims,
+    task: &AttachmentTaskContextRow,
+) -> Option<String> {
+    let current_node = task
+        .current_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sj");
+    if current_node != "sj" {
+        return Some(format!(
+            "当前任务位于「{}」节点，仅设计（sj）节点允许编辑附件；其余节点只能查看和下载",
+            current_node
+        ));
+    }
+    let requester_id = task
+        .requester_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if requester_id.is_empty() || requester_id != claims.user_id {
+        return Some(format!(
+            "仅任务发起人可编辑附件（发起人={}，当前用户={}）",
+            if requester_id.is_empty() {
+                "<未记录>"
+            } else {
+                requester_id
+            },
+            claims.user_id
+        ));
+    }
+    None
+}
+
 /// POST /api/review/attachments - 上传附件
-async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
+///
+/// 校验顺序（先验证、后落盘）：
+/// 1. multipart 解析（请求体超限 → 413，不再静默丢字段）
+/// 2. 单文件 ≤ 50MB → 413
+/// 3. 扩展名白名单 → 415；PDF/PNG/JPEG 文件头校验 → 415
+/// 4. 解析并验证 formId/taskId 与上传权限 → 400/403
+/// 5. 落盘 → 入库 → 同步 review_tasks.attachments 投影；
+///    入库/投影失败回滚已写文件与记录，避免孤儿文件。
+async fn upload_attachment(
+    Extension(claims): Extension<TokenClaims>,
+    mut multipart: Multipart,
+) -> Response {
+    let started = std::time::Instant::now();
     info!("Uploading attachment");
 
     fn normalize_attachment_file_type(raw: Option<&str>) -> String {
@@ -5431,10 +5822,30 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     let mut description: Option<String> = None;
     let mut file_name: Option<String> = None;
     let mut file_data: Option<Vec<u8>> = None;
-    let mut mime_type: Option<String> = None;
 
-    // 解析 multipart 表单
-    while let Ok(Some(field)) = multipart.next_field().await {
+    // 解析 multipart 表单：显式处理解析错误（请求体超限返回 413，而不是静默丢字段后报“缺少文件”）
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                let status = error.status();
+                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "文件超过 50MB 上限".to_string()
+                } else {
+                    format!("附件表单解析失败: {}", error)
+                };
+                return attachment_error_response(
+                    status,
+                    message,
+                    "review.attachments.parse_multipart",
+                    started,
+                    form_id.as_deref(),
+                    task_id.as_deref(),
+                );
+            }
+        };
+
         let name: String = field.name().unwrap_or("").to_string();
         let field_name = name.trim().to_ascii_lowercase();
 
@@ -5476,9 +5887,24 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
             }
             "file" => {
                 file_name = field.file_name().map(|s: &str| s.to_string());
-                mime_type = field.content_type().map(|s: &str| s.to_string());
-                if let Ok(bytes) = field.bytes().await {
-                    file_data = Some(bytes.to_vec());
+                match field.bytes().await {
+                    Ok(bytes) => file_data = Some(bytes.to_vec()),
+                    Err(error) => {
+                        let status = error.status();
+                        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                            "文件超过 50MB 上限".to_string()
+                        } else {
+                            format!("附件内容读取失败: {}", error)
+                        };
+                        return attachment_error_response(
+                            status,
+                            message,
+                            "review.attachments.read_file",
+                            started,
+                            form_id.as_deref(),
+                            task_id.as_deref(),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -5489,13 +5915,13 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     let file_name = match file_name {
         Some(name) => name,
         None => {
-            return (
+            return attachment_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(AttachmentUploadResponse {
-                    success: false,
-                    attachment: None,
-                    error_message: Some("缺少文件".to_string()),
-                }),
+                "缺少文件".to_string(),
+                "review.attachments.validate",
+                started,
+                form_id.as_deref(),
+                task_id.as_deref(),
             );
         }
     };
@@ -5503,58 +5929,70 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     let file_data = match file_data {
         Some(data) => data,
         None => {
-            return (
+            return attachment_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(AttachmentUploadResponse {
-                    success: false,
-                    attachment: None,
-                    error_message: Some("文件数据为空".to_string()),
-                }),
+                "文件数据为空".to_string(),
+                "review.attachments.validate",
+                started,
+                form_id.as_deref(),
+                task_id.as_deref(),
             );
         }
     };
 
-    // 生成附件 ID 和保存路径
-    let attachment_id = format!("att-{}", uuid::Uuid::new_v4());
+    // 单文件大小限制（服务端强制，独立于请求体限制）
+    if file_data.len() > REVIEW_ATTACHMENT_MAX_FILE_BYTES {
+        return attachment_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "文件超过 50MB 上限（当前 {:.1}MB）",
+                file_data.len() as f64 / 1024.0 / 1024.0
+            ),
+            "review.attachments.validate_size",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
+        );
+    }
+
+    // 扩展名白名单（与前端一致），并统一规范化为小写
     let file_ext = std::path::Path::new(&file_name)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let stored_name = format!("{}.{}", attachment_id, file_ext);
-
-    // 确保上传目录存在
-    let upload_dir = "assets/review_attachments";
-    if let Err(e) = std::fs::create_dir_all(upload_dir) {
-        warn!("Failed to create upload directory: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AttachmentUploadResponse {
-                success: false,
-                attachment: None,
-                error_message: Some(format!("创建上传目录失败: {}", e)),
-            }),
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !REVIEW_ATTACHMENT_ALLOWED_EXTENSIONS.contains(&file_ext.as_str()) {
+        return attachment_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!(
+                "不支持的文件类型「.{}」，允许：PDF、DWG、DXF、XLS/XLSX、CSV、DOC/DOCX、PNG、JPG/JPEG",
+                file_ext
+            ),
+            "review.attachments.validate_ext",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
         );
     }
 
-    // 保存文件
-    let file_path = format!("{}/{}", upload_dir, stored_name);
-    if let Err(e) = std::fs::write(&file_path, &file_data) {
-        warn!("Failed to save file: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AttachmentUploadResponse {
-                success: false,
-                attachment: None,
-                error_message: Some(format!("保存文件失败: {}", e)),
-            }),
+    // 可在线预览格式做文件头校验，禁止伪装文件进入在线预览
+    if !attachment_content_matches_extension(&file_ext, &file_data) {
+        return attachment_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("文件内容与扩展名「.{}」不匹配，已拒绝", file_ext),
+            "review.attachments.validate_magic",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
         );
     }
 
-    let file_size = file_data.len() as i64;
-    let url = format!("/files/review_attachments/{}", stored_name);
-
-    // 写入 workflow 附件表（用于 /api/review/workflow/sync 汇总）
-    // form_id：优先请求传入；否则尝试从 task_id 反查 review_tasks.form_id
+    // 先解析并验证 formId/taskId 与权限，再落盘
+    let trimmed_task_id = task_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let mut resolved_form_id = form_id
         .as_ref()
         .map(|s| s.trim())
@@ -5565,69 +6003,90 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     let db = match fresh_review_db().await {
         Ok(db) => db,
         Err(e) => {
-            warn!("upload_attachment: failed to connect review db: {}", e);
-            return (
+            return attachment_error_response(
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(AttachmentUploadResponse {
-                    success: false,
-                    attachment: None,
-                    error_message: Some(format!("连接校审数据库超时: {}", e)),
-                }),
+                format!("校审附件服务暂不可用（连接数据库超时）: {}", e),
+                "review.attachments.connect",
+                started,
+                resolved_form_id.as_deref(),
+                trimmed_task_id.as_deref(),
             );
         }
     };
 
-    if resolved_form_id.is_none() {
-        if let Some(tid) = task_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            #[derive(Debug, Deserialize, SurrealValue)]
-            struct TaskLookupRow {
-                form_id: Option<String>,
-                components: Option<Vec<ReviewComponent>>,
+    // 已有任务：反查任务上下文（form_id / refnos / 权限 / 附件投影）
+    let mut task_context: Option<AttachmentTaskContextRow> = None;
+    if let Some(tid) = trimmed_task_id.as_deref() {
+        match await_review_query(
+            "review.attachments.task_lookup",
+            db.query(ATTACHMENT_TASK_CONTEXT_BY_ID_SQL)
+                .bind(("id", tid.to_string())),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<AttachmentTaskContextRow> = resp.take(0).unwrap_or_default();
+                task_context = rows.into_iter().next();
             }
-
-            let sql = "SELECT form_id, components FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
-            if let Ok(mut resp) = await_review_query(
-                "review.attachments.task_lookup",
-                db.query(sql).bind(("id", tid.to_string())),
-            )
-            .await
-            {
-                let rows: Vec<TaskLookupRow> = resp.take(0).unwrap_or_default();
-                if let Some(row) = rows.into_iter().next() {
-                    resolved_form_id = row
-                        .form_id
-                        .as_ref()
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-
-                    if resolved_model_refnos.is_empty() {
-                        let mut set = HashSet::<String>::new();
-                        if let Some(comps) = row.components {
-                            for c in comps {
-                                let refno = c.ref_no.trim();
-                                if !refno.is_empty() {
-                                    set.insert(refno.to_string());
-                                }
-                            }
-                        }
-                        resolved_model_refnos = set.into_iter().collect();
-                    }
-                }
+            Err(e) => {
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("校审附件服务暂不可用（任务查询超时）: {}", e),
+                    "review.attachments.task_lookup",
+                    started,
+                    resolved_form_id.as_deref(),
+                    trimmed_task_id.as_deref(),
+                );
             }
         }
     }
 
+    if let Some(task) = task_context.as_ref() {
+        // 已有任务：后端强制执行编辑权限（仅发起人 + sj 节点）
+        if let Some(reason) = attachment_edit_denied_reason(&claims, task) {
+            return attachment_error_response(
+                StatusCode::FORBIDDEN,
+                reason,
+                "review.attachments.permission",
+                started,
+                resolved_form_id.as_deref(),
+                trimmed_task_id.as_deref(),
+            );
+        }
+
+        if resolved_form_id.is_none() {
+            resolved_form_id = task
+                .form_id
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+        }
+        if resolved_model_refnos.is_empty() {
+            let mut set = HashSet::<String>::new();
+            if let Some(comps) = task.components.as_ref() {
+                for c in comps {
+                    let refno = c.ref_no.trim();
+                    if !refno.is_empty() {
+                        set.insert(refno.to_string());
+                    }
+                }
+            }
+            resolved_model_refnos = set.into_iter().collect();
+        }
+    }
+    // 创建任务前上传（仅 formId）：已认证设计人员即可，claims 由 JWT 中间件保证存在
+
     let resolved_form_id = match resolved_form_id {
         Some(v) => v,
         None => {
-            return (
+            return attachment_error_response(
                 StatusCode::BAD_REQUEST,
-                Json(AttachmentUploadResponse {
-                    success: false,
-                    attachment: None,
-                    error_message: Some("缺少 formId（且无法由 taskId 反查）".to_string()),
-                }),
+                "缺少 formId（且无法由 taskId 反查）".to_string(),
+                "review.attachments.validate_lineage",
+                started,
+                None,
+                trimmed_task_id.as_deref(),
             );
         }
     };
@@ -5641,7 +6100,51 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         .map(|s| s.to_string())
         .unwrap_or_else(|| file_name.clone());
 
+    // 生成附件 ID；存储文件名只使用附件 UUID + 规范化扩展名，原始文件名仅作显示元数据
+    let attachment_id = format!("att-{}", uuid::Uuid::new_v4());
+    let stored_name = format!("{}.{}", attachment_id, file_ext);
     let file_ext_with_dot = format!(".{}", file_ext);
+    let resolved_mime = mime_type_for_extension(&file_ext);
+
+    // 确保上传目录存在
+    let upload_dir = "assets/review_attachments";
+    if let Err(e) = std::fs::create_dir_all(upload_dir) {
+        return attachment_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建上传目录失败: {}", e),
+            "review.attachments.mkdir",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
+        );
+    }
+
+    // 保存文件（校验全部通过后才落盘）
+    let file_path = format!("{}/{}", upload_dir, stored_name);
+    if let Err(e) = std::fs::write(&file_path, &file_data) {
+        return attachment_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存文件失败: {}", e),
+            "review.attachments.write_file",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
+        );
+    }
+
+    // 失败回滚：删除已写文件，避免孤儿文件
+    let rollback_file = |reason: &str| {
+        if let Err(remove_error) = std::fs::remove_file(&file_path) {
+            warn!(
+                "[REVIEW_API.upload_attachment] rollback file failed path={} reason={} remove_error={}",
+                file_path, reason, remove_error
+            );
+        }
+    };
+
+    let file_size = file_data.len() as i64;
+    let url = format!("/files/review_attachments/{}", stored_name);
+    let uploaded_at_millis = chrono::Utc::now().timestamp_millis();
 
     let insert_sql = r#"
         CREATE review_attachment CONTENT {
@@ -5652,6 +6155,9 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
             download_url: $download_url,
             description: $description,
             file_ext: $file_ext,
+            file_name: $file_name,
+            file_size: $file_size,
+            mime_type: $mime_type,
             created_at: time::now()
         }
     "#;
@@ -5659,24 +6165,27 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
     if let Err(e) = await_review_query(
         "review.attachments.insert",
         db.query(insert_sql)
-            .bind(("form_id", resolved_form_id))
+            .bind(("form_id", resolved_form_id.clone()))
             .bind(("model_refnos", resolved_model_refnos))
             .bind(("file_id", attachment_id.clone()))
             .bind(("file_type", resolved_file_type))
             .bind(("download_url", url.clone()))
             .bind(("description", resolved_description))
-            .bind(("file_ext", file_ext_with_dot)),
+            .bind(("file_ext", file_ext_with_dot))
+            .bind(("file_name", file_name.clone()))
+            .bind(("file_size", file_size))
+            .bind(("mime_type", resolved_mime.clone())),
     )
     .await
     {
-        warn!("Failed to insert review_attachment: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(AttachmentUploadResponse {
-                success: false,
-                attachment: None,
-                error_message: Some(format!("附件入库失败: {}", e)),
-            }),
+        rollback_file("insert review_attachment failed");
+        return attachment_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("附件入库失败（已回滚文件）: {}", e),
+            "review.attachments.insert",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
         );
     }
 
@@ -5686,12 +6195,60 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
         name: file_name,
         url,
         size: Some(file_size),
-        mime_type,
+        mime_type: resolved_mime,
+        uploaded_at: Some(uploaded_at_millis),
     };
 
+    // 上传到已有任务：同步 review_tasks.attachments 兼容投影
+    if let Some(task) = task_context.as_ref() {
+        if let Some(task_logical_id) = task
+            .logical_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut projected = task.attachments.clone().unwrap_or_default();
+            projected.retain(|item| item.id != attachment.id);
+            projected.push(attachment.clone());
+
+            if let Err(e) = await_review_query(
+                "review.attachments.project_to_task",
+                db.query(
+                    "UPDATE review_tasks SET attachments = $attachments, updated_at = time::now() \
+                     WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
+                )
+                .bind(("attachments", projected))
+                .bind(("id", task_logical_id.to_string())),
+            )
+            .await
+            {
+                // 投影失败时回滚附件行 + 文件，保持“上传成功=各处可见”的一致性
+                let _ = await_review_query(
+                    "review.attachments.insert_rollback",
+                    db.query("DELETE review_attachment WHERE file_id = $file_id")
+                        .bind(("file_id", attachment_id.clone())),
+                )
+                .await;
+                rollback_file("project to review_tasks.attachments failed");
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("附件任务投影更新失败（已回滚）: {}", e),
+                    "review.attachments.project_to_task",
+                    started,
+                    Some(resolved_form_id.as_str()),
+                    trimmed_task_id.as_deref(),
+                );
+            }
+        }
+    }
+
     info!(
-        "Attachment uploaded: id={}, task_id={:?}",
-        attachment_id, task_id
+        "[REVIEW_API.upload_attachment] OK id={} form_id={} task_id={:?} size={} elapsed_ms={}",
+        attachment_id,
+        resolved_form_id,
+        trimmed_task_id,
+        file_size,
+        started.elapsed().as_millis()
     );
 
     (
@@ -5702,107 +6259,256 @@ async fn upload_attachment(mut multipart: Multipart) -> impl IntoResponse {
             error_message: None,
         }),
     )
+        .into_response()
 }
 
 /// DELETE /api/review/attachments/:attachment_id - 删除附件
-async fn delete_attachment(Path(attachment_id): Path<String>) -> impl IntoResponse {
+///
+/// 一致性删除：数据库记录 → review_tasks.attachments 投影 → 磁盘文件。
+/// 任一步失败返回明确错误，避免界面显示“已删除”但文件/记录仍残留。
+/// 权限：附件关联任务存在时，仅任务发起人且当前节点为 sj 可删除。
+async fn delete_attachment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(attachment_id): Path<String>,
+) -> Response {
+    let started = std::time::Instant::now();
     info!("Deleting attachment: {}", attachment_id);
 
-    // 尝试删除文件（支持多种扩展名）
     let upload_dir = "assets/review_attachments";
-    let extensions = ["png", "jpg", "jpeg", "gif", "pdf", "bin"];
-    let mut deleted = false;
+
     let db = match fresh_review_db().await {
-        Ok(db) => Some(db),
+        Ok(db) => db,
         Err(e) => {
-            warn!(
-                "delete_attachment: failed to connect review db, will only try local file deletion: {}",
-                e
+            return attachment_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("校审附件服务暂不可用（连接数据库超时）: {}", e),
+                "review.attachments.delete_connect",
+                started,
+                None,
+                None,
             );
-            None
         }
     };
 
-    // 优先使用 DB 中记录的 file_ext
-    let mut db_ext: Option<String> = None;
-    if let Some(db) = &db {
-        if let Ok(mut resp) = await_review_query(
-            "review.attachments.ext_lookup",
-            db.query("SELECT file_ext FROM review_attachment WHERE file_id = $file_id LIMIT 1")
-                .bind(("file_id", attachment_id.clone())),
+    // 读取附件记录（扩展名来自数据库，不再依赖固定扩展名数组猜测）
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct AttachmentLookupRow {
+        file_ext: Option<String>,
+        form_id: Option<String>,
+    }
+
+    let attachment_row: Option<AttachmentLookupRow> = match await_review_query(
+        "review.attachments.delete_lookup",
+        db.query(
+            "SELECT file_ext, form_id FROM review_attachment WHERE file_id = $file_id LIMIT 1",
+        )
+        .bind(("file_id", attachment_id.clone())),
+    )
+    .await
+    {
+        Ok(mut resp) => {
+            let rows: Vec<AttachmentLookupRow> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            return attachment_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("校审附件服务暂不可用（附件查询超时）: {}", e),
+                "review.attachments.delete_lookup",
+                started,
+                None,
+                None,
+            );
+        }
+    };
+
+    let attachment_row = match attachment_row {
+        Some(row) => row,
+        None => {
+            return attachment_error_response(
+                StatusCode::NOT_FOUND,
+                format!("附件不存在或已删除: {}", attachment_id),
+                "review.attachments.delete_lookup",
+                started,
+                None,
+                None,
+            );
+        }
+    };
+
+    let form_id = attachment_row
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // 附件关联任务存在时，强制执行编辑权限（仅发起人 + sj 节点）
+    let mut task_context: Option<AttachmentTaskContextRow> = None;
+    if let Some(fid) = form_id.as_deref() {
+        match await_review_query(
+            "review.attachments.delete_task_lookup",
+            db.query(ATTACHMENT_TASK_CONTEXT_BY_FORM_SQL)
+                .bind(("form_id", fid.to_string())),
         )
         .await
         {
-            #[derive(Debug, Deserialize, SurrealValue)]
-            struct ExtRow {
-                file_ext: Option<String>,
+            Ok(mut resp) => {
+                let rows: Vec<AttachmentTaskContextRow> = resp.take(0).unwrap_or_default();
+                task_context = rows.into_iter().next();
             }
-            let rows: Vec<ExtRow> = resp.take(0).unwrap_or_default();
-            db_ext = rows.into_iter().next().and_then(|r| r.file_ext);
-        }
-    }
-
-    if let Some(ext) = db_ext.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let normalized = ext.trim_start_matches('.');
-        let file_path = format!("{}/{}.{}", upload_dir, attachment_id, normalized);
-        if std::path::Path::new(&file_path).exists() {
-            if let Err(e) = std::fs::remove_file(&file_path) {
-                warn!("Failed to delete file {}: {}", file_path, e);
-            } else {
-                deleted = true;
+            Err(e) => {
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("校审附件服务暂不可用（任务查询超时）: {}", e),
+                    "review.attachments.delete_task_lookup",
+                    started,
+                    form_id.as_deref(),
+                    None,
+                );
             }
         }
     }
 
-    for ext in &extensions {
-        if deleted {
-            break;
-        }
-        let file_path = format!("{}/{}.{}", upload_dir, attachment_id, ext);
-        if std::path::Path::new(&file_path).exists() {
-            if let Err(e) = std::fs::remove_file(&file_path) {
-                warn!("Failed to delete file {}: {}", file_path, e);
-            } else {
-                deleted = true;
-                break;
-            }
+    if let Some(task) = task_context.as_ref() {
+        if let Some(reason) = attachment_edit_denied_reason(&claims, task) {
+            return attachment_error_response(
+                StatusCode::FORBIDDEN,
+                reason,
+                "review.attachments.delete_permission",
+                started,
+                form_id.as_deref(),
+                task.logical_id.as_deref(),
+            );
         }
     }
 
-    if let Some(db) = &db {
-        let _ = await_review_query(
-            "review.attachments.delete",
-            db.query(
-                r#"
-            LET $ids = SELECT VALUE id FROM review_attachment WHERE file_id = $file_id;
-            DELETE $ids;
-            "#,
-            )
+    // 1) 删除数据库记录
+    if let Err(e) = await_review_query(
+        "review.attachments.delete",
+        db.query("DELETE review_attachment WHERE file_id = $file_id")
             .bind(("file_id", attachment_id.clone())),
-        )
-        .await;
+    )
+    .await
+    {
+        return attachment_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("附件记录删除失败: {}", e),
+            "review.attachments.delete",
+            started,
+            form_id.as_deref(),
+            None,
+        );
     }
 
-    if deleted {
-        (
-            StatusCode::OK,
-            Json(ActionResponse {
-                success: true,
-                message: Some("附件已删除".to_string()),
-                error_message: None,
-            }),
-        )
-    } else {
-        // 文件可能已被删除，仍返回成功
-        (
-            StatusCode::OK,
-            Json(ActionResponse {
-                success: true,
-                message: Some("附件记录已清除".to_string()),
-                error_message: None,
-            }),
-        )
+    // 2) 同步 review_tasks.attachments 投影（防止 hydrate 时从投影“复活”已删附件）
+    if let Some(task) = task_context.as_ref() {
+        if let Some(task_logical_id) = task
+            .logical_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut projected = task.attachments.clone().unwrap_or_default();
+            let before = projected.len();
+            projected.retain(|item| item.id != attachment_id);
+            if projected.len() != before {
+                if let Err(e) = await_review_query(
+                    "review.attachments.delete_project",
+                    db.query(
+                        "UPDATE review_tasks SET attachments = $attachments, updated_at = time::now() \
+                         WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
+                    )
+                    .bind(("attachments", projected))
+                    .bind(("id", task_logical_id.to_string())),
+                )
+                .await
+                {
+                    return attachment_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "附件记录已删除，但任务附件投影更新失败，请刷新后重试: {}",
+                            e
+                        ),
+                        "review.attachments.delete_project",
+                        started,
+                        form_id.as_deref(),
+                        Some(task_logical_id),
+                    );
+                }
+            }
+        }
     }
+
+    // 3) 删除磁盘文件：优先数据库记录的扩展名；缺失时按附件 ID 前缀扫描目录兜底
+    let mut file_paths_to_delete: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(ext) = attachment_row
+        .file_ext
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let normalized = ext.trim_start_matches('.');
+        file_paths_to_delete.push(
+            std::path::PathBuf::from(upload_dir).join(format!("{}.{}", attachment_id, normalized)),
+        );
+    } else if let Ok(entries) = std::fs::read_dir(upload_dir) {
+        let prefix = format!("{}.", attachment_id);
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with(&prefix))
+                .unwrap_or(false)
+            {
+                file_paths_to_delete.push(entry.path());
+            }
+        }
+    }
+
+    let mut removed_any_file = false;
+    for path in &file_paths_to_delete {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            return attachment_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "附件记录已删除，但磁盘文件删除失败（{}）: {}",
+                    path.display(),
+                    e
+                ),
+                "review.attachments.delete_file",
+                started,
+                form_id.as_deref(),
+                None,
+            );
+        }
+        removed_any_file = true;
+    }
+
+    info!(
+        "[REVIEW_API.delete_attachment] OK id={} form_id={:?} removed_file={} elapsed_ms={}",
+        attachment_id,
+        form_id,
+        removed_any_file,
+        started.elapsed().as_millis()
+    );
+
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            success: true,
+            message: Some(if removed_any_file {
+                "附件已删除".to_string()
+            } else {
+                "附件记录已清除（磁盘文件不存在）".to_string()
+            }),
+            error_message: None,
+        }),
+    )
+        .into_response()
 }
 
 // ============================================================================

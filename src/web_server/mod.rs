@@ -39,6 +39,7 @@ pub mod db_startup_handlers;
 pub mod db_startup_manager;
 pub mod db_status_handlers;
 pub mod db_status_template;
+pub mod generation_lock;
 pub mod incremental_update_handlers;
 pub mod instance_export;
 pub mod layout;
@@ -71,6 +72,126 @@ pub mod topology_handlers; // 拓扑配置处理器
 pub mod web_listen; // 当前进程 HTTP 监听与站点身份（一 web_server 一站）
 pub mod wizard_handlers;
 pub mod wizard_template; // 模型实时补齐 + parquet 增量队列
+
+/// 校审附件静态响应统一附加 `X-Content-Type-Options: nosniff`，
+/// 阻止浏览器对附件内容做 MIME 嗅探（Content-Type 本身由 ServeDir 按扩展名设置）。
+///
+/// 同时补齐 `Content-Disposition`：磁盘上只有 `att-<uuid>.<ext>`，不带该响应头时
+/// 「另存为」「新窗口打开后保存」「跨源下载」都会拿到 UUID 文件名。
+/// 调用方通过 `?name=<原始文件名>` 传显示名，`?download=1` 强制下载。
+async fn attachment_response_headers_middleware(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let uri = request.uri().clone();
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+
+    if response.status().is_success() {
+        let stored_name = uri.path().rsplit('/').next().unwrap_or_default();
+        if !stored_name.is_empty() {
+            let disposition =
+                build_attachment_content_disposition(stored_name, uri.query().unwrap_or_default());
+            if let Ok(value) = header::HeaderValue::from_str(&disposition) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, value);
+            }
+        }
+    }
+
+    response
+}
+
+/// 附件显示名长度上限（字符数）；超长的一律回退到磁盘文件名。
+const ATTACHMENT_DISPLAY_NAME_MAX_CHARS: usize = 120;
+
+/// ServeDir 会忽略查询串，这里自行取出并做百分号解码（`+` 按表单编码约定还原为空格）。
+fn attachment_query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        if name != key {
+            return None;
+        }
+        urlencoding::decode(&value.replace('+', " "))
+            .ok()
+            .map(|decoded| decoded.into_owned())
+    })
+}
+
+fn attachment_extension_lower(name: &str) -> Option<String> {
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+}
+
+/// 解析客户端请求的显示文件名。
+///
+/// 该值来自查询串，必须清洗后才能进响应头：控制字符与路径分隔符替换掉（防响应头注入
+/// 与路径歧义），长度设上限，且扩展名必须与磁盘文件一致——否则回退磁盘文件名，
+/// 避免用真实附件的字节冒充另一种类型的文件下发。
+fn resolve_attachment_display_name(stored_name: &str, requested: Option<&str>) -> String {
+    let Some(raw) = requested else {
+        return stored_name.to_string();
+    };
+
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '/' | '\\' | '"' => '_',
+            other => other,
+        })
+        .collect();
+    let cleaned = cleaned.trim();
+
+    if cleaned.is_empty() || cleaned.chars().count() > ATTACHMENT_DISPLAY_NAME_MAX_CHARS {
+        return stored_name.to_string();
+    }
+    if attachment_extension_lower(cleaned) != attachment_extension_lower(stored_name) {
+        return stored_name.to_string();
+    }
+
+    cleaned.to_string()
+}
+
+/// 组装 `Content-Disposition`：ASCII 回退名 + RFC 5987 的 `filename*`，兼顾中文名与老浏览器。
+fn build_attachment_content_disposition(stored_name: &str, query: &str) -> String {
+    let force_download = matches!(
+        attachment_query_param(query, "download").as_deref(),
+        Some("1") | Some("true")
+    );
+    let display_name = resolve_attachment_display_name(
+        stored_name,
+        attachment_query_param(query, "name").as_deref(),
+    );
+
+    let ascii_fallback: String = display_name
+        .chars()
+        .map(|c| {
+            if c == ' ' || (c.is_ascii_graphic() && c != '"' && c != '\\') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    format!(
+        "{}; filename=\"{}\"; filename*=UTF-8''{}",
+        if force_download {
+            "attachment"
+        } else {
+            "inline"
+        },
+        ascii_fallback,
+        urlencoding::encode(&display_name)
+    )
+}
 
 pub(crate) fn is_loopback_or_unspecified_host(host: &str) -> bool {
     let normalized = host
@@ -1181,10 +1302,22 @@ pub async fn start_web_server_with_config(
             post(handlers::api_space_steel_relative),
         )
         .route("/api/space/tray-span", post(handlers::api_space_tray_span))
+        .route(
+            "/api/space/nearest-points",
+            post(sqlite_spatial_api::api_space_nearest_points),
+        )
         // SQLite RTree 空间索引：AABB 粗筛查询（供前端按需加载/最近点测量使用）
         .route(
             "/api/sqlite-spatial/query",
             get(sqlite_spatial_api::api_sqlite_spatial_query),
+        )
+        .route(
+            "/api/sqlite-spatial/nearby/refnos",
+            get(sqlite_spatial_api::api_sqlite_spatial_nearby_refnos),
+        )
+        .route(
+            "/api/sqlite-spatial/backfill-names",
+            post(sqlite_spatial_api::api_sqlite_spatial_backfill_names),
         )
         .route(
             "/api/sqlite-spatial/nearby",
@@ -1291,10 +1424,12 @@ pub async fn start_web_server_with_config(
         })
         // CBA 文件分发服务 - 用于远程站点下载增量数据包
         .nest_service("/assets/archives", ServeDir::new("assets/archives"))
-        // 校审附件文件服务
+        // 校审附件文件服务（响应统一带 nosniff + Content-Disposition，见中间件说明）
         .nest_service(
             "/files/review_attachments",
-            ServeDir::new("assets/review_attachments"),
+            Router::new()
+                .fallback_service(ServeDir::new("assets/review_attachments"))
+                .layer(middleware::from_fn(attachment_response_headers_middleware)),
         )
         // 主页面
         .route("/", get(console_root_redirect))

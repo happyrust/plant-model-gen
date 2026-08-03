@@ -1,16 +1,4 @@
-//! specs/023：pe_owner 历史可信分界元记录（`pe_owner_version_meta`）。
-//!
-//! 每 dbnum 一条 `pe_owner_version_meta:<dbnum>`，记录"自哪个 sesno（含）起
-//! pe_owner 边由解析链路持续维护"。读侧（e3d_tree_api 版本分支）据此在
-//! pe_owner 主路径与 pe.children 回退路径之间选择（FR-008）：
-//! `requested_sesno >= maintained_since_sesno` → pe_owner；否则 → pe.children。
-//!
-//! 写入时机（data-model.md 状态迁移）：
-//! - 全量重灌完成：UPSERT 重置（source=`full_reload`）
-//! - 存量重建 CLI：UPSERT（source=`rebuild_cli`）
-//! - **增量不写 meta**：增量只维护"本批变更过的 owner"的边；若站点曾在旧二进制下跑过
-//!   增量（边未维护、已陈旧），首个新增量并不能修复陈旧边，此时打可信标记会产生
-//!   静默错误历史。可信起点只能由全量重灌或重建 CLI 建立。
+//! `pe_owner` 覆盖起点与最近一次全量审计状态。
 
 use aios_core::project_primary_db;
 use serde::Deserialize;
@@ -24,7 +12,9 @@ static PE_OWNER_META_SCHEMA_INIT: OnceCell<()> = OnceCell::const_new();
 
 #[derive(Debug, Deserialize, SurrealValue)]
 struct MetaRow {
-    maintained_since_sesno: i64,
+    maintained_since_sesno: Option<i64>,
+    #[serde(default)]
+    bulk_state: Option<String>,
 }
 
 /// 幂等 schema；进程内成功一次后不再重复执行，失败不缓存、下次重试。
@@ -34,8 +24,13 @@ pub async fn ensure_pe_owner_version_meta_schema() -> anyhow::Result<()> {
             let sql = r#"
 DEFINE TABLE IF NOT EXISTS pe_owner_version_meta SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS dbnum ON TABLE pe_owner_version_meta TYPE int;
-DEFINE FIELD IF NOT EXISTS maintained_since_sesno ON TABLE pe_owner_version_meta TYPE int;
+DEFINE FIELD IF NOT EXISTS maintained_since_sesno ON TABLE pe_owner_version_meta TYPE option<int>;
 DEFINE FIELD IF NOT EXISTS source ON TABLE pe_owner_version_meta TYPE string ASSERT $value IN ['full_reload', 'rebuild_cli'];
+DEFINE FIELD IF NOT EXISTS bulk_state ON TABLE pe_owner_version_meta TYPE string DEFAULT 'not_ready' ASSERT $value IN ['not_ready', 'ready'];
+DEFINE FIELD IF NOT EXISTS verified_sesno ON TABLE pe_owner_version_meta TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS node_count ON TABLE pe_owner_version_meta TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS edge_count ON TABLE pe_owner_version_meta TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS hierarchy_hash ON TABLE pe_owner_version_meta TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS updated_at ON TABLE pe_owner_version_meta TYPE datetime DEFAULT time::now();
 "#;
             project_primary_db()
@@ -50,28 +45,70 @@ DEFINE FIELD IF NOT EXISTS updated_at ON TABLE pe_owner_version_meta TYPE dateti
     Ok(())
 }
 
-/// 读取 dbnum 的 pe_owner 可信起点 sesno；记录缺失返回 None（读侧应回退 pe.children）。
+/// 读取 dbnum 的 pe_owner 历史覆盖起点；它不代表最近一次全量审计水位。
 pub async fn get_maintained_since(dbnum: u32) -> anyhow::Result<Option<u32>> {
     ensure_pe_owner_version_meta_schema().await?;
-    let sql = format!("SELECT maintained_since_sesno FROM pe_owner_version_meta:{dbnum};");
+    let sql =
+        format!("SELECT maintained_since_sesno, bulk_state FROM pe_owner_version_meta:{dbnum};");
     let mut response = project_primary_db().query(sql).await?.check()?;
     let rows: Vec<MetaRow> = response.take(0)?;
     Ok(rows
         .into_iter()
         .next()
-        .map(|row| row.maintained_since_sesno.max(0) as u32))
+        .filter(|row| row.bulk_state.as_deref() == Some("ready"))
+        .and_then(|row| row.maintained_since_sesno)
+        .map(|sesno| sesno.max(0) as u32))
 }
 
-/// UPSERT 可信起点（full_reload / rebuild_cli 语义：重置分界）。
-pub async fn upsert_maintained_since(dbnum: u32, sesno: u32, source: &str) -> anyhow::Result<()> {
+pub async fn require_bulk_ready(dbnum: u32) -> anyhow::Result<()> {
+    ensure_pe_owner_version_meta_schema().await?;
+    let sql = format!("SELECT VALUE bulk_state FROM pe_owner_version_meta:{dbnum};");
+    let mut response = project_primary_db().query(sql).await?.check()?;
+    let states: Vec<Option<String>> = response.take(0)?;
+    anyhow::ensure!(
+        states.into_iter().flatten().next().as_deref() == Some("ready"),
+        "dbnum={dbnum} pe_owner 尚未通过全量完整性审计"
+    );
+    Ok(())
+}
+
+/// 全量写入前调用。失败时调用方必须在修改 PE/pe_owner 前中止。
+pub async fn mark_bulk_not_ready(dbnum: u32, source: &str) -> anyhow::Result<()> {
     ensure_pe_owner_version_meta_schema().await?;
     let sql = format!(
-        "UPSERT pe_owner_version_meta:{dbnum} SET dbnum = {dbnum}, \
-         maintained_since_sesno = {sesno}, source = $source, updated_at = time::now();"
+        "UPSERT pe_owner_version_meta:{dbnum} SET dbnum = {dbnum}, source = $source, \
+         maintained_since_sesno = maintained_since_sesno ?? 0, bulk_state = 'not_ready', \
+         verified_sesno = NONE, node_count = NONE, \
+         edge_count = NONE, hierarchy_hash = NONE, updated_at = time::now();"
     );
     project_primary_db()
         .query(sql)
         .bind(("source", source.to_string()))
+        .await?
+        .check()?;
+    Ok(())
+}
+
+/// worker 全部完成且持久数据审计通过后发布 Ready。
+pub async fn publish_bulk_ready(
+    dbnum: u32,
+    sesno: u32,
+    source: &str,
+    node_count: usize,
+    edge_count: usize,
+    hierarchy_hash: &str,
+) -> anyhow::Result<()> {
+    ensure_pe_owner_version_meta_schema().await?;
+    let sql = format!(
+        "UPSERT pe_owner_version_meta:{dbnum} SET dbnum = {dbnum}, \
+         maintained_since_sesno = {sesno}, source = $source, bulk_state = 'ready', \
+         verified_sesno = {sesno}, node_count = {node_count}, edge_count = {edge_count}, \
+         hierarchy_hash = $hierarchy_hash, updated_at = time::now();"
+    );
+    project_primary_db()
+        .query(sql)
+        .bind(("source", source.to_string()))
+        .bind(("hierarchy_hash", hierarchy_hash.to_string()))
         .await?
         .check()?;
     Ok(())

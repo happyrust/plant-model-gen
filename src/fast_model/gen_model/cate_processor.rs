@@ -30,11 +30,8 @@ pub async fn process_cate_refno_page(
     let target_cata_map = match build_cata_hash_map_from_session(&generation_read, refnos).await {
         Ok(map) => Arc::new(map),
         Err(e) => {
-            // Direct 路径保留历史错误语义：记录并跳过当前 CATE 页面。
-            eprintln!(
-                "[cate_processor] build_cata_hash_map_from_tree 失败（将跳过 CATE）: {}",
-                e
-            );
+            // 跳过整页会让这些 CATE 静默无几何，而 run 仍以成功收尾并推进
+            // model_gen 水位；诊断照记，但错误必须上抛。
             super::cache_miss_report::with_global_report(|r| {
                 r.record_simple_miss(
                     "generate",
@@ -42,7 +39,10 @@ pub async fn process_cate_refno_page(
                     Some("build_cata_hash_map_from_tree failed (missing db_meta or tree files?)"),
                 )
             });
-            return Ok(());
+            return Err(e.context(format!(
+                "build_cata_hash_map_from_session failed for {} CATE refnos",
+                refnos.len()
+            )));
         }
     };
 

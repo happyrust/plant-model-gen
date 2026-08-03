@@ -744,8 +744,8 @@ impl ModelWriterBackend for SurrealModelWriterBackend {
         mesh_aabb_map: &DashMap<String, Aabb>,
         mesh_pts_map: &DashMap<u64, String>,
     ) -> anyhow::Result<ModelWriterStageReport> {
+        crate::fast_model::gen_model::mesh_state::flush_aabb_cache();
         if crate::fast_model::gen_model::mesh_state::use_file_mesh_state() {
-            crate::fast_model::gen_model::mesh_state::flush_aabb_cache();
             return Ok(ModelWriterStageReport::skipped(
                 "final_sweep",
                 "file mesh state active; flushed aabb cache",

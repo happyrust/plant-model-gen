@@ -126,8 +126,7 @@ impl DbIndexStore {
                     fingerprint  TEXT    NOT NULL DEFAULT '',
                     scanned_at   TEXT    NOT NULL DEFAULT ''
                 );
-                -- 以 (dbnum, ref0) 为主键：同一 dbnum 的 ref0 自动去重，且天然支持
-                -- 「按 dbnum 查其全部 ref0」；file_name 记录该库的 dbfile。
+                -- 同一 dbnum 可拥有多个 ref0，但一个 ref0 只能属于一个 dbnum。
                 CREATE TABLE IF NOT EXISTS ref0_owner (
                     dbnum     INTEGER NOT NULL,
                     ref0      INTEGER NOT NULL,
@@ -139,8 +138,7 @@ impl DbIndexStore {
                     dst_dbnum INTEGER NOT NULL,
                     PRIMARY KEY (src_dbnum, dst_dbnum)
                 );
-                -- ref0 -> dbnum 反查（依赖推导用）；dbnum -> ref0s 走 (dbnum,ref0) 主键索引。
-                CREATE INDEX IF NOT EXISTS idx_ref0_owner_ref0 ON ref0_owner(ref0);
+                CREATE UNIQUE INDEX IF NOT EXISTS unique_ref0_owner_ref0 ON ref0_owner(ref0);
                 CREATE INDEX IF NOT EXISTS idx_db_file_index_type ON db_file_index(db_type);
                 CREATE INDEX IF NOT EXISTS idx_db_dependency_src ON db_dependency(src_dbnum);",
             )
@@ -195,14 +193,13 @@ impl DbIndexStore {
     /// 用最新 owned ref0 集合覆盖某 dbnum 的 ref0_owner 记录（事务）。
     ///
     /// - `file_name`：该 dbnum 对应的 dbfile 文件名，随 ref0 一并存储。
-    /// - ref0 在 `(dbnum, ref0)` 主键下按 dbnum 去重（`INSERT OR IGNORE`），调用方传入的
-    ///   ref0 列表通常已由预扫去重（`BTreeSet`），此处再兜底一层。
+    /// 唯一索引保证一个 ref0 只对应一个 dbnum；冲突会回滚整个事务。
     pub fn replace_ref0_owners(&self, dbnum: u32, file_name: &str, ref0s: &[u32]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM ref0_owner WHERE dbnum = ?1", params![dbnum])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO ref0_owner (dbnum, ref0, file_name) VALUES (?1, ?2, ?3)",
+                "INSERT INTO ref0_owner (dbnum, ref0, file_name) VALUES (?1, ?2, ?3)",
             )?;
             for &ref0 in ref0s {
                 stmt.execute(params![dbnum, ref0, file_name])?;
@@ -212,11 +209,11 @@ impl DbIndexStore {
         Ok(())
     }
 
-    /// 全局 ref0 -> dbnum（ref0 理论上全局唯一，多归属时取其一）。
+    /// 全局唯一 ref0 -> dbnum。
     pub fn dbnum_by_ref0(&self, ref0: u32) -> Option<u32> {
         self.conn
             .query_row(
-                "SELECT dbnum FROM ref0_owner WHERE ref0 = ?1 LIMIT 1",
+                "SELECT dbnum FROM ref0_owner WHERE ref0 = ?1",
                 params![ref0],
                 |row| row.get::<_, u32>(0),
             )

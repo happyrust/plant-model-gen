@@ -149,17 +149,26 @@ pub(crate) fn resolve_root_generation_targets(
     targets_from_candidates(hierarchy, config, candidates, include_bran_hang)
 }
 
+/// 变更根按后代展开，口径必须与 `pre_cleanup_for_regen_versioned` 一致。
+///
+/// cleanup 会删掉每个目标 refno **及其全部后代**的旧产物；若这里只重算根自身，
+/// 被删的子件就不会被重建（典型：只改 EQUI 的 POS，其子 PRIM 的模型产物被清掉
+/// 却无人写回），而这一轮仍会以 `Ok` 收尾、推进 model_gen 水位并消费欠账，
+/// 下一轮增量不再重试。
+///
+/// 新切面里已不存在的根（区间内先增后删、或已删除）先过滤掉：`descendants()`
+/// 对缺席根返回 `MissingRequiredData`，而它们的旧产物由 `delete_refnos` 负责清理。
 pub(crate) fn resolve_incremental_generation_targets(
     hierarchy: &HierarchySnapshot,
     config: &GenPipelineConfig,
     log: &IncrGeoUpdateLog,
 ) -> Result<GenerationTargets> {
-    let generated = targets_from_candidates(
-        hierarchy,
-        config,
-        log.get_all_visible_refnos().into_iter().collect(),
-        should_include_bran_hang(config),
-    )?;
+    let present_roots = log
+        .get_all_visible_refnos()
+        .into_iter()
+        .filter(|refno| hierarchy.node(*refno).is_some())
+        .collect::<Vec<_>>();
+    let generated = resolve_root_generation_targets(hierarchy, config, &present_roots)?;
     Ok(GenerationTargets::new(
         generated.bran_hang_refnos().iter().copied(),
         generated.loop_refnos().iter().copied(),
@@ -225,9 +234,11 @@ fn targets_from_candidates(
     let mut cate_refnos = Vec::new();
     let mut prim_refnos = Vec::new();
     for (noun, mut refnos) in grouped {
-        refnos.sort_by_key(ToString::to_string);
-        refnos.dedup();
         if let Some(limit) = config.gen_pipeline_debug_limit_per_target_type {
+            // 只有截断需要在这里先定序：口径必须与 GenerationTargets::new 的
+            // normalize_refnos 一致，否则同一输入会截出不同子集。
+            refnos.sort_by_key(ToString::to_string);
+            refnos.dedup();
             refnos.truncate(limit);
         }
 
@@ -430,16 +441,16 @@ async fn process_bran_hang_core_logic(
     let target_bran_reuse_cata_map = if child_refnos.is_empty() {
         DashMap::new()
     } else {
-        match build_cata_hash_map_from_session(&generation_read, &child_refnos).await {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!(
-                    "[BRAN/HANG] build_cata_hash_map_from_tree 失败（Direct 路径将跳过 CATE 生成）: {}",
-                    e
-                );
-                DashMap::new()
-            }
-        }
+        // 失败必须上抛：退化成空 map 会静默跳过整批 BRAN 子件的 CATE 几何，
+        // 而调用方仍会把这次 run 当成功、推进 model_gen 水位并消费欠账。
+        build_cata_hash_map_from_session(&generation_read, &child_refnos)
+            .await
+            .map_err(|error| {
+                GenPipelineError::GeometryGenerationFailed(
+                    "bran_cata_hash_map".to_string(),
+                    error.to_string(),
+                )
+            })?
     };
     let unique_cata_cnt = target_bran_reuse_cata_map.len();
     let target_bran_reuse_cata_map = Arc::new(target_bran_reuse_cata_map);
@@ -452,9 +463,12 @@ async fn process_bran_hang_core_logic(
         child_refnos.len(),
         unique_cata_cnt
     );
-    // 记录每个 BRAN 子 refno，便于 grep 分析（如 24381_145019 是否进入 gen_cata_instances）
-    for r in &child_refnos {
-        println!("[gen_model] BRAN child refno={}", r.to_string());
+    // 逐个 refno 便于 grep 分析（如 24381_145019 是否进入 gen_cata_instances）。
+    // 全量生成下这是百万级输出，只在 RUST_LOG=trace 时产生。
+    if log::log_enabled!(log::Level::Trace) {
+        for r in &child_refnos {
+            log::trace!("[gen_model] BRAN child refno={r}");
+        }
     }
 
     // ── 阶段 3: 生成 CATE 几何 ──
@@ -530,20 +544,24 @@ async fn process_bran_hang_core_logic(
     #[cfg(feature = "profile")]
     drop(_span6);
     let t6_ms = t6.elapsed().as_millis();
-    if let Ok(ref tubi_outcome) = tubi_result {
-        println!(
-            "  [BRAN perf] 阶段5 gen_branch_tubi: {} ms (tubi_count={}, elapsed_inner={} ms)",
-            t6_ms, tubi_outcome.tubi_count, tubi_outcome.elapsed_ms
-        );
-        for (k, v) in &tubi_outcome.time_stats {
-            println!("    [BRAN perf]   tubi_time.{}: {} ms", k, v);
+    // 失败必须上抛：吞掉这里的错误会让整条 BRAN 的 tubing 缺失，
+    // 而 run 仍以成功收尾并推进 model_gen 水位，下一轮增量也不会重试。
+    let tubi_outcome = match tubi_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            println!("  [BRAN perf] 阶段5 gen_branch_tubi: {} ms (failed)", t6_ms);
+            return Err(GenPipelineError::GeometryGenerationFailed(
+                "bran_tubi".to_string(),
+                error.to_string(),
+            ));
         }
-    } else {
-        println!(
-            "  [BRAN perf] 阶段5 gen_branch_tubi: {} ms (result={:?})",
-            t6_ms,
-            tubi_result.err()
-        );
+    };
+    println!(
+        "  [BRAN perf] 阶段5 gen_branch_tubi: {} ms (tubi_count={}, elapsed_inner={} ms)",
+        t6_ms, tubi_outcome.tubi_count, tubi_outcome.elapsed_ms
+    );
+    for (k, v) in &tubi_outcome.time_stats {
+        println!("    [BRAN perf]   tubi_time.{}: {} ms", k, v);
     }
 
     // ── 汇总 ──
@@ -556,15 +574,14 @@ async fn process_bran_hang_core_logic(
     Ok(())
 }
 
+/// `refnos` 由 `GenerationTargets` 提供，已在 `normalize_refnos` 里排序去重。
 async fn process_loop_stage(
     ctx: &NounProcessContext,
-    mut refnos: Vec<RefnoEnum>,
+    refnos: Vec<RefnoEnum>,
     loop_sjus_map_arc: Arc<DashMap<RefnoEnum, (Vec3, f32)>>,
     sender: flume::Sender<ShapeInstancesData>,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
-    refnos.sort_by_key(|r| r.to_string());
-    refnos.dedup();
     let chunk_size = ctx.batch_size.max(1);
     for (page_idx, slice) in refnos.chunks(chunk_size).enumerate() {
         let offset = page_idx * chunk_size;
@@ -591,9 +608,8 @@ async fn process_cate_stage(
     sender: flume::Sender<ShapeInstancesData>,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
+    // retain 保序，`GenerationTargets` 给的顺序在过滤后依然有效。
     refnos.retain(|r| !bran_generated_refnos.contains(r));
-    refnos.sort_by_key(|r| r.to_string());
-    refnos.dedup();
     let chunk_size = ctx.batch_size.max(1);
     for (page_idx, slice) in refnos.chunks(chunk_size).enumerate() {
         let offset = page_idx * chunk_size;
@@ -612,14 +628,13 @@ async fn process_cate_stage(
     Ok((refnos, start.elapsed()))
 }
 
+/// `refnos` 由 `GenerationTargets` 提供，已在 `normalize_refnos` 里排序去重。
 async fn process_prim_stage(
     ctx: &NounProcessContext,
-    mut refnos: Vec<RefnoEnum>,
+    refnos: Vec<RefnoEnum>,
     sender: flume::Sender<ShapeInstancesData>,
 ) -> Result<(Vec<RefnoEnum>, Duration)> {
     let start = Instant::now();
-    refnos.sort_by_key(|r| r.to_string());
-    refnos.dedup();
     let chunk_size = ctx.batch_size.max(1);
     for (page_idx, slice) in refnos.chunks(chunk_size).enumerate() {
         let offset = page_idx * chunk_size;

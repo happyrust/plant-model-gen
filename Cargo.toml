@@ -95,12 +95,9 @@ tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0.137", features = ["derive"] }
 sha2 = "0.10"
 id_tree = { version = "1.8.0", features = ["serde_support"] }
-indextree = { git = "https://github.com/happyrust/indextree", branch = "main", features = [
-    "rkyv",
-] }
 glam = { version = "0.30.8", features = ["serde", "rkyv"] }
 glamx = { version = "0.1.3", features = ["approx", "rand"], optional = true }
-rkyv = { version = "0.8.12", features = ["hashbrown-0_15"] }
+rkyv = { version = "=0.8.17", features = ["aligned", "hashbrown-0_15", "little_endian", "pointer_width_64"] }
 rfd = { version = "0.15.4", features = ["async-std"], optional = true }
 
 # redb = "3.0.1" # Removed - using SQLite for all storage

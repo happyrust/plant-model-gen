@@ -14,6 +14,8 @@ pub struct GenerationReadContext {
     pub hierarchy: Arc<HierarchySnapshot>,
     pub catalog: Arc<CatalogResolver>,
     pub attributes: Arc<BTreeMap<aios_core::RefnoEnum, AttributeSet>>,
+    pub runtime_attributes: dashmap::DashMap<aios_core::RefnoEnum, AttributeSet>,
+    pub runtime_attribute_load_lock: tokio::sync::Mutex<()>,
     pub catalog_nodes: Arc<BTreeMap<aios_core::RefnoEnum, CatalogNode>>,
     pub transforms: Arc<BTreeMap<aios_core::RefnoEnum, TransformSnapshot>>,
 }
@@ -97,6 +99,8 @@ impl GenerationReadContext {
             hierarchy: Arc::new(hierarchy),
             catalog: Arc::new(catalog),
             attributes,
+            runtime_attributes: dashmap::DashMap::new(),
+            runtime_attribute_load_lock: tokio::sync::Mutex::new(()),
             catalog_nodes,
             transforms,
         }))

@@ -196,6 +196,35 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
 
 ### Phase 6 — deps epoch 与 ZONE 规划（主线）
 - T6.1 dbnum 按现有升序；ZONE 按稳定的层级/refno 顺序。
+
+> **T6.1 前置分析：给定 dbnum，怎么枚举「当前最新」的全部 ZONE？**（2026-08-03）
+>
+> 两条看起来现成的路都不通：
+>
+> | 候选 | 为什么不行 |
+> |---|---|
+> | `db_index.sqlite` | 只存 `dbnum / db_type / file / latest_sesno / fingerprint` 与 `ref0 → dbnum` 归属。`scan_one_db` 走 `build_index_map()` 是 **index-only、不解析元素记录**，因此**没有元素类型**。它答得出「这个 ref0 属于哪个库」，答不出「哪些 refno 是 ZONE」。 |
+> | `query_type_refnos_by_dbnum(&["ZONE"], dbnum, ..)` | 查的是已解析的 SurrealDB。ZoneStream 是**初始化**，规划阶段目标库是空的，没有可查的数据。 |
+>
+> **采用的办法：搭 CATA 种子扫描那趟车。**
+> `cata_closure::seed_refs_from_design_file` 已经在做「遍历 `refno_table_map` → 按偏移随机访问
+> → `parse_ele_data_with_info_sync` 单元素解析」来收集 CATA 种子，而解析出的 `NamedAttrMap`
+> 本身就带 `get_type_str()`（noun）与 `get_owner()`。所以枚举 ZONE **不需要第二趟扫描**：
+> 同一趟顺手挑出 noun 为 `ZONE` 的元素并记下 owner，边际成本只是每元素一次字符串比较，
+> 文件 I/O 一次不多。落在 `zone_stream::discovery::sweep_design_file`，一次返回
+> ZONE 列表 + CATA 种子。
+>
+> **备选（未采用）**：从库根沿 WORL → SITE → ZONE 逐层下降，理论上只解析三层更省。
+> 没选是因为需要先拿到库根 refno（`DbBasicData` 未直接暴露），且要假定 ZONE 一定挂在
+> SITE 下第二层 —— 工程里一旦有嵌套或非常规层级就会漏。搭车方案的边际成本本来就是零。
+>
+> **稳定序**：先 owner（SITE）升序、再 ZONE refno 升序。用 owner 而非纯 refno 排，
+> 是为了让同一个 SITE 下的 ZONE 连续执行 —— 它们的 CATA 闭包重合度最高，deps 命中率最好。
+>
+> **「当前最新」的保证不在这里**：`parse_file_db_basic_data` 读的是文件当前状态；
+> 调用方须把 `latest_sesno`（`db_file_index.latest_sesno` 或 `PdmsIO::get_latest_sesno()`）
+> 记进源清单哈希。源漂移由 Resume 判等发现并判为不可恢复错误（R15），
+> 而不是靠规划阶段重扫一遍去比对。
 - T6.2 每个 dbnum 先算**全部 ZONE 的依赖并集**，装载 SYSTEM、CATA 及闭包所需 DICT 元数据，生成不可变 `deps_epoch/hash` 后才启动 ZONE 流水。
 - T6.3 `ZoneScopeSeal`：证明子树、祖先链、CATA 闭包、transform 完整；**不修改也不伪造** dbnum 级 `pe_owner Ready`（I6）。
 - T6.4 ZONE plan 哈希入 `initialization_runs`，供 Resume 判等。

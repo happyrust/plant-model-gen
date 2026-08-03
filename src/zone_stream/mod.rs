@@ -4,6 +4,7 @@
 //! 编排入口**：旧解析（`spawn_parse_process`）与旧生成（`spawn_generation_process`）
 //! 入口内部不含任何模式判断（ADR-0016 D1），Legacy 行为逐位不变。
 
+pub mod discovery;
 pub mod orchestrator;
 pub mod plan;
 pub mod run_store;
@@ -14,6 +15,7 @@ pub use orchestrator::{
     is_zone_stream, reject_legacy_entry_for_zone_stream, request_stop, resume_initialization,
     run_initialization, ZoneStreamStage,
 };
+pub use discovery::{sweep_design_file, DesignSweep, DiscoveredZone};
 pub use plan::{DepsEpoch, ZoneEntry, ZonePlan, ZoneScopeSeal};
 pub use run_store::{InitializationRun, RunIdentity, SlotState};
 pub use sidecar::{SidecarEndpoint, ZoneStreamSidecar, DEPS_DB, SLOT_A_DB, SLOT_B_DB};

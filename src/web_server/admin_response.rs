@@ -91,6 +91,8 @@ pub fn classify_error_status(message: &str) -> StatusCode {
         || message.contains("已被占用")
         || message.contains("端口冲突")
         || message.contains("端口")
+        // spec 030：任务类型与站点的初始化流水模式不匹配属状态冲突，不是参数错误
+        || message.contains("初始化流水模式")
     {
         StatusCode::CONFLICT
     } else {

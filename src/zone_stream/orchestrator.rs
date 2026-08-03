@@ -72,12 +72,31 @@ pub fn reject_legacy_entry_for_zone_stream(site: &ManagedProjectSite, entry: &st
     Ok(())
 }
 
-/// ZoneStream 初始化的唯一入口。
+/// Start：ZoneStream 初始化的唯一入口。
 ///
 /// 失败即失败，不回退 Legacy（ADR-0016 D1 / D11）。
 pub async fn run_initialization(site_id: &str) -> Result<()> {
     bail!(
-        "ZoneStream 初始化尚未实现（站点 `{site_id}`）：spec 030 Phase 2 只落配置与分流骨架，\
+        "ZoneStream 初始化尚未实现（站点 `{site_id}`）：spec 030 已落配置分流、任务与运行记录，\
          流水调度在 Phase 4 及之后接入。当前请把站点的 initialization_pipeline_mode 设回 legacy。"
+    )
+}
+
+/// Stop：在当前解析或写回批次边界停止。
+///
+/// 停止后 task 标记 `Cancelled`、run 标记 `Interrupted`，未完成的 ZONE 不写检查点
+/// （ADR-0016 D9 恢复规则）。
+pub async fn request_stop(site_id: &str) -> Result<()> {
+    bail!(
+        "ZoneStream Stop 尚未实现（站点 `{site_id}`）：批次边界停止与 Interrupted 落库在 Phase 10 接入。"
+    )
+}
+
+/// Resume：仅在源 manifest、contract hash、ZONE plan 三者一致时继续同一个 run。
+///
+/// 允许在 Resume 前调大 `zone_stream_memory_budget_mib`——预算不参与判等（ADR-0016 D10）。
+pub async fn resume_initialization(site_id: &str) -> Result<()> {
+    bail!(
+        "ZoneStream Resume 尚未实现（站点 `{site_id}`）：run 判等、槽位清空与半写行清理在 Phase 10 接入。"
     )
 }

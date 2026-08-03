@@ -114,6 +114,7 @@ pub fn create_and_dispatch_site_task(
 
     let site_id = normalize_site_id(Some(site_id))
         .ok_or_else(|| "创建 admin 任务必须指定 site_id".to_string())?;
+    ensure_task_type_matches_site_mode(&site_id, &task_type)?;
     let _submit_guard = site_task_submit_lock()
         .lock()
         .map_err(|_| "站点任务提交锁已中毒".to_string())?;
@@ -219,15 +220,64 @@ async fn create_task(Json(payload): Json<CreateTaskRequest>) -> impl IntoRespons
     }
 }
 
+/// ZoneStream 的 Stop 映射到 cancel；其余 admin 任务仍不支持取消。
+///
+/// 注意先把查询结果解构掉再 await：`load_task_record_by_id` 的错误类型是
+/// `Box<dyn Error>`（非 Send），跨 await 持有会让 handler future 失去 Send，
+/// axum 的 `Handler` 约束随之不满足。
 async fn cancel_task(Path(task_id): Path<String>) -> impl IntoResponse {
-    match load_task_by_id(&task_id) {
-        Ok(Some(_)) => admin_response::conflict("当前 admin 任务暂不支持取消"),
-        Ok(None) => admin_response::not_found(format!("任务不存在: {task_id}")),
-        Err(e) => admin_response::server_error(format!("读取任务失败: {e}")),
+    let stored = match load_task_record_by_id(&task_id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return admin_response::not_found(format!("任务不存在: {task_id}")),
+        Err(e) => return admin_response::server_error(format!("读取任务失败: {e}")),
+    };
+
+    if !matches!(stored.task.task_type, TaskType::ZoneStreamInitialization) {
+        return admin_response::conflict("当前 admin 任务暂不支持取消");
+    }
+    let Some(site_id) = stored.site_id.clone() else {
+        return admin_response::conflict("任务缺少 site_id，无法停止");
+    };
+
+    match crate::zone_stream::request_stop(&site_id).await {
+        Ok(()) => admin_response::ok(
+            "已请求在批次边界停止 ZoneStream 初始化",
+            serde_json::json!({ "id": task_id, "site_id": site_id }),
+        ),
+        Err(e) => admin_response::managed_error(e.to_string()),
     }
 }
 
+/// ZoneStream 的 Resume 映射到 retry；其余任务仍是「失败后重新提交一次」的语义。
+///
+/// 与 [`cancel_task`] 同理：先解构查询结果再 await，避免非 Send 的错误类型跨 await。
 async fn retry_task(Path(task_id): Path<String>) -> impl IntoResponse {
+    let zone_stream_target = match load_task_record_by_id(&task_id) {
+        Ok(Some(stored)) if matches!(stored.task.task_type, TaskType::ZoneStreamInitialization) => {
+            if matches!(
+                stored.task.status,
+                TaskStatus::Pending | TaskStatus::Running
+            ) {
+                return admin_response::conflict("ZoneStream 初始化仍在运行中，无需 Resume");
+            }
+            let Some(site_id) = stored.site_id.clone() else {
+                return admin_response::conflict("任务缺少 site_id，无法 Resume");
+            };
+            Some(site_id)
+        }
+        _ => None,
+    };
+
+    if let Some(site_id) = zone_stream_target {
+        return match crate::zone_stream::resume_initialization(&site_id).await {
+            Ok(()) => admin_response::ok(
+                "已请求 Resume ZoneStream 初始化",
+                serde_json::json!({ "id": task_id, "site_id": site_id }),
+            ),
+            Err(e) => admin_response::managed_error(e.to_string()),
+        };
+    }
+
     match load_task_record_by_id(&task_id) {
         Ok(Some(stored)) if stored.task.status == TaskStatus::Failed => {
             let Some(site_id) = stored.site_id.clone() else {
@@ -491,6 +541,7 @@ fn parse_task_type(s: &str) -> TaskType {
         "StartManagedSite" => TaskType::StartManagedSite,
         "DeployManagedSite" => TaskType::DeployManagedSite,
         "RemoteDeployManagedSite" => TaskType::RemoteDeployManagedSite,
+        "ZoneStreamInitialization" => TaskType::ZoneStreamInitialization,
         other => TaskType::Custom(other.to_string()),
     }
 }
@@ -556,6 +607,18 @@ async fn dispatch_admin_task(task_id: String) {
             match crate::web_server::managed_project_sites::generate_site(sid.to_string(), true)
                 .await
             {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        (TaskType::ZoneStreamInitialization, Some(sid)) => {
+            mark_task_running(
+                &mut stored.task,
+                "已提交 ZoneStream 初始化任务，等待流水启动",
+                10.0,
+            );
+            let _ = save_task(&stored.task, stored.site_id.as_deref());
+            match crate::zone_stream::run_initialization(sid).await {
                 Ok(()) => Ok(()),
                 Err(e) => Err(e.to_string()),
             }
@@ -695,7 +758,44 @@ fn is_supported_admin_task_type(task_type: &TaskType) -> bool {
             | TaskType::StartManagedSite
             | TaskType::DeployManagedSite
             | TaskType::RemoteDeployManagedSite
+            | TaskType::ZoneStreamInitialization
     )
+}
+
+/// 走 Legacy 两段式解析/生成语义的任务类型；ZoneStream 站点一律拒绝这些任务。
+fn is_legacy_pipeline_task_type(task_type: &TaskType) -> bool {
+    matches!(
+        task_type,
+        TaskType::ParsePdmsData
+            | TaskType::DataGeneration
+            | TaskType::FullGeneration
+            | TaskType::DeployManagedSite
+            | TaskType::RemoteDeployManagedSite
+    )
+}
+
+/// 任务类型必须与站点的初始化流水模式匹配（spec 030 R1）。
+///
+/// 错误文案里的「初始化流水模式」会被 [`admin_response::classify_error_status`] 归类成
+/// HTTP 409 —— 这是状态冲突（站点当前不接受这种任务），不是参数错误。
+///
+/// `StartManagedSite` 不在管辖范围：它只拉起已完成初始化的站点，与模式无关。
+fn ensure_task_type_matches_site_mode(site_id: &str, task_type: &TaskType) -> Result<(), String> {
+    let site = managed_project_sites::get_site(site_id)
+        .map_err(|err| format!("读取站点失败: {err}"))?
+        .ok_or_else(|| format!("站点不存在: {site_id}"))?;
+    let zone_stream = crate::zone_stream::is_zone_stream(&site);
+
+    match task_type {
+        TaskType::ZoneStreamInitialization if !zone_stream => Err(format!(
+            "站点 `{site_id}` 的初始化流水模式为 legacy，不接受 ZoneStreamInitialization 任务"
+        )),
+        task_type if zone_stream && is_legacy_pipeline_task_type(task_type) => Err(format!(
+            "站点 `{site_id}` 的初始化流水模式为 zone-stream，不接受 {task_type:?} 任务；\
+             请改用 ZoneStreamInitialization 的 Start / Stop / Resume"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn task_from_row(row: &Row<'_>) -> rusqlite::Result<StoredAdminTask> {

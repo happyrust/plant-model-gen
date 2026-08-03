@@ -114,8 +114,65 @@ pub enum TaskType {
     DeployManagedSite,
     /// 远端部署受管站点
     RemoteDeployManagedSite,
+    /// ZoneStream 初始化（spec 030）：Start=创建任务，Stop=cancel，Resume=retry。
+    /// 只对 `initialization_pipeline_mode = zone-stream` 的站点可用。
+    ZoneStreamInitialization,
     /// 自定义任务
     Custom(String),
+}
+
+/// 初始化维度的状态（spec 030 / ADR-0016 D9）。
+///
+/// 刻意**不并入** [`ManagedSiteStatus`]：两者正交，站点可以同时是
+/// `ManagedSiteStatus::Running` + `ManagedInitializationStatus::PartiallyReady`
+/// （已发布的 dbnum 只读可用，其余仍在初始化或已失败）。
+/// Legacy 站点恒为 `NotStarted`。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ManagedInitializationStatus {
+    /// 未开始，或该站点走 Legacy。
+    #[default]
+    NotStarted,
+    /// 有 run 在推进，且尚无 dbnum 发布。
+    Running,
+    /// 至少一个 dbnum 已 Published、但未全部完成；全程只读。
+    PartiallyReady,
+    /// 全部目标 dbnum 均已 Published。
+    Ready,
+    /// 被 Stop 打断，可 Resume。
+    Interrupted,
+    /// 不可恢复错误；已发布 dbnum 保持只读，需显式新建/重置目标后重跑。
+    Failed,
+}
+
+impl ManagedInitializationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not-started",
+            Self::Running => "running",
+            Self::PartiallyReady => "partially-ready",
+            Self::Ready => "ready",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// 未知字面量按 `NotStarted` 处理会掩盖状态丢失，因此这里返回 `None` 让调用方失败。
+    pub fn from_str_strict(value: &str) -> Option<Self> {
+        match value.trim() {
+            "not-started" => Some(Self::NotStarted),
+            "running" => Some(Self::Running),
+            "partially-ready" => Some(Self::PartiallyReady),
+            "ready" => Some(Self::Ready),
+            "interrupted" => Some(Self::Interrupted),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    /// 该状态下是否禁止一切写入口（watch / 增量 / 手工生成一律 409）。
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Running | Self::PartiallyReady | Self::Interrupted)
+    }
 }
 
 /// 任务状态

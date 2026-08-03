@@ -2,6 +2,12 @@
 
 > ADR-0015 的实施规格；spec 028（mem 生成缓存轮转）的先导切片。
 > 案例：ZONE `=24381/144870`（AvevaMarineSample / DESI dbnum 7997）。
+>
+> **2026-08-03 更新（ADR-0016 D7）**：本 spec 定义的 `GenerationOutputBackfill` seam
+> 在主干至今无实现。其**首次实现改由 [spec 030](../030-zone-stream-initialization/spec.md)
+> 承担**（初始化场景的回填清单与本 spec 同构且更完整）；本 spec 的切片站点场景转为该 seam 的
+> 第二个消费者。两者的 `pe_owner` 发布时机不同：切片库「裁剪集即全量」可直接按 full 语义发 ready
+> （D5），初始化库的单个 ZONE 只是局部，必须等整库审计后才发（ADR-0016 D6）。
 
 ## User Need
 

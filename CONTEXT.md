@@ -144,6 +144,32 @@ _Avoid_: 生成失败列表、重试队列、历史全量补偿
 欠账跟踪启用之前发生的数据版本与模型状态差距；默认忽略、不告警、不自动重建，仅绑定既有数据锚点的受控 catch-up/repair 可追平。
 _Avoid_: 历史欠账、存量洞
 
+## ZONE 流水初始化
+
+**ZONE 流水初始化（ZoneStream Initialization）**:
+以完整 ZONE 为最小流水边界、双缓冲交替推进的初始化模式；同一 ZONE 解析并封存后才能生成，同一时刻只有一个生成/回填下游通道，只允许"解析下一 ZONE"与"生成、回填当前 ZONE"重叠。与 Legacy 两段式串行并存，按站点选择，初始化开始后不可切换。
+_Avoid_: 并行初始化、流式解析、分块生成
+
+**ZONE 工作区（ZONE Slot）**:
+双缓冲中的一个内存工作库（`slot-a` / `slot-b`），承载单个 ZONE 的设计 PE/ATT/owner/transform 及该 ZONE 的生成产物；由常驻 supervisor 维护 slot generation 与防 ABA lease，ZONE 回填完成后整体清空复用。读路由必须精确指向当前 slot，不存在跨 slot 兜底查询。
+_Avoid_: 内存分片、缓存槽、双写缓冲
+
+**共享生成依赖库（Shared Generation Dependency DB）**:
+一个 dbnum 的全部 ZONE 依赖并集在流水开始前一次性装载而成的只读内存库（`deps`），含 SYSTEM、CATA 及闭包所需 DICT 元数据；装载完成即产出不可变的 deps epoch/hash，流水期间不再变动，变动视为不可恢复错误。
+_Avoid_: CATA 缓存、公共库、依赖快照
+
+**ZONE 范围封存（ZONE Scope Seal）**:
+单个 ZONE 解析完成后产生的范围完整性证明，覆盖子树、祖先链、CATA 闭包与 transform；它是该 ZONE 允许进入生成的前置条件，只证明 ZONE 范围完整，既不修改也不代替 dbnum 级 `pe_owner` Ready。
+_Avoid_: ZONE Ready、局部 bulk_state、裁剪审计通过
+
+**ZONE 检查点（ZONE Checkpoint）**:
+单个 ZONE 回填后、经目标库 read-back 校验行数与 digest 通过才创建的 create-only Verified 证明，是 Resume 跳过该 ZONE 的唯一依据；相同 payload 幂等，不同 payload 冲突。未完成的 ZONE 永不写检查点。
+_Avoid_: 阶段快照、进度记录、回填完成标记
+
+**dbnum 发布（dbnum Publication）**:
+一个 dbnum 的全部 ZONE Verified、整库层级/reference/模型关系审计通过、导出物提升到最终路径并复核源文件之后，在同一个 Surreal 事务中写入 `model_gen` baseline anchor 与 create-only 注册项的动作；发布是公共 API 可见性的唯一开关，未发布的 dbnum 在公共入口一律返回 404。
+_Avoid_: 上线、生成完成、站点 Ready
+
 ## 已废除术语（历史文档中出现时一律按废除理解）
 
 - **权威版本库 / 版本化读副本**：DuckLake 权威 + Surreal 读副本的双库分工（ADR-0002 时期）；版本真相已收敛为 Surreal MVCC + sesno 锚点单源（ADR-0007），不存在第二个版本库

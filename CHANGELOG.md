@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-31
+
+### Changed — visible-insts 几何数据源收口到 parquet（与前端 DuckDB WASM 同源）
+
+> `/api/e3d/visible-insts` 此前是 `instances_{dbnum}.json` → parquet → `inst_relate` 三级回退。前端加载几何走的是 DuckDB WASM 查 parquet，与后两级数据源不同源：SurrealDB 兜底会给出前端根本加载不出来的 refno，JSON 与 parquet 的生成时机也可能不一致。现统一收口到 parquet 单源。
+
+- `e3d_tree_api.rs::get_visible_insts_inner`：删除 `surreal_geometry` 回退（`query_geometry_instances`，按 `visible_dbnum` 是否可解析写了两份完全重复的分支），删除 `instances_{dbnum}.json` 读取分支（新/旧项目输出目录 + `output/instances` 三级路径级联，以及递归收集 `refno` 的 `collect_component_refnos`）。
+- 数据源不可用（parquet 未找到或解析失败）不再静默降级：返回 `success:false` + `debug.source="unavailable"`，错误信息带 dbnum。`file_ok` 且结果为空的旧语义（数据源明确说"这里没几何"）由 parquet 分支自然承接，仍返回空集而非报错。
+- **依赖变化**：本接口现在必须带 `parquet-export` 编译。发布包（`scripts/package/build-windows-bundle.ps1`）本就包含该 feature；仅带 `--features web_server` 的 dev 构建下该接口恒返回 `unavailable`。
+- 验证：`cargo check --bin web_server --features web_server` 与 `--features "web_server,parquet-export"` 均通过，`e3d_tree_api.rs` 零告警。
+- 前端配套改动见 `plant3d-web` 同日条目（删除 JSON 加载通道、`getE3dSource()` 默认切 parquet）。
+
 ## 2026-07-23
 
 ### Changed — 增量模型生成默认开启并支持欠账自愈

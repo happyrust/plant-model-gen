@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="drawio" agent="Cursor" version="26.0.0" type="device">
+  <diagram id="genpipeline-internal-topology" name="GenPipeline 内部管线拓扑">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="1120" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="p2-title" value="GenPipeline 内部拓扑：几何生成阶段 → flume 通道 → 并发写入管线" style="text;html=1;fontSize=24;fontStyle=1;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1620" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2-laneA" value="几何生成阶段（stage 顺序执行，stage 内按 batch 并发）" style="swimlane;startSize=32;horizontal=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;rounded=0;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="520" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-targets" value="GenerationTargets&#xa;bran_hang / loop / cate / prim / delete&#xa;target_hash 参与 provenance" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="45" width="480" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-s1" value="① BRAN / HANG（优先）&#xa;收集 BRAN 子件 → 构建 cata_hash_map&#xa;→ gen_cata_instances_versioned&#xa;→ 收集 tubi_info → gen_branch_tubi&#xa;任一子阶段失败即上抛，不静默降级" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="170" width="480" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-s2" value="② LOOP&#xa;process_loop_refno_page&#xa;产出 loop_sjus_map 供 CATE 复用" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="350" width="480" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-s3" value="③ CATE&#xa;process_cate_refno_page&#xa;跳过 BRAN 已生成的子件" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="480" width="480" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-s4" value="④ PRIM&#xa;process_prim_refno_page" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="610" width="480" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-note-stage" value="所有输入只能来自 GenerationReadContext 预载快照；边界测试禁止管线内出现裸 SQL 与全局读取。生成阶段不直接写库，只向通道投递批次。" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;align=left;spacingLeft=12;fillColor=#f5f5f5;strokeColor=#666666;fontSize=13;" vertex="1" parent="p2-laneA">
+          <mxGeometry x="20" y="740" width="480" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2-chan" value="flume::bounded&#xa;channel_capacity&#xa;&#xa;ShapeInstancesData&#xa;批次" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="250" width="100" height="520" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2-laneB" value="ModelWritePipeline（并发 worker 池 + batch barrier）" style="swimlane;startSize=32;horizontal=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;rounded=0;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="740" y="80" width="920" height="880" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-precleanup" value="pipeline 启动前（仅增量）&#xa;pre_cleanup_for_regen_versioned&#xa;按旧模型水位切面清理目标及后代" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="560" y="150" width="330" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-sink" value="batch sink&#xa;编号分批 · 记录 touched refno&#xa;写入 GenerationArtifacts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="20" y="150" width="320" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-base" value="base writer 池&#xa;write_base_batch&#xa;+ persist_pe_transform" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="20" y="310" width="320" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-mesh" value="mesh stage 池&#xa;extract_mesh_tasks&#xa;缓存去重 + 新网格生成" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="390" y="310" width="320" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-join" value="BatchStageJoiner&#xa;按 batch_id 汇合 base 指标与 mesh 结果" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="200" y="460" width="330" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-aabb" value="inst_aabb writer 池&#xa;persist_mesh_results&#xa;+ persist_inst_relate_aabb" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="200" y="600" width="330" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-barrier" value="finish() barrier&#xa;等齐全部 batch → 最终 AABB sweep&#xa;→ 缺失 NEG 关系补偿" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontStyle=1;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="200" y="750" width="330" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-bool" value="bool_tasks&#xa;→ boolean bridge 布尔运算" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="580" y="600" width="310" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="p2-artifacts" value="GenerationArtifacts&#xa;geometry_artifact_hash&#xa;semantic_hash / model_semantic_hash" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="p2-laneB">
+          <mxGeometry x="580" y="750" width="310" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2e-targets-s1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-targets" target="p2-s1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s1-s2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-s1" target="p2-s2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s2-s3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-s2" target="p2-s3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s3-s4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-s3" target="p2-s4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s1-chan" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.135;entryDx=0;entryDy=0;endArrow=block;endFill=1;flowAnimation=1;" edge="1" parent="1" source="p2-s1" target="p2-chan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s2-chan" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.404;entryDx=0;entryDy=0;endArrow=block;endFill=1;flowAnimation=1;" edge="1" parent="1" source="p2-s2" target="p2-chan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s3-chan" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.654;entryDx=0;entryDy=0;endArrow=block;endFill=1;flowAnimation=1;" edge="1" parent="1" source="p2-s3" target="p2-chan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-s4-chan" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.904;entryDx=0;entryDy=0;endArrow=block;endFill=1;flowAnimation=1;" edge="1" parent="1" source="p2-s4" target="p2-chan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-chan-sink" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.077;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;endArrow=block;endFill=1;flowAnimation=1;" edge="1" parent="1" source="p2-chan" target="p2-sink">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-sink-base" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-sink" target="p2-base">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-sink-mesh" value="同批双发" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-sink" target="p2-mesh">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-base-join" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-base" target="p2-join">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-mesh-join" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-mesh" target="p2-join">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-join-aabb" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-join" target="p2-aabb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-aabb-barrier" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-aabb" target="p2-barrier">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-barrier-bool" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-barrier" target="p2-bool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1188" y="805" />
+              <mxPoint x="1475" y="805" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="p2e-barrier-artifacts" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.7;entryDx=0;entryDy=0;endArrow=block;endFill=1;" edge="1" parent="1" source="p2-barrier" target="p2-artifacts">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="p2e-precleanup-sink" value="先于 sink 执行" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;endArrow=block;endFill=1;dashed=1;strokeColor=#d79b00;" edge="1" parent="1" source="p2-precleanup" target="p2-sink">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2-footer" value="并发要点：base 写入与 mesh 计算对同一批次并行推进，各自由信号量限流；joiner 按 batch_id 汇合后才做 inst_relate_aabb 写入；barrier 之后才允许布尔运算与导出。drain-only writer 模式下跳过整条下游管线，只消费批次并 finalize。" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=16;fillColor=#f5f5f5;strokeColor=#666666;fontSize=14;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="990" width="1620" height="80" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

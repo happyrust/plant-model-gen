@@ -93,7 +93,10 @@ ZoneStream 依赖「裁剪解析 + scoped 生成」修复与 ADR-0015/spec029 �
      并行只体现在「编辑 + 思考」，编译必须串行。
    - 在 worktree 之间来回构建会反复重编 `aios_database` 本体（外部依赖与 `pdms-io-fork`
      由 sccache 复用），单次 `cargo check` 约 2 分钟、`cargo build --bin aios-database` 约 2.5 分钟。
-   - 若要真正的并行编译，需为每个 worktree 显式覆盖 `CARGO_TARGET_DIR`，代价是各自一份完整产物。
+   - **已决定隔离**（2026-08-03）：每条线在自己的 session 里先 dot-source
+     `. scripts/dev/use-worktree-target.ps1`，把 `CARGO_TARGET_DIR` 指到
+     `<base>/target-<worktree 名>`，换取真正的并行编译；代价是三份完整产物占磁盘。
+     注意环境变量优先级高于 `.cargo/config.toml` 的 `build.target-dir`，改配置文件无效。
 5. **运行时隔离**：ZoneStream 会拉 surreal sidecar，各 worktree 必须用**不同 `db_port` 段**与不同 `runtime_dir`，否则会互相杀进程（参考 `stop_site_ws_db_for_exclusivity` 的按端口杀逻辑）。
 6. 开工前 `git worktree prune` 清掉 6 个 prunable 条目。
 

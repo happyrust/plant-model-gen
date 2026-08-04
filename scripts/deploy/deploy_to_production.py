@@ -17,7 +17,7 @@
 环境变量（可选覆盖）：
     DEPLOY_HOST          目标服务器 IP，默认 123.57.182.243
     DEPLOY_USER          SSH 用户，默认 root
-    DEPLOY_PASSWORD      SSH 密码，默认从 setup-deploy-server.sh 一致
+    DEPLOY_PASSWORD      SSH 密码，必填；仅从环境变量读取
     DEPLOY_TIMEOUT       等待 CI 完成的最大秒数，默认 1800（30 分钟）
 """
 
@@ -50,7 +50,7 @@ WORKSPACE_ROOT = REPO_ROOT.parent  # work/plant-code/
 
 HOST = os.environ.get("DEPLOY_HOST", "123.57.182.243")
 USER = os.environ.get("DEPLOY_USER", "root")
-PASSWORD = os.environ.get("DEPLOY_PASSWORD", "Happytest123_")
+PASSWORD = os.environ.get("DEPLOY_PASSWORD")
 TIMEOUT = int(os.environ.get("DEPLOY_TIMEOUT", "1800"))
 
 
@@ -228,6 +228,8 @@ def gh_watch_run(spec: RepoSpec, run_id: str, timeout: int) -> Optional[str]:
 
 
 def ssh_connect() -> paramiko.SSHClient:
+    if not PASSWORD:
+        raise RuntimeError("缺少环境变量 DEPLOY_PASSWORD")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(HOST, username=USER, password=PASSWORD, timeout=20)
@@ -506,6 +508,10 @@ def main() -> int:
     parser.add_argument("--no-gh", action="store_true", help="不使用 gh CLI 自动触发 workflow_dispatch（回退到手动 + mtime 监听）")
     parser.add_argument("--timeout", type=int, default=TIMEOUT, help=f"等待 CI 完成的最大秒数（默认 {TIMEOUT}）")
     args = parser.parse_args()
+
+    if not args.skip_verify and not PASSWORD:
+        log("FAIL", "缺少环境变量 DEPLOY_PASSWORD；拒绝在无法验证远端时开始部署")
+        return 1
 
     targets = list(REPOS.values()) if args.repo == "all" else [REPOS[args.repo]]
     log("STEP", f"目标：{', '.join(t.name for t in targets)}（host={HOST}）")

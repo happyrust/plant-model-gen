@@ -46,6 +46,47 @@ use crate::fast_model::gen_model::utilities::is_valid_cata_hash;
 use crate::fast_model::unit_converter::{LengthUnit, UnitConverter};
 use crate::versioned_db::db_meta_info;
 
+#[cfg(not(windows))]
+fn persist_latest_manifest(temp: tempfile::NamedTempFile, pointer_path: &Path) -> Result<()> {
+    temp.persist(pointer_path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn persist_latest_manifest(temp: tempfile::NamedTempFile, pointer_path: &Path) -> Result<()> {
+    let backup_path = pointer_path.with_extension("json.previous");
+    if !pointer_path.exists() && backup_path.exists() {
+        fs::rename(&backup_path, pointer_path).with_context(|| {
+            format!("恢复上次中断的 Parquet latest manifest 失败: {}", backup_path.display())
+        })?;
+    }
+    if pointer_path.exists() && backup_path.exists() {
+        fs::remove_file(&backup_path)
+            .with_context(|| format!("清理旧 manifest 恢复文件失败: {}", backup_path.display()))?;
+    }
+    if pointer_path.exists() {
+        fs::rename(pointer_path, &backup_path).with_context(|| {
+            format!(
+                "备份现有 Parquet latest manifest 失败: {}",
+                pointer_path.display()
+            )
+        })?;
+    }
+    if let Err(error) = temp.persist(pointer_path) {
+        if backup_path.exists() {
+            fs::rename(&backup_path, pointer_path).with_context(|| {
+                format!("恢复旧 Parquet latest manifest 失败: {}", pointer_path.display())
+            })?;
+        }
+        return Err(error.error.into());
+    }
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)
+            .with_context(|| format!("清理 manifest 恢复文件失败: {}", backup_path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn publish_dbnum_latest_manifest(
     artifact_dir: &Path,
     latest_root: &Path,
@@ -161,7 +202,7 @@ pub fn publish_dbnum_latest_manifest(
     serde_json::to_writer_pretty(temp.as_file_mut(), &manifest)?;
     temp.as_file_mut().write_all(b"\n")?;
     temp.as_file_mut().sync_all()?;
-    temp.persist(&pointer_path).map_err(|error| error.error)?;
+    persist_latest_manifest(temp, &pointer_path)?;
     Ok(pointer_path)
 }
 

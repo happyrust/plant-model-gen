@@ -60,8 +60,8 @@ GitHub 端：
 - 推荐：`gh` CLI 已 `gh auth login` 登录，token 含 `repo` + `workflow` scope
 
 SSH 端：
-- 默认用户/密码已写在脚本中（与 setup-deploy-server.sh 一致）
-- 可用环境变量覆盖：`DEPLOY_HOST`、`DEPLOY_USER`、`DEPLOY_PASSWORD`
+- 用户默认 `root`，密码必须通过环境变量 `DEPLOY_PASSWORD` 提供，禁止写入仓库
+- 目标与用户可用环境变量覆盖：`DEPLOY_HOST`、`DEPLOY_USER`
 
 ## 用法
 

@@ -20,6 +20,7 @@ use super::types::{
 };
 
 const QUERY_CHUNK_SIZE: usize = 500;
+const QUERY_PAGE_SIZE: usize = 5_000;
 
 /// Surreal main-table generation reader.
 ///
@@ -554,12 +555,23 @@ impl SurrealVersionedReadSession {
             };
             clauses.push(predicate.to_string());
         }
-        let sql = format!(
-            "SELECT * FROM pe WHERE {} ORDER BY dbnum, id{};",
-            clauses.join(" AND "),
-            self.version_suffix
-        );
-        self.query_pe_rows(sql, "element.query_rows").await
+        let predicate = clauses.join(" AND ");
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        loop {
+            let sql = format!(
+                "SELECT * FROM pe WHERE {predicate} ORDER BY dbnum, id LIMIT {QUERY_PAGE_SIZE} START {offset}{};",
+                self.version_suffix
+            );
+            let page = self.query_pe_rows(sql, "element.query_rows").await?;
+            let page_len = page.len();
+            rows.extend(page);
+            if page_len < QUERY_PAGE_SIZE {
+                break;
+            }
+            offset += QUERY_PAGE_SIZE;
+        }
+        Ok(rows)
     }
 
     async fn query_pe_rows(

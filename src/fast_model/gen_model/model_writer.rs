@@ -225,17 +225,33 @@ impl GenerationArtifacts {
             .mesh_results
             .lock()
             .map_err(|_| anyhow::anyhow!("mesh artifact mutex poisoned"))?;
-        let mut mesh_digest = BTreeMap::new();
+        let mut mesh_digest: BTreeMap<u64, (bool, bool, Option<u64>, Vec<u64>)> = BTreeMap::new();
         for results in mesh_results.values() {
             for (geo_hash, result) in results {
                 let mut pts = result.pts_hashes.clone();
                 pts.sort_unstable();
                 let digest = (result.meshed, result.bad, result.aabb_hash, pts);
-                if let Some(existing) = mesh_digest.insert(*geo_hash, digest.clone()) {
+                if let Some(existing) = mesh_digest.get_mut(geo_hash) {
                     anyhow::ensure!(
-                        existing == digest,
-                        "conflicting mesh artifact geo_hash={geo_hash}"
+                        existing.0 == digest.0 && existing.1 == digest.1,
+                        "conflicting mesh artifact state geo_hash={geo_hash}"
                     );
+                    anyhow::ensure!(
+                        existing.2.is_none() || digest.2.is_none() || existing.2 == digest.2,
+                        "conflicting mesh artifact aabb geo_hash={geo_hash}"
+                    );
+                    anyhow::ensure!(
+                        existing.3.is_empty() || digest.3.is_empty() || existing.3 == digest.3,
+                        "conflicting mesh artifact points geo_hash={geo_hash}"
+                    );
+                    if existing.2.is_none() {
+                        existing.2 = digest.2;
+                    }
+                    if existing.3.is_empty() {
+                        existing.3 = digest.3;
+                    }
+                } else {
+                    mesh_digest.insert(*geo_hash, digest);
                 }
             }
         }

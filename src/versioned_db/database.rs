@@ -373,6 +373,12 @@ fn validate_parse_scene_tree_artifacts(artifacts: &[ParsedDbArtifact]) -> anyhow
 const SYSTEM_SYNC_DB_TYPES: &[&str] = &["DICT", "SYST", "GLB", "GLOB"];
 const DEFAULT_DATA_SYNC_DB_TYPES: &[&str] = &["DESI", "CATA"];
 
+fn is_plain_pdms_db_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| !value.contains('.'))
+}
+
 fn collect_project_db_files(project_dir: impl AsRef<Path>) -> anyhow::Result<Vec<PathBuf>> {
     let project_dir = project_dir.as_ref();
     let mut children_files = {
@@ -397,6 +403,9 @@ fn collect_project_db_files(project_dir: impl AsRef<Path>) -> anyhow::Result<Vec
 
     let mut file_map = HashMap::new();
     for path in children_files.iter() {
+        if !is_plain_pdms_db_file(&path) {
+            continue;
+        }
         let file_name = path.file_stem().unwrap().to_str().unwrap();
         if let Some(base_name) = file_name.strip_suffix("_0001") {
             file_map.insert(base_name.to_string(), path.clone());
@@ -949,6 +958,9 @@ where
             // 处理文件名_0001和文件名同时存在的情况
             let mut file_map = HashMap::new();
             for path in children_files.iter() {
+                if !is_plain_pdms_db_file(&path) {
+                    continue;
+                }
                 let file_name = path.file_stem().unwrap().to_str().unwrap();
                 if let Some(base_name) = file_name.strip_suffix("_0001") {
                     file_map.insert(base_name.to_string(), path.clone());
@@ -1329,6 +1341,9 @@ where
     // 处理文件名_0001和文件名同时存在的情况
     let mut file_map = HashMap::new();
     for path in children_files.iter() {
+        if !is_plain_pdms_db_file(&path) {
+            continue;
+        }
         let file_name = path.file_stem().unwrap().to_str().unwrap();
         if let Some(base_name) = file_name.strip_suffix("_0001") {
             file_map.insert(base_name.to_string(), path.clone());
@@ -2170,6 +2185,9 @@ pub async fn sync_total_async_threaded(
     // 处理文件名_0001和文件名同时存在的情况
     let mut file_map = HashMap::new();
     for path in children_files.iter() {
+        if !is_plain_pdms_db_file(&path) {
+            continue;
+        }
         let file_name = path.file_stem().unwrap().to_str().unwrap();
         if let Some(base_name) = file_name.strip_suffix("_0001") {
             file_map.insert(base_name.to_string(), path.clone());

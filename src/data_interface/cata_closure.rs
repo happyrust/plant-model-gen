@@ -1534,7 +1534,8 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
             let sql = format!("INSERT IGNORE INTO ATT_UDA [{}]", chunk.join(","));
             project_primary_db().query(&sql).await?;
         }
-        let mut pe_owner_sql = Vec::new();
+        let mut pe_owner_deletes = Vec::new();
+        let mut pe_owner_inserts = Vec::new();
         for parent in refs {
             let Some((_, children)) = retained.get(parent) else {
                 continue;
@@ -1545,15 +1546,23 @@ pub async fn ensure_cata_refnos_parsed(seeds: &[RefU64]) -> Result<LazyFallbackO
                     continue;
                 }
                 let child_key = child.to_pe_key();
-                pe_owner_sql.push(format!(
-                    "DELETE pe_owner:[{parent_key}, {order}]; \
-                     INSERT RELATION INTO pe_owner {{ id: pe_owner:[{parent_key}, {order}], \
+                pe_owner_deletes.push(format!("DELETE pe_owner:[{parent_key}, {order}];"));
+                pe_owner_inserts.push(format!(
+                    "INSERT RELATION INTO pe_owner {{ id: pe_owner:[{parent_key}, {order}], \
                      in: {child_key}, out: {parent_key} }};"
                 ));
             }
         }
-        for chunk in pe_owner_sql.chunks(200) {
-            project_primary_db().query(chunk.join("\n")).await?.check()?;
+        // versioned 引擎中，同一请求“删边→重插同 (in,out)”可能仍命中旧的
+        // unique_pe_owner 索引项。与 full/partial/increment 层级写入保持同一约束：
+        // 删除必须先独立提交，后续请求才能安全重插。
+        for statements in [pe_owner_deletes, pe_owner_inserts] {
+            for chunk in statements.chunks(200) {
+                project_primary_db()
+                    .query(chunk.join("\n"))
+                    .await?
+                    .check()?;
+            }
         }
     }
 

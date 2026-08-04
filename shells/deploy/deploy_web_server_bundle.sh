@@ -505,6 +505,18 @@ run_remote "set -e; \
   systemctl status '$SERVICE_NAME' || true; \
   exit 1"
 
+log "Ensuring SQLite spatial index is populated"
+run_remote "set -e; \
+  stats=\$(curl -fsS http://127.0.0.1:3100/api/sqlite-spatial/stats); \
+  count=\$(printf '%s' \"\$stats\" | sed -n 's/.*\"total_elements\":\([0-9][0-9]*\).*/\1/p'); \
+  if [ \"\${count:-0}\" -eq 0 ]; then \
+    curl -fsS -X POST http://127.0.0.1:3100/api/sqlite-spatial/rebuild; \
+    stats=\$(curl -fsS http://127.0.0.1:3100/api/sqlite-spatial/stats); \
+    count=\$(printf '%s' \"\$stats\" | sed -n 's/.*\"total_elements\":\([0-9][0-9]*\).*/\1/p'); \
+  fi; \
+  [ \"\${count:-0}\" -gt 0 ] || { echo \"SQLite spatial index remains empty: \$stats\"; exit 1; }; \
+  echo \"SQLite spatial index elements: \$count\""
+
 log "Deployment finished"
 log "Remote binary: $REMOTE_BIN"
 log "Remote assets: $REMOTE_ASSETS_DIR"

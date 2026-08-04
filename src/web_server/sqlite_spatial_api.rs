@@ -781,6 +781,7 @@ fn compare_spatial_items(
 /// 装进最大堆之后，堆一满就弹出「当前最差的一条」，于是留下的始终是当前排序口径下
 /// 最好的 `RESULT_HARD_CAP` 条。`db_rank` 在入堆时算一次而不是每次比较都算。
 struct RankedResult {
+    id: i64,
     item: SpatialQueryResultItem,
     db_rank: u8,
     sort_by: SpatialSortBy,
@@ -813,7 +814,9 @@ impl PartialEq for RankedResult {
 impl Eq for RankedResult {}
 
 /// 统计完整命中集合的专业分组计数。
-fn build_spec_groups(results: &[SpatialQueryResultItem]) -> Vec<SpatialQuerySpecGroup> {
+fn build_spec_groups<'a>(
+    results: impl IntoIterator<Item = &'a SpatialQueryResultItem>,
+) -> Vec<SpatialQuerySpecGroup> {
     let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
     for item in results {
         *counts.entry(item.spec_value).or_insert(0) += 1;
@@ -2947,6 +2950,7 @@ fn query_by_target_geometry(
     self_id: Option<i64>,
 ) -> SpatialQueryResult {
     let (page, per_page) = resolve_pagination(&params);
+    let hydrate_page = params.per_page_cap_override != Some(REFNOS_HARD_CAP);
 
     let query_regions = match &target_geometry {
         QueryTargetGeometry::Aabbs(target_aabbs) => target_aabbs.clone(),
@@ -2993,7 +2997,7 @@ fn query_by_target_geometry(
     });
 
     match outcome {
-        Ok(outcome) => paginate_scan_outcome(&outcome, page, per_page),
+        Ok(outcome) => paginate_scan_outcome(&outcome, &conn, page, per_page, hydrate_page),
         Err(error_result) => error_result,
     }
 }
@@ -3009,6 +3013,7 @@ fn scan_spatial_results(
     self_id: Option<i64>,
     is_sphere: bool,
 ) -> Result<SpatialScanOutcome, SpatialQueryResult> {
+    let generation = crate::sqlite_index::index_generation();
     let noun_filter = parse_noun_filter(&params.nouns);
     let spec_value_filter = parse_spec_value_filter(&params.spec_values);
     let keyword_filter = parse_keyword_filter(&params.keyword);
@@ -3023,6 +3028,8 @@ fn scan_spatial_results(
             filter_options: empty_filter_options(include_negative),
             query_bbox: None,
             meta: SpatialScanMeta::default(),
+            generation,
+            search_distance,
         });
     }
 
@@ -3118,6 +3125,7 @@ fn scan_spatial_results(
         };
         let db_rank = preferred_db_rank(&item, &preferred_db_prefix);
         heap.push(RankedResult {
+            id,
             item,
             db_rank,
             sort_by,
@@ -3129,20 +3137,31 @@ fn scan_spatial_results(
     }
 
     // into_sorted_vec 按 `Ord` 升序输出，与取舍口径同源，不需要再排一次。
-    let results: Vec<SpatialQueryResultItem> = heap
-        .into_sorted_vec()
-        .into_iter()
-        .map(|ranked| ranked.item)
-        .collect();
+    let ranked_results = heap.into_sorted_vec();
 
     // 分组计数取自完整命中集合，与分页无关，否则前端只能按当前页算出偏小的计数。
-    let groups = build_spec_groups(&results);
+    let groups = build_spec_groups(ranked_results.iter().map(|ranked| &ranked.item));
+    let results = ranked_results
+        .into_iter()
+        .map(|ranked| SpatialScanHit {
+            id: ranked.id,
+            spec_value: ranked.item.spec_value,
+            distance: ranked.item.distance,
+        })
+        .collect();
 
     let filter_options = build_filter_options_from_counts(
         noun_option_counts,
         spec_value_option_counts,
         include_negative,
     );
+
+    if crate::sqlite_index::index_generation() != generation {
+        return Err(error_spatial_query_result(
+            "spatial index changed during query; retry the query",
+            query_bbox_dto,
+        ));
+    }
 
     Ok(SpatialScanOutcome {
         results,
@@ -3154,18 +3173,31 @@ fn scan_spatial_results(
             truncated_candidates: scan.truncated,
             truncated_results,
         },
+        generation,
+        search_distance,
     })
 }
 
-/// 一次完整扫描的产物：已排序的全量命中 + 分组 + 过滤面板 + 规模信息。
+/// 缓存中的轻量命中项。属性和 AABB 在取页时按 id 批量补齐。
+#[derive(Clone, Copy)]
+struct SpatialScanHit {
+    id: i64,
+    spec_value: i64,
+    distance: Option<f32>,
+}
+const _: () = assert!(std::mem::size_of::<SpatialScanHit>() <= 24);
+
+/// 一次完整扫描的产物：已排序的轻量命中 + 分组 + 过滤面板 + 规模信息。
 ///
-/// 不含分页，翻页时可以直接复用。
+/// 不缓存 String/AABB 响应对象，避免 10 万条结果的单份快照占约 19MB。
 struct SpatialScanOutcome {
-    results: Vec<SpatialQueryResultItem>,
+    results: Vec<SpatialScanHit>,
     groups: Vec<SpatialQuerySpecGroup>,
     filter_options: SpatialQueryFilterOptions,
     query_bbox: Option<AabbDto>,
     meta: SpatialScanMeta,
+    generation: u64,
+    search_distance: f32,
 }
 
 struct ScanCacheEntry {
@@ -3243,11 +3275,13 @@ fn cached_scan_outcome(
 ) -> Result<Arc<SpatialScanOutcome>, SpatialQueryResult> {
     let cache = SCAN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    if let Ok(guard) = cache.lock() {
+    if let Ok(mut guard) = cache.lock() {
+        let generation_prefix = scan_cache_generation_prefix();
+        guard.retain(|entry_key, entry| {
+            entry.created.elapsed() < SCAN_CACHE_TTL && entry_key.starts_with(&generation_prefix)
+        });
         if let Some(entry) = guard.get(&key) {
-            if entry.created.elapsed() < SCAN_CACHE_TTL {
-                return Ok(Arc::clone(&entry.outcome));
-            }
+            return Ok(Arc::clone(&entry.outcome));
         }
     }
 
@@ -3285,18 +3319,79 @@ fn cached_scan_outcome(
 
 fn paginate_scan_outcome(
     outcome: &SpatialScanOutcome,
+    conn: &Connection,
     page: usize,
     per_page: usize,
+    hydrate_page: bool,
 ) -> SpatialQueryResult {
+    if crate::sqlite_index::index_generation() != outcome.generation {
+        return error_spatial_query_result(
+            "spatial index changed while reading cached page; retry the query",
+            outcome.query_bbox.clone(),
+        );
+    }
+
     let total_count = outcome.results.len();
     let offset = page.saturating_sub(1).saturating_mul(per_page);
-    let page_results = outcome
+    let page_hits: Vec<SpatialScanHit> = outcome
         .results
         .iter()
         .skip(offset)
         .take(per_page)
         .cloned()
         .collect();
+    let page_results = if hydrate_page {
+        let ids: Vec<i64> = page_hits.iter().map(|hit| hit.id).collect();
+        let rows = match fetch_candidates_by_ids(conn, &ids) {
+            Ok(rows) => rows,
+            Err(error) => return error_spatial_query_result(error, outcome.query_bbox.clone()),
+        };
+        let mut rows_by_id: HashMap<i64, CandidateRow> =
+            rows.into_iter().map(|row| (row.id, row)).collect();
+        if rows_by_id.len() != ids.len() {
+            return error_spatial_query_result(
+                "spatial index changed while reading cached page; retry the query",
+                outcome.query_bbox.clone(),
+            );
+        }
+        page_hits
+            .into_iter()
+            .map(|hit| {
+                let row = rows_by_id
+                    .remove(&hit.id)
+                    .expect("page ids were verified above");
+                SpatialQueryResultItem {
+                    refno: i64_to_refno_str(hit.id),
+                    noun: row.noun,
+                    spec_value: row.spec_value,
+                    name: row.name,
+                    aabb: Some(aabb_to_dto(&row.aabb)),
+                    distance: hit.distance,
+                    within_radius: hit.distance.map(|value| value <= outcome.search_distance),
+                }
+            })
+            .collect()
+    } else {
+        page_hits
+            .into_iter()
+            .map(|hit| SpatialQueryResultItem {
+                refno: i64_to_refno_str(hit.id),
+                noun: String::new(),
+                spec_value: hit.spec_value,
+                name: None,
+                aabb: None,
+                distance: hit.distance,
+                within_radius: hit.distance.map(|value| value <= outcome.search_distance),
+            })
+            .collect()
+    };
+
+    if crate::sqlite_index::index_generation() != outcome.generation {
+        return error_spatial_query_result(
+            "spatial index changed while reading cached page; retry the query",
+            outcome.query_bbox.clone(),
+        );
+    }
 
     success_spatial_query_result(
         page_results,

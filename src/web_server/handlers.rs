@@ -6631,6 +6631,67 @@ fn wall_distance_aabb_to_dto(aabb: &Aabb) -> WallDistanceAabbDto {
     }
 }
 
+/// 解析 wall-distance 的源构件：`source_refno` 优先，缺省回退 `suppo_refno`。
+///
+/// 历史上两个调用方各用一个字段（管道测距传 source_refno、空间计算面板传
+/// suppo_refno），处理端只认 source_refno 曾让面板调用必然失败。
+#[cfg(feature = "sqlite-index")]
+fn resolve_wall_distance_source_input(req: &WallDistanceRequest) -> Option<String> {
+    let trimmed = req.source_refno.trim();
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    match req.suppo_refno.as_ref()? {
+        SpaceSuppoRefnoInput::Full(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                Some(raw.to_string())
+            }
+        }
+        SpaceSuppoRefnoInput::Legacy(n) => Some(format!("0/{n}")),
+    }
+}
+
+/// 候选 AABB 上朝向源 AABB 的最近点。
+///
+/// 逐轴独立：分离轴取候选面向源的那一面，重叠轴取重叠区间中点
+/// （该轴对距离无贡献），得到的点与 `wall_distance_aabb_distance_mm`
+/// 的最小间距口径一致。
+#[cfg(feature = "sqlite-index")]
+fn wall_distance_closest_point_on_candidate(source: &Aabb, candidate: &Aabb) -> Point3<f32> {
+    let axis = |s_min: f32, s_max: f32, c_min: f32, c_max: f32| -> f32 {
+        if s_max < c_min {
+            c_min
+        } else if c_max < s_min {
+            c_max
+        } else {
+            (s_min.max(c_min) + s_max.min(c_max)) * 0.5
+        }
+    };
+    Point3::new(
+        axis(
+            source.mins.x,
+            source.maxs.x,
+            candidate.mins.x,
+            candidate.maxs.x,
+        ),
+        axis(
+            source.mins.y,
+            source.maxs.y,
+            candidate.mins.y,
+            candidate.maxs.y,
+        ),
+        axis(
+            source.mins.z,
+            source.maxs.z,
+            candidate.mins.z,
+            candidate.maxs.z,
+        ),
+    )
+}
+
 #[cfg(feature = "sqlite-index")]
 fn wall_distance_aabb_distance_mm(a: &Aabb, b: &Aabb) -> f64 {
     let dx = if a.maxs.x < b.mins.x {
@@ -6734,7 +6795,13 @@ pub async fn api_space_wall_distance(
             .unwrap_or(WALL_DISTANCE_DEFAULT_SEARCH_RADIUS_MM)
             .max(0.0);
 
-        let source_refno = match parse_wall_distance_source_refno(&req.source_refno) {
+        let Some(source_input) = resolve_wall_distance_source_input(&req) else {
+            return Json(json!({
+                "status": "error",
+                "message": "缺少源构件：source_refno 与 suppo_refno 至少提供一个"
+            }));
+        };
+        let source_refno = match parse_wall_distance_source_refno(&source_input) {
             Ok(v) => v,
             Err(err) => {
                 return Json(json!({
@@ -6818,7 +6885,9 @@ pub async fn api_space_wall_distance(
                 noun,
                 spec_value,
                 distance_mm,
-                closest_point: wall_distance_point_to_dto(candidate_aabb.mins),
+                closest_point: wall_distance_point_to_dto(
+                    wall_distance_closest_point_on_candidate(&source_aabb, &candidate_aabb),
+                ),
                 aabb: Some(wall_distance_aabb_to_dto(&candidate_aabb)),
             });
         }

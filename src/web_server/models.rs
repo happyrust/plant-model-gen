@@ -2544,13 +2544,18 @@ pub struct FittingResponseData {
 }
 
 /// 距墙/定位块 距离 请求
+///
+/// 兼容两类调用方：管道测距链路传 `source_refno`（含 dbnum 前缀），
+/// 空间计算面板传 `suppo_refno`。两个都缺才算参数错误，处理端按
+/// `source_refno` 优先、`suppo_refno` 兜底解析。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallDistanceRequest {
     #[serde(default)]
     pub dbnum: Option<u32>,
     #[serde(default)]
     pub source_refno: String,
-    pub suppo_refno: SpaceSuppoRefnoInput,
+    #[serde(default)]
+    pub suppo_refno: Option<SpaceSuppoRefnoInput>,
     #[serde(default)]
     pub suppo_type: Option<String>,
     #[serde(default)]

@@ -2139,7 +2139,7 @@ fn do_nearest_clearance_query(
 
     let mut nearest_by_group = Vec::new();
     let mut warnings = Vec::new();
-    for (group_priority, group) in groups.iter().enumerate() {
+    for group in groups.iter() {
         let group_nouns: HashSet<String> = group.nouns.iter().cloned().collect();
         let mut group_candidates = candidates
             .iter()
@@ -2147,6 +2147,8 @@ fn do_nearest_clearance_query(
             .map(|(_noun, candidate)| candidate.clone())
             .collect::<Vec<_>>();
 
+        // 组内排序：距离 → scope 内 dbnum 优先级 → refno。
+        // 分组之间互不比较（各组独立截断），不需要组间 tiebreaker。
         group_candidates.sort_by(|a, b| {
             a.distance_mm
                 .partial_cmp(&b.distance_mm)
@@ -2155,7 +2157,6 @@ fn do_nearest_clearance_query(
                     candidate_sort_key_scope_rank(a, &scope_dbnums)
                         .cmp(&candidate_sort_key_scope_rank(b, &scope_dbnums))
                 })
-                .then_with(|| group_priority.cmp(&group_priority))
                 .then_with(|| a.refno.cmp(&b.refno))
         });
         if group_candidates.is_empty() {
@@ -2369,7 +2370,14 @@ fn do_spatial_query(
                 );
             }
         };
-        let row = query_aabb_row(&conn, id).unwrap_or(None);
+        // 读库失败必须冒泡：吞成 None 会让「查询出错」伪装成「refno 不存在」，
+        // 静默走 fallback 或返回空结果。
+        let row = match query_aabb_row(&conn, id) {
+            Ok(row) => row,
+            Err(e) => {
+                return error_spatial_query_result(format!("query refno aabb failed: {}", e), None);
+            }
+        };
         let Some((minx, miny, minz, maxx, maxy, maxz)) = row else {
             if let Some(ids) = fallback_refno_ids.as_deref() {
                 match query_aabbs_for_ids(&conn, ids) {

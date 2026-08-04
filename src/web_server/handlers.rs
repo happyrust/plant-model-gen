@@ -1968,8 +1968,12 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         // 刷新路径会额外做层级 AABB 聚合，补齐 BRAN/HANG/PIPE 等中间节点空间占位。
         let mut total_processed: usize = 0;
         let mut exported_dbnums: Vec<u32> = Vec::new();
+        let mut rebuild_source = "inst_relate";
+        let mut rebuild_error: Option<String> = None;
         let t0 = std::time::Instant::now();
-        let dbnums = match query_distinct_dbnums_from_inst_relate().await {
+        let db_option = aios_core::get_db_option();
+        let db_option_ext = crate::options::DbOptionExt::from((*db_option).clone());
+        let mut dbnums = match query_distinct_dbnums_from_inst_relate().await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(Json(
@@ -1977,19 +1981,51 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
                 ));
             }
         };
+        dbnums.extend(db_option.manual_db_nums.clone().unwrap_or_default());
+        dbnums.sort_unstable();
+        dbnums.dedup();
 
         if !dbnums.is_empty() {
             match refresh_sqlite_spatial_index_from_inst_relate_aabb(Some(&dbnums), None).await {
                 Ok(count) => {
                     total_processed = count;
-                    exported_dbnums = dbnums;
+                    exported_dbnums = dbnums.clone();
                 }
                 Err(e) => {
-                    return Ok(Json(json!({
-                        "success": false,
-                        "error": format!("刷新 SQLite 空间索引失败: {}", e),
-                    })));
+                    rebuild_error = Some(format!("从 inst_relate 刷新失败: {}", e));
                 }
+            }
+        }
+
+        // 新模型发布以 Parquet 为稳定产物；部分生成模式不会保留可供旧重建路径读取的
+        // inst_relate AABB。旧路径返回 0 时，直接从已发布 Parquet 恢复同一份索引。
+        if total_processed == 0 && !dbnums.is_empty() {
+            let parquet_root = db_option_ext.get_project_output_dir().join("parquet");
+
+            for dbnum in &dbnums {
+                let parquet_dir = parquet_root.join(dbnum.to_string());
+                if !parquet_dir.join("aabb.parquet").is_file() {
+                    continue;
+                }
+                let import_stats = match index
+                    .inner()
+                    .refresh_dbnum_from_parquet_dir(*dbnum, &parquet_dir)
+                {
+                    Ok(stats) => stats,
+                    Err(e) => {
+                        return Ok(Json(json!({
+                            "success": false,
+                            "error": format!("从 Parquet 恢复 SQLite 空间索引失败: {}", e),
+                        })));
+                    }
+                };
+                total_processed += import_stats.total_inserted;
+                if import_stats.total_inserted > 0 && !exported_dbnums.contains(dbnum) {
+                    exported_dbnums.push(*dbnum);
+                }
+            }
+            if total_processed > 0 {
+                rebuild_source = "parquet";
             }
         }
 
@@ -2004,11 +2040,23 @@ pub async fn api_sqlite_spatial_rebuild() -> Result<Json<serde_json::Value>, Sta
         };
         let elapsed = t0.elapsed();
 
+        if stats.total_elements == 0 {
+            return Ok(Json(json!({
+                "success": false,
+                "error": rebuild_error.unwrap_or_else(|| "未找到可导入的已发布 Parquet AABB".to_string()),
+                "processed_refnos": total_processed,
+                "dbnums": exported_dbnums,
+                "index_elements": 0,
+                "elapsed_ms": elapsed.as_millis(),
+            })));
+        }
+
         Ok(Json(json!({
             "success": true,
             "message": "SQLite 空间索引重建完成",
             "processed_refnos": total_processed,
             "dbnums": exported_dbnums,
+            "source": rebuild_source,
             "index_elements": stats.total_elements,
             "index_type": stats.index_type,
             "elapsed_ms": elapsed.as_millis(),

@@ -304,7 +304,13 @@ jobs:
                journalctl -u web-server -n 120 --no-pager || true; \
                ss -tlnp | grep -E ':3100|:8020' || true; \
                exit 1; \
-             fi"
+             fi; \
+             spatial_stats=\$(curl -fsS http://127.0.0.1:3100/api/sqlite-spatial/stats); \
+             if ! printf %s \$spatial_stats | grep -Eq 'total_elements[^0-9]*[1-9][0-9]*'; then \
+               curl -fsS -X POST http://127.0.0.1:3100/api/sqlite-spatial/rebuild; \
+               spatial_stats=\$(curl -fsS http://127.0.0.1:3100/api/sqlite-spatial/stats); \
+             fi; \
+             printf %s \$spatial_stats | grep -Eq 'total_elements[^0-9]*[1-9][0-9]*' || { echo SQLite-spatial-index-remains-empty:\$spatial_stats; exit 1; }"
 
   install-ssh-key:
     name: Install SSH Key Only

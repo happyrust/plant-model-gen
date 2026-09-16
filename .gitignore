@@ -117,6 +117,8 @@ nul
 /runtime/local-collab/*/project/
 /runtime/local-collab/*/output/
 /runtime/local-collab/*/*.sqlite*
+# plant-web-server 当站点后端时每站一份的状态目录（PLANT_WEB_RUNTIME_DIR）
+/runtime/local-collab/*/pws-runtime/
 
 # ═══════════════════════════════════════════════════════════════
 # External binaries & tools

@@ -831,20 +831,37 @@ pub fn default_index_path(project_name: &str) -> PathBuf {
 /// 设计库精确依赖边，写入 [`default_index_path`]。
 ///
 /// `force=true` 全量重扫；`force=false` 按指纹增量。
+///
+/// 整轮重建都是同步重活：walkdir + pdms_io 逐库读 B+ 树（Phase 1）、parse_pdms_db 解析 DESI
+/// （Phase 2，接口虽是 `async fn`，函数体是 std 文件读 + 纯 CPU 解析，没有真正的挂起点）。
+/// 直接在 async 上下文里跑会把一个 tokio worker 占住整轮（整套 E3D 样例首轮全量扫描 10 分钟以上，
+/// 期间 HTTP / MQTT 任务少一个 worker 可用），所以整体放到阻塞线程池，Phase 2 用
+/// [`tokio::runtime::Handle::block_on`] 在阻塞线程上驱动。
 pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || rebuild_from_config_blocking(force, &handle))
+        .await
+        .context("db_index 重建任务异常退出")?
+}
+
+/// [`rebuild_from_config`] 的同步实现；只在阻塞线程上调用（Phase 2 靠 `handle.block_on`）。
+fn rebuild_from_config_blocking(
+    force: bool,
+    handle: &tokio::runtime::Handle,
+) -> anyhow::Result<ScanReport> {
     let db_option = load_db_option_from_env()?;
     let project_name = db_option.project_name.clone();
     let roots = derive_project_roots(&db_option)?;
 
     let out_path = default_index_path(&project_name);
 
-    // Phase 1（同步）：index-only 归属扫描；在 await 前释放连接以保持 Send。
+    // Phase 1（同步）：index-only 归属扫描；用完即关连接。
     let report = {
         let store = DbIndexStore::open(&out_path)?;
         prescan_roots(&store, &roots, force)
     };
 
-    // Phase 2（async）：设计库外向引用（不持有连接）。
+    // Phase 2：设计库外向引用（不持有连接）。
     // 单库/少量库部署时只解析目标 DESI，避免把一次快速部署放大成全工程 DESI 深扫。
     let manual_db_nums = db_option
         .manual_db_nums
@@ -852,9 +869,9 @@ pub async fn rebuild_from_config(force: bool) -> anyhow::Result<ScanReport> {
         .unwrap_or_default()
         .to_vec();
     let outbound = if manual_db_nums.iter().any(|dbnum| *dbnum > 0) {
-        collect_design_outbound_for_dbnums(&roots, &manual_db_nums).await
+        handle.block_on(collect_design_outbound_for_dbnums(&roots, &manual_db_nums))
     } else {
-        collect_design_outbound(&roots).await
+        handle.block_on(collect_design_outbound(&roots))
     };
 
     // Phase 3（同步）：记录精确依赖边。

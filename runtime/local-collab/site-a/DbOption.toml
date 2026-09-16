@@ -1,4 +1,4 @@
-# 由 plant-collab-monitor/scripts/local-remote-collab-setup.ps1 于 2026-09-15 22:23:34 生成
+# 由 plant-collab-monitor/scripts/local-remote-collab-setup.ps1 于 2026-09-16 09:47:43 生成
 # 模板：db_options/DbOption.toml · 站点：site-a（local-a · :4100 · 中继模式 sync_relay_mode = true，无 SurrealDB）
 # 仅供本机双站点 smoke 使用；activate 会改写本文件的 mqtt_host / mqtt_port / file_server_host / location / location_dbs
 # ====== rs-core 同步管线（仅 run_app 同步流程使用，不影响模型生成/导出） ======

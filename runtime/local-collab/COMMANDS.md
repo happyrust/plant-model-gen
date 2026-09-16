@@ -1,11 +1,11 @@
 ```powershell
 # 本机双站点 smoke · 启动顺序（每条长驻命令各开一个终端）· SQLite-only 中继模式，不需要 SurrealDB
-# 生成时间 2026-09-15 22:23:34 · 后端根目录 D:\work\plant-code\plant-model-gen
+# 生成时间 2026-09-16 09:47:44 · 后端根目录 D:\work\plant-code\plant-model-gen
 # 工程：每站一份副本 <site>/project/（SCB） · 演练文件 scb6000_0001
 
 # 0. 前置（缺什么装什么，装完重开终端）
 #    winget install --id EclipseFoundation.Mosquitto -e
-#    cd D:\work\plant-code\plant-model-gen; cargo build --bin web_server --features web_server,relay-sync
+#    cd D:\work\plant-code\plant-web-server; cargo build --bin plant-web-server
 
 # 1. MQTT broker（127.0.0.1:1883）
 #    winget 装的 Mosquitto 会以服务 mosquitto 常驻 127.0.0.1:1883（local-only 模式、允许匿名），服务在跑就直接用；

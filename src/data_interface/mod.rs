@@ -33,6 +33,11 @@ pub mod increment_record;
 
 pub mod mqtt_file_sync;
 
+/// MQTT 源文件同步台账（SQLite `e3d_sync_ledger` / `e3d_sync_changes` / `relay_sync_watermark`），
+/// 取代原先写 SurrealDB `e3d_sync` 的两处调用；中继站点不需要 SurrealDB。
+#[cfg(feature = "mqtt")]
+pub mod sync_ledger;
+
 pub mod sesno_increment;
 
 pub mod tidb_manager;

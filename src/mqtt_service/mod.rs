@@ -26,6 +26,14 @@ pub struct SyncE3dFileMsg {
     // 加入时间戳, 或者这里开启索引
     // 这个字段用于存储文件的时间戳信息
     pub timestamp: SurrealDatetime,
+
+    /// 与 `file_names` 一一对应的 latest sesno；`0` 表示该文件未声明。
+    ///
+    /// 2026-09-15 新增（异地协同 SQLite-only 方案 P1）。线格式向后兼容：旧发送端没有此字段，
+    /// 新接收端反序列化得到空 vec，收包端 sesno 校验降级为 `skipped`；旧接收端 serde_json
+    /// 忽略未知字段。用 [`Self::declared_sesno`] 取值，不要直接按下标读。
+    #[serde(default)]
+    pub file_sesnos: Vec<u32>,
 }
 
 // 对 SyncE3dFileMsg 类型进行 trait 实现
@@ -44,7 +52,26 @@ impl SyncE3dFileMsg {
             location: get_db_option().location.clone(),
             // 使用Default trait 的 default 方法将 timestamp 字段初始化为默认值
             timestamp: Default::default(),
+            // 发送端知道 sesno 时再填（见 mqtt_file_sync::MqttFilePublisher::publish_source_files）
+            file_sesnos: Vec::new(),
         }
+    }
+
+    /// 第 `index` 个文件在消息里声明的 latest sesno；字段缺失或为 0 视为未声明。
+    pub fn declared_sesno(&self, index: usize) -> Option<u32> {
+        self.file_sesnos
+            .get(index)
+            .copied()
+            .filter(|sesno| *sesno > 0)
+    }
+
+    /// 第 `index` 个文件在消息里声明的源文件 Blake2b512（小写 hex）；缺失或空串视为未声明。
+    pub fn declared_hash(&self, index: usize) -> Option<&str> {
+        self.file_hashes
+            .get(index)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
     }
 }
 

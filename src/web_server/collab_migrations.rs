@@ -122,6 +122,17 @@ pub fn ensure_collab_schema() {
         log::debug!("✓ [collab-migrate] node_config 表就绪");
     }
 
+    // 3. MQTT 源文件同步台账 + 中继水位（e3d_sync_ledger / e3d_sync_changes / relay_sync_watermark）。
+    //    DDL 由 data_interface::sync_ledger 持有（首次写入前也会自建）；这里在启动期建一次，
+    //    让还没收过消息的站点也能直接查表。
+    #[cfg(feature = "mqtt")]
+    match crate::data_interface::sync_ledger::ensure_schema(&conn) {
+        Ok(()) => log::debug!(
+            "✓ [collab-migrate] e3d_sync_ledger / e3d_sync_changes / relay_sync_watermark 就绪"
+        ),
+        Err(e) => log::warn!("⚠️  [collab-migrate] 创建同步台账表失败: {}", e),
+    }
+
     log::info!(
         "🎯 [collab-migrate] 异地协同 schema 对齐完成 (path={})",
         db_path

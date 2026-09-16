@@ -77,6 +77,11 @@ surrealdb = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1"
 # surrealdb-types 需要显式引入：SurrealValue derive 宏默认使用 ::surrealdb_types 路径
 surrealdb-types = { git = "https://github.com/happyrust/surrealdb", branch = "dev-3.1" }
 pdms_io = { git = "https://github.com/happyrust/pdms-io.git", branch = "dev-3.1" }
+# e3d-io：E3D 2.1/3.1 db 文件只读解析（结构 / 会话 / 会话间 diff），不带数据库。
+# 只给异地协同的中继模式用（feature relay-sync）。同级 clone 自 old/vendor/e3d-io，
+# 它自己 path 依赖 ../e3d-attlib，两者必须并排放在 D:\work\plant-code\ 下。
+# 见 plant-collab-monitor/docs/plans/2026-09-15-sqlite-only-remote-collab-plan.md P0。
+e3d-io = { path = "../e3d-io", optional = true }
 # gen-xkt = { path = "../gen-xkt" }
 rvm-rs = { git = "https://github.com/happyrust/rvm-rs", optional = true }
 
@@ -94,6 +99,8 @@ dashmap = { version = "=7.0.0-rc2", features = ["serde", "rayon"] }
 tokio = { version = "1.47.1", features = ["full"] }
 serde = { version = "1.0.137", features = ["derive"] }
 sha2 = "0.10"
+# 收包端对着 SyncE3dFileMsg.file_hashes 校验 clone 结果；与 pdms_io::sync::compress 同一算法（Blake2b512）
+blake2 = { version = "0.10", optional = true }
 id_tree = { version = "1.8.0", features = ["serde_support"] }
 glam = { version = "0.30.8", features = ["serde", "rkyv"] }
 glamx = { version = "0.1.3", features = ["approx", "rand"], optional = true }
@@ -255,8 +262,13 @@ local = []
 ws = []
 debug_obj_export = []
 debug_expr = ["aios_core/debug_expr"]
-# mqtt 路径依赖 pdms_io::sync（CBA 压缩/克隆），必须连带打开 pdms_io/sync-archive
-mqtt = ["dep:rumqttc", "pdms_io/sync-archive"]
+# mqtt 路径依赖 pdms_io::sync（CBA 压缩/克隆），必须连带打开 pdms_io/sync-archive。
+# 同步台账（data_interface::sync_ledger）写 SQLite：blake2 校验 hash、uuid 生成行 id、
+# sqlite-index 带进 rusqlite——所以 mqtt 蕴含 sqlite-index。
+mqtt = ["dep:rumqttc", "dep:blake2", "dep:uuid", "pdms_io/sync-archive", "sqlite-index"]
+# 异地协同中继模式：SQLite 台账 + e3d-io 做收包校验与增量 diff，站点不需要 SurrealDB。
+# 中继只有配上 MQTT 才有意义，所以蕴含 mqtt。web_server 构建：--features web_server,relay-sync
+relay-sync = ["mqtt", "dep:e3d-io"]
 viewer = []                           #是否开启视图
 gen_model = ["aios_core/gen_model"]
 manifold = ["aios_core/manifold"]

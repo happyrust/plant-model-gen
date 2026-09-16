@@ -1404,6 +1404,8 @@ pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
     let guard = REMOTE_RUNTIME.read().await;
     let active = guard.is_some();
     let env_id = guard.as_ref().map(|s| s.env_id.clone());
+    // 中继模式（sync_relay_mode）：运行态没有 SurrealDB、不跑 watch-incremental。未激活时为 false。
+    let relay = guard.as_ref().is_some_and(|s| s.relay);
     let mqtt_connected = {
         let l = MQTT_CONNECT_STATUS.lock().await;
         l.clone()
@@ -1412,6 +1414,7 @@ pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
         "status":"success",
         "active": active,
         "env_id": env_id,
+        "relay": relay,
         "mqtt_connected": mqtt_connected,
     })))
 }

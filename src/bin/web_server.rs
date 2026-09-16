@@ -43,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|e| panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e));
     let db_option: aios_core::options::DbOption = toml::from_str(&config_content)
         .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
-    // versioned 存储参数是 DbOptionExt 扩展字段（specs/022），从同一 toml 直接提取
-    let (versioned_storage, version_retention) = {
+    // versioned 存储参数与中继开关都是 DbOptionExt 扩展字段（specs/022 / 异地协同 P2），从同一 toml 直接提取
+    let (versioned_storage, version_retention, sync_relay_mode) = {
         let value: toml::Value = toml::from_str(&config_content)
             .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
         let versioned = value
@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
             .filter(|v| !v.is_empty())
             .unwrap_or("0")
             .to_string();
-        (versioned, retention)
+        let relay = aios_database::options::sync_relay_mode_from_toml(&value);
+        (versioned, retention, relay)
     };
 
     let ws_cfg = &db_option.web_server;
@@ -75,8 +76,14 @@ async fn main() -> anyhow::Result<()> {
         port
     );
 
-    // 自启动 SurrealDB
-    let _surreal_child = if ws_cfg.auto_start_surreal {
+    // 自启动 SurrealDB。中继模式（sync_relay_mode = true）不需要 SurrealDB：这里直接跳过，
+    // 否则 `surreal` 不在 PATH 的中继站点会在这一步 spawn 失败、整个进程退出。
+    let _surreal_child = if ws_cfg.auto_start_surreal && sync_relay_mode {
+        println!(
+            "⏭️  中继模式（sync_relay_mode = true）：跳过 SurrealDB 自启动（忽略 auto_start_surreal = true）"
+        );
+        None
+    } else if ws_cfg.auto_start_surreal {
         let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
         let db_uri = aios_database::options::rocksdb_conn_str(
             data_path,

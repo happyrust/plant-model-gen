@@ -236,10 +236,16 @@ async fn run_with_sqlite_index(
                             .iter()
                             .map(|anchor| anchor.dbnum)
                             .collect::<std::collections::BTreeSet<_>>();
+                        // 随消息声明每个文件的 latest sesno（file_sesnos），收包端据此校验
                         let committed_files = increment_records
                             .iter()
                             .filter(|record| committed_dbnums.contains(&record.dbnum))
-                            .map(|record| PathBuf::from(&record.file_path))
+                            .map(|record| {
+                                crate::data_interface::mqtt_file_sync::PublishSourceFile::new(
+                                    PathBuf::from(&record.file_path),
+                                    Some(record.latest_sesno),
+                                )
+                            })
                             .collect::<Vec<_>>();
                         if !committed_files.is_empty()
                             && let Err(error) = mqtt_file_publisher

@@ -37,12 +37,19 @@ pub async fn trigger_file_download(
         file_server_host: file_server_host.to_string(),
         location: "test".to_string(),
         timestamp: aios_core::Datetime::default(),
+        // 手工触发没有 sesno 可声明；收包端校验会记 skipped
+        file_sesnos: vec![],
     };
+    // 手工触发没有原始 MQTT 字节，msg_id 从结构体重新序列化得到
+    let msg_id = crate::data_interface::sync_ledger::msg_id_for(&sync_e3d);
 
     // 创建一个临时的 watcher（实际使用时应该从全局状态获取）
     let watcher = pdms_io::watch::PdmsWatcher::new(Vec::<std::path::PathBuf>::new());
 
-    match crate::data_interface::mqtt_file_sync::exec_delta_clone_remotes(&watcher, sync_e3d).await
+    match crate::data_interface::mqtt_file_sync::exec_delta_clone_remotes(
+        &watcher, sync_e3d, &msg_id,
+    )
+    .await
     {
         Ok(_) => Ok(Json(json!({
             "status": "success",

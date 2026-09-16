@@ -12,8 +12,12 @@
 //!
 //! 表：
 //! - `e3d_sync_ledger`      每条 MQTT 消息里的每个文件一行（outbound / inbound），带校验结果与 diff 计数
-//! - `e3d_sync_changes`     变更清单（RefNo 级），中继轮询（P3）用 e3d-io diff 填
-//! - `relay_sync_watermark` 中继水位（每 dbnum 一行）：收包端校验通过后写入以防回声，P3 轮询读写
+//! - `e3d_sync_changes`     变更清单（RefNo 级），由中继轮询的 e3d-io diff 填
+//! - `relay_sync_watermark` 中继水位（每 dbnum 一行）：收包端校验通过后写入以防回声
+//!
+//! 中继本身 2026-09-16 搬去了 `../plant-web-server`（`src/relay/`），这个后端只剩完整站点
+//! 那条路径：仍然收发 MQTT 源文件并记这本账，但不判会话 diff（没有 e3d-io），也不做中继广播。
+//! 水位表因此只由收包端写，`load_watermarks_*` / `set_watermark_*` 这几个读写口留着给中继用。
 //!
 //! 设计见 `plant-collab-monitor/docs/plans/2026-09-15-sqlite-only-remote-collab-plan.md` P1 / P3。
 
@@ -506,29 +510,18 @@ impl InboundVerdict {
 }
 
 enum E3dProbe {
-    /// 本构建没有 e3d-io（未开 `relay-sync` feature）。
+    /// 本构建没有 e3d-io。
     Unavailable(&'static str),
+    #[allow(dead_code)]
     Opened { latest_sesno: Option<u32> },
+    #[allow(dead_code)]
     Failed(String),
 }
 
-#[cfg(feature = "relay-sync")]
-fn probe_e3d(path: &Path) -> E3dProbe {
-    let mut engine = match e3d_io::ReadOnlyEngine::open(path) {
-        Ok(engine) => engine,
-        Err(error) => return E3dProbe::Failed(format!("open: {error}")),
-    };
-    match engine.sessions() {
-        Ok(sessions) => E3dProbe::Opened {
-            latest_sesno: sessions.iter().map(|session| session.session_id).max(),
-        },
-        Err(error) => E3dProbe::Failed(format!("sessions: {error}")),
-    }
-}
-
-#[cfg(not(feature = "relay-sync"))]
+/// 这个后端不带 e3d-io：会话链校验只有中继站点做，而中继已经搬到 `../plant-web-server`
+/// （2026-09-16）。收包端因此只比 hash，sesno 一项记 `skipped`。
 fn probe_e3d(_path: &Path) -> E3dProbe {
-    E3dProbe::Unavailable("e3d-io 未编入本构建（需 --features relay-sync）")
+    E3dProbe::Unavailable("e3d-io 未编入本构建（会话链校验在 plant-web-server 的中继里做）")
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -818,13 +811,9 @@ mod tests {
         assert_eq!(v.verify_status, VerifyStatus::HashMismatch);
         assert_eq!(v.actual_hash.as_deref(), Some(good_hash.as_str()));
 
-        // hash 对、不是 E3D 库 → 有 e3d-io 时 open_failed，没有时 skipped
+        // hash 对、不是 E3D 库 → 本构建没有 e3d-io，sesno 一项记 skipped
         let v = verify_cloned_file_blocking(&file, Some(&good_hash.to_uppercase()), Some(3));
-        if cfg!(feature = "relay-sync") {
-            assert_eq!(v.verify_status, VerifyStatus::OpenFailed);
-        } else {
-            assert_eq!(v.verify_status, VerifyStatus::Skipped);
-        }
+        assert_eq!(v.verify_status, VerifyStatus::Skipped);
         assert!(v.verify_detail.as_deref().unwrap().contains("hash=ok"));
 
         // 文件不存在 → open_failed(read_failed)

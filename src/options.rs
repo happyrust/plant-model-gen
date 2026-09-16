@@ -549,14 +549,6 @@ pub struct DbOptionExt {
     #[serde(default = "default_true")]
     pub use_surrealdb: bool,
 
-    /// 异地协同中继模式：站点只做源 db 文件分发（检测 / 广播 / 接收 / 校验），不解析、不落模型库，
-    /// 因此不需要 SurrealDB——`activate` 跳过 `ensure_surreal_init` 硬闸，`web_server` 启动期跳过
-    /// SurrealDB 自启动，轮询走 `relay_sync`（e3d-io 判变更）而不是 `watch_incremental`。
-    /// 与 `use_surrealdb` 无关：那个只控制 SurrealDB 进程 / 副本可用性。
-    /// 见 plant-collab-monitor/docs/plans/2026-09-15-sqlite-only-remote-collab-plan.md P2。
-    #[serde(default)]
-    pub sync_relay_mode: bool,
-
     /// model 缓存目录（默认 output/instance_cache）
     #[serde(default)]
     pub model_cache_dir: Option<String>,
@@ -849,7 +841,6 @@ impl From<DbOption> for DbOptionExt {
             gen_pipeline_debug_limit_per_target_type: None,
             mesh_formats: vec![MeshFormat::PdmsMesh],
             use_surrealdb: true,
-            sync_relay_mode: false,
             model_cache_dir: None,
             defer_db_write: false,
             boolean_pipeline_mode: BooleanPipelineMode::MemoryTasks,
@@ -894,39 +885,6 @@ pub fn current_versioned_params() -> anyhow::Result<(bool, String)> {
         )
     })?;
     Ok((ext.versioned_storage, ext.version_retention))
-}
-
-/// 从已解析的 toml 里取 `sync_relay_mode`（顶层键，缺省 false）。
-///
-/// `bin/web_server.rs`（决定要不要自启动 SurrealDB）与 `get_db_option_ext_from_path` 共用这一处，
-/// 免得两边对同一个键各写一套取法。
-pub fn sync_relay_mode_from_toml(toml_value: &toml::Value) -> bool {
-    toml_value
-        .get("sync_relay_mode")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-/// 读取当前运行时配置里的中继模式开关（异地协同 SQLite-only 方案 P2）。
-///
-/// `sync_relay_mode` 是 DbOptionExt 扩展字段，`aios_core::get_db_option()` 拿不到，
-/// 也不能走 `get_db_option_ext()`（它从 DbOption 反推，扩展键一律取默认值）；这里从
-/// `DB_OPTION_FILE` 指向的 toml 直接读——`activate` 刚把 env 写进这个文件，读到的就是当前站点的口径。
-///
-/// 语义与 [`current_versioned_params`] 一致：文件不存在 = 非中继部署，返回 false；
-/// 文件存在但读不了 / 解析不了必须报错，不能静默按「非中继」去撞 SurrealDB 硬闸。
-pub fn current_sync_relay_mode() -> anyhow::Result<bool> {
-    let raw = std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".into());
-    let config_path = raw.strip_suffix(".toml").unwrap_or(&raw).to_string();
-    let config_file = format!("{}.toml", config_path);
-    if !std::path::Path::new(&config_file).exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(&config_file)
-        .map_err(|e| anyhow::anyhow!("读取 sync_relay_mode 失败（配置文件 {}）: {e}", config_file))?;
-    let toml_value: toml::Value = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("解析 sync_relay_mode 失败（配置文件 {}）: {e}", config_file))?;
-    Ok(sync_relay_mode_from_toml(&toml_value))
 }
 
 /// 获取扩展的数据库选项
@@ -1100,9 +1058,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    // 异地协同中继模式（P2）：只分发源文件，不需要 SurrealDB。
-    let sync_relay_mode = sync_relay_mode_from_toml(&toml_value);
-
     // specs/027（ADR-0007）：DuckLake 配置键分级检测（行为键硬错误、惰性键警告）。
     check_retired_ducklake_keys(&toml_value)?;
     // specs/027 FR-015 / T011：sync_history=true 硬错误、false 与 sync_versioned 告警。
@@ -1250,7 +1205,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         gen_pipeline_debug_limit_per_target_type,
         mesh_formats,
         use_surrealdb,
-        sync_relay_mode,
         model_cache_dir,
         defer_db_write,
         boolean_pipeline_mode,
@@ -1319,9 +1273,6 @@ pub fn get_db_option_ext_from_path(config_path: &str) -> anyhow::Result<DbOption
         );
         if db_option_ext.enable_db_backfill {
             println!("   - enable_db_backfill: true");
-        }
-        if db_option_ext.sync_relay_mode {
-            println!("   - sync_relay_mode: true（异地协同中继：只分发源文件，不需要 SurrealDB）");
         }
         if let Some(output_root) = db_option_ext.output_root.as_deref() {
             println!("   - output_root: {}", output_root);

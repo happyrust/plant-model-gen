@@ -15,10 +15,6 @@ pub mod model_gen_catchup;
 pub mod model_generation_run;
 pub mod model_impact;
 pub mod project_mutation_lock;
-/// 异地协同中继模式（`sync_relay_mode = true`）的广播轮询：SQLite 水位 + e3d-io 判变更，不碰 SurrealDB。
-/// 与 `watch_incremental` 并列，后者是完整站点的实现；只在 `relay-sync` feature（带 e3d-io）下编译。
-#[cfg(feature = "relay-sync")]
-pub mod relay_sync;
 pub mod watch_incremental;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

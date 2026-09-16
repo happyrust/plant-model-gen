@@ -1404,8 +1404,9 @@ pub async fn runtime_status() -> Result<Json<serde_json::Value>, StatusCode> {
     let guard = REMOTE_RUNTIME.read().await;
     let active = guard.is_some();
     let env_id = guard.as_ref().map(|s| s.env_id.clone());
-    // 中继模式（sync_relay_mode）：运行态没有 SurrealDB、不跑 watch-incremental。未激活时为 false。
-    let relay = guard.as_ref().is_some_and(|s| s.relay);
+    // 中继站点现在是 ../plant-web-server，这个后端的运行态只有完整站点一种，恒为 false。
+    // 字段保留是因为监控台按它区分两类站点（`plant-collab-monitor` 的 shape 判定会读）。
+    let relay = false;
     let mqtt_connected = {
         let l = MQTT_CONNECT_STATUS.lock().await;
         l.clone()

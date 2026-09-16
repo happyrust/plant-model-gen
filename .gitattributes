@@ -1,0 +1,24 @@
+# 行尾统一：索引一律 LF。仓建于 2026-09-16，工作区里 Windows 编辑器留下的 CRLF
+# 在入库时归一化，避免以后出现整文件重写的假 diff。
+* text=auto eol=lf
+
+# cmd.exe 解释的脚本必须 CRLF（标签跳转在 LF 下会出错）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资产
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.xls binary
+*.xlsx binary
+*.rvm binary
+*.e3d binary
+*.pen binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

@@ -1,0 +1,1376 @@
+//! specs/022 候选4（方案 A）：增量状态 HTTP 面。
+//!
+//! 状态类端点是 Version Commit 存储（`sesno_version_anchor` / `version_commit_state`
+//! / `dbnum_info_table`）之上的只读 adapter——与 CLI 共享同一事实源，不再返回 mock。
+//! 动作类端点（触发检测/同步、任务、配置）从未有过实现，统一返回 501 并指引走
+//! CLI `incremental-sesno` / `watch-incremental`；未来要回填时应接
+//! `version_management::increment_run`（同一 IncrementRun seam），而非旁路实现。
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{fs, path::Path as FsPath, time::SystemTime};
+
+use crate::web_server::AppState;
+use crate::web_server::models::{IncrementalUpdateRequest, UpdateType};
+use aios_core::project_primary_db;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use surrealdb::types::SurrealValue;
+
+use crate::versioned_db::version_commit::committed_watermark;
+
+/// specs/022 候选4·方案B：HTTP 触发的增量运行注册表（内存态）。
+/// sync = 真实落库（persist），detect = 只读试跑（no-persist），
+/// sync+generate = 落库后按增量范围生成模型；全部走
+/// `version_management::increment_run::run_increment`（同一 IncrementRun /
+/// Version Commit seam）。写侧安全由 commit_version 的 lease + Commit Pending
+/// + 锚点固化兜底。进程重启后注册表清空（运行记录不持久，锚点才是权威）。
+static INCREMENT_RUNS: Lazy<DashMap<String, IncrementRunStatus>> = Lazy::new(DashMap::new);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IncrementRunStatus {
+    pub run_id: String,
+    pub dbnum: u32,
+    /// "sync"（落库）| "detect"（只读试跑）| "sync+generate"（落库+增量生成）
+    pub kind: String,
+    /// "queued" | "running" | "succeeded" | "failed" | "contention"
+    pub state: String,
+    pub from_sesno: u32,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub summary: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+fn publish_increment_run_progress(
+    hub: &crate::shared::ProgressHub,
+    run: &IncrementRunStatus,
+    processed: usize,
+    total: usize,
+) {
+    use crate::shared::{ProgressMessageBuilder, TaskStatus};
+
+    let status = match run.state.as_str() {
+        "queued" => TaskStatus::Pending,
+        "running" => TaskStatus::Running,
+        "succeeded" => TaskStatus::Completed,
+        _ => TaskStatus::Failed,
+    };
+    let percentage = match &status {
+        TaskStatus::Pending => 0.0,
+        TaskStatus::Running if total > 0 => processed as f32 * 100.0 / total as f32,
+        TaskStatus::Running => 0.0,
+        _ => 100.0,
+    };
+    let _ = hub.publish(
+        ProgressMessageBuilder::new(&run.run_id)
+            .status(status)
+            .percentage(percentage)
+            .step("manual_model_update", processed as u32, total as u32)
+            .items(processed as u64, total as u64)
+            .message(format!("dbnum={} {}", run.dbnum, run.state))
+            .details(json!(run))
+            .build(),
+    );
+}
+
+fn new_run_id(kind: &str, dbnum: u32) -> String {
+    format!(
+        "{kind}-db{dbnum}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+    )
+}
+
+/// 执行一次 IncrementRun（增量采集 → Version Commit → 可选增量模型生成）。
+///
+/// 所有 HTTP 增量入口共用的唯一执行函数——连接探针、选项组装都在这里，
+/// 保证 HTTP 面不可能绕过 commit_version 的 lease/fingerprint/锚点语义。
+async fn run_increment_once(
+    dbnum: u32,
+    from_sesno: u32,
+    to_sesno: Option<u32>,
+    persist: bool,
+    generate_model: bool,
+    model_impact_filter: bool,
+) -> anyhow::Result<crate::version_management::increment_run::IncrementRunResult> {
+    let db_option_ext = crate::options::DbOptionExt::from((*aios_core::get_db_option()).clone());
+    let options = crate::version_management::increment_run::IncrementRunOptions {
+        file: None,
+        dbnums: vec![dbnum],
+        dbnum_ranges: Vec::new(),
+        from_sesno,
+        to_sesno,
+        rescan_index: false,
+        persist_data: persist,
+        recover_pending: false,
+        generate_model,
+        model_impact_filter,
+        require_pe_owner_ready: false,
+        verbose: false,
+    };
+    // web server 启动时已连 surreal；这里做一次轻量探针即可。
+    let ensure = || async {
+        project_primary_db()
+            .query("RETURN 1;")
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+    };
+    crate::version_management::increment_run::run_increment(&db_option_ext, options, ensure).await
+}
+
+/// 把一次运行的结果写回注册表。
+fn record_run_result(
+    run_id: &str,
+    result: anyhow::Result<crate::version_management::increment_run::IncrementRunResult>,
+) {
+    if let Some(mut entry) = INCREMENT_RUNS.get_mut(run_id) {
+        entry.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        match result {
+            Ok(run) => {
+                if run.failures.is_empty() {
+                    entry.state = "succeeded".to_string();
+                } else {
+                    entry.state = "failed".to_string();
+                    entry.error = Some(run.failures.join("; "));
+                }
+                entry.summary = Some(run.summary);
+            }
+            Err(err) => {
+                let message = err.to_string();
+                // 并发让路（另有写者/提交进行中）不是真实故障，呈现为结构化 contention
+                // 而非 failed（specs/026 P2.4/P6.6），UI 据此可区分"排队等锁"与"真错误"。
+                entry.state = if crate::version_management::project_mutation_lock::is_mutation_contention_error(
+                    &message,
+                ) {
+                    "contention".to_string()
+                } else {
+                    "failed".to_string()
+                };
+                entry.error = Some(message);
+            }
+        }
+    }
+}
+
+/// UI 状态位维护：dbnum_info_table.updating / last_update_result。
+/// 只是展示用记账，不属于 Version Commit 语义；失败静默忽略。
+async fn set_dbnum_updating(dbnum: u32, updating: bool, result: Option<&str>) {
+    let sql = match result {
+        Some(result) => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            format!(
+                "UPDATE dbnum_info_table SET updating = {updating}, last_update_result = '{result}', last_update_at = {ts} WHERE dbnum = {dbnum};"
+            )
+        }
+        None => format!("UPDATE dbnum_info_table SET updating = {updating} WHERE dbnum = {dbnum};"),
+    };
+    let _ = project_primary_db().query(sql).await;
+}
+
+/// 后台跑一次 IncrementRun 并把结果写回注册表。persist=false 即 detect 试跑。
+async fn spawn_increment_run(
+    dbnum: u32,
+    persist: bool,
+    generate_model: bool,
+    model_impact_filter: bool,
+) -> Result<IncrementRunStatus, String> {
+    let watermark = committed_watermark(dbnum)
+        .await
+        .map_err(|e| format!("查询 Committed Watermark 失败 dbnum={dbnum}: {e}"))?;
+    if watermark == 0 {
+        return Err(format!(
+            "dbnum={dbnum} 无 Committed Watermark（从未全量解析），不能做增量；请先全量建库"
+        ));
+    }
+
+    let kind = if generate_model {
+        "sync+generate"
+    } else if persist {
+        "sync"
+    } else {
+        "detect"
+    };
+    let run_id = new_run_id(kind, dbnum);
+    let status = IncrementRunStatus {
+        run_id: run_id.clone(),
+        dbnum,
+        kind: kind.to_string(),
+        state: "running".to_string(),
+        from_sesno: watermark,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        finished_at: None,
+        summary: None,
+        error: None,
+    };
+    INCREMENT_RUNS.insert(run_id.clone(), status.clone());
+
+    let run_id_task = run_id.clone();
+    tokio::spawn(async move {
+        let result = run_increment_once(
+            dbnum,
+            watermark,
+            None,
+            persist,
+            generate_model,
+            model_impact_filter,
+        )
+        .await;
+        record_run_result(&run_id_task, result);
+    });
+
+    Ok(status)
+}
+
+/// UI「增量更新」端点 `/api/db-status/update` 的真实实现。
+///
+/// 历史实现是旁路：把"增量更新"映射为 `sync_pdms(total_sync=true)` 全量重解析，
+/// 且硬编码 project_name（AvevaMarineSample/1516），绕开 Version Commit seam 的
+/// 语义约定。现在与其余增量入口同源：
+/// - `ParseOnly` → persist-only IncrementRun（同 `/api/incremental/sync/{dbnum}`）
+/// - `ParseAndModel` / `Full` → persist + 增量范围模型生成（mesh 由生成管线内部处理）
+/// - 多 dbnum 串行执行：每库独立 commit_version（lease/锚点各自独立），
+///   串行是为了避免生成管线并发互踩
+/// - 真正的全量重解析是另一个显式动作（任务创建 API / CLI sync_pdms），不在此端点
+pub async fn execute_incremental_update(
+    State(state): State<AppState>,
+    Json(request): Json<IncrementalUpdateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let generate_model = !matches!(request.update_type, UpdateType::ParseOnly);
+    let model_impact_filter = !request.no_model_impact_filter;
+    if generate_model && !cfg!(feature = "gen_model") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "当前构建未启用 gen_model feature，只支持 ParseOnly 增量",
+            })),
+        );
+    }
+    let mut dbnums: Vec<u32> = request.dbnums.clone();
+    dbnums.sort_unstable();
+    dbnums.dedup();
+    if dbnums.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "dbnums 不能为空",
+            })),
+        );
+    }
+
+    // 逐库校验 Committed Watermark（增量采集唯一合法起点，见 CONTEXT.md）
+    let mut accepted: Vec<(u32, u32, String)> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let kind = if generate_model {
+        "sync+generate"
+    } else {
+        "sync"
+    };
+    for dbnum in dbnums {
+        match committed_watermark(dbnum).await {
+            Ok(0) => skipped.push(json!({
+                "dbnum": dbnum,
+                "reason": "无 Committed Watermark（从未全量解析），不能做增量；请先全量建库",
+            })),
+            Ok(watermark) => {
+                let run_id = new_run_id(kind, dbnum);
+                INCREMENT_RUNS.insert(
+                    run_id.clone(),
+                    IncrementRunStatus {
+                        run_id: run_id.clone(),
+                        dbnum,
+                        kind: kind.to_string(),
+                        state: "queued".to_string(),
+                        from_sesno: watermark,
+                        started_at: chrono::Utc::now().to_rfc3339(),
+                        finished_at: None,
+                        summary: None,
+                        error: None,
+                    },
+                );
+                state.progress_hub.register(run_id.clone());
+                if let Some(entry) = INCREMENT_RUNS.get(&run_id) {
+                    publish_increment_run_progress(&state.progress_hub, entry.value(), 0, 1);
+                }
+                accepted.push((dbnum, watermark, run_id));
+            }
+            Err(e) => skipped.push(json!({
+                "dbnum": dbnum,
+                "reason": format!("查询 Committed Watermark 失败: {e}"),
+            })),
+        }
+    }
+    if accepted.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "status": "error",
+                "error": "没有可执行增量的 dbnum",
+                "skipped": skipped,
+            })),
+        );
+    }
+
+    let run_ids: Vec<String> = accepted.iter().map(|(_, _, id)| id.clone()).collect();
+    let accepted_dbnums: Vec<u32> = accepted.iter().map(|(dbnum, _, _)| *dbnum).collect();
+    let to_sesno = request.to_sesno;
+    let progress_hub = state.progress_hub.clone();
+    tokio::spawn(async move {
+        for (dbnum, watermark, run_id) in accepted {
+            if let Some(mut entry) = INCREMENT_RUNS.get_mut(&run_id) {
+                entry.state = "running".to_string();
+                entry.started_at = chrono::Utc::now().to_rfc3339();
+                publish_increment_run_progress(&progress_hub, entry.value(), 0, 1);
+            }
+            set_dbnum_updating(dbnum, true, None).await;
+            let result = run_increment_once(
+                dbnum,
+                watermark,
+                to_sesno,
+                true,
+                generate_model,
+                model_impact_filter,
+            )
+            .await;
+            let result_tag = match &result {
+                Ok(run) if run.failures.is_empty() => "Success",
+                Ok(_) => "Failed",
+                Err(err)
+                    if crate::version_management::project_mutation_lock::is_mutation_contention_error(
+                        &err.to_string(),
+                    ) =>
+                {
+                    "Contention"
+                }
+                Err(_) => "Failed",
+            };
+            record_run_result(&run_id, result);
+            if let Some(entry) = INCREMENT_RUNS.get(&run_id) {
+                publish_increment_run_progress(&progress_hub, entry.value(), 1, 1);
+            }
+            set_dbnum_updating(dbnum, false, Some(result_tag)).await;
+        }
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "success": true,
+            "status": "success",
+            "message": "增量更新已启动（IncrementRun / Version Commit seam）",
+            "task_id": run_ids.first(),
+            "run_ids": run_ids,
+            "dbnums": accepted_dbnums,
+            "generate_model": generate_model,
+            "skipped": skipped,
+            "query": "/api/incremental/task/{run_id}",
+        })),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveFile {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<String>,
+    pub dbnum: Option<u32>,
+    pub sesno: Option<u32>,
+}
+
+fn system_time_to_rfc3339(time: SystemTime) -> String {
+    DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+fn digit_runs(input: &str) -> Vec<u32> {
+    let mut runs = Vec::new();
+    let mut current = String::new();
+
+    for ch in input.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u32>() {
+                runs.push(value);
+            }
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<u32>() {
+            runs.push(value);
+        }
+    }
+
+    runs
+}
+
+fn infer_dbnum(file_stem: &str) -> Option<u32> {
+    digit_runs(file_stem)
+        .into_iter()
+        .find(|value| *value >= 1000)
+}
+
+fn infer_sesno(file_stem: &str, dbnum: Option<u32>) -> Option<u32> {
+    digit_runs(file_stem)
+        .into_iter()
+        .filter(|value| Some(*value) != dbnum)
+        .next_back()
+}
+
+/// 列出本地已生成的 CBA 归档包，供 collab monitor 的归档页面展示与下载。
+pub async fn list_incremental_archives() -> Result<Json<serde_json::Value>, StatusCode> {
+    let archive_dir = FsPath::new("assets/archives");
+    let mut files = Vec::new();
+
+    if archive_dir.exists() {
+        let entries = fs::read_dir(archive_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) if name.to_ascii_lowercase().ends_with(".cba") => name.to_string(),
+                _ => continue,
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            let dbnum = infer_dbnum(stem);
+
+            files.push(ArchiveFile {
+                path: format!("/assets/archives/{}", name),
+                name,
+                size: metadata.len(),
+                modified: metadata.modified().ok().map(system_time_to_rfc3339),
+                dbnum,
+                sesno: infer_sesno(stem, dbnum),
+            });
+        }
+    }
+
+    files.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(Json(json!({
+        "success": true,
+        "files": files,
+    })))
+}
+
+/// 每库增量/版本状态（真实数据）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DbIncrementStatus {
+    pub dbnum: u32,
+    /// Committed Watermark：已发布 Version Anchor 的最高 sesno（0 = 无锚点）
+    pub committed_watermark: u32,
+    /// dbnum_info_table 记录级最大 sesno（存量/记账口径，Commit Pending 时可能领先锚点）
+    pub legacy_max_sesno: u32,
+    /// 最近一条锚点
+    pub last_anchor_sesno: Option<u32>,
+    pub last_anchored_at: Option<String>,
+    pub last_anchor_source: Option<String>,
+    /// 未恢复的 Commit Pending（阻塞该 dbnum 更高 sesno 提交）
+    pub pending_commits: Vec<PendingCommitInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCommitInfo {
+    pub to_sesno: u32,
+    pub status: String,
+    pub last_error: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorAggRow {
+    dbnum: u32,
+    max_sesno: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorLatestRow {
+    dbnum: u32,
+    sesno: u32,
+    anchored_at: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct PendingRow {
+    dbnum: u32,
+    to_sesno: u32,
+    status: String,
+    last_error: Option<String>,
+    updated_at: Option<String>,
+}
+
+fn statement_missing_table(error: &surrealdb::Error) -> bool {
+    error.to_string().contains("does not exist")
+}
+
+async fn collect_db_increment_status() -> anyhow::Result<Vec<DbIncrementStatus>> {
+    use std::collections::BTreeMap;
+
+    let sql = r#"
+SELECT dbnum, math::max(sesno) AS max_sesno FROM dbnum_info_table GROUP BY dbnum;
+SELECT dbnum, math::max(sesno) AS max_sesno FROM sesno_version_anchor
+    WHERE source IN ['full', 'incremental'] GROUP BY dbnum;
+SELECT dbnum, sesno, type::string(anchored_at) AS anchored_at, source FROM sesno_version_anchor ORDER BY anchored_at DESC LIMIT 200;
+SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_at FROM version_commit_state WHERE status IN ['preparing', 'pending'];
+"#;
+    let mut response = project_primary_db().query(sql).await?;
+
+    // 表不存在（未启用锚点/从未解析）按空处理，其余错误上抛
+    let legacy_rows: Vec<AnchorAggRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let anchor_rows: Vec<AnchorAggRow> = match response.take(1) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let latest_rows: Vec<AnchorLatestRow> = match response.take(2) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let pending_rows: Vec<PendingRow> = match response.take(3) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut by_dbnum: BTreeMap<u32, DbIncrementStatus> = BTreeMap::new();
+    for row in legacy_rows {
+        let entry = by_dbnum
+            .entry(row.dbnum)
+            .or_insert_with(|| DbIncrementStatus {
+                dbnum: row.dbnum,
+                ..Default::default()
+            });
+        entry.legacy_max_sesno = row.max_sesno.unwrap_or_default();
+    }
+    for row in anchor_rows {
+        let entry = by_dbnum
+            .entry(row.dbnum)
+            .or_insert_with(|| DbIncrementStatus {
+                dbnum: row.dbnum,
+                ..Default::default()
+            });
+        entry.committed_watermark = row.max_sesno.unwrap_or_default();
+    }
+    // Committed Watermark 语义：无锚点回退 legacy（与 committed_watermark() 一致）
+    for status in by_dbnum.values_mut() {
+        if status.committed_watermark == 0 {
+            status.committed_watermark = status.legacy_max_sesno;
+        }
+    }
+    for row in latest_rows {
+        if let Some(entry) = by_dbnum.get_mut(&row.dbnum) {
+            if entry.last_anchor_sesno.is_none() {
+                entry.last_anchor_sesno = Some(row.sesno);
+                entry.last_anchored_at = row.anchored_at;
+                entry.last_anchor_source = row.source;
+            }
+        }
+    }
+    for row in pending_rows {
+        if let Some(entry) = by_dbnum.get_mut(&row.dbnum) {
+            entry.pending_commits.push(PendingCommitInfo {
+                to_sesno: row.to_sesno,
+                status: row.status,
+                last_error: row.last_error,
+                updated_at: row.updated_at,
+            });
+        }
+    }
+
+    Ok(by_dbnum.into_values().collect())
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdatePreviewRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub dbnums: Vec<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdateExecuteRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub dbnums: Vec<u32>,
+    #[serde(default)]
+    pub to_sesno: Option<u32>,
+    #[serde(default)]
+    pub no_model_impact_filter: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ManualUpdateTaskQuery {
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PendingModelUnitsQuery {
+    #[serde(default)]
+    pub dbnum: Option<u32>,
+    #[serde(default)]
+    pub include_complete: bool,
+}
+
+fn operation_counts<'a>(
+    changes: impl Iterator<Item = &'a crate::data_interface::sesno_increment::PdmsSesnoElementChange>,
+) -> (usize, usize, usize) {
+    let mut added = 0;
+    let mut modified = 0;
+    let mut deleted = 0;
+    for change in changes {
+        match change.operation.trim().to_ascii_lowercase().as_str() {
+            "add" | "added" => added += 1,
+            "delete" | "deleted" => deleted += 1,
+            _ => modified += 1,
+        }
+    }
+    (added, modified, deleted)
+}
+
+/// `POST /api/v1/update/preview`
+///
+/// 只读执行 IncrementRun collect 阶段，不写 PE/ATT、Version Anchor 或模型。执行范围仍是
+/// dbnum + committed sesno；ZONE 只用于把受影响的最小生成根分桶给前端展示。
+pub async fn preview_manual_model_update(
+    _state: State<AppState>,
+    Json(request): Json<ManualUpdatePreviewRequest>,
+) -> impl IntoResponse {
+    let current_project = aios_core::get_db_option().project_name.clone();
+    if let Some(project) = request.project.as_deref()
+        && !project.trim().is_empty()
+        && !project.eq_ignore_ascii_case(&current_project)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!(
+                    "当前服务只承载项目 {current_project}，不能预览项目 {project}"
+                ),
+            })),
+        );
+    }
+
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let mut dbnums = if request.dbnums.is_empty() {
+        meta.get_dbnums_by_type("DESI")
+    } else {
+        request.dbnums
+    };
+    dbnums.sort_unstable();
+    dbnums.dedup();
+
+    let mut previews = Vec::new();
+    let mut warnings = Vec::new();
+    for dbnum in dbnums {
+        let Some(file_info) = meta.get_db_file_info(dbnum) else {
+            warnings.push(format!("dbnum={dbnum} 不在 db_meta_info 中，已跳过"));
+            continue;
+        };
+        if !file_info.db_type.eq_ignore_ascii_case("DESI") {
+            warnings.push(format!(
+                "dbnum={dbnum} 类型为 {}，本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+                file_info.db_type
+            ));
+            continue;
+        }
+
+        let watermark = match committed_watermark(dbnum).await {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "dbnum={dbnum} 查询 Committed Watermark 失败: {error}"
+                ));
+                continue;
+            }
+        };
+        if watermark == 0 {
+            previews.push(json!({
+                "dbnum": dbnum,
+                "db_type": file_info.db_type,
+                "file_name": file_info.file_name,
+                "file_path": file_info.file_path,
+                "applied_sesno": 0,
+                "file_latest_sesno": file_info.latest_sesno,
+                "sessions": [],
+                "units": [],
+                "zones": [],
+                "blocked": true,
+                "anomaly": "无 Committed Watermark，请先全量建库",
+            }));
+            continue;
+        }
+
+        let run = match run_increment_once(dbnum, watermark, None, false, false, true).await {
+            Ok(run) => run,
+            Err(error) => {
+                let message = error.to_string();
+                let status = if crate::version_management::project_mutation_lock::
+                    is_mutation_contention_error(&message)
+                {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return (
+                    status,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("dbnum={dbnum} 增量预览失败: {message}"),
+                    })),
+                );
+            }
+        };
+
+        let hierarchy = crate::fast_model::gen_model::hier_view::HierView::load(vec![dbnum])
+            .await
+            .ok();
+        let mut units = std::collections::BTreeMap::<String, serde_json::Value>::new();
+        for change in &run.outcome.element_changes {
+            let Some(root) = change.model_refno else {
+                continue;
+            };
+            let root_key = root.to_string();
+            units.entry(root_key.clone()).or_insert_with(|| {
+                let noun = hierarchy
+                    .as_ref()
+                    .and_then(|view| view.get_noun(root))
+                    .unwrap_or_else(|| change.noun.clone());
+                let zone = hierarchy.as_ref().and_then(|view| {
+                    if noun.eq_ignore_ascii_case("ZONE") {
+                        Some(root)
+                    } else {
+                        view.query_ancestors_filtered(root, &["ZONE"])
+                            .last()
+                            .copied()
+                            .or_else(|| {
+                                change.owner_refno.and_then(|owner| {
+                                    view.query_ancestors_filtered(owner, &["ZONE"])
+                                        .last()
+                                        .copied()
+                                })
+                            })
+                    }
+                });
+                json!({
+                    "root_refno": root_key,
+                    "noun": noun,
+                    "zone_refno": zone.map(|value| value.to_string()),
+                    "model_category": change.model_category,
+                })
+            });
+        }
+        let units: Vec<serde_json::Value> = units.into_values().collect();
+
+        let mut zone_buckets = std::collections::BTreeMap::<String, Vec<serde_json::Value>>::new();
+        for unit in &units {
+            let zone = unit
+                .get("zone_refno")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("UNASSIGNED")
+                .to_string();
+            zone_buckets.entry(zone).or_default().push(unit.clone());
+        }
+        let zones: Vec<serde_json::Value> = zone_buckets
+            .into_iter()
+            .map(|(zone_refno, units)| {
+                json!({
+                    "zone_refno": if zone_refno == "UNASSIGNED" {
+                        serde_json::Value::Null
+                    } else {
+                        json!(zone_refno)
+                    },
+                    "unit_count": units.len(),
+                    "units": units,
+                })
+            })
+            .collect();
+
+        let mut by_session = std::collections::BTreeMap::<u32, Vec<_>>::new();
+        for change in &run.outcome.element_changes {
+            by_session.entry(change.sesno).or_default().push(change);
+        }
+        let sessions: Vec<serde_json::Value> = by_session
+            .into_iter()
+            .map(|(sesno, changes)| {
+                let (added, modified, deleted) = operation_counts(changes.iter().copied());
+                json!({
+                    "sesno": sesno,
+                    "added": added,
+                    "modified": modified,
+                    "deleted": deleted,
+                    "changed_count": changes.len(),
+                })
+            })
+            .collect();
+        let (added, modified, deleted) = operation_counts(run.outcome.element_changes.iter());
+        let file_latest_sesno = run
+            .outcome
+            .files
+            .iter()
+            .map(|file| file.latest_sesno)
+            .max()
+            .unwrap_or(file_info.latest_sesno);
+
+        previews.push(json!({
+            "dbnum": dbnum,
+            "db_type": file_info.db_type,
+            "file_name": file_info.file_name,
+            "file_path": file_info.file_path,
+            "applied_sesno": watermark,
+            "file_latest_sesno": file_latest_sesno,
+            "sessions": sessions,
+            "net_added": added,
+            "net_modified": modified,
+            "net_deleted": deleted,
+            "model_affecting": run.outcome.element_changes.iter()
+                .filter(|change| change.model_refno.is_some())
+                .count(),
+            "units": units,
+            "zones": zones,
+            "blocked": false,
+            "anomaly": serde_json::Value::Null,
+        }));
+    }
+
+    let up_to_date = !previews.is_empty()
+        && previews.iter().all(|preview| {
+            preview.get("blocked").and_then(serde_json::Value::as_bool) == Some(false)
+                && preview
+                    .get("sessions")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "project": current_project,
+            "dbnums": previews,
+            "warnings": warnings,
+            "up_to_date": up_to_date,
+            "execution_scope": "dbnum+sesno",
+            "zone_role": "reporting_bucket",
+        })),
+    )
+}
+
+/// `POST /api/v1/update/execute`
+///
+/// 执行仍按 dbnum + sesno；未指定 dbnum 时选择全部 DESI，CATA 等非 DESI 库直接排除。
+pub async fn execute_manual_model_update(
+    state: State<AppState>,
+    Json(request): Json<ManualUpdateExecuteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let current_project = aios_core::get_db_option().project_name.clone();
+    if let Some(project) = request.project.as_deref()
+        && !project.trim().is_empty()
+        && !project.eq_ignore_ascii_case(&current_project)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("当前服务只承载项目 {current_project}，不能更新项目 {project}"),
+            })),
+        );
+    }
+
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let mut requested = if request.dbnums.is_empty() {
+        meta.get_dbnums_by_type("DESI")
+    } else {
+        request.dbnums
+    };
+    requested.sort_unstable();
+    requested.dedup();
+
+    let mut dbnums = Vec::new();
+    let mut excluded = Vec::new();
+    for dbnum in requested {
+        match meta.get_db_file_info(dbnum) {
+            Some(info) if info.db_type.eq_ignore_ascii_case("DESI") => dbnums.push(dbnum),
+            Some(info) => excluded.push(json!({
+                "dbnum": dbnum,
+                "db_type": info.db_type,
+                "reason": "本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+            })),
+            None => excluded.push(json!({
+                "dbnum": dbnum,
+                "reason": "不在 db_meta_info 中",
+            })),
+        }
+    }
+
+    let (status, Json(mut body)) = execute_incremental_update(
+        state,
+        Json(IncrementalUpdateRequest {
+            dbnums,
+            force_update: false,
+            update_type: UpdateType::ParseAndModel,
+            to_sesno: request.to_sesno,
+            no_model_impact_filter: request.no_model_impact_filter,
+        }),
+    )
+    .await;
+    body["project"] = json!(current_project);
+    body["excluded"] = json!(excluded);
+    body["execution_scope"] = json!("dbnum+sesno");
+    (status, Json(body))
+}
+
+/// `GET /api/v1/tasks`：进程内 IncrementRun 运行记录；版本锚点仍是持久化事实源。
+pub async fn list_manual_update_tasks(
+    _state: State<AppState>,
+    Query(query): Query<ManualUpdateTaskQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut runs: Vec<IncrementRunStatus> = INCREMENT_RUNS
+        .iter()
+        .filter(|entry| {
+            query
+                .state
+                .as_deref()
+                .is_none_or(|state| entry.state.eq_ignore_ascii_case(state))
+                && query
+                    .kind
+                    .as_deref()
+                    .is_none_or(|kind| entry.kind.eq_ignore_ascii_case(kind))
+        })
+        .map(|entry| entry.value().clone())
+        .collect();
+    runs.sort_unstable_by(|left, right| right.started_at.cmp(&left.started_at));
+    runs.truncate(query.limit.unwrap_or(100).min(1000));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "tasks": runs,
+            "persistence": "in_memory",
+        })),
+    )
+}
+
+/// `GET /api/v1/update/pending-units`
+///
+/// 直接投影持久化的 model_gen_debt；只返回 DESI 库，不维护第二份 pending 状态。
+pub async fn list_pending_model_units(
+    _state: State<AppState>,
+    Query(query): Query<PendingModelUnitsQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let meta = crate::data_interface::db_meta_manager::DbMetaManager::global();
+    if let Err(error) = meta.ensure_loaded() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("加载 db_meta_info 失败: {error}"),
+            })),
+        );
+    }
+
+    let dbnums = match query.dbnum {
+        Some(dbnum) => vec![dbnum],
+        None => {
+            match crate::versioned_db::model_gen_debt::list_model_gen_candidate_dbnums().await {
+                Ok(dbnums) => dbnums,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({
+                            "success": false,
+                            "error": format!("查询 model_gen_debt 候选库失败: {error}"),
+                        })),
+                    );
+                }
+            }
+        }
+    };
+
+    let mut units = Vec::new();
+    let mut excluded = Vec::new();
+    for dbnum in dbnums {
+        let Some(info) = meta.get_db_file_info(dbnum) else {
+            excluded.push(json!({ "dbnum": dbnum, "reason": "不在 db_meta_info 中" }));
+            continue;
+        };
+        if !info.db_type.eq_ignore_ascii_case("DESI") {
+            excluded.push(json!({
+                "dbnum": dbnum,
+                "db_type": info.db_type,
+                "reason": "本期只处理 DESI；CATA 等非 DESI 变化已跳过",
+            }));
+            continue;
+        }
+        match crate::versioned_db::model_gen_debt::analyze_model_gen_debt(dbnum).await {
+            Ok(coverage)
+                if query.include_complete
+                    || coverage.data_watermark > coverage.model_generation_watermark
+                    || coverage.debt_bucket_counts.total > 0 =>
+            {
+                units.push(coverage)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("分析 dbnum={dbnum} model_gen_debt 失败: {error}"),
+                    })),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "units": units,
+            "excluded": excluded,
+            "source": "model_gen_debt",
+        })),
+    )
+}
+
+/// 全部 dbnum 的增量/版本状态（真实数据：锚点 + 水位 + Commit Pending）。
+pub async fn get_all_incremental_status(_state: State<AppState>) -> impl IntoResponse {
+    match collect_db_increment_status().await {
+        Ok(databases) => {
+            let pending_total: usize = databases
+                .iter()
+                .map(|status| status.pending_commits.len())
+                .sum();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "databases": databases,
+                    "pending_commit_total": pending_total,
+                    "last_check": Utc::now(),
+                    "source": "sesno_version_anchor + dbnum_info_table + version_commit_state",
+                })),
+            )
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "error": format!("查询增量状态失败: {error}"),
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AnchorDetailRow {
+    sesno: u32,
+    from_sesno: Option<u32>,
+    source: Option<String>,
+    anchored_at: Option<String>,
+    fingerprint: Option<String>,
+    pe_rows: Option<i64>,
+    att_rows: Option<i64>,
+    uda_rows: Option<i64>,
+    delete_count: Option<i64>,
+}
+
+/// 单库增量详情：锚点时间线（最近 50 条）+ Commit Pending。
+/// 路径参数为 dbnum（历史路由名为 site_id，语义即数据库编号）。
+pub async fn get_site_incremental_details(
+    _state: State<AppState>,
+    Path(site_id): Path<String>,
+) -> impl IntoResponse {
+    let Ok(dbnum) = site_id.trim().parse::<u32>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("site_id 需为 dbnum（数字），收到: {site_id}"),
+            })),
+        );
+    };
+
+    let sql = format!(
+        "SELECT sesno, from_sesno, source, type::string(anchored_at) AS anchored_at, fingerprint, \
+         pe_rows, att_rows, uda_rows, delete_count \
+         FROM sesno_version_anchor WHERE dbnum = {dbnum} ORDER BY sesno DESC LIMIT 50;\n\
+         SELECT dbnum, to_sesno, status, last_error, type::string(updated_at) AS updated_at \
+         FROM version_commit_state WHERE dbnum = {dbnum} AND status IN ['preparing', 'pending'];"
+    );
+    let mut response = match project_primary_db().query(sql).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("查询 dbnum={dbnum} 增量详情失败: {error}"),
+                })),
+            );
+        }
+    };
+    let anchors: Vec<AnchorDetailRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("读取锚点失败: {error}"),
+                })),
+            );
+        }
+    };
+    let pending: Vec<PendingRow> = match response.take(1) {
+        Ok(rows) => rows,
+        Err(error) if statement_missing_table(&error) => Vec::new(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "error": format!("读取 Commit Pending 失败: {error}"),
+                })),
+            );
+        }
+    };
+
+    let anchors: Vec<serde_json::Value> = anchors
+        .into_iter()
+        .map(|row| {
+            json!({
+                "sesno": row.sesno,
+                "from_sesno": row.from_sesno,
+                "source": row.source,
+                "anchored_at": row.anchored_at,
+                "fingerprint": row.fingerprint,
+                "counts": {
+                    "pe_rows": row.pe_rows,
+                    "att_rows": row.att_rows,
+                    "uda_rows": row.uda_rows,
+                    "delete_count": row.delete_count,
+                },
+            })
+        })
+        .collect();
+    let pending: Vec<serde_json::Value> = pending
+        .into_iter()
+        .map(|row| {
+            json!({
+                "to_sesno": row.to_sesno,
+                "status": row.status,
+                "last_error": row.last_error,
+                "updated_at": row.updated_at,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "dbnum": dbnum,
+            "anchors": anchors,
+            "pending_commits": pending,
+        })),
+    )
+}
+
+fn not_implemented(action: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "success": false,
+            "error": format!(
+                "{action} 未实现：请使用 CLI incremental-sesno / watch-incremental（specs/022，写路径统一走 Version Commit seam）"
+            ),
+        })),
+    )
+}
+
+fn parse_dbnum_path(raw: &str) -> Result<u32, (StatusCode, Json<serde_json::Value>)> {
+    raw.trim().parse::<u32>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "error": format!("site_id 需为 dbnum（数字），收到: {raw}"),
+            })),
+        )
+    })
+}
+
+/// 触发增量检测（只读试跑，no-persist）：后台跑 IncrementRun 收集变更但不落库。
+/// 路径参数为 dbnum。返回 run_id，用 get_detection_task_status 轮询。
+pub async fn start_incremental_detection(
+    _state: State<AppState>,
+    Path(site_id): Path<String>,
+) -> impl IntoResponse {
+    let dbnum = match parse_dbnum_path(&site_id) {
+        Ok(dbnum) => dbnum,
+        Err(resp) => return resp,
+    };
+    match spawn_increment_run(dbnum, false, false, true).await {
+        Ok(status) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "success": true,
+                "run_id": status.run_id,
+                "dbnum": dbnum,
+                "kind": "detect",
+                "from_sesno": status.from_sesno,
+                "message": "增量检测（只读试跑）已启动，用 /api/incremental/task/{run_id} 查询",
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": err })),
+        ),
+    }
+}
+
+/// 触发增量同步（真实落库，persist）：后台跑 IncrementRun，经 commit_version
+/// 固化 Version Anchor。persist-only，不触发模型生成（与 watch 语义一致）。
+#[derive(Debug, Deserialize, Default)]
+pub struct IncrementalSyncQuery {
+    #[serde(default)]
+    pub no_model_impact_filter: bool,
+}
+
+pub async fn start_incremental_sync(
+    _state: State<AppState>,
+    Path(site_id): Path<String>,
+    Query(query): Query<IncrementalSyncQuery>,
+) -> impl IntoResponse {
+    let dbnum = match parse_dbnum_path(&site_id) {
+        Ok(dbnum) => dbnum,
+        Err(resp) => return resp,
+    };
+    match spawn_increment_run(dbnum, true, true, !query.no_model_impact_filter).await {
+        Ok(status) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "success": true,
+                "run_id": status.run_id,
+                "dbnum": dbnum,
+                "kind": "sync+generate",
+                "from_sesno": status.from_sesno,
+                "message": "增量同步与模型生成已启动（IncrementRun / Version Commit seam），用 /api/incremental/task/{run_id} 查询",
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "error": err })),
+        ),
+    }
+}
+
+/// 查询某次增量运行（sync/detect）的状态。
+pub async fn get_detection_task_status(
+    _state: State<AppState>,
+    Path(task_id): Path<String>,
+) -> impl IntoResponse {
+    match INCREMENT_RUNS.get(&task_id) {
+        Some(status) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "run": status.value() })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "error": format!("未找到增量运行 run_id={task_id}（进程重启后运行记录会清空）"),
+            })),
+        ),
+    }
+}
+
+/// 取消增量任务：IncrementRun 一旦进入落库阶段不可安全中断，故不支持中途取消。
+/// Commit 的原子性/幂等由 commit_version 保证，失败自然回退等待重试。
+pub async fn cancel_task(
+    _state: State<AppState>,
+    Path(_task_id): Path<String>,
+) -> impl IntoResponse {
+    not_implemented(
+        "取消进行中的增量运行（IncrementRun 落库不可中途安全中断，请等待完成或依赖 Commit Pending 恢复）",
+    )
+}
+
+/// 未实现：增量配置读取（无配置存储，检测/同步为按需触发）。
+pub async fn get_incremental_config(_state: State<AppState>) -> impl IntoResponse {
+    not_implemented("增量配置读取")
+}
+
+/// 未实现：增量配置更新（无配置存储）。
+pub async fn update_incremental_config(
+    _state: State<AppState>,
+    Json(_config): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    not_implemented("增量配置更新")
+}

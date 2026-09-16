@@ -1,0 +1,650 @@
+//! DbMetaManager - 数据库元信息管理模块
+//!
+//! 统一管理 db_meta_info.json 的加载、缓存和查询
+
+use anyhow::Result;
+use once_cell::sync::OnceCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+static DB_META_MANAGER: OnceCell<DbMetaManager> = OnceCell::new();
+
+/// 数据库元信息管理器
+pub struct DbMetaManager {
+    /// ref0 -> dbnum 映射
+    ref0_to_dbnum: RwLock<HashMap<u32, u32>>,
+    /// dbnum -> db_file_info 映射
+    db_files: RwLock<HashMap<u32, DbFileInfo>>,
+    /// 元信息文件路径
+    meta_path: RwLock<Option<PathBuf>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DbFileInfo {
+    pub dbnum: u32,
+    pub db_type: String,
+    pub file_name: String,
+    pub file_path: String,
+    pub latest_sesno: u32,
+    pub ref0s: Vec<u32>,
+}
+
+impl DbMetaManager {
+    fn new() -> Self {
+        Self {
+            ref0_to_dbnum: RwLock::new(HashMap::new()),
+            db_files: RwLock::new(HashMap::new()),
+            meta_path: RwLock::new(None),
+        }
+    }
+
+    /// 获取全局单例
+    pub fn global() -> &'static DbMetaManager {
+        DB_META_MANAGER.get_or_init(DbMetaManager::new)
+    }
+
+    /// 加载 db_meta_info.json
+    pub fn load(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)?;
+        let json: serde_json::Value = serde_json::from_str(&content)?;
+
+        // 解析 ref0_to_dbnum
+        let mut ref0_map = self.ref0_to_dbnum.write().unwrap();
+        ref0_map.clear();
+        if let Some(obj) = json.get("ref0_to_dbnum").and_then(|v| v.as_object()) {
+            for (ref0_str, dbnum_val) in obj {
+                if let (Ok(ref0), Some(dbnum)) = (ref0_str.parse::<u32>(), dbnum_val.as_u64()) {
+                    ref0_map.insert(ref0, dbnum as u32);
+                }
+            }
+        }
+
+        // 解析 db_files
+        let mut db_files_map = self.db_files.write().unwrap();
+        db_files_map.clear();
+        if let Some(obj) = json.get("db_files").and_then(|v| v.as_object()) {
+            for (dbnum_str, info) in obj {
+                if let Ok(dbnum) = dbnum_str.parse::<u32>() {
+                    let file_info = DbFileInfo {
+                        dbnum,
+                        db_type: info
+                            .get("db_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        file_name: info
+                            .get("file_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        file_path: info
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        latest_sesno: info
+                            .get("latest_sesno")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                        ref0s: info
+                            .get("ref0s")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    };
+                    db_files_map.insert(dbnum, file_info);
+                }
+            }
+        }
+
+        // 同时更新 aios_core 中的缓存
+        if let Err(e) = aios_core::tree_query::load_db_meta_info(path) {
+            log::warn!("同步 aios_core 缓存失败: {}", e);
+        }
+
+        *self.meta_path.write().unwrap() = Some(path.to_path_buf());
+        println!(
+            "✅ DbMetaManager: 已加载 {:?}, ref0 映射 {} 条, db_files {} 条",
+            path,
+            ref0_map.len(),
+            db_files_map.len()
+        );
+        Ok(())
+    }
+
+    /// 尝试从默认路径加载
+    ///
+    /// 只使用项目目录 <output_root>/{project_name}/scene_tree/db_meta_info.json
+    /// 若不存在，自动触发解析生成
+    pub fn try_load_default(&self) -> Result<()> {
+        // 尝试从 DbOption 获取 project_name
+        let project_paths = self.get_project_based_paths();
+
+        // 尝试项目目录
+        for path in &project_paths {
+            if Path::new(path).exists() {
+                return self.load(path);
+            }
+        }
+
+        // 文件不存在时，自动触发解析生成（不再兼容旧目录结构 output/scene_tree）
+        println!("📂 检测到 db_meta_info.json 缺失，正在自动生成...");
+        self.auto_generate_db_meta()?;
+
+        // 重新尝试加载
+        for path in &project_paths {
+            if Path::new(path).exists() {
+                return self.load(path);
+            }
+        }
+
+        anyhow::bail!(
+            "自动生成后仍未找到 db_meta_info.json，尝试路径: {:?}",
+            project_paths
+        )
+    }
+
+    /// 获取基于项目名称的路径列表
+    ///
+    /// 从配置文件读取 project_name，构建 <output_root>/{project_name}/scene_tree/ 路径
+    /// 优先使用 DB_OPTION_FILE 环境变量指定的配置文件
+    fn get_project_based_paths(&self) -> Vec<String> {
+        let mut paths = Vec::new();
+
+        if let Some(tree_dir) = crate::versioned_db::db_meta_info::get_current_project_tree_dir() {
+            let path = tree_dir.join("db_meta_info.json");
+            paths.push(path.to_string_lossy().to_string());
+        }
+
+        paths
+    }
+
+    /// 自动生成 db_meta_info.json（使用解析方式，只处理 DESI 类型）
+    fn auto_generate_db_meta(&self) -> Result<()> {
+        use crate::versioned_db::database::sync_total_async_threaded;
+        use aios_core::options::DbOption;
+        use dashmap::DashSet;
+        use std::sync::Arc;
+
+        // 从配置文件读取配置
+        let config_name =
+            std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+        let config_path = format!("{}.toml", config_name);
+        if !std::path::Path::new(&config_path).exists() {
+            anyhow::bail!("未找到配置文件 {}", config_path);
+        }
+
+        let content = std::fs::read_to_string(&config_path)?;
+        let mut db_option: DbOption = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
+
+        // 设置为仅维护 db_meta 模式
+        db_option.gen_db_meta_only = true;
+        db_option.total_sync = true;
+        db_option.save_db = Some(false);
+
+        // project_name 是输出/运行库名称；源 E3D 工程必须来自 included_projects。
+        let output_project_name = db_option.project_name.clone();
+        let mut source_projects = db_option
+            .included_projects
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .filter(|project| db_option.get_project_path(project).is_some())
+            .collect::<Vec<_>>();
+        if source_projects.is_empty() {
+            let fallback = db_option.project_name.trim().to_string();
+            if !fallback.is_empty() && db_option.get_project_path(&fallback).is_some() {
+                source_projects.push(fallback);
+            }
+        }
+        if source_projects.is_empty() {
+            anyhow::bail!(
+                "无法生成 db_meta：输出项目 {} 未映射到源工程路径，included_projects={:?}",
+                output_project_name,
+                db_option.included_projects
+            );
+        }
+
+        println!(
+            "🔄 正在通过 PDMS 解析生成 db_meta (gen_db_meta_only 模式, 输出项目: {}, 源工程: {:?}, 类型: DESI)...",
+            output_project_name, source_projects
+        );
+
+        // 使用 tokio runtime 执行异步生成
+        let result: Result<()> = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let cur_dbno_set = Arc::new(DashSet::new());
+                        for project in &source_projects {
+                            // 【关键】只处理 DESI 类型的 db 文件
+                            sync_total_async_threaded(
+                                &db_option,
+                                project,
+                                cur_dbno_set.clone(),
+                                &["DESI"],
+                                100,
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+            }
+            Err(_) => {
+                let rt = build_indextree_runtime()?;
+                rt.block_on(async {
+                    let cur_dbno_set = Arc::new(DashSet::new());
+                    for project in &source_projects {
+                        // 【关键】只处理 DESI 类型的 db 文件
+                        sync_total_async_threaded(
+                            &db_option,
+                            project,
+                            cur_dbno_set.clone(),
+                            &["DESI"],
+                            100,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            }
+        };
+
+        match result {
+            Ok(_) => {
+                println!("✅ db_meta 生成完成");
+                Ok(())
+            }
+            Err(e) => {
+                anyhow::bail!("db_meta 生成失败: {}", e)
+            }
+        }
+    }
+
+    /// 从指定项目目录加载
+    pub fn load_from_project(&self, project_name: &str) -> Result<()> {
+        let path = crate::versioned_db::db_meta_info::get_project_tree_dir(project_name)
+            .join("db_meta_info.json");
+        if path.exists() {
+            self.load(&path)
+        } else {
+            anyhow::bail!(
+                "项目 {} 的 db_meta_info.json 不存在: {}",
+                project_name,
+                path.display()
+            )
+        }
+    }
+
+    /// 确保已加载（如未加载则尝试从默认路径加载）
+    pub fn ensure_loaded(&self) -> Result<()> {
+        if self.meta_path.read().unwrap().is_none() {
+            self.try_load_default()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 根据 ref0 获取 dbnum
+    pub fn get_dbnum_by_ref0(&self, ref0: u32) -> Option<u32> {
+        self.ref0_to_dbnum.read().unwrap().get(&ref0).copied()
+    }
+
+    /// 根据 refno 获取 dbnum
+    pub fn get_dbnum_by_refno(&self, refno: aios_core::RefnoEnum) -> Option<u32> {
+        let ref0 = match refno {
+            aios_core::RefnoEnum::Refno(r) => r.get_0(),
+            aios_core::RefnoEnum::SesRef(r) => r.refno.get_0(),
+        };
+        self.get_dbnum_by_ref0(ref0)
+    }
+
+    /// 获取所有 dbnum 列表
+    pub fn get_all_dbnums(&self) -> Vec<u32> {
+        self.db_files.read().unwrap().keys().copied().collect()
+    }
+
+    /// 按数据库类型获取 dbnum 列表（例如 DESI / CATA / DICT）。
+    pub fn get_dbnums_by_type(&self, db_type: &str) -> Vec<u32> {
+        let target = db_type.trim().to_ascii_uppercase();
+        self.db_files
+            .read()
+            .unwrap()
+            .values()
+            .filter(|info| info.db_type.trim().eq_ignore_ascii_case(&target))
+            .map(|info| info.dbnum)
+            .collect()
+    }
+
+    /// 根据 dbnum 获取文件信息
+    pub fn get_db_file_info(&self, dbnum: u32) -> Option<DbFileInfo> {
+        self.db_files.read().unwrap().get(&dbnum).cloned()
+    }
+
+    /// 根据 dbnum 从 ref0_to_dbnum 反查对应的 ref0 列表
+    /// 当 db_files 无该 dbnum 或 ref0s 为空时，用此方法兜底（ref0 ≠ dbnum）
+    pub fn get_ref0s_by_dbnum(&self, dbnum: u32) -> Vec<u32> {
+        self.ref0_to_dbnum
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(&ref0, &d)| if d == dbnum { Some(ref0) } else { None })
+            .collect()
+    }
+
+    /// 将 ref0 列表转换为 dbnum 列表（去重）
+    pub fn ref0s_to_dbnums(&self, ref0s: &[u32]) -> Vec<u32> {
+        let dbnums: std::collections::HashSet<u32> = ref0s
+            .iter()
+            .filter_map(|&ref0| self.get_dbnum_by_ref0(ref0))
+            .collect();
+        dbnums.into_iter().collect()
+    }
+
+    /// 是否已加载
+    pub fn is_loaded(&self) -> bool {
+        self.meta_path.read().unwrap().is_some()
+    }
+}
+
+/// 便捷函数：获取全局管理器
+pub fn db_meta() -> &'static DbMetaManager {
+    DbMetaManager::global()
+}
+
+/// 便捷函数：根据 ref0 获取 dbnum
+pub fn get_dbnum(ref0: u32) -> Option<u32> {
+    db_meta().get_dbnum_by_ref0(ref0)
+}
+
+/// 便捷函数：将 ref0 列表转换为 dbnum 列表
+pub fn ref0s_to_dbnums(ref0s: &[u32]) -> Vec<u32> {
+    db_meta().ref0s_to_dbnums(ref0s)
+}
+
+#[inline]
+fn env_bool_true(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+#[inline]
+fn resolve_indextree_rt_threads() -> usize {
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4)
+        .max(1);
+
+    std::env::var("AIOS_INDEXTREE_RT_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|v| v.min(64))
+        .unwrap_or(default_threads)
+}
+
+fn build_indextree_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    if env_bool_true("AIOS_INDEXTREE_FORCE_CURRENT_THREAD") {
+        println!("⚙️ 使用单线程 runtime（AIOS_INDEXTREE_FORCE_CURRENT_THREAD=1）");
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(Into::into);
+    }
+
+    let worker_threads = resolve_indextree_rt_threads();
+    println!("⚙️ 使用多线程 runtime（worker_threads={}）", worker_threads);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
+pub(crate) fn indextree_project_dir_candidates(
+    project_root: &Path,
+    project_name: &str,
+    project_dir_names: &[String],
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    let mut push_candidate = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let path = PathBuf::from(trimmed);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        };
+
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            candidates.push(path);
+        }
+    };
+
+    push_candidate(project_name);
+    for dir_name in project_dir_names {
+        push_candidate(dir_name);
+    }
+
+    candidates
+}
+
+/// 从 refno 解析 dbnum（cache-only，依赖 db_meta_info.json，不回退 SurrealDB）。
+pub fn resolve_dbnum_for_refno(refno: aios_core::RefnoEnum) -> anyhow::Result<u32> {
+    let _ = db_meta().ensure_loaded();
+    if let Some(dbnum) = db_meta().get_dbnum_by_refno(refno) {
+        return Ok(dbnum);
+    }
+    if let Some(dbnum) = crate::fast_model::db_meta_cache::get_dbnum_for_refno(refno) {
+        return Ok(dbnum);
+    }
+    anyhow::bail!(
+        "无法从缓存推导 refno 的 dbnum（cache-only 不回退 SurrealDB）：refno={}\n\
+         处理建议：\n\
+         - 先生成当前 DB_OPTION_FILE 对应的 <output_root>/<project>/scene_tree/db_meta_info.json\n\
+         - 或确认当前运行目录/配置指向了正确的输出目录（output/scene_tree 仅为旧路径 fallback）",
+        refno
+    )
+}
+
+/// 生成所有 DESI 类型的 db_meta_info.json
+pub fn generate_desi_db_meta(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_db_meta_for_types(&["DESI"], ignore_manual_dbnum)
+}
+
+/// 生成全部库类型（DESI/CATA/DICT/SYST/GLB/GLOB）的 db_meta_info.json。
+///
+/// 用于全量预扫描 ref0↔dbnum 映射：只有覆盖全部库类型，才能把"外部引用 ref0"
+/// 正确反查到所属 dbnum（仅 DESI 时外部库 ref0 缺失）。这是关联库精确解析的基础。
+pub fn generate_all_types_db_meta(ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    generate_db_meta_for_types(
+        &["DESI", "CATA", "DICT", "SYST", "GLB", "GLOB"],
+        ignore_manual_dbnum,
+    )
+}
+
+/// 按给定 db 类型集合做 gen_db_meta_only 轻量解析并写出 `db_meta_info.json`。
+fn generate_db_meta_for_types(db_types: &[&str], ignore_manual_dbnum: bool) -> anyhow::Result<()> {
+    use crate::versioned_db::database::sync_total_async_threaded;
+    use aios_core::options::DbOption;
+    use dashmap::DashSet;
+    use std::sync::Arc;
+
+    // 优先使用环境变量指定的配置文件，否则回退到默认
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_path = format!("{}.toml", config_name);
+    if !std::path::Path::new(&config_path).exists() {
+        anyhow::bail!("未找到配置文件 {}", config_path);
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+    let mut db_option: DbOption = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
+
+    // 设置为仅生成树结构模式
+    db_option.gen_db_meta_only = true;
+    db_option.total_sync = true;
+    db_option.save_db = Some(false);
+
+    if ignore_manual_dbnum {
+        db_option.manual_db_nums = None;
+    }
+
+    let project_name = db_option.project_name.clone();
+    println!(
+        "🔄 正在生成 db_meta (项目: {}, 类型: {:?})...",
+        project_name, db_types
+    );
+
+    // 使用 tokio runtime 执行异步生成
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let cur_dbno_set = Arc::new(DashSet::new());
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, db_types, 100)
+                    .await
+            })
+        }),
+        Err(_) => {
+            let rt = build_indextree_runtime()?;
+            rt.block_on(async {
+                let cur_dbno_set = Arc::new(DashSet::new());
+                sync_total_async_threaded(&db_option, &project_name, cur_dbno_set, db_types, 100)
+                    .await
+            })
+        }
+    };
+
+    result.map_err(|e| anyhow::anyhow!("db_meta 生成失败: {}", e))
+}
+
+/// 生成指定 dbnum 的 db_meta_info.json
+pub fn generate_single_db_meta(target_dbnum: u32) -> anyhow::Result<()> {
+    use aios_core::options::DbOption;
+    use parse_pdms_db::parse::parse_file_basic_info;
+    use std::fs;
+    use std::io::Read;
+
+    // 优先使用环境变量指定配置，否则回退到默认配置
+    let config_name =
+        std::env::var("DB_OPTION_FILE").unwrap_or_else(|_| "db_options/DbOption".to_string());
+    let config_path = format!("{}.toml", config_name);
+    if !std::path::Path::new(&config_path).exists() {
+        anyhow::bail!("未找到配置文件 {}", config_path);
+    }
+
+    let content = fs::read_to_string(&config_path)?;
+    let db_option: DbOption = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("解析 {} 失败: {}", config_path, e))?;
+
+    let project_name = db_option.project_name.clone();
+    let project_dir_names = db_option.get_project_dir_names().clone();
+    let project_candidates = indextree_project_dir_candidates(
+        Path::new(&db_option.project_path),
+        &project_name,
+        &project_dir_names,
+    );
+    let project_dir = project_candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "无法获取项目路径（project_path={}, project_name={}, project_dirs={:?}）",
+                db_option.project_path,
+                project_name,
+                project_dir_names
+            )
+        })?;
+
+    println!("🔍 扫描项目目录: {}", project_dir.display());
+
+    // 扫描项目目录下的所有文件，找到匹配的 dbnum（包括子目录）
+    let mut found_file: Option<String> = None;
+
+    fn scan_dir_recursive(
+        dir: &std::path::Path,
+        target_dbnum: u32,
+        found: &mut Option<String>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(mut file) = fs::File::open(&path) {
+                    let mut buf = [0u8; 60];
+                    if file.read_exact(&mut buf).is_ok() {
+                        let db_info = parse_file_basic_info(&buf);
+                        if db_info.dbnum == target_dbnum {
+                            *found = Some(path.to_string_lossy().to_string());
+                            println!("✅ 找到 dbnum={} 的文件: {}", target_dbnum, path.display());
+                            return Ok(());
+                        }
+                    }
+                }
+            } else if path.is_dir() {
+                scan_dir_recursive(&path, target_dbnum, found)?;
+                if found.is_some() {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let _ = scan_dir_recursive(&project_dir, target_dbnum, &mut found_file);
+
+    let file_path = found_file
+        .ok_or_else(|| anyhow::anyhow!("未找到 dbnum={} 对应的 db 文件", target_dbnum))?;
+
+    println!("🔄 正在生成 dbnum={} 的 db_meta...", target_dbnum);
+
+    // 调用单文件解析函数
+    let result = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                crate::versioned_db::database::parse_single_db_file(
+                    &db_option,
+                    &project_name,
+                    &file_path,
+                    target_dbnum,
+                )
+                .await
+            })
+        }),
+        Err(_) => {
+            let rt = build_indextree_runtime()?;
+            rt.block_on(async {
+                crate::versioned_db::database::parse_single_db_file(
+                    &db_option,
+                    &project_name,
+                    &file_path,
+                    target_dbnum,
+                )
+                .await
+            })
+        }
+    };
+
+    result.map_err(|e| anyhow::anyhow!("db_meta 生成失败: {}", e))
+}

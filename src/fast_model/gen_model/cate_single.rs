@@ -1,0 +1,400 @@
+// 单个 Cate 元件的几何生成
+//
+// 从 cata_model.rs 提取的 gen_cata_single_geoms 函数及其依赖
+
+use crate::data_interface::structs::PlantAxisMap;
+use crate::fast_model::gen_model::resolve::resolve_desi_comp_with_session;
+use crate::fast_model::gen_model::{GenerationReadContext, session_query};
+use crate::fast_model::{debug_model, debug_model_debug, resolve_desi_comp};
+use aios_core::parsed_data::CateGeomsInfo;
+use aios_core::parsed_data::PlineSnapPoint;
+use aios_core::prim_geo::category::{
+    CateCsgShape, derive_implied_extent_from_axis_map, try_convert_cate_geo_to_csg_shape,
+};
+use aios_core::prim_geo::profile::create_profile_geos;
+use aios_core::{NamedAttrMap, RefnoEnum};
+use dashmap::DashMap;
+use std::sync::Arc;
+
+pub type CateCsgShapeMap = DashMap<RefnoEnum, Vec<CateCsgShape>>;
+
+fn cata_p1_trace_refno_filter() -> Option<String> {
+    std::env::var("AIOS_CATA_P1_TRACE_REFNO")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn should_trace_cata_p1(design_refno: RefnoEnum) -> bool {
+    let Some(target) = cata_p1_trace_refno_filter() else {
+        return false;
+    };
+    let target_normalized = target.replace('/', "_");
+    target == design_refno.to_string()
+        || target_normalized == design_refno.to_string()
+        || target == design_refno.to_e3d_id()
+}
+
+/// 获取单个元件的模型数据
+///
+/// # Arguments
+/// * `design_refno` - 设计元件的 refno
+/// * `csg_shape_map` - CSG 形状映射表
+/// * `design_axis_map` - 设计轴映射表
+///
+/// # 处理流程
+/// 1. 获取元件属性
+/// 2. 解析元件几何信息
+/// 3. 特殊处理 Profile 类型 (SCTN/STWALL/GENSEC/WALL)
+/// 4. 普通元件转换为 CSG 形状
+/// 5. 处理负实体 (n_geometries)
+///
+/// # 性能优化
+/// - 使用 #[cfg(feature = "profile")] 条件编译性能跟踪
+/// - 分段计时各个处理步骤
+pub async fn gen_cata_single_geoms(
+    design_refno: RefnoEnum,
+    csg_shape_map: &CateCsgShapeMap,
+    design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
+    design_pline_snap_map: &DashMap<RefnoEnum, Vec<PlineSnapPoint>>,
+) -> anyhow::Result<bool> {
+    gen_cata_single_geoms_inner(
+        None,
+        design_refno,
+        csg_shape_map,
+        design_axis_map,
+        design_pline_snap_map,
+    )
+    .await
+}
+
+pub async fn gen_cata_single_geoms_with_session(
+    read: &GenerationReadContext,
+    design_refno: RefnoEnum,
+    csg_shape_map: &CateCsgShapeMap,
+    design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
+    design_pline_snap_map: &DashMap<RefnoEnum, Vec<PlineSnapPoint>>,
+) -> anyhow::Result<bool> {
+    gen_cata_single_geoms_inner(
+        Some(read),
+        design_refno,
+        csg_shape_map,
+        design_axis_map,
+        design_pline_snap_map,
+    )
+    .await
+}
+
+async fn gen_cata_single_geoms_inner(
+    read: Option<&GenerationReadContext>,
+    design_refno: RefnoEnum,
+    csg_shape_map: &CateCsgShapeMap,
+    design_axis_map: &DashMap<RefnoEnum, PlantAxisMap>,
+    design_pline_snap_map: &DashMap<RefnoEnum, Vec<PlineSnapPoint>>,
+) -> anyhow::Result<bool> {
+    let total_start = std::time::Instant::now();
+    let trace_this = should_trace_cata_p1(design_refno);
+
+    // Timing for get_named_attmap
+    let t_get_attmap = std::time::Instant::now();
+    let desi_att = match read {
+        Some(read) => session_query::get_named_attmap(read, design_refno).await?,
+        None => aios_core::get_named_attmap(design_refno).await?,
+    };
+    let get_attmap_time = t_get_attmap.elapsed().as_millis();
+
+    let type_name = desi_att.get_type_str();
+    let owner = desi_att.get_owner();
+    if !owner.is_valid() {
+        use crate::fast_model::ModelErrorKind;
+        crate::model_error!(
+            code = "E-REF-002",
+            kind = ModelErrorKind::InvalidReference,
+            stage = "validate_owner",
+            refno = design_refno,
+            desc = "DESI元件owner无效",
+            "design_refno={}, owner={}, type_name={}",
+            design_refno,
+            owner,
+            type_name
+        );
+        return Ok(false);
+    }
+
+    // Timing for resolve_desi_comp
+    let t_resolve = std::time::Instant::now();
+    let resolve_result = match read {
+        Some(read) => {
+            resolve_desi_comp_with_session(read, design_refno, None, Some(&desi_att)).await
+        }
+        None => resolve_desi_comp(design_refno, None, Some(&desi_att)).await,
+    };
+    let geoms_info = match resolve_result {
+        Ok(info) => info,
+        Err(e) => {
+            // 无 CAT 引用时，按 cata_model 的设计应走“子原语直解”路径。
+            // 这里回退为以 design_refno 作为 scom_ref 再尝试一次，避免直接中断整条负实体链路。
+            let err_msg = e.to_string();
+            if err_msg.contains("CAT引用不存在") {
+                debug_model_debug!(
+                    "[fallback] design_refno={} 无CAT，改用 design_refno 作为 scom_ref 重试 resolve_desi_comp",
+                    design_refno
+                );
+                match read {
+                    Some(read) => {
+                        resolve_desi_comp_with_session(
+                            read,
+                            design_refno,
+                            Some(design_refno),
+                            Some(&desi_att),
+                        )
+                        .await?
+                    }
+                    None => {
+                        resolve_desi_comp(design_refno, Some(design_refno), Some(&desi_att)).await?
+                    }
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    let resolve_time = t_resolve.elapsed().as_millis();
+    debug_model!(
+        "📦 resolve_desi_comp 返回: geometries={}, n_geometries={}",
+        geoms_info.geometries.len(),
+        geoms_info.n_geometries.len()
+    );
+
+    // DEBUG: Print basic info
+    debug_model!(
+        "🎯 gen_cata_single_geoms: design_refno={}, type_name={}, owner={}",
+        design_refno,
+        type_name,
+        owner
+    );
+
+    // 🔍 调试：记录 design 元素的详细信息
+    if let Some(name) = desi_att.get_as_string("NAME") {
+        debug_model_debug!("   NAME: {}", name);
+    }
+    if let Some(desc) = desi_att.get_as_string("DESC") {
+        debug_model_debug!("   DESC: {}", desc);
+    }
+    if let Some(cat_refno) = desi_att.get_foreign_refno("CATR") {
+        debug_model_debug!("   元件库参考号: {}", cat_refno);
+        let cat_att = match read {
+            Some(read) => session_query::get_named_attmap(read, cat_refno).await,
+            None => aios_core::get_named_attmap(cat_refno).await,
+        };
+        if let Ok(cat_att) = cat_att {
+            if let Some(cat_name) = cat_att.get_as_string("NAME") {
+                debug_model_debug!("   元件库名称: {}", cat_name);
+            }
+        }
+    }
+
+    // Profile 类型特殊处理
+    if type_name == "SCTN" || type_name == "STWALL" || type_name == "GENSEC" || type_name == "WALL"
+    {
+        let t_profile = std::time::Instant::now();
+        create_profile_geos(
+            design_refno,
+            &geoms_info,
+            &csg_shape_map,
+            design_pline_snap_map,
+        )
+        .await?;
+        let profile_time = t_profile.elapsed().as_millis();
+        let total_elapsed = total_start.elapsed().as_millis();
+
+        if trace_this {
+            println!(
+                "    [P1 trace] refno={} type={} stage=profile get_attmap={}ms resolve={}ms profile={}ms total={}ms",
+                design_refno, type_name, get_attmap_time, resolve_time, profile_time, total_elapsed
+            );
+        }
+
+        #[cfg(feature = "profile")]
+        {
+            let timestamp = chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string();
+            tracing::info!(
+                "Performance - gen_cata_single_geoms profile: timestamp={}, refno={:?}, get_attmap={}ms, resolve={}ms, profile={}ms, total={}ms",
+                timestamp,
+                design_refno,
+                get_attmap_time,
+                resolve_time,
+                profile_time,
+                total_elapsed
+            );
+        }
+
+        #[cfg(not(feature = "profile"))]
+        let _ = (get_attmap_time, resolve_time, profile_time);
+
+        return Ok(true);
+    }
+
+    // 普通元件处理
+    let CateGeomsInfo {
+        refno,
+        geometries,
+        n_geometries,
+        axis_map,
+        plin_points: _,
+    } = geoms_info;
+
+    debug_model!(
+        "geometries.len()={}, n_geometries.len()={}",
+        geometries.len(),
+        n_geometries.len()
+    );
+
+    // 转换正实体几何
+    let t_convert_geo = std::time::Instant::now();
+    let mut geo_count = 0;
+    for (idx, geom) in geometries.iter().enumerate() {
+        debug_model!("Processing geometry[{}]: {:?}", idx, geom);
+        // L*/S* 圆柱族兜底:显式范围/口径表达式为空时,由构件 p-point 跨距推导(E3D 隐含语义)
+        let geom = {
+            let mut g = geom.clone();
+            derive_implied_extent_from_axis_map(&mut g, &axis_map);
+            g
+        };
+        match try_convert_cate_geo_to_csg_shape(&geom) {
+            Some(cate_shape) => {
+                debug_model!("Successfully converted geometry[{}] to csg shape", idx);
+                csg_shape_map
+                    .entry(design_refno)
+                    .or_insert(Vec::new())
+                    .push(cate_shape);
+                geo_count += 1;
+            }
+            None => {
+                debug_model!(
+                    "Failed to convert geometry[{}] to csg shape (returned None)",
+                    idx
+                );
+            }
+        }
+    }
+    let convert_geo_time = t_convert_geo.elapsed().as_millis();
+
+    // 转换负实体几何 (NGMR)
+    let t_convert_ngeo = std::time::Instant::now();
+    let mut ngeo_count = 0;
+    for (idx, geom) in n_geometries.iter().enumerate() {
+        debug_model!("Processing n_geometry[{}]: {:?}", idx, geom);
+        let geom = {
+            let mut g = geom.clone();
+            derive_implied_extent_from_axis_map(&mut g, &axis_map);
+            g
+        };
+        match try_convert_cate_geo_to_csg_shape(&geom) {
+            Some(mut cate_shape) => {
+                debug_model!("Successfully converted n_geometry[{}] to csg shape", idx);
+                cate_shape.is_ngmr = true;
+                csg_shape_map
+                    .entry(design_refno)
+                    .or_insert(Vec::new())
+                    .push(cate_shape);
+                ngeo_count += 1;
+            }
+            None => {
+                debug_model!(
+                    "Failed to convert n_geometry[{}] to csg shape (returned None)",
+                    idx
+                );
+            }
+        }
+    }
+    let convert_ngeo_time = t_convert_ngeo.elapsed().as_millis();
+
+    // 保存轴映射
+    let t_axis_map = std::time::Instant::now();
+    let axis_map_len = axis_map.len();
+    design_axis_map.insert(design_refno, axis_map);
+    let axis_map_time = t_axis_map.elapsed().as_millis();
+
+    debug_model!(
+        "Final stats: geo_count={}, ngeo_count={}, csg_shape_map entry count for design_refno={}",
+        geo_count,
+        ngeo_count,
+        csg_shape_map
+            .get(&design_refno)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    );
+
+    // 检查是否完全没有几何成功转换
+    if geo_count == 0 && ngeo_count == 0 {
+        use crate::fast_model::ModelErrorKind;
+        crate::model_error!(
+            code = "E-GEO-003",
+            kind = ModelErrorKind::UnsupportedGeometry,
+            stage = "try_convert_cate_geo_to_csg_shape",
+            refno = design_refno,
+            desc = "元件未生成任何几何",
+            "design_refno={}, type_name={}, geometries_len={}, n_geometries_len={}",
+            design_refno,
+            type_name,
+            geometries.len(),
+            n_geometries.len()
+        );
+    }
+
+    let total_elapsed = total_start.elapsed().as_millis();
+    if trace_this {
+        println!(
+            "    [P1 trace] refno={} type={} stage=regular get_attmap={}ms resolve={}ms convert_geo={}ms({}/{}) convert_ngeo={}ms({}/{}) axis_map={}ms(len={}) total={}ms",
+            design_refno,
+            type_name,
+            get_attmap_time,
+            resolve_time,
+            convert_geo_time,
+            geo_count,
+            geometries.len(),
+            convert_ngeo_time,
+            ngeo_count,
+            n_geometries.len(),
+            axis_map_time,
+            axis_map_len,
+            total_elapsed
+        );
+    }
+
+    #[cfg(feature = "profile")]
+    {
+        let timestamp = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        tracing::info!(
+            "Performance - gen_cata_single_geoms regular: timestamp={}, refno={:?}, get_attmap={}ms, resolve={}ms, convert_geo(count={})={}ms, convert_ngeo(count={})={}ms, axis_map={}ms, total={}ms",
+            timestamp,
+            design_refno,
+            get_attmap_time,
+            resolve_time,
+            geo_count,
+            convert_geo_time,
+            ngeo_count,
+            convert_ngeo_time,
+            axis_map_time,
+            total_elapsed
+        );
+    }
+
+    #[cfg(not(feature = "profile"))]
+    let _ = (
+        get_attmap_time,
+        resolve_time,
+        geo_count,
+        convert_geo_time,
+        ngeo_count,
+        convert_ngeo_time,
+        axis_map_time,
+    );
+
+    Ok(true)
+}

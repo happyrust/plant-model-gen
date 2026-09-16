@@ -1,0 +1,1281 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, Json},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::time::Duration;
+
+use crate::web_server::{AppState, remote_sync_handlers, sync_control_center::*};
+
+// ========= 控制接口 =========
+
+/// 测试触发文件下载（仅用于测试）
+#[cfg(feature = "mqtt")]
+pub async fn trigger_file_download(
+    _state: State<AppState>,
+    Json(request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::mqtt_service::SyncE3dFileMsg;
+
+    let file_names = request["file_names"]
+        .as_array()
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
+    let file_server_host = request["file_server_host"]
+        .as_str()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let sync_e3d = SyncE3dFileMsg {
+        file_names,
+        file_hashes: vec![],
+        file_server_host: file_server_host.to_string(),
+        location: "test".to_string(),
+        timestamp: aios_core::Datetime::default(),
+    };
+
+    // 创建一个临时的 watcher（实际使用时应该从全局状态获取）
+    let watcher = pdms_io::watch::PdmsWatcher::new(Vec::<std::path::PathBuf>::new());
+
+    match crate::data_interface::mqtt_file_sync::exec_delta_clone_remotes(&watcher, sync_e3d).await
+    {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "文件下载已触发"
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("下载失败: {}", e)
+        }))),
+    }
+}
+
+/// 测试触发文件下载（仅用于测试，mqtt 特性未启用时的占位实现）
+#[cfg(not(feature = "mqtt"))]
+pub async fn trigger_file_download(
+    _state: State<AppState>,
+    Json(_request): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    Ok(Json(json!({
+        "status": "error",
+        "message": "当前构建未启用 mqtt feature，无法触发远端文件下载"
+    })))
+}
+pub async fn start_sync_service(
+    _state: State<AppState>,
+    Json(request): Json<StartSyncRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    match center.start(request.env_id).await {
+        Ok(_) => {
+            // 启动监控任务
+            tokio::spawn(start_monitoring());
+
+            Ok(Json(json!({
+                "status": "success",
+                "message": "同步服务已启动",
+                "state": center.get_state_snapshot()
+            })))
+        }
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("启动失败: {}", e)
+        }))),
+    }
+}
+
+/// 停止同步服务
+pub async fn stop_sync_service(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    match center.stop().await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "同步服务已停止",
+            "state": center.get_state_snapshot()
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("停止失败: {}", e)
+        }))),
+    }
+}
+
+/// 重启同步服务
+pub async fn restart_sync_service(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    let env_id = center.config.env_id.clone();
+    if env_id.is_empty() {
+        return Ok(Json(json!({
+            "status": "error",
+            "message": "未配置环境ID"
+        })));
+    }
+
+    // 先停止
+    let _ = center.stop().await;
+
+    // 等待一下
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 重新启动
+    match center.start(env_id).await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "同步服务已重启",
+            "state": center.get_state_snapshot()
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("重启失败: {}", e)
+        }))),
+    }
+}
+
+/// 暂停同步
+pub async fn pause_sync_service(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    match center.pause() {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "同步已暂停",
+            "state": center.get_state_snapshot()
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("暂停失败: {}", e)
+        }))),
+    }
+}
+
+/// 恢复同步
+pub async fn resume_sync_service(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    match center.resume() {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "同步已恢复",
+            "state": center.get_state_snapshot()
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("恢复失败: {}", e)
+        }))),
+    }
+}
+
+// ========= 监控接口 =========
+
+/// 获取同步状态
+pub async fn get_sync_status(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    Ok(Json(json!({
+        "status": "success",
+        "state": center.get_state_snapshot(),
+        "config": center.get_config(),
+        "mqtt_server": center.mqtt_server.clone(),
+        "queue_length": center.task_queue.len(),
+        "running_tasks": center.running_tasks.len(),
+        "history_count": center.history.len()
+    })))
+}
+
+/// 获取最新事件（轮询方式）
+/// 注：SSE 功能暂时简化为轮询实现
+pub async fn sync_events_stream(
+    _state: State<AppState>,
+    Query(params): Query<EventQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // 收集最近的事件
+    let mut events = Vec::new();
+    let mut rx = SYNC_EVENT_TX.subscribe();
+
+    // 非阻塞地获取所有可用事件
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+        if events.len() >= 10 {
+            // 最多返回10个事件
+            break;
+        }
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "events": events,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    })))
+}
+
+/// 获取性能指标
+pub async fn get_sync_metrics(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    let (cpu_usage, memory_usage) = sample_system_metrics().await;
+    let (completed_files, completed_bytes, completed_records, failed_files_db) =
+        collect_sync_totals();
+
+    Ok(Json(json!({
+        "status": "success",
+        "metrics": {
+            "sync_rate_mbps": center.state.sync_rate_mbps,
+            "avg_sync_time_ms": center.state.avg_sync_time_ms,
+            "total_synced": center.state.total_synced,
+            "total_failed": center.state.total_failed,
+            "success_rate": if center.state.total_synced + center.state.total_failed > 0 {
+                (center.state.total_synced as f64) /
+                ((center.state.total_synced + center.state.total_failed) as f64) * 100.0
+            } else {
+                0.0
+            },
+            "cpu_usage": cpu_usage,
+            "memory_usage": memory_usage,
+            "uptime_seconds": center.state.uptime_seconds,
+            "completed_files_total": completed_files,
+            "completed_bytes_total": completed_bytes,
+            "completed_records_total": completed_records,
+            "failed_files_total": failed_files_db
+        }
+    })))
+}
+
+/// 获取队列状态
+pub async fn get_sync_queue(
+    _state: State<AppState>,
+    Query(params): Query<QueueQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+
+    let queue_items: Vec<_> = center
+        .task_queue
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(Json(json!({
+        "status": "success",
+        "queue": queue_items,
+        "total": center.task_queue.len(),
+        "pending": center.state.pending_count,
+        "running": center.running_tasks.len()
+    })))
+}
+
+// ========= 配置接口 =========
+
+/// 获取同步配置
+pub async fn get_sync_config(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    Ok(Json(json!({
+        "status": "success",
+        "config": center.get_config()
+    })))
+}
+
+/// 更新同步配置
+pub async fn update_sync_config(
+    _state: State<AppState>,
+    Json(config): Json<SyncConfig>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+    center.update_config(config);
+
+    Ok(Json(json!({
+        "status": "success",
+        "message": "配置已更新",
+        "config": center.get_config()
+    })))
+}
+
+/// 测试连接
+pub async fn test_sync_connection(
+    _state: State<AppState>,
+    Json(request): Json<TestConnectionRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use tokio::time::timeout;
+
+    // 测试 MQTT 连接
+    let mqtt_result = if let (Some(host), Some(port)) = (request.mqtt_host, request.mqtt_port) {
+        let addr = format!("{}:{}", host, port);
+        match timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => json!({
+                "status": "connected",
+                "message": "MQTT连接成功"
+            }),
+            Ok(Err(e)) => json!({
+                "status": "failed",
+                "message": format!("MQTT连接失败: {}", e)
+            }),
+            Err(_) => json!({
+                "status": "timeout",
+                "message": "MQTT连接超时"
+            }),
+        }
+    } else {
+        json!({
+            "status": "skipped",
+            "message": "未提供MQTT配置"
+        })
+    };
+
+    // 测试文件服务器连接
+    let file_server_result = if let Some(url) = request.file_server_host {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        match client.get(&url).send().await {
+            Ok(resp) => json!({
+                "status": "connected",
+                "message": format!("文件服务器连接成功，状态码: {}", resp.status())
+            }),
+            Err(e) => json!({
+                "status": "failed",
+                "message": format!("文件服务器连接失败: {}", e)
+            }),
+        }
+    } else {
+        json!({
+            "status": "skipped",
+            "message": "未提供文件服务器配置"
+        })
+    };
+
+    Ok(Json(json!({
+        "status": "success",
+        "mqtt": mqtt_result,
+        "file_server": file_server_result
+    })))
+}
+
+// ========= 任务管理接口 =========
+
+/// 添加同步任务
+pub async fn add_sync_task(
+    _state: State<AppState>,
+    Json(request): Json<AddTaskRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    let task_id = center.add_task(NewSyncTaskParams {
+        file_path: request.file_path,
+        file_size: request.file_size,
+        priority: request.priority.unwrap_or(5),
+        file_name: request.file_name,
+        file_hash: request.file_hash,
+        record_count: request.record_count,
+        env_id: request.env_id,
+        source_env: request.source_env,
+        target_site: request.target_site,
+        direction: request.direction,
+        notes: request.notes,
+    });
+
+    Ok(Json(json!({
+        "status": "success",
+        "message": "任务已添加到队列",
+        "task_id": task_id,
+        "queue_size": center.state.queue_size
+    })))
+}
+
+/// 取消任务
+pub async fn cancel_sync_task(
+    _state: State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+
+    // 从待处理队列移除
+    let cancelled_in_queue = center.cancel_pending_task(&task_id, "用户取消");
+
+    // 从运行中任务移除
+    if center.running_tasks.contains_key(&task_id) {
+        center.complete_task(&task_id, false, Some("用户取消".to_string()));
+    } else if !cancelled_in_queue {
+        // 未找到任务
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "message": "任务已取消"
+    })))
+}
+
+/// 清空队列
+pub async fn clear_sync_queue(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mut center = SYNC_CONTROL_CENTER.write().await;
+    let count = center.clear_queue("队列清空");
+
+    Ok(Json(json!({
+        "status": "success",
+        "message": format!("已清空 {} 个任务", count)
+    })))
+}
+
+/// 获取任务历史
+pub async fn get_sync_history(
+    _state: State<AppState>,
+    Query(params): Query<HistoryQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+
+    let history: Vec<_> = center
+        .history
+        .iter()
+        .rev() // 最新的在前
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect();
+
+    Ok(Json(json!({
+        "status": "success",
+        "history": history,
+        "total": center.history.len()
+    })))
+}
+
+// ========= MQTT 服务器管理 =========
+
+/// 启动 MQTT 服务器
+pub async fn start_mqtt_server_api(
+    _state: State<AppState>,
+    Json(request): Json<StartMqttRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let port = request.port.unwrap_or(1883);
+
+    match start_mqtt_server(port).await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": format!("MQTT服务器已启动在端口 {}", port),
+            "port": port
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("启动MQTT服务器失败: {}", e)
+        }))),
+    }
+}
+
+/// 停止 MQTT 服务器
+pub async fn stop_mqtt_server_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match stop_mqtt_server().await {
+        Ok(_) => Ok(Json(json!({
+            "status": "success",
+            "message": "MQTT服务器已停止"
+        }))),
+        Err(e) => Ok(Json(json!({
+            "status": "error",
+            "message": format!("停止MQTT服务器失败: {}", e)
+        }))),
+    }
+}
+
+/// 获取 MQTT 服务器状态
+pub async fn get_mqtt_server_status(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let center = SYNC_CONTROL_CENTER.read().await;
+
+    Ok(Json(json!({
+        "status": "success",
+        "mqtt_server": center.mqtt_server.clone()
+    })))
+}
+
+// ========= 请求/响应类型 =========
+
+#[derive(Debug, Deserialize)]
+pub struct StartSyncRequest {
+    pub env_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestConnectionRequest {
+    pub mqtt_host: Option<String>,
+    pub mqtt_port: Option<u16>,
+    pub file_server_host: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddTaskRequest {
+    pub file_path: String,
+    pub file_size: u64,
+    pub priority: Option<u8>,
+    pub file_name: Option<String>,
+    pub file_hash: Option<String>,
+    pub record_count: Option<u64>,
+    pub env_id: Option<String>,
+    pub source_env: Option<String>,
+    pub target_site: Option<String>,
+    pub direction: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventQuery {
+    pub since: Option<u64>, // 时间戳
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueueQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StartMqttRequest {
+    pub port: Option<u16>,
+}
+
+// ========= 辅助函数 =========
+
+async fn sample_system_metrics() -> (f32, f32) {
+    match tokio::task::spawn_blocking(|| {
+        use std::thread;
+        use std::time::Duration as StdDuration;
+        use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+        let mut system = System::new();
+        system.refresh_specifics(
+            RefreshKind::everything()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything()),
+        );
+        thread::sleep(StdDuration::from_millis(100));
+        system.refresh_specifics(
+            RefreshKind::everything()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything()),
+        );
+
+        let cpu_usage = system.global_cpu_usage();
+        let total_memory = system.total_memory();
+        let used_memory = system.used_memory();
+        let memory_usage = if total_memory == 0 {
+            0.0
+        } else {
+            (used_memory as f64 / total_memory as f64 * 100.0) as f32
+        };
+
+        (cpu_usage, memory_usage)
+    })
+    .await
+    {
+        Ok(metrics) => metrics,
+        Err(_) => (0.0, 0.0),
+    }
+}
+
+fn collect_sync_totals() -> (u64, u64, u64, u64) {
+    let Ok(conn) = remote_sync_handlers::open_sqlite() else {
+        return (0, 0, 0, 0);
+    };
+
+    let completed = conn
+        .query_row(
+            "SELECT COUNT(*), SUM(COALESCE(file_size, 0)), SUM(COALESCE(record_count, 0)) \
+             FROM remote_sync_logs WHERE status = 'completed'",
+            [],
+            |row| {
+                let count: i64 = row.get(0)?;
+                let bytes: Option<i64> = row.get(1)?;
+                let records: Option<i64> = row.get(2)?;
+                Ok((count, bytes.unwrap_or(0), records.unwrap_or(0)))
+            },
+        )
+        .unwrap_or((0, 0, 0));
+
+    let failed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM remote_sync_logs WHERE status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    (
+        clamp_u64(completed.0),
+        clamp_u64(completed.1),
+        clamp_u64(completed.2),
+        clamp_u64(failed),
+    )
+}
+
+fn clamp_u64(v: i64) -> u64 {
+    if v < 0 { 0 } else { v as u64 }
+}
+
+// ========= 页面渲染 =========
+
+/// 同步控制面板页面
+pub async fn sync_control_page() -> Html<String> {
+    Html(render_sync_control_page())
+}
+
+fn render_sync_control_page() -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>同步控制中心</title>
+    <link rel="stylesheet" href="/static/simple-tailwind.css">
+    <style>
+        .status-card {{
+            @apply bg-white rounded-lg shadow p-4 mb-4;
+        }}
+        .status-indicator {{
+            @apply inline-block w-3 h-3 rounded-full mr-2;
+        }}
+        .status-running {{ @apply bg-green-500; }}
+        .status-stopped {{ @apply bg-gray-400; }}
+        .status-error {{ @apply bg-red-500; }}
+        .status-warning {{ @apply bg-yellow-500; }}
+
+        .control-button {{
+            @apply px-4 py-2 rounded font-medium transition-colors;
+        }}
+        .btn-primary {{ @apply bg-blue-500 text-white hover:bg-blue-600; }}
+        .btn-success {{ @apply bg-green-500 text-white hover:bg-green-600; }}
+        .btn-danger {{ @apply bg-red-500 text-white hover:bg-red-600; }}
+        .btn-warning {{ @apply bg-yellow-500 text-white hover:bg-yellow-600; }}
+
+        .metric-card {{
+            @apply bg-gray-50 rounded p-3 text-center;
+        }}
+        .metric-value {{
+            @apply text-2xl font-bold text-gray-800;
+        }}
+        .metric-label {{
+            @apply text-sm text-gray-600 mt-1;
+        }}
+
+        .log-entry {{
+            @apply font-mono text-sm p-2 border-b border-gray-200;
+        }}
+        .log-entry.error {{ @apply bg-red-50 text-red-800; }}
+        .log-entry.warning {{ @apply bg-yellow-50 text-yellow-800; }}
+        .log-entry.info {{ @apply bg-blue-50 text-blue-800; }}
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto p-4">
+        <h1 class="text-3xl font-bold mb-6">同步控制中心</h1>
+
+        <!-- 状态概览 -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div class="status-card">
+                <div class="flex items-center justify-between">
+                    <span class="text-gray-600">服务状态</span>
+                    <span id="service-status" class="flex items-center">
+                        <span class="status-indicator status-stopped"></span>
+                        <span>已停止</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="status-card">
+                <div class="flex items-center justify-between">
+                    <span class="text-gray-600">MQTT连接</span>
+                    <span id="mqtt-status" class="flex items-center">
+                        <span class="status-indicator status-stopped"></span>
+                        <span>未连接</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="status-card">
+                <div class="flex items-center justify-between">
+                    <span class="text-gray-600">文件监听</span>
+                    <span id="watcher-status" class="flex items-center">
+                        <span class="status-indicator status-stopped"></span>
+                        <span>未激活</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="status-card">
+                <div class="flex items-center justify-between">
+                    <span class="text-gray-600">队列长度</span>
+                    <span id="queue-length" class="text-xl font-bold">0</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 控制按钮 -->
+        <div class="bg-white rounded-lg shadow p-6 mb-6">
+            <h2 class="text-xl font-semibold mb-4">服务控制</h2>
+            <div class="flex gap-3 flex-wrap">
+                <button id="btn-start" class="control-button btn-success">
+                    启动服务
+                </button>
+                <button id="btn-stop" class="control-button btn-danger">
+                    停止服务
+                </button>
+                <button id="btn-restart" class="control-button btn-warning">
+                    重启服务
+                </button>
+                <button id="btn-pause" class="control-button btn-primary">
+                    暂停同步
+                </button>
+                <button id="btn-resume" class="control-button btn-primary">
+                    恢复同步
+                </button>
+                <button id="btn-clear-queue" class="control-button btn-danger">
+                    清空队列
+                </button>
+            </div>
+        </div>
+
+        <!-- 性能指标 -->
+        <div class="bg-white rounded-lg shadow p-6 mb-6">
+            <h2 class="text-xl font-semibold mb-4">性能指标</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="metric-card">
+                    <div class="metric-value" id="metric-sync-rate">0</div>
+                    <div class="metric-label">同步速率 (MB/s)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="metric-total-synced">0</div>
+                    <div class="metric-label">已同步文件</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="metric-success-rate">0%</div>
+                    <div class="metric-label">成功率</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" id="metric-uptime">0s</div>
+                    <div class="metric-label">运行时长</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 实时日志 -->
+        <div class="bg-white rounded-lg shadow p-6">
+            <h2 class="text-xl font-semibold mb-4">实时日志</h2>
+            <div id="log-container" class="h-64 overflow-y-auto border border-gray-200 rounded">
+                <!-- 日志内容将动态插入这里 -->
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/sync-control.js"></script>
+</body>
+</html>"#
+    )
+}
+
+// ============================================================================
+// Metrics History API
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MetricsHistoryQuery {
+    pub time_range: Option<String>, // "hour", "day", "week", "month"
+    pub limit: Option<usize>,
+}
+
+/// 获取性能指标历史
+pub async fn get_sync_metrics_history(
+    Query(params): Query<MetricsHistoryQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use rusqlite::Connection;
+
+    let time_range = params.time_range.as_deref().unwrap_or("day");
+    let limit = params.limit.unwrap_or(100).min(1000);
+
+    // 计算时间范围
+    let hours_ago = match time_range {
+        "hour" => 1,
+        "day" => 24,
+        "week" => 24 * 7,
+        "month" => 24 * 30,
+        _ => 24,
+    };
+
+    let conn = Connection::open("deployment_sites.sqlite")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // 从日志中聚合历史指标
+    let sql = format!(
+        "SELECT 
+            datetime(created_at) as timestamp,
+            COUNT(*) as task_count,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_count,
+            SUM(CASE WHEN status = 'completed' THEN COALESCE(file_size, 0) ELSE 0 END) as total_bytes,
+            AVG(CASE WHEN status = 'completed' AND completed_at IS NOT NULL AND started_at IS NOT NULL 
+                THEN (julianday(completed_at) - julianday(started_at)) * 86400000 
+                ELSE NULL END) as avg_sync_time_ms
+         FROM remote_sync_logs
+         WHERE datetime(created_at) >= datetime('now', '-{} hours')
+         GROUP BY strftime('%Y-%m-%d %H:00:00', created_at)
+         ORDER BY timestamp DESC
+         LIMIT ?",
+        hours_ago
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let rows = stmt
+        .query_map([limit as i64], |row| {
+            Ok(json!({
+                "timestamp": row.get::<_, String>(0).unwrap_or_default(),
+                "task_count": row.get::<_, i64>(1).unwrap_or(0),
+                "completed_count": row.get::<_, i64>(2).unwrap_or(0),
+                "failed_count": row.get::<_, i64>(3).unwrap_or(0),
+                "total_bytes": row.get::<_, i64>(4).unwrap_or(0),
+                "avg_sync_time_ms": row.get::<_, Option<f64>>(5).unwrap_or(None).unwrap_or(0.0),
+            }))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut history = Vec::new();
+    for row in rows {
+        history.push(row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+
+    Ok(Json(json!({
+        "status": "success",
+        "time_range": time_range,
+        "history": history
+    })))
+}
+
+// ============================================================================
+// Phase 1.3a · MQTT 订阅与主从节点控制 (简化 stub)
+//
+// 完整实现位于 web-server/src/web_server/sync_control_handlers.rs L483-L1600，
+// 依赖 check_is_master_node / get_available_master_nodes / SYNC_EVENT_TX 等
+// helper 以及 sse_handlers::SyncEvent::MqttSubscriptionStatusChanged variant。
+// 本轮先以简化版保证 API 可应答合法 JSON，真实逻辑待 Phase 1.3b 或 Phase 5 回填。
+// ============================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StartSubscriptionRequest {
+    #[serde(default)]
+    pub master_location: Option<String>,
+    #[serde(default)]
+    pub master_mqtt_host: Option<String>,
+    #[serde(default)]
+    pub master_mqtt_port: Option<u16>,
+    #[serde(default)]
+    pub env_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetNodeRequest {
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+/// GET /api/mqtt/broker/logs
+///
+/// 读取进程内 ring-buffer（容量 200）的 MQTT broker 操作日志。
+///
+/// Query：
+/// - `limit`：返回最近 N 条（默认 200，上限 200）
+///
+/// 响应：
+/// ```json
+/// { "status": "success",
+///   "count": 12,
+///   "capacity": 200,
+///   "logs": [{ "timestamp": "...", "level": "info", "event": "set_master",
+///             "location": "BJ", "message": "..." }, ...] }
+/// ```
+pub async fn get_mqtt_broker_logs_api(
+    _state: State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(mqtt_monitor_handlers::BROKER_LOG_CAPACITY)
+        .min(mqtt_monitor_handlers::BROKER_LOG_CAPACITY);
+
+    let logs = mqtt_monitor_handlers::read_broker_logs(Some(limit)).await;
+
+    Ok(Json(json!({
+        "status": "success",
+        "count": logs.len(),
+        "capacity": mqtt_monitor_handlers::BROKER_LOG_CAPACITY,
+        "logs": logs,
+    })))
+}
+
+/// B4 helper：推送 `MqttSubscriptionStatusChanged` 事件
+///
+/// 字段计算口径与 `GET /api/mqtt/subscription/status` 完全一致，前端
+/// `LogsView` / `MqttNodesView` 收到事件后可直接 reload 状态而无需差量解析。
+///
+/// 调用方：set_as_master_node / set_as_client_node / start_mqtt_subscription_api
+/// / stop_mqtt_subscription_api 操作成功后立即触发。
+pub(crate) async fn push_subscription_status_event(location: String) {
+    use crate::web_server::mqtt_monitor_handlers;
+    use crate::web_server::remote_runtime;
+
+    let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    let is_master_node = mqtt_monitor_handlers::check_is_master_node(&location, &db_path);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default();
+
+    let _ = SYNC_EVENT_TX.send(SyncEvent::MqttSubscriptionStatusChanged {
+        is_running,
+        is_master_node,
+        location,
+        timestamp,
+    });
+}
+
+/// POST /api/mqtt/subscription/start — 简化: 直接 start_runtime
+pub async fn start_mqtt_subscription_api(
+    _state: State<AppState>,
+    request: Option<Json<StartSubscriptionRequest>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+    use crate::web_server::remote_runtime;
+
+    let request = request.map(|Json(r)| r).unwrap_or_default();
+    let env_id = request.env_id.unwrap_or_else(|| "default".to_string());
+    let location = aios_core::get_db_option().location.clone();
+
+    {
+        let guard = remote_runtime::REMOTE_RUNTIME.read().await;
+        if guard.is_some() {
+            return Ok(Json(json!({
+                "status": "error",
+                "message": "MQTT 订阅已经在运行中"
+            })));
+        }
+    }
+
+    match remote_runtime::start_runtime(env_id.clone()).await {
+        Ok(_) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "subscription_started",
+                Some(&location),
+                format!("MQTT 订阅已启动（env={}，简化模式）", env_id),
+            )
+            .await;
+            push_subscription_status_event(location.clone()).await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": "MQTT 订阅已启动 (简化模式)"
+            })))
+        }
+        Err(e) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "subscription_failed",
+                Some(&location),
+                format!("MQTT 订阅启动失败（env={}）: {}", env_id, e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("启动失败: {}", e)
+            })))
+        }
+    }
+}
+
+/// POST /api/mqtt/subscription/stop
+pub async fn stop_mqtt_subscription_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+    use crate::web_server::remote_runtime;
+
+    let location = aios_core::get_db_option().location.clone();
+    let mut guard = remote_runtime::REMOTE_RUNTIME.write().await;
+    if guard.is_some() {
+        *guard = None;
+        drop(guard);
+        mqtt_monitor_handlers::push_broker_log(
+            "info",
+            "subscription_stopped",
+            Some(&location),
+            "MQTT 订阅已停止",
+        )
+        .await;
+        push_subscription_status_event(location.clone()).await;
+        Ok(Json(json!({
+            "status": "success",
+            "message": "MQTT 订阅已停止"
+        })))
+    } else {
+        Ok(Json(json!({
+            "status": "error",
+            "message": "MQTT 订阅未在运行"
+        })))
+    }
+}
+
+/// 内部 helper：清除当前站点的主节点配置（供 mqtt_monitor_handlers::remove_mqtt_node 调用）
+pub async fn clear_master_config_internal() -> anyhow::Result<()> {
+    use aios_core::get_db_option;
+
+    let location = get_db_option().location.clone();
+    let conn = rusqlite::Connection::open("deployment_sites.sqlite")?;
+    conn.execute(
+        "UPDATE remote_sync_sites \
+            SET master_location = NULL, master_mqtt_host = NULL, master_mqtt_port = NULL, updated_at = datetime('now') \
+          WHERE location = ?1",
+        rusqlite::params![location],
+    )?;
+    Ok(())
+}
+
+/// POST /api/mqtt/subscription/clear-master-config
+pub async fn clear_master_config_api(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = aios_core::get_db_option().location.clone();
+
+    match clear_master_config_internal().await {
+        Ok(_) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "clear_master_config",
+                Some(&location),
+                "已清除当前站点的主节点订阅配置",
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": "主节点配置已清除"
+            })))
+        }
+        Err(e) => {
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "clear_master_config",
+                Some(&location),
+                format!("清除主节点配置失败: {}", e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("清除失败: {}", e)
+            })))
+        }
+    }
+}
+
+/// GET /api/mqtt/subscription/status
+///
+/// 返回字段（与跨仓 plant-collab-monitor `MqttNodesView.vue` 期望对齐）：
+/// - `is_running`：MQTT 订阅 runtime 是否在跑
+/// - `is_server_running`：MQTT broker 是否在跑（占位 false，B4 接入真值）
+/// - `mqtt_server_port`：broker 端口（占位 1883）
+/// - `location`：当前站点 location
+/// - `is_master_node` / `node_role`：来自 `node_config` 表（B1 写入）
+/// - `connection_status`：connected / disconnected
+/// - `master_info`：当前从节点订阅的 master 信息（仅 client 节点）
+/// - `subscribed_topics`：订阅 topic 列表
+pub async fn get_mqtt_subscription_status(
+    _state: State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+    use crate::web_server::remote_runtime;
+
+    let is_running = remote_runtime::REMOTE_RUNTIME.read().await.is_some();
+    let location = aios_core::get_db_option().location.clone();
+
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    let is_master_node = mqtt_monitor_handlers::check_is_master_node(&location, &db_path);
+    let node_role = if is_master_node { "master" } else { "client" };
+
+    // master_info 仅对 client 节点有意义；当前简化为 None，后续可调用
+    // mqtt_monitor_handlers::get_subscribed_master_info（目前仍是私有函数，B4 时再开放）
+    let master_info: Option<serde_json::Value> = None;
+
+    let connection_status = if is_running {
+        "connected"
+    } else {
+        "disconnected"
+    };
+
+    Ok(Json(json!({
+        "status": "success",
+        "is_running": is_running,
+        "is_subscription_running": is_running,
+        "is_server_running": false,
+        "mqtt_server_port": 1883,
+        "location": location,
+        "is_master_node": is_master_node,
+        "node_role": node_role,
+        "connection_status": connection_status,
+        "master_info": master_info,
+        "subscribed_topics": ["Sync/E3d"],
+    })))
+}
+
+/// POST /api/mqtt/node/set-master
+///
+/// 写 `node_config` 表（schema 与 mqtt_monitor_handlers::ensure_node_config_table 一致）。
+/// 不写 DbOption.toml（DbOption 中无 is_master 字段，location 由部署期固定）。
+/// 操作完成后下次 `subscription/status` 即返回 is_master_node=true。
+pub async fn set_as_master_node(
+    _state: State<AppState>,
+    Json(req): Json<SetNodeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = req
+        .location
+        .unwrap_or_else(|| aios_core::get_db_option().location.clone());
+
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    match mqtt_monitor_handlers::set_node_master_flag(&location, true, &db_path) {
+        Ok(_) => {
+            log::info!("✅ [mqtt] {} 已标记为主节点（写入 node_config）", location);
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "set_master",
+                Some(&location),
+                format!("{} 已标记为主节点（node_config 写入成功）", location),
+            )
+            .await;
+            push_subscription_status_event(location.clone()).await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": format!("已标记 {} 为主节点", location),
+                "location": location,
+                "is_master_node": true,
+            })))
+        }
+        Err(e) => {
+            log::error!("❌ [mqtt] set_as_master_node 写盘失败: {}", e);
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "set_master",
+                Some(&location),
+                format!("set_as_master_node 写盘失败: {}", e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("写入主节点标识失败: {}", e),
+            })))
+        }
+    }
+}
+
+/// POST /api/mqtt/node/set-client
+///
+/// 与 `set_as_master_node` 对偶；将 `is_master` 写为 false。
+pub async fn set_as_client_node(
+    _state: State<AppState>,
+    Json(req): Json<SetNodeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::web_server::mqtt_monitor_handlers;
+
+    let location = req
+        .location
+        .unwrap_or_else(|| aios_core::get_db_option().location.clone());
+
+    let db_path = mqtt_monitor_handlers::get_node_config_db_path();
+    match mqtt_monitor_handlers::set_node_master_flag(&location, false, &db_path) {
+        Ok(_) => {
+            log::info!("✅ [mqtt] {} 已标记为从节点（写入 node_config）", location);
+            mqtt_monitor_handlers::push_broker_log(
+                "info",
+                "set_client",
+                Some(&location),
+                format!("{} 已标记为从节点（node_config 写入成功）", location),
+            )
+            .await;
+            push_subscription_status_event(location.clone()).await;
+            Ok(Json(json!({
+                "status": "success",
+                "message": format!("已标记 {} 为从节点", location),
+                "location": location,
+                "is_master_node": false,
+            })))
+        }
+        Err(e) => {
+            log::error!("❌ [mqtt] set_as_client_node 写盘失败: {}", e);
+            mqtt_monitor_handlers::push_broker_log(
+                "error",
+                "set_client",
+                Some(&location),
+                format!("set_as_client_node 写盘失败: {}", e),
+            )
+            .await;
+            Ok(Json(json!({
+                "status": "error",
+                "message": format!("写入从节点标识失败: {}", e),
+            })))
+        }
+    }
+}

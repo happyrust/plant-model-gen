@@ -1,0 +1,2423 @@
+use crate::options::DbOptionExt;
+use anyhow::Context;
+use clap::{Arg, ArgMatches, Command};
+#[cfg(feature = "gen_model")]
+use std::path::PathBuf;
+
+pub fn model_version_command() -> Command {
+    Command::new("model-version")
+        .about("Query RocksDB-versioned data/model history by immutable sesno anchors")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("history")
+                .about("specs/022: PE/ATT time-travel by data anchor")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("snapshot")
+                        .about("Fetch a PE(+ATT) snapshot at a data anchor")
+                        .arg(
+                            Arg::new("refno")
+                                .long("refno")
+                                .value_name("REFNO")
+                                .required_unless_present("pe-key"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Override PE record id for verification fixtures"),
+                        )
+                        .arg(required_u32("sesno"))
+                        .arg(required_u32("dbnum"))
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("timeline")
+                        .about("List content-changing data anchors for one element")
+                        .arg(
+                            Arg::new("refno")
+                                .long("refno")
+                                .value_name("REFNO")
+                                .required_unless_present("pe-key"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Override PE record id for verification fixtures"),
+                        )
+                        .arg(required_u32("from-sesno"))
+                        .arg(required_u32("to-sesno"))
+                        .arg(required_u32("dbnum"))
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("diff")
+                        .about("Field-level PE/ATT diff between two data anchors")
+                        .arg(
+                            Arg::new("refnos")
+                                .long("refnos")
+                                .value_name("CSV")
+                                .required_unless_present("pe-key"),
+                        )
+                        .arg(
+                            Arg::new("pe-key")
+                                .long("pe-key")
+                                .value_name("KEY")
+                                .help("Single-element fixture PE key"),
+                        )
+                        .arg(required_u32("from-sesno"))
+                        .arg(required_u32("to-sesno"))
+                        .arg(required_u32("dbnum"))
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("model-snapshot")
+                        .about("Fetch one model snapshot at a model_gen anchor")
+                        .arg(
+                            Arg::new("refno")
+                                .long("refno")
+                                .value_name("REFNO")
+                                .required(true),
+                        )
+                        .arg(required_u32("sesno"))
+                        .arg(required_u32("dbnum"))
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("model-diff")
+                        .about("Diff model records between two model_gen anchors")
+                        .arg(
+                            Arg::new("refnos")
+                                .long("refnos")
+                                .value_name("CSV")
+                                .required(true),
+                        )
+                        .arg(required_u32("from-sesno"))
+                        .arg(required_u32("to-sesno"))
+                        .arg(required_u32("dbnum"))
+                        .arg(json_arg()),
+                ),
+        )
+        .subcommand(
+            Command::new("export")
+                .about("Export model records from a resolved model_gen anchor")
+                .arg(required_u32("dbnum"))
+                .arg(required_u32("sesno"))
+                .arg(
+                    Arg::new("format")
+                        .long("format")
+                        .value_name("FORMAT")
+                        .value_parser(["v3-json"])
+                        .default_value("v3-json"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .long("output")
+                        .value_name("DIR")
+                        .help("Output directory; defaults to project output/v3_history"),
+                )
+                .arg(
+                    Arg::new("target-unit")
+                        .long("target-unit")
+                        .value_name("UNIT")
+                        .default_value("mm"),
+                )
+                .arg(
+                    Arg::new("rotate-z-up-to-y-up")
+                        .long("rotate-z-up-to-y-up")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .long("verbose")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("resolve-anchor")
+                .about("Resolve a full/incremental data anchor for (dbnum, sesno)")
+                .arg(required_u32("dbnum"))
+                .arg(required_u32("sesno"))
+                .arg(
+                    Arg::new("exact-only")
+                        .long("exact-only")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("unit-export")
+                .about("Export and record one minimum delivery unit model commit in Surreal")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Database number; resolved from unit-refno when omitted"),
+                )
+                .arg(
+                    Arg::new("unit-refno")
+                        .long("unit-refno")
+                        .value_name("REFNO")
+                        .required(true),
+                )
+                .arg(
+                    required_u32("sesno"),
+                )
+                .arg(
+                    Arg::new("verbose")
+                        .long("verbose")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("unit-list")
+                .about("List model commits for one minimum delivery unit")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Database number; resolved from unit-refno when omitted"),
+                )
+                .arg(
+                    Arg::new("unit-refno")
+                        .long("unit-refno")
+                        .value_name("REFNO")
+                        .required(true),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("unit-import")
+                .about("Register an existing validated minimum delivery unit artifact")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Database number; resolved from unit-refno when omitted"),
+                )
+                .arg(
+                    Arg::new("unit-refno")
+                        .long("unit-refno")
+                        .value_name("REFNO")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("unit-noun")
+                        .long("unit-noun")
+                        .value_name("NOUN")
+                        .required(true)
+                        .help("Minimum delivery unit noun: BRAN/HANG/EQUI/WALL/FLOOR"),
+                )
+                .arg(required_u32("sesno"))
+                .arg(
+                    Arg::new("impact-kind")
+                        .long("impact-kind")
+                        .value_parser(["mesh", "placement", "delivery", "noop"])
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("artifact-sesno")
+                        .long("artifact-sesno")
+                        .value_parser(clap::value_parser!(u32))
+                        .help("Artifact sesno; defaults to commit sesno"),
+                )
+                .arg(
+                    Arg::new("manifest-path")
+                        .long("manifest-path")
+                        .value_name("RELATIVE_PATH")
+                        .required(true)
+                        .help("Path relative to the configured project output directory"),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("backfill-pe-cata-hash")
+                .about("specs/023 M0/T2: backfill pe.cata_hash (D1-A) from ele_reuse_relate edges; optionally compute misses from ATT maps")
+                .arg(required_u32("dbnum"))
+                .arg(
+                    Arg::new("batch-size")
+                        .long("batch-size")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("500")
+                        .help("Page/apply chunk size (clamped to 50..=1000)"),
+                )
+                .arg(
+                    Arg::new("compute-missing")
+                        .long("compute-missing")
+                        .help("For rows without a reuse edge, compute cata_hash from ATT maps (slow, per-row query)")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("catch-up")
+                .about("Inspect or consume model generation debt up to the committed data watermark")
+                .arg(
+                    Arg::new("dbnum")
+                        .long("dbnum")
+                        .help("Target dbnum(s); omit to inspect all data-anchor/debt candidates")
+                        .value_parser(clap::value_parser!(u32))
+                        .action(clap::ArgAction::Append)
+                        .num_args(1..),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("allow-full-regen")
+                        .long("allow-full-regen")
+                        .action(clap::ArgAction::SetTrue)
+                        .help(
+                            "Explicitly authorize controlled full-db repair at the existing data anchor when debt coverage has a gap",
+                        ),
+                )
+                .arg(
+                    Arg::new("require-pe-owner-ready")
+                        .long("require-pe-owner-ready")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("rebuild-pe-owner")
+                .about(
+                    "specs/023: rebuild pe_owner edges for a dbnum from current pe.owner (reverse-mapped, no pe.children), then mark pe_owner_version_meta (source=rebuild_cli)",
+                )
+                .arg(required_u32("dbnum"))
+                .arg(
+                    Arg::new("batch-size")
+                        .long("batch-size")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("200")
+                        .help("Statements per SurrealDB request batch"),
+                )
+                .arg(
+                    Arg::new("dry-run")
+                        .long("dry-run")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Enumerate and count only; do not write edges or meta"),
+                )
+                .arg(json_arg()),
+        )
+        .subcommand(
+            Command::new("reference-index")
+                .about(
+                    "ADR-0011 P1: catalogue reverse-reference index (cata_ref_index) backfill/audit",
+                )
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("backfill")
+                        .about(
+                            "Build/replace cata_ref_index edges for a dbnum from current PE/ATT (replace-by-source), then mark cata_ref_index_state ready",
+                        )
+                        .arg(required_u32("dbnum"))
+                        .arg(
+                            Arg::new("batch-size")
+                                .long("batch-size")
+                                .value_parser(clap::value_parser!(usize))
+                                .default_value("500")
+                                .help("PE page / apply chunk size (clamped to 50..=1000)"),
+                        )
+                        .arg(
+                            Arg::new("dry-run")
+                                .long("dry-run")
+                                .action(clap::ArgAction::SetTrue)
+                                .help("Extract and count only; do not write edges or state"),
+                        )
+                        .arg(json_arg()),
+                )
+                .subcommand(
+                    Command::new("audit")
+                        .about(
+                            "Reconcile cata_ref_index vs a fresh full-scan PE/ATT extraction (count + content checksum + orphan detection); non-zero exit on mismatch",
+                        )
+                        .arg(required_u32("dbnum"))
+                        .arg(
+                            Arg::new("sample")
+                                .long("sample")
+                                .value_parser(clap::value_parser!(usize))
+                                .default_value("20")
+                                .help("Max per-source mismatches to include in the report"),
+                        )
+                        .arg(json_arg()),
+                ),
+        )
+}
+
+pub fn repair_missing_meshes_command() -> Command {
+    Command::new("repair-missing-meshes")
+        .about("Repair missing mesh files independently of model-version delivery")
+        .arg(required_u32("dbnum"))
+        .arg(
+            Arg::new("project")
+                .long("project")
+                .value_name("PROJECT")
+                .help("Project name override"),
+        )
+        .arg(
+            Arg::new("report-file")
+                .long("report-file")
+                .value_name("FILE")
+                .required(true),
+        )
+        .arg(
+            Arg::new("mesh-root")
+                .long("mesh-root")
+                .value_name("DIR")
+                .help("Mesh output root; defaults to DbOption meshes_path"),
+        )
+        .arg(
+            Arg::new("limit")
+                .long("limit")
+                .value_parser(clap::value_parser!(usize))
+                .value_name("N"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("retry-bad")
+                .long("retry-bad")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(json_arg())
+}
+
+fn required_u32(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .value_parser(clap::value_parser!(u32))
+        .required(true)
+}
+
+fn json_arg() -> Arg {
+    Arg::new("json")
+        .long("json")
+        .action(clap::ArgAction::SetTrue)
+}
+
+pub async fn handle_model_version_command(
+    matches: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<bool> {
+    let Some(model_matches) = matches.subcommand_matches("model-version") else {
+        return Ok(false);
+    };
+    match model_matches.subcommand() {
+        Some(("history", history)) => handle_history_command(history, db_option_ext).await?,
+        Some(("export", sub)) => handle_model_export_command(sub, db_option_ext).await?,
+        Some(("resolve-anchor", sub)) => handle_resolve_anchor_command(sub).await?,
+        Some(("unit-export", sub)) => handle_unit_export_command(sub, db_option_ext).await?,
+        Some(("unit-list", sub)) => handle_unit_list_command(sub, db_option_ext).await?,
+        Some(("unit-import", sub)) => handle_unit_import_command(sub, db_option_ext).await?,
+        Some(("backfill-pe-cata-hash", sub)) => handle_backfill_pe_cata_hash_command(sub).await?,
+        Some(("catch-up", sub)) => handle_model_gen_catch_up_command(sub, db_option_ext).await?,
+        Some(("rebuild-pe-owner", sub)) => handle_rebuild_pe_owner_command(sub).await?,
+        Some(("reference-index", sub)) => handle_reference_index_command(sub).await?,
+        _ => unreachable!("subcommand_required by clap"),
+    }
+    Ok(true)
+}
+
+async fn handle_model_gen_catch_up_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    let requested_dbnums = sub
+        .get_many::<u32>("dbnum")
+        .map(|values| values.copied().collect::<std::collections::BTreeSet<_>>())
+        .unwrap_or_default();
+    let dbnums = if requested_dbnums.is_empty() {
+        crate::versioned_db::model_gen_debt::list_model_gen_candidate_dbnums()
+            .await?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        requested_dbnums
+    };
+    if dbnums.is_empty() {
+        anyhow::bail!("model catch-up found no data-anchor/debt candidate dbnums");
+    }
+    let dry_run = sub.get_flag("dry-run");
+    let allow_full_regen = sub.get_flag("allow-full-regen");
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    for dbnum in dbnums {
+        match super::model_gen_catchup::catch_up_model_generation(
+            db_option_ext,
+            dbnum,
+            super::model_gen_catchup::ModelGenCatchUpOptions {
+                require_pe_owner_ready: sub.get_flag("require-pe-owner-ready"),
+                allow_full_regen,
+                dry_run,
+            },
+        )
+        .await
+        {
+            Ok(result) => {
+                if result.coverage.needs_full_regen && !allow_full_regen && !dry_run {
+                    failures.push(format!(
+                        "dbnum={dbnum} needs controlled repair because debt coverage has a gap"
+                    ));
+                }
+                results.push(result);
+            }
+            Err(error) => failures.push(format!("dbnum={dbnum}: {error:#}")),
+        }
+    }
+    if sub.get_flag("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "results": results,
+                "failures": failures,
+            }))?
+        );
+    } else {
+        for result in &results {
+            println!(
+                "model catch-up dbnum={} data={} model={} coverage_complete={} needs_full_regen={} gaps={} debt_buckets={} consumable_buckets={} stale_reconciled={} generated={:?} anchor={}",
+                result.dbnum,
+                result.coverage.data_watermark,
+                result.coverage.model_generation_watermark,
+                result.coverage.coverage_complete,
+                result.coverage.needs_full_regen,
+                result.coverage.gap_ranges.len(),
+                result.coverage.debt_bucket_counts.total,
+                result.coverage.consumable_bucket_counts.total,
+                result.stale_debt_reconciled,
+                result.generation_success,
+                result
+                    .model_gen_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.sesno.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+        for failure in &failures {
+            eprintln!("❌ {failure}");
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("model catch-up failed for {} dbnum(s)", failures.len());
+    }
+    Ok(())
+}
+
+fn validate_unit_manifest(
+    path: &std::path::Path,
+    dbnum: u32,
+    unit_refno: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        anyhow::anyhow!(
+            "读取最小交付单元 manifest 失败: {}: {error}",
+            path.display()
+        )
+    })?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "解析最小交付单元 manifest 失败: {}: {error}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        manifest.get("dbnum").and_then(serde_json::Value::as_u64) == Some(u64::from(dbnum)),
+        "manifest dbnum 与提交不一致: expected={dbnum} path={}",
+        path.display()
+    );
+    anyhow::ensure!(
+        manifest
+            .get("root_refno")
+            .and_then(serde_json::Value::as_str)
+            == Some(unit_refno),
+        "manifest root_refno 与提交不一致: expected={unit_refno} path={}",
+        path.display()
+    );
+    let table_rows = |table: &str| {
+        manifest
+            .pointer(&format!("/tables/{table}/rows"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+    };
+    anyhow::ensure!(
+        table_rows("geo_instances") > 0 || table_rows("tubings") > 0,
+        "最小交付单元 manifest 无可渲染几何，拒绝记录模型提交: {}",
+        path.display()
+    );
+    Ok(manifest)
+}
+
+fn verify_unit_commit_artifact(
+    commit: &crate::versioned_db::model_unit_commit::ModelUnitCommit,
+    project_output_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    use crate::versioned_db::model_unit_commit::ModelUnitImpactKind;
+
+    if commit.impact_kind == ModelUnitImpactKind::Tombstone {
+        return Ok(());
+    }
+    let manifest_path = project_output_dir.join(&commit.manifest_path);
+    let _ = validate_unit_manifest(&manifest_path, commit.dbnum, &commit.unit_refno)?;
+    let actual_hash = crate::version_management::hashing::sha256_file(&manifest_path)?;
+    anyhow::ensure!(
+        actual_hash == commit.artifact_hash,
+        "模型单元 artifact 已变化: ({}, {}, {}) expected={} actual={} path={}",
+        commit.dbnum,
+        commit.unit_refno,
+        commit.sesno,
+        commit.artifact_hash,
+        actual_hash,
+        manifest_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
+async fn unit_manifest_refnos(
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<Vec<aios_core::RefnoEnum>> {
+    let instances_path = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("unit manifest 缺少父目录"))?
+        .join("instances.parquet");
+    anyhow::ensure!(
+        instances_path.is_file(),
+        "unit manifest 缺少 instances.parquet: {}",
+        instances_path.display()
+    );
+    tokio::task::spawn_blocking(move || {
+        use polars::prelude::{ParquetReader, SerReader};
+
+        let frame = ParquetReader::new(std::fs::File::open(&instances_path)?)
+            .with_columns(Some(vec!["refno_str".into()]))
+            .finish()?;
+        let mut refnos = frame
+            .column("refno_str")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .map(aios_core::RefnoEnum::from)
+            .collect::<Vec<_>>();
+        refnos.sort_unstable();
+        refnos.dedup();
+        anyhow::Ok(refnos)
+    })
+    .await
+    .context("读取模型单元 instances.parquet 任务失败")?
+}
+
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
+async fn resolve_unit_impact(
+    dbnum: u32,
+    root_refno: aios_core::RefnoEnum,
+    sesno: u32,
+    previous: Option<&crate::versioned_db::model_unit_commit::ModelUnitCommit>,
+    project_output_dir: &std::path::Path,
+) -> anyhow::Result<(
+    crate::versioned_db::model_unit_commit::ModelUnitImpactKind,
+    serde_json::Value,
+)> {
+    use std::collections::BTreeSet;
+
+    use crate::versioned_db::model_unit_commit::ModelUnitImpactKind;
+    use aios_core::DiffKind;
+
+    let Some(previous) = previous else {
+        return Ok((
+            ModelUnitImpactKind::Mesh,
+            serde_json::json!({"reason": "first_unit_commit"}),
+        ));
+    };
+    anyhow::ensure!(
+        previous.sesno < sesno,
+        "unit-export 只允许在最新提交之后追加 sesno: latest={} requested={sesno}",
+        previous.sesno
+    );
+
+    if previous.impact_kind == ModelUnitImpactKind::Tombstone {
+        return Ok((
+            ModelUnitImpactKind::Mesh,
+            serde_json::json!({
+                "reason": "unit_recreated_after_tombstone",
+                "from_sesno": previous.sesno,
+                "to_sesno": sesno,
+            }),
+        ));
+    }
+
+    let root_diffs = aios_core::diff_range(&[root_refno], previous.sesno, sesno, dbnum).await?;
+    if model_unit_root_deleted(root_refno, &root_diffs) {
+        let root_diff = root_diffs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 diff"))?;
+        let from = root_diff
+            .from_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 from snapshot"))?;
+        let to = root_diff
+            .to_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少根元素 to snapshot"))?;
+        anyhow::ensure!(
+            from.exact_anchor && from.resolved_sesno == previous.sesno,
+            "unit impact 必须精确命中上一提交 sesno={}，refno={}",
+            previous.sesno,
+            root_diff.pe_key
+        );
+        anyhow::ensure!(
+            to.exact_anchor && to.resolved_sesno == sesno,
+            "unit impact 必须精确命中目标 sesno={sesno}，refno={}",
+            root_diff.pe_key
+        );
+        return Ok((
+            ModelUnitImpactKind::Tombstone,
+            serde_json::json!({
+                "reason": "unit_root_deleted",
+                "from_sesno": previous.sesno,
+                "to_sesno": sesno,
+                "root_refno": root_refno.to_string(),
+            }),
+        ));
+    }
+
+    let previous_manifest = project_output_dir.join(&previous.manifest_path);
+    let mut refnos = unit_manifest_refnos(&previous_manifest)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    refnos.insert(root_refno);
+    refnos.extend(
+        crate::fast_model::export_model::model_exporter::collect_export_refnos(
+            &[root_refno],
+            true,
+            None,
+            false,
+        )
+        .await?,
+    );
+    let refnos = refnos.into_iter().collect::<Vec<_>>();
+    let diffs = aios_core::diff_range(&refnos, previous.sesno, sesno, dbnum).await?;
+
+    let mut changed_refnos = 0usize;
+    let mut relevant_fields = BTreeSet::new();
+    for diff in &diffs {
+        let from = diff
+            .from_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少 from snapshot"))?;
+        let to = diff
+            .to_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unit impact 缺少 to snapshot"))?;
+        anyhow::ensure!(
+            from.exact_anchor && from.resolved_sesno == previous.sesno,
+            "unit impact 必须精确命中上一提交 sesno={}，refno={}",
+            previous.sesno,
+            diff.pe_key
+        );
+        anyhow::ensure!(
+            to.exact_anchor && to.resolved_sesno == sesno,
+            "unit impact 必须精确命中目标 sesno={sesno}，refno={}",
+            diff.pe_key
+        );
+        if diff.kind == DiffKind::Unchanged {
+            continue;
+        }
+        changed_refnos += 1;
+        if matches!(
+            diff.kind,
+            DiffKind::Added | DiffKind::Deleted | DiffKind::Removed
+        ) {
+            relevant_fields.insert("record_membership".to_string());
+            continue;
+        }
+        for change in &diff.changes {
+            if crate::version_management::model_impact::field_path_affects_model(&change.path) {
+                relevant_fields.insert(change.path.clone());
+            }
+        }
+    }
+    let impact_kind = if relevant_fields.is_empty() {
+        ModelUnitImpactKind::Noop
+    } else {
+        ModelUnitImpactKind::Mesh
+    };
+    Ok((
+        impact_kind,
+        serde_json::json!({
+            "reason": if impact_kind == ModelUnitImpactKind::Noop {
+                "metadata_only_or_no_change"
+            } else {
+                "generator_input_changed"
+            },
+            "from_sesno": previous.sesno,
+            "to_sesno": sesno,
+            "examined_refnos": refnos.len(),
+            "changed_refnos": changed_refnos,
+            "relevant_fields": relevant_fields,
+        }),
+    ))
+}
+
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
+fn model_unit_root_deleted(
+    root_refno: aios_core::RefnoEnum,
+    diffs: &[aios_core::ElementDiff],
+) -> bool {
+    diffs.iter().any(|diff| {
+        diff.refno_u64 == root_refno.refno().0
+            && matches!(
+                diff.kind,
+                aios_core::DiffKind::Deleted | aios_core::DiffKind::Removed
+            )
+    })
+}
+
+#[cfg(all(feature = "gen_model", feature = "parquet-export"))]
+async fn handle_unit_export_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    use crate::versioned_db::model_unit_commit::{
+        ModelUnitCommit, ModelUnitImpactKind, commit_model_unit, latest_model_unit_commit,
+        model_unit_commit,
+    };
+
+    ensure_model_unit_store_connection().await?;
+    let unit_refno = sub
+        .get_one::<String>("unit-refno")
+        .expect("required by clap")
+        .trim()
+        .replace('/', "_");
+    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
+    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
+        Some(value) => value,
+        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
+    };
+    let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+    let project_name = db_option_ext.inner.project_name.trim().to_string();
+    if let Some(existing) = model_unit_commit(dbnum, &unit_refno, sesno).await? {
+        anyhow::ensure!(
+            existing.project_name == project_name,
+            "已存在提交与当前 project 不一致"
+        );
+        verify_unit_commit_artifact(&existing, &db_option_ext.get_project_output_dir())?;
+        let outcome = commit_model_unit(existing).await?;
+        let output = serde_json::json!({
+            "success": true,
+            "idempotent": true,
+            "manifest_url": outcome.commit.manifest_url(),
+            "commit": outcome.commit,
+            "impact_evidence": {"reason": "existing_tuple"},
+            "stats": serde_json::Value::Null,
+        });
+        if sub.get_flag("json") {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!(
+                "model unit commit already exists: ({}, {}, {}) artifact_sesno={} manifest={}",
+                outcome.commit.dbnum,
+                outcome.commit.unit_refno,
+                outcome.commit.sesno,
+                outcome.commit.artifact_sesno,
+                outcome
+                    .commit
+                    .manifest_url()
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+        }
+        return Ok(());
+    }
+
+    let previous = latest_model_unit_commit(dbnum, &unit_refno).await?;
+    let (impact_kind, impact_evidence) = resolve_unit_impact(
+        dbnum,
+        root_refno,
+        sesno,
+        previous.as_ref(),
+        &db_option_ext.get_project_output_dir(),
+    )
+    .await?;
+
+    let unit_noun = if impact_kind == ModelUnitImpactKind::Tombstone {
+        previous
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tombstone 提交缺少上一模型提交"))?
+            .unit_noun
+            .clone()
+    } else {
+        let noun = aios_core::get_type_name(root_refno)
+            .await?
+            .trim()
+            .to_ascii_uppercase();
+        anyhow::ensure!(
+            crate::version_management::model_impact::is_delivery_unit_root_noun(&noun),
+            "{} 的 noun={}，不是最小交付单元根 BRAN/HANG/EQUI/WALL/FLOOR；其他模型仍按 dbnum 汇总导出",
+            unit_refno,
+            noun
+        );
+        noun
+    };
+
+    let mut stats = None;
+    let (artifact_sesno, manifest_path, artifact_hash) = match impact_kind {
+        ModelUnitImpactKind::Mesh => {
+            let relative_dir = PathBuf::from("model_units")
+                .join(dbnum.to_string())
+                .join(&unit_refno)
+                .join(sesno.to_string());
+            let output_dir = db_option_ext.get_project_output_dir().join(&relative_dir);
+            let manifest = output_dir.join("manifest.json");
+            if !manifest.is_file() {
+                let export = crate::fast_model::export_model::export_dbnum_instances_parquet::export_dbnum_instances_parquet(
+                        dbnum,
+                        &output_dir,
+                        db_option_ext.inner.clone().into(),
+                        sub.get_flag("verbose"),
+                        Some(crate::fast_model::unit_converter::LengthUnit::Millimeter),
+                        Some(root_refno),
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    export.instance_count > 0 || export.tubing_count > 0,
+                    "最小交付单元导出为空，拒绝记录模型提交"
+                );
+                stats = Some(serde_json::json!({
+                    "instances": export.instance_count,
+                    "geo_instances": export.geo_instance_count,
+                    "tubings": export.tubing_count,
+                    "total_bytes": export.total_bytes,
+                }));
+            }
+            let _ = validate_unit_manifest(&manifest, dbnum, &unit_refno)?;
+            let artifact_hash = crate::version_management::hashing::sha256_file(&manifest)?;
+            (
+                sesno,
+                relative_dir
+                    .join("manifest.json")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                artifact_hash,
+            )
+        }
+        ModelUnitImpactKind::Noop => {
+            let previous = previous
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("NoOp 提交缺少可复用的上一模型提交"))?;
+            anyhow::ensure!(
+                previous.unit_noun == unit_noun,
+                "NoOp unit_noun 与被复用提交不一致"
+            );
+            anyhow::ensure!(
+                previous.project_name == project_name,
+                "NoOp project_name 与被复用提交不一致"
+            );
+            verify_unit_commit_artifact(previous, &db_option_ext.get_project_output_dir())?;
+            (
+                previous.artifact_sesno,
+                previous.manifest_path.clone(),
+                previous.artifact_hash.clone(),
+            )
+        }
+        ModelUnitImpactKind::Tombstone => (sesno, String::new(), String::new()),
+        _ => anyhow::bail!("unit-export 当前只接受 mesh、noop 或 tombstone"),
+    };
+
+    let outcome = commit_model_unit(ModelUnitCommit {
+        dbnum,
+        unit_refno,
+        unit_noun,
+        sesno,
+        impact_kind,
+        artifact_sesno,
+        project_name,
+        manifest_path,
+        artifact_hash,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    })
+    .await?;
+    let output = serde_json::json!({
+        "success": true,
+        "idempotent": outcome.idempotent,
+        "manifest_url": outcome.commit.manifest_url(),
+        "commit": outcome.commit,
+        "impact_evidence": impact_evidence,
+        "stats": stats,
+    });
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "model unit commit: ({}, {}, {}) impact={} artifact_sesno={} manifest={}",
+            outcome.commit.dbnum,
+            outcome.commit.unit_refno,
+            outcome.commit.sesno,
+            outcome.commit.impact_kind.as_str(),
+            outcome.commit.artifact_sesno,
+            outcome
+                .commit
+                .manifest_url()
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "gen_model", feature = "parquet-export")))]
+async fn handle_unit_export_command(
+    _sub: &ArgMatches,
+    _db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    anyhow::bail!("unit-export 需要 gen_model 与 parquet-export features")
+}
+
+async fn handle_unit_list_command(
+    sub: &ArgMatches,
+    _db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    ensure_model_unit_store_connection().await?;
+    let unit_refno = sub
+        .get_one::<String>("unit-refno")
+        .expect("required by clap")
+        .trim()
+        .replace('/', "_");
+    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
+    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
+        Some(value) => value,
+        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
+    };
+    let commits =
+        crate::versioned_db::model_unit_commit::list_model_unit_commits(dbnum, &unit_refno).await?;
+    let output = commits
+        .iter()
+        .map(|commit| {
+            serde_json::json!({
+                "manifest_url": commit.manifest_url(),
+                "commit": commit,
+            })
+        })
+        .collect::<Vec<_>>();
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        for commit in commits {
+            println!(
+                "({}, {}, {}) impact={} artifact_sesno={} manifest={}",
+                commit.dbnum,
+                commit.unit_refno,
+                commit.sesno,
+                commit.impact_kind.as_str(),
+                commit.artifact_sesno,
+                commit
+                    .manifest_url()
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn handle_unit_import_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    use crate::versioned_db::model_unit_commit::{
+        ModelUnitCommit, ModelUnitImpactKind, commit_model_unit,
+    };
+    use std::str::FromStr;
+
+    ensure_model_unit_store_connection().await?;
+    let unit_refno = sub
+        .get_one::<String>("unit-refno")
+        .expect("required by clap")
+        .trim()
+        .replace('/', "_");
+    let root_refno = aios_core::RefnoEnum::from(unit_refno.as_str());
+    let dbnum = match sub.get_one::<u32>("dbnum").copied() {
+        Some(value) => value,
+        None => crate::data_interface::db_meta_manager::resolve_dbnum_for_refno(root_refno)?,
+    };
+    let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+    let artifact_sesno = sub
+        .get_one::<u32>("artifact-sesno")
+        .copied()
+        .unwrap_or(sesno);
+    let impact_kind = ModelUnitImpactKind::from_str(
+        sub.get_one::<String>("impact-kind")
+            .expect("required by clap"),
+    )?;
+    let relative_manifest = sub
+        .get_one::<String>("manifest-path")
+        .expect("required by clap")
+        .trim()
+        .replace('\\', "/");
+    let project_output_dir = db_option_ext.get_project_output_dir();
+    let canonical_project_output =
+        std::fs::canonicalize(&project_output_dir).with_context(|| {
+            format!(
+                "项目输出目录不存在或不可访问: {}",
+                project_output_dir.display()
+            )
+        })?;
+    let manifest_path = project_output_dir.join(&relative_manifest);
+    let canonical_manifest = std::fs::canonicalize(&manifest_path)
+        .with_context(|| format!("最小交付单元 manifest 不存在: {}", manifest_path.display()))?;
+    anyhow::ensure!(
+        canonical_manifest.starts_with(&canonical_project_output),
+        "manifest-path 逃逸项目输出目录: {}",
+        manifest_path.display()
+    );
+
+    let manifest = validate_unit_manifest(&canonical_manifest, dbnum, &unit_refno)?;
+    let generated_at = manifest
+        .get("generated_at")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("manifest 缺少 generated_at: {}", manifest_path.display()))?
+        .to_string();
+    let artifact_hash = crate::version_management::hashing::sha256_file(&canonical_manifest)?;
+    let outcome = commit_model_unit(ModelUnitCommit {
+        dbnum,
+        unit_refno,
+        unit_noun: sub
+            .get_one::<String>("unit-noun")
+            .expect("required by clap")
+            .to_string(),
+        sesno,
+        impact_kind,
+        artifact_sesno,
+        project_name: db_option_ext.inner.project_name.trim().to_string(),
+        manifest_path: relative_manifest,
+        artifact_hash,
+        generated_at,
+    })
+    .await?;
+    let output = serde_json::json!({
+        "success": true,
+        "idempotent": outcome.idempotent,
+        "manifest_url": outcome.commit.manifest_url(),
+        "commit": outcome.commit,
+    });
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "registered ({}, {}, {}) impact={} artifact_sesno={} idempotent={} manifest={}",
+            outcome.commit.dbnum,
+            outcome.commit.unit_refno,
+            outcome.commit.sesno,
+            outcome.commit.impact_kind.as_str(),
+            outcome.commit.artifact_sesno,
+            outcome.idempotent,
+            outcome
+                .commit
+                .manifest_url()
+                .unwrap_or_else(|| "<none>".to_string()),
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_model_unit_store_connection() -> anyhow::Result<()> {
+    #[cfg(feature = "gen_model")]
+    {
+        crate::fast_model::utils::ensure_surreal_init().await?;
+    }
+    #[cfg(not(feature = "gen_model"))]
+    {
+        aios_core::init_surreal().await?;
+    }
+    Ok(())
+}
+
+/// specs/023 T018 / M3-T8：存量 versioned 站点重建 pe_owner 边。
+///
+/// **成员关系以 `pe.owner` 为唯一权威源反推**（Q2：彻底不再读 `pe.children`）：
+/// cursor 分页枚举本 dbnum 全部节点的 `(id, owner)`，按 owner 反向分组得到每个 owner
+/// 的成员集合；`owner==自身` 或 owner 不在本 dbnum 物化集内 → 视为根、不建边。
+///
+/// 同胞顺序（与种子构建器同一约定）：已有边的孩子保留其现存 ordinal，新增孩子按 refno
+/// 升序填补空位；`child_count` 由反推成员数重算；遗留 `children` 字段顺带清 NONE。
+///
+/// verify-and-skip 重建（T021 实测教训，逻辑保留）：
+/// - 先把现存边全量读入内存（ORDER BY id 分页；无排序的 START/LIMIT 页序不稳定会漏读/重读）；
+/// - 与反推出的目标 `(ordinal, child)` 序列对比，**只重写不一致的 owner**（幂等重跑零写放大）；
+/// - 每 owner 先删后插；删段与插段分批 flush（versioned 引擎"同请求删边→重插同 id"
+///   撞 unique_pe_owner 的边界见 sesno_increment.rs 注释）；
+/// - flush 失败走逐语句慢路径：内容一致的唯一索引冲突视为幂等成功，内容不同的
+///   真实冲突做"清边→重插"带核实重试；
+/// - 幽灵 owner（元素已删但残留边）清理；
+/// - 成功后 UPSERT `pe_owner_version_meta`（source=rebuild_cli，值=dbnum_info_table
+///   该 dbnum latest sesno；查不到 sesno 拒绝写 meta）。
+async fn handle_rebuild_pe_owner_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
+    use surrealdb::types::SurrealValue;
+
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct PeNodeRow {
+        id: RefnoEnum,
+        #[serde(default)]
+        owner: Option<RefnoEnum>,
+    }
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required");
+    let batch_size = (*sub.get_one::<usize>("batch-size").expect("defaulted")).clamp(20, 1000);
+    let dry_run = sub.get_flag("dry-run");
+    let json = sub.get_flag("json");
+    let started = std::time::Instant::now();
+
+    // 0) D3 索引（幂等）：cursor 分页 `WHERE dbnum` 依赖它
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    // 1) 该 dbnum 当前 latest_sesno（meta 值；缺失则拒绝，避免错误分界）
+    let latest_sesno: Option<i64> = project_primary_db()
+        .query_take(
+            &format!(
+                "SELECT VALUE sesno FROM dbnum_info_table WHERE dbnum = {dbnum} ORDER BY sesno DESC LIMIT 1;"
+            ),
+            0,
+        )
+        .await
+        .map(|rows: Vec<i64>| rows.into_iter().next())
+        .map_err(|e| anyhow::anyhow!("查询 dbnum_info_table latest_sesno 失败: {e}"))?;
+    let Some(latest_sesno) = latest_sesno.filter(|s| *s > 0) else {
+        anyhow::bail!(
+            "dbnum={dbnum} 在 dbnum_info_table 无 sesno 记录，无法确定 pe_owner 可信分界；请先完成解析/增量落库"
+        );
+    };
+
+    const RELATION_ROWS_PER_INSERT: usize = 500;
+    let mut owners_with_children = 0usize;
+    let mut edges_inserted = 0usize;
+    let mut nodes_processed = 0usize;
+    let mut owners_skipped = 0usize;
+    let mut owners_rewritten = 0usize;
+    let mut stale_edge_deleted = 0usize;
+    let mut audit_nodes = std::collections::BTreeMap::new();
+    let mut audit_edges = Vec::new();
+
+    if !dry_run {
+        crate::versioned_db::pe_graph_seed::mark_not_ready(dbnum).await?;
+        crate::versioned_db::pe_owner_meta::mark_bulk_not_ready(
+            dbnum,
+            crate::versioned_db::pe_owner_meta::META_SOURCE_REBUILD_CLI,
+        )
+        .await?;
+    }
+
+    // 2) 现存边全量读入（分页 VALUE 投影；ord 取 id 第二段）。
+    // 分页必须 ORDER BY id：无排序的 START/LIMIT 页序不稳定会漏读/重读，
+    // 把本已一致的 owner 误判为不一致，触发无谓重写（T021 实测教训）。
+    let mut existing: std::collections::HashMap<u64, std::collections::BTreeMap<i64, u64>> =
+        std::collections::HashMap::new();
+    let mut existing_edge_count = 0usize;
+    {
+        const PAGE: usize = 100_000;
+        let mut start = 0usize;
+        loop {
+            let sql = format!(
+                "SELECT VALUE [type::string(record::id(id)[0]), type::string(in), record::id(id)[1]] FROM pe_owner ORDER BY id LIMIT {PAGE} START {start};"
+            );
+            let rows: Vec<(String, String, i64)> =
+                project_primary_db()
+                    .query_take(&sql, 0)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("读取现存 pe_owner 边失败(start={start}): {e}"))?;
+            let fetched = rows.len();
+            existing_edge_count += fetched;
+            for (owner_raw, child_raw, ord) in rows {
+                let (Ok(owner), Ok(child)) = (
+                    owner_raw.parse::<aios_core::RefU64>(),
+                    child_raw.parse::<aios_core::RefU64>(),
+                ) else {
+                    continue;
+                };
+                existing.entry(owner.0).or_default().insert(ord, child.0);
+            }
+            if fetched < PAGE {
+                break;
+            }
+            start += PAGE;
+        }
+    }
+    log::info!(
+        "rebuild: 现存 pe_owner {} 条边，覆盖 {} 个 owner",
+        existing_edge_count,
+        existing.len()
+    );
+
+    async fn exec_one(sql: &str) -> anyhow::Result<()> {
+        aios_core::project_primary_db()
+            .query(sql)
+            .await?
+            .check()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// 从本命令生成的 INSERT RELATION 语句里提取 owner 键（`pe_owner:[<owner>, n]` 的第一段）。
+    fn owner_key_from_insert_stmt(stmt: &str) -> Option<String> {
+        let start = stmt.find("pe_owner:[")? + "pe_owner:[".len();
+        let rest = &stmt[start..];
+        let end = rest.find(',')?;
+        let owner = rest[..end].trim();
+        (!owner.is_empty()).then(|| owner.to_string())
+    }
+
+    /// 把本命令生成的 `INSERT RELATION INTO pe_owner [{..},{..}];` 拆成单行对象文本。
+    fn split_relation_rows(stmt: &str) -> Vec<String> {
+        let Some(open) = stmt.find('[') else {
+            return vec![];
+        };
+        let Some(close) = stmt.rfind(']') else {
+            return vec![];
+        };
+        let inner = &stmt[open + 1..close];
+        // 行对象内不含嵌套花括号（本命令生成格式固定），按 `},{` 拆分
+        inner
+            .split("},")
+            .map(|part| {
+                let mut s = part.trim().to_string();
+                if !s.ends_with('}') {
+                    s.push('}');
+                }
+                s
+            })
+            .filter(|s| s.starts_with('{'))
+            .collect()
+    }
+
+    /// 唯一索引冲突错误是否与本行意图一致（同 id 且同 [in, out]）→ 幂等成功。
+    /// 错误样式：Database index `unique_pe_owner` already contains [pe:`A`, pe:`B`],
+    ///           with record `pe_owner:[pe:`B`, n]`
+    fn conflict_matches_intent(err_msg: &str, row_sql: &str) -> bool {
+        if !err_msg.contains("unique_pe_owner") && !err_msg.contains("already exists") {
+            return false;
+        }
+        let norm = |s: &str| s.replace(['`', ' '], "");
+        let row = norm(row_sql);
+        // row 形如 {id:pe_owner:[pe:B,n],in:pe:A,out:pe:B}
+        let extract = |key: &str| -> Option<String> {
+            let start = row.find(key)? + key.len();
+            let rest = &row[start..];
+            let end = rest.find([',', '}'])?;
+            Some(rest[..end].to_string())
+        };
+        let (Some(want_in), Some(want_out)) = (extract("in:"), extract("out:")) else {
+            return false;
+        };
+        let err = norm(err_msg);
+        // "already exists"（同 id 重建同内容）：id 在错误里，in/out 不在——退化为仅比对 record id
+        if err.contains("alreadyexists") && !err.contains("contains[") {
+            let want_id = extract("id:").unwrap_or_default();
+            return !want_id.is_empty() && err.contains(&want_id);
+        }
+        err.contains(&format!("contains[{want_in},{want_out}]"))
+    }
+
+    /// 批量执行；失败时逐语句慢路径重放。
+    ///
+    /// 慢路径存在的原因：fixture 的 versioned 引擎在同连接高频写入下偶发 **DELETE 返回
+    /// OK 但未生效**（T021 实测：随机 owner、跨运行不复现同一批），随后 INSERT 撞
+    /// unique_pe_owner。兜底：对冲突的 INSERT 做"清边→点查核实确已清空→重插"的
+    /// 带核实重试。id 区间删仅用于**当前态写清理**，与 research C3 的
+    /// "区间扫+VERSION 读"禁令无关。
+    async fn flush(stmts: &mut Vec<String>, dry_run: bool) -> anyhow::Result<()> {
+        if stmts.is_empty() || dry_run {
+            stmts.clear();
+            return Ok(());
+        }
+        let sql = stmts.join("\n");
+        if exec_one(&sql).await.is_ok() {
+            stmts.clear();
+            return Ok(());
+        }
+        log::warn!(
+            "rebuild 批次执行失败，进入逐语句慢路径（{} 条）",
+            stmts.len()
+        );
+        for stmt in stmts.iter() {
+            if exec_one(stmt).await.is_ok() {
+                continue;
+            }
+            let Some(owner) = owner_key_from_insert_stmt(stmt) else {
+                let dump =
+                    std::path::Path::new("db-data").join("rebuild_pe_owner_failed_batch.sql");
+                let _ = std::fs::write(&dump, &sql);
+                anyhow::bail!(
+                    "rebuild 语句失败且无法按 owner 兜底（已存 {}）: {stmt}",
+                    dump.display()
+                );
+            };
+            // 逐行重放：行内容与库中完全一致的冲突视为幂等成功。
+            // 背景（T021 实测）：长连接在高写入量后图遍历/条件读偶发读到陈旧视图
+            // （看不到边→bulk 对比误判 mismatch→DELETE 无的放矢），而唯一索引在写入侧
+            // 看到的是真实状态并报出准确的 [in, out] 与 record id——以冲突错误文本为准，
+            // 与本行意图一致即数据已达目标态。
+            let rows = split_relation_rows(stmt);
+            if rows.is_empty() {
+                let dump =
+                    std::path::Path::new("db-data").join("rebuild_pe_owner_failed_batch.sql");
+                let _ = std::fs::write(&dump, &sql);
+                anyhow::bail!(
+                    "rebuild 语句失败且无法拆行（已存 {}）: {stmt}",
+                    dump.display()
+                );
+            }
+            for row_sql in rows {
+                let single = format!("INSERT RELATION INTO pe_owner [{row_sql}];");
+                match exec_one(&single).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if conflict_matches_intent(&msg, &row_sql) {
+                            log::debug!("owner {owner} 行已达目标态（幂等冲突）");
+                            continue;
+                        }
+                        // 内容不同的真实冲突：清边后单行重试一次
+                        exec_one(&format!("DELETE {owner}<-pe_owner;")).await?;
+                        exec_one(&format!(
+                            "DELETE pe_owner:[{owner}, 0]..=[{owner}, 4294967295];"
+                        ))
+                        .await?;
+                        if let Err(e2) = exec_one(&single).await {
+                            let msg2 = e2.to_string();
+                            if conflict_matches_intent(&msg2, &row_sql) {
+                                continue;
+                            }
+                            let dump = std::path::Path::new("db-data")
+                                .join("rebuild_pe_owner_failed_batch.sql");
+                            let _ = std::fs::write(&dump, &sql);
+                            anyhow::bail!(
+                                "rebuild owner {owner} 行清边重试后仍失败（已存 {}）: {e2}",
+                                dump.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        stmts.clear();
+        Ok(())
+    }
+
+    // 3) 枚举本 dbnum 全部节点（只读 id, owner；不再读 children），以 pe.owner 反推成员关系
+    const ENUM_PAGE: usize = 500;
+    let mut candidate_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut node_owner: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    {
+        let mut last_key: Option<String> = None;
+        loop {
+            let page_sql = match &last_key {
+                Some(key) => format!(
+                    "SELECT id, owner FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {ENUM_PAGE};"
+                ),
+                None => format!(
+                    "SELECT id, owner FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {ENUM_PAGE};"
+                ),
+            };
+            let rows: Vec<PeNodeRow> = project_primary_db()
+                .query_take(&page_sql, 0)
+                .await
+                .map_err(|e| anyhow::anyhow!("pe 节点分页失败(last={last_key:?}): {e}"))?;
+            let fetched = rows.len();
+            if fetched == 0 {
+                break;
+            }
+            last_key = rows.last().map(|r| r.id.to_pe_key());
+            for row in &rows {
+                let refno = row.id.refno().0;
+                let normalized_owner = row.owner.as_ref().map(|o| o.refno().0).unwrap_or(refno);
+                candidate_set.insert(refno);
+                node_owner.insert(refno, normalized_owner);
+            }
+            if fetched < ENUM_PAGE {
+                break;
+            }
+        }
+    }
+    nodes_processed = node_owner.len();
+
+    // 3a) 由 owner 反推 children_by_owner（owner==自身 或 owner 不在物化集内 → 根，不建边）。
+    let mut children_by_owner: std::collections::BTreeMap<u64, Vec<u64>> =
+        std::collections::BTreeMap::new();
+    for (&refno, &owner) in &node_owner {
+        if owner != refno && candidate_set.contains(&owner) {
+            children_by_owner.entry(owner).or_default().push(refno);
+        }
+    }
+
+    // 3b) 更新每个节点 owner/child_count（由反推重算）并清空遗留 children 字段。
+    {
+        let mut update_stmts: Vec<String> = Vec::new();
+        for (&refno, &owner) in &node_owner {
+            let child_count = children_by_owner.get(&refno).map(Vec::len).unwrap_or(0);
+            audit_nodes.insert(refno, (owner, child_count as u32));
+            update_stmts.push(format!(
+                "UPDATE {} SET owner = {}, child_count = {}, children = NONE;",
+                RefU64(refno).to_pe_key(),
+                RefU64(owner).to_pe_key(),
+                child_count,
+            ));
+        }
+        for batch in update_stmts.chunks(batch_size) {
+            let mut stmts = batch.to_vec();
+            flush(&mut stmts, dry_run).await?;
+        }
+    }
+
+    // 3c) 逐 owner 计算目标 (ordinal, child) 序列并 verify-and-skip 重建边。
+    // 处理集合 = 有成员的 owner ∪ 本 dbnum 内仍有现存边的 owner（后者可能已失去全部
+    // 成员，其残留边需删除；跨 dbnum 的幽灵 owner 留给步骤 4）。
+    {
+        let mut owners_to_process: std::collections::BTreeSet<u64> =
+            children_by_owner.keys().copied().collect();
+        for owner in existing.keys() {
+            if candidate_set.contains(owner) {
+                owners_to_process.insert(*owner);
+            }
+        }
+
+        let mut delete_stmts: Vec<String> = Vec::new();
+        let mut insert_stmts: Vec<String> = Vec::new();
+        for owner in owners_to_process {
+            let members: Vec<u64> = children_by_owner.get(&owner).cloned().unwrap_or_default();
+            if !members.is_empty() {
+                owners_with_children += 1;
+            }
+
+            // 已有边的孩子保留原 ordinal，新增孩子按 refno 升序填补空位（与种子构建器同一约定）。
+            let existing_ord: std::collections::HashMap<u64, u32> = existing
+                .get(&owner)
+                .map(|m| m.iter().map(|(&ord, &child)| (child, ord as u32)).collect())
+                .unwrap_or_default();
+            let mut order_of: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
+            let mut used: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for &child in &members {
+                if let Some(&ord) = existing_ord.get(&child) {
+                    order_of.insert(child, ord);
+                    used.insert(ord);
+                }
+            }
+            let mut new_children: Vec<u64> = members
+                .iter()
+                .copied()
+                .filter(|c| !order_of.contains_key(c))
+                .collect();
+            new_children.sort_unstable();
+            let mut next_order = 0u32;
+            for child in new_children {
+                while used.contains(&next_order) {
+                    next_order += 1;
+                }
+                order_of.insert(child, next_order);
+                used.insert(next_order);
+                next_order += 1;
+            }
+            let mut ordered: Vec<(u32, u64)> = order_of
+                .into_iter()
+                .map(|(child, ord)| (ord, child))
+                .collect();
+            ordered.sort_unstable();
+
+            for &(ord, child) in &ordered {
+                audit_edges.push((owner, ord, child));
+            }
+
+            let current_pairs: Vec<(u32, u64)> = existing
+                .get(&owner)
+                .map(|m| m.iter().map(|(&ord, &child)| (ord as u32, child)).collect())
+                .unwrap_or_default();
+            if ordered == current_pairs {
+                owners_skipped += 1;
+                continue;
+            }
+            owners_rewritten += 1;
+            edges_inserted += ordered.len();
+            let owner_key = RefU64(owner).to_pe_key();
+            if !current_pairs.is_empty() {
+                delete_stmts.push(format!("DELETE {owner_key}<-pe_owner;"));
+                delete_stmts.push(format!(
+                    "DELETE pe_owner:[{owner_key}, 0]..=[{owner_key}, 4294967295];"
+                ));
+            }
+            for ch in ordered.chunks(RELATION_ROWS_PER_INSERT) {
+                let rows_sql = ch
+                    .iter()
+                    .map(|(ord, child)| {
+                        format!(
+                            "{{ id: pe_owner:[{owner_key}, {ord}], in: {}, out: {owner_key} }}",
+                            RefU64(*child).to_pe_key()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                insert_stmts.push(format!("INSERT RELATION INTO pe_owner [{rows_sql}];"));
+            }
+        }
+        for batch in delete_stmts.chunks(batch_size) {
+            let mut stmts = batch.to_vec();
+            flush(&mut stmts, dry_run).await?;
+        }
+        for batch in insert_stmts.chunks(batch_size) {
+            let mut stmts = batch.to_vec();
+            flush(&mut stmts, dry_run).await?;
+        }
+    }
+
+    // 4) 幽灵 owner 清理：现存边的 owner 已不在候选集（元素已删但残留边）。
+    // 注意：existing 是全库边快照，候选集只含本 dbnum——非本 dbnum 的 owner 不能算幽灵。
+    {
+        let _ = crate::data_interface::db_meta_manager::db_meta().ensure_loaded();
+        let mut ghost_stmts: Vec<String> = Vec::new();
+        for (owner_u64, edges) in &existing {
+            if candidate_set.contains(owner_u64) {
+                continue;
+            }
+            let owner_refno = aios_core::RefU64(*owner_u64);
+            // 只清理属于本 dbnum 的幽灵 owner（ref0→dbnum 由 db_meta 映射；映射不到时跳过，
+            // 避免误删其它 dbnum 的合法边）
+            let owner_dbnum = crate::data_interface::db_meta_manager::db_meta()
+                .get_dbnum_by_refno(aios_core::RefnoEnum::from(owner_refno));
+            if owner_dbnum != Some(dbnum) {
+                continue;
+            }
+            let owner_key = owner_refno.to_pe_key();
+            stale_edge_deleted += edges.len();
+            ghost_stmts.push(format!("DELETE {owner_key}<-pe_owner;"));
+            ghost_stmts.push(format!(
+                "DELETE pe_owner:[{owner_key}, 0]..=[{owner_key}, 4294967295];"
+            ));
+        }
+        if !ghost_stmts.is_empty() {
+            log::info!("rebuild: 清理幽灵 owner 残留边 {} 条", stale_edge_deleted);
+            for batch in ghost_stmts.chunks(batch_size) {
+                let mut stmts = batch.to_vec();
+                flush(&mut stmts, dry_run).await?;
+            }
+        }
+    }
+
+    // 5) 固化可信分界与本次全量审计摘要（dry-run 不写）
+    if !dry_run {
+        audit_edges.sort_unstable();
+        let integrity = crate::versioned_db::pe_graph_seed::audit_expected(
+            dbnum,
+            &audit_nodes,
+            &audit_edges,
+        )
+        .await
+        .context("重建后 PE/pe_owner 持久化审计失败，保持 NotReady")?;
+        crate::versioned_db::pe_owner_meta::publish_bulk_ready(
+            dbnum,
+            latest_sesno as u32,
+            crate::versioned_db::pe_owner_meta::META_SOURCE_REBUILD_CLI,
+            integrity.node_count,
+            integrity.edge_count,
+            &integrity.hierarchy_hash,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("pe_owner_version_meta 写入失败（边已重建，可重跑本命令补写）: {e}")
+        })?;
+    }
+
+    let summary = serde_json::json!({
+        "dbnum": dbnum,
+        "dry_run": dry_run,
+        "enumeration": "pe_cursor_paging",
+        "nodes_processed": nodes_processed,
+        "owners_with_children": owners_with_children,
+        "owners_skipped": owners_skipped,
+        "owners_rewritten": owners_rewritten,
+        "edges_inserted": edges_inserted,
+        "ghost_edges_deleted": stale_edge_deleted,
+        "maintained_since_sesno": if dry_run { serde_json::Value::Null } else { serde_json::json!(latest_sesno) },
+        "meta_source": if dry_run { serde_json::Value::Null } else { serde_json::json!("rebuild_cli") },
+        "duration_ms": started.elapsed().as_millis() as u64,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "rebuild-pe-owner dbnum={dbnum} dry_run={dry_run} nodes={nodes_processed} skipped={owners_skipped} rewritten={owners_rewritten} edges_inserted={edges_inserted} ghost_deleted={stale_edge_deleted} maintained_since_sesno={} elapsed={}ms",
+            if dry_run {
+                "-".to_string()
+            } else {
+                latest_sesno.to_string()
+            },
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
+/// specs/023 M0/T2（D1 方案 A）：存量 pe 行回填 `cata_hash` 字段。
+///
+/// 数据来源两级：
+/// 1. **ele_reuse_relate 边**（full 解析期产物，`pe->ele_reuse_relate->inst_info:⟨hash⟩`）：
+///    批量图查直接搬运，快路径；
+/// 2. `--compute-missing`：无边的行（如旧二进制增量新增的元素）逐行取 ATT map 重算
+///    `cal_cata_hash()`（慢路径，逐 refno 查询，显式 opt-in）。
+///
+/// 幂等可重跑：UPDATE 只 SET cata_hash，不触碰其他字段；重复执行结果一致。
+/// 增量常态维护由 sesno_increment 的 UPSERT 注入负责，本命令只管存量。
+async fn handle_reference_index_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    match sub.subcommand() {
+        Some(("backfill", m)) => handle_reference_index_backfill_command(m).await,
+        Some(("audit", m)) => handle_reference_index_audit_command(m).await,
+        _ => unreachable!("subcommand_required by clap"),
+    }
+}
+
+/// ADR-0011 P1 step-1：从当前 PE/ATT 全量重建某 dbnum 的 `cata_ref_index` 出边
+/// （replace-by-source），并写 `cata_ref_index_state` ready 水位 + 内容 checksum。
+/// 不触碰增量提交热路径，可独立 CLI 自测。
+async fn handle_reference_index_backfill_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use crate::versioned_db::cata_ref_index as crx;
+    use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let batch = (*sub.get_one::<usize>("batch-size").expect("defaulted")).clamp(50, 1000);
+    let dry_run = sub.get_flag("dry-run");
+    let json_output = sub.get_flag("json");
+    let started = std::time::Instant::now();
+
+    crx::ensure_cata_ref_index_schema().await?;
+    // 分页枚举 WHERE dbnum 依赖该索引（幂等）。
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    let mut scanned = 0usize;
+    let mut sources_with_edges = 0usize;
+    let mut edge_count = 0usize;
+    let mut att_errors = 0usize;
+    let mut digest = crx::EdgeDigest::new();
+    let mut last_key: Option<String> = None;
+
+    loop {
+        let page_sql = match &last_key {
+            Some(key) => format!(
+                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {batch};"
+            ),
+            None => {
+                format!("SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {batch};")
+            }
+        };
+        let ids: Vec<RefnoEnum> = project_primary_db().query_take(&page_sql, 0).await?;
+        if ids.is_empty() {
+            break;
+        }
+        last_key = ids.last().map(|r| r.refno().to_pe_key());
+        scanned += ids.len();
+
+        let mut page_sources: Vec<String> = Vec::with_capacity(ids.len());
+        let mut page_edges: Vec<crx::RefEdge> = Vec::new();
+        for refno_enum in &ids {
+            let refno = refno_enum.refno();
+            let att = match aios_core::get_named_attmap(*refno_enum).await {
+                Ok(att) => att,
+                Err(_) => {
+                    att_errors += 1;
+                    continue;
+                }
+            };
+            let edges = crx::extract_ref_edges(refno, dbnum, &att);
+            page_sources.push(refno.to_string());
+            if !edges.is_empty() {
+                sources_with_edges += 1;
+                edge_count += edges.len();
+                digest.absorb_all(edges.iter());
+                page_edges.extend(edges);
+            }
+        }
+
+        if !dry_run {
+            // 先删后插分属不同请求（同请求内删+重插同 id 会撞唯一约束）。
+            if let Some(del_sql) = crx::delete_sources_sql(dbnum, &page_sources) {
+                project_primary_db().query(del_sql).await?.check()?;
+            }
+            for insert_sql in crx::insert_edges_sql(&page_edges, batch) {
+                project_primary_db().query(insert_sql).await?.check()?;
+            }
+        }
+
+        if scanned % (batch * 20) == 0 {
+            eprintln!(
+                "[reference-index backfill] dbnum={dbnum} scanned={scanned} edges={edge_count} ..."
+            );
+        }
+    }
+
+    let checksum = digest.checksum();
+    if !dry_run {
+        crx::write_state(dbnum, true, edge_count, &checksum).await?;
+    }
+
+    let summary = serde_json::json!({
+        "command": "reference-index backfill",
+        "dbnum": dbnum,
+        "scanned_sources": scanned,
+        "sources_with_edges": sources_with_edges,
+        "edge_count": edge_count,
+        "checksum": checksum,
+        "att_read_errors": att_errors,
+        "applied": !dry_run,
+        "extractor_version": crx::EXTRACTOR_VERSION,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "✅ reference-index backfill dbnum={dbnum} sources={scanned} edges={edge_count} checksum={checksum} applied={}",
+            !dry_run
+        );
+    }
+    Ok(())
+}
+
+/// ADR-0011 P1 step-1：对账 `cata_ref_index` 与「当前 PE/ATT 全扫描抽取」的边集
+/// （行数 + 顺序无关 checksum + 孤儿行检测 + 抽样逐 source 差分）。不一致时非零退出。
+/// 注：step-1 在 latest 快照对账；`VERSION AT` 历史对账随 P2 读会话接入。
+async fn handle_reference_index_audit_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use crate::versioned_db::cata_ref_index as crx;
+    use aios_core::{RefU64, RefnoEnum, SurrealQueryExt, project_primary_db};
+    use std::collections::HashMap;
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let sample_limit = *sub.get_one::<usize>("sample").expect("defaulted");
+    let _json_output = sub.get_flag("json"); // 对账工具恒输出 JSON，保留 flag 兼容
+    let started = std::time::Instant::now();
+
+    crx::ensure_cata_ref_index_schema().await?;
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    const PAGE: usize = 500;
+    let mut scanned = 0usize;
+    let mut fresh_digest = crx::EdgeDigest::new();
+    let mut index_digest = crx::EdgeDigest::new();
+    let mut fresh_rows = 0usize;
+    let mut index_rows_by_source = 0usize;
+    let mut att_errors = 0usize;
+    let mut mismatches: Vec<serde_json::Value> = Vec::new();
+    let mut last_key: Option<String> = None;
+
+    loop {
+        let page_sql = match &last_key {
+            Some(key) => format!(
+                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {PAGE};"
+            ),
+            None => {
+                format!("SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {PAGE};")
+            }
+        };
+        let ids: Vec<RefnoEnum> = project_primary_db().query_take(&page_sql, 0).await?;
+        if ids.is_empty() {
+            break;
+        }
+        last_key = ids.last().map(|r| r.refno().to_pe_key());
+        scanned += ids.len();
+
+        // 当前 PE/ATT 全扫描抽取（oracle）。
+        let mut fresh_by_source: HashMap<String, Vec<crx::RefEdge>> = HashMap::new();
+        let refus: Vec<RefU64> = ids.iter().map(|r| r.refno()).collect();
+        for refno_enum in &ids {
+            let refno = refno_enum.refno();
+            let att = match aios_core::get_named_attmap(*refno_enum).await {
+                Ok(att) => att,
+                Err(_) => {
+                    att_errors += 1;
+                    continue;
+                }
+            };
+            let edges = crx::extract_ref_edges(refno, dbnum, &att);
+            fresh_rows += edges.len();
+            fresh_digest.absorb_all(edges.iter());
+            fresh_by_source.insert(refno.to_string(), edges);
+        }
+
+        // 索引侧出边。
+        let index_edges = crx::load_outbound_references(dbnum, &refus).await?;
+        index_rows_by_source += index_edges.len();
+        index_digest.absorb_all(index_edges.iter());
+        let mut index_by_source: HashMap<String, Vec<crx::RefEdge>> = HashMap::new();
+        for edge in index_edges {
+            index_by_source
+                .entry(edge.source_refno.clone())
+                .or_default()
+                .push(edge);
+        }
+
+        for (source, fresh_edges) in &fresh_by_source {
+            let empty: Vec<crx::RefEdge> = Vec::new();
+            let idx_edges = index_by_source.get(source).unwrap_or(&empty);
+            if !crx::edges_equal_ignoring_order(fresh_edges, idx_edges)
+                && mismatches.len() < sample_limit
+            {
+                mismatches.push(serde_json::json!({
+                    "source_refno": source,
+                    "fresh_edges": fresh_edges.len(),
+                    "index_edges": idx_edges.len(),
+                }));
+            }
+        }
+    }
+
+    let total_index_rows = crx::count_index_rows(dbnum).await?;
+    let orphan_rows = total_index_rows.saturating_sub(index_rows_by_source);
+    let fresh_checksum = fresh_digest.checksum();
+    let index_checksum = index_digest.checksum();
+    let state = crx::read_state(dbnum).await?;
+    let state_ready = state.as_ref().map(|s| s.ready).unwrap_or(false);
+
+    let passed = fresh_rows == index_rows_by_source
+        && fresh_checksum == index_checksum
+        && orphan_rows == 0
+        && mismatches.is_empty();
+
+    let summary = serde_json::json!({
+        "command": "reference-index audit",
+        "dbnum": dbnum,
+        "scanned_sources": scanned,
+        "fresh_edge_count": fresh_rows,
+        "index_edge_count": index_rows_by_source,
+        "index_total_rows": total_index_rows,
+        "orphan_rows": orphan_rows,
+        "fresh_checksum": fresh_checksum,
+        "index_checksum": index_checksum,
+        "checksum_match": fresh_checksum == index_checksum,
+        "att_read_errors": att_errors,
+        "state_ready": state_ready,
+        "state_extractor_version": state.as_ref().and_then(|s| s.extractor_version.clone()),
+        "mismatch_sample": mismatches,
+        "passed": passed,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    if !passed {
+        anyhow::bail!(
+            "reference-index audit FAILED for dbnum={dbnum}: fresh={fresh_rows} index={index_rows_by_source} orphans={orphan_rows} mismatches={}",
+            mismatches.len()
+        );
+    }
+    Ok(())
+}
+
+async fn handle_backfill_pe_cata_hash_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    use aios_core::utils::RecordIdExt;
+    use aios_core::{RefnoEnum, SurrealQueryExt, project_primary_db};
+    use serde::Deserialize;
+    use surrealdb::types::{RecordId, SurrealValue};
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct EdgeHashRow {
+        p: RefnoEnum,
+        /// `->ele_reuse_relate.out`（0 或 1 个 inst_info 记录 id，key 即 cata_hash）
+        #[serde(default)]
+        h: Vec<RecordId>,
+    }
+
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let batch = (*sub.get_one::<usize>("batch-size").expect("defaulted")).clamp(50, 1000);
+    let compute_missing = sub.get_flag("compute-missing");
+    let dry_run = sub.get_flag("dry-run");
+    let json_output = sub.get_flag("json");
+    let started = std::time::Instant::now();
+
+    // D3 索引（幂等）：分页枚举 WHERE dbnum 依赖它
+    crate::versioned_db::pe_owner_tree::PeOwnerTreeStore::ensure_pe_dbnum_noun_index().await?;
+
+    let mut scanned = 0usize;
+    let mut from_edge = 0usize;
+    let mut computed = 0usize;
+    let mut no_hash = 0usize;
+    let mut updates_applied = 0usize;
+    // cursor 分页（id > last ORDER BY id）：无序 START/LIMIT 页序不稳定会漏读/重读
+    let mut last_key: Option<String> = None;
+
+    loop {
+        let page_sql = match &last_key {
+            Some(key) => format!(
+                "SELECT VALUE id FROM pe WHERE dbnum = {dbnum} AND id > {key} ORDER BY id LIMIT {batch};"
+            ),
+            None => {
+                format!("SELECT VALUE id FROM pe WHERE dbnum = {dbnum} ORDER BY id LIMIT {batch};")
+            }
+        };
+        let ids: Vec<RefnoEnum> = project_primary_db().query_take(&page_sql, 0).await?;
+        if ids.is_empty() {
+            break;
+        }
+        last_key = ids.last().map(|r| r.to_pe_key());
+        scanned += ids.len();
+
+        let keys = ids
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let edge_sql =
+            format!("SELECT VALUE {{ p: id, h: ->ele_reuse_relate.out }} FROM [{keys}];");
+        let rows: Vec<EdgeHashRow> = project_primary_db().query_take(&edge_sql, 0).await?;
+
+        let mut update_sqls: Vec<String> = Vec::new();
+        for row in rows {
+            let edge_hash = row
+                .h
+                .first()
+                .map(|rid| rid.to_mesh_id())
+                .filter(|h| !h.is_empty());
+            let hash = if let Some(h) = edge_hash {
+                from_edge += 1;
+                Some(h)
+            } else if compute_missing {
+                match aios_core::get_named_attmap(row.p).await {
+                    Ok(att) => att.cal_cata_hash().map(|h| {
+                        computed += 1;
+                        h.to_string()
+                    }),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            match hash {
+                Some(h) => {
+                    update_sqls.push(format!(
+                        "UPDATE {} SET cata_hash = '{h}';",
+                        row.p.to_pe_key()
+                    ));
+                }
+                None => no_hash += 1,
+            }
+        }
+
+        if !dry_run && !update_sqls.is_empty() {
+            for chunk in update_sqls.chunks(batch) {
+                project_primary_db()
+                    .query(chunk.join("\n"))
+                    .await?
+                    .check()?;
+            }
+        }
+        updates_applied += update_sqls.len();
+
+        if scanned % (batch * 20) == 0 {
+            eprintln!(
+                "[backfill-pe-cata-hash] dbnum={dbnum} scanned={scanned} updates={updates_applied} ..."
+            );
+        }
+    }
+
+    let summary = serde_json::json!({
+        "dbnum": dbnum,
+        "scanned": scanned,
+        "from_edge": from_edge,
+        "computed_from_att": computed,
+        "no_cata_hash": no_hash,
+        "updates": updates_applied,
+        "applied": !dry_run,
+        "compute_missing": compute_missing,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "backfill-pe-cata-hash dbnum={dbnum} scanned={scanned} from_edge={from_edge} computed={computed} no_hash={no_hash} updates={updates_applied} applied={} elapsed_ms={}",
+            !dry_run,
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(())
+}
+
+async fn handle_model_export_command(
+    sub: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    #[cfg(not(feature = "gen_model"))]
+    {
+        let _ = (sub, db_option_ext);
+        anyhow::bail!(
+            "model-version export 需要 gen_model feature；瘦构建不会回退到当前态或伪造历史导出"
+        );
+    }
+    #[cfg(feature = "gen_model")]
+    {
+        use crate::fast_model::export_model::AnchorExportContext;
+        use crate::fast_model::export_model::export_dbnum_instances_v3::export_dbnum_instances_v3_at_anchor;
+        use crate::fast_model::export_model::export_transform_config::ExportTransformConfig;
+        use crate::fast_model::unit_converter::LengthUnit;
+        use std::str::FromStr;
+        use std::sync::Arc;
+
+        let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+        let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+        let format = sub
+            .get_one::<String>("format")
+            .map(String::as_str)
+            .unwrap_or("v3-json");
+        if format != "v3-json" {
+            anyhow::bail!("unsupported historical export format: {format}");
+        }
+        crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
+        let anchor = AnchorExportContext::resolve(dbnum, sesno).await?;
+        let target_unit = LengthUnit::from_str(
+            sub.get_one::<String>("target-unit")
+                .map(String::as_str)
+                .unwrap_or("mm"),
+        )
+        .map_err(|error| anyhow::anyhow!("invalid --target-unit: {error}"))?;
+        let transform_config = ExportTransformConfig {
+            source_unit: LengthUnit::Millimeter,
+            target_unit,
+            apply_rotation: sub.get_flag("rotate-z-up-to-y-up"),
+            inline_matrices: false,
+        };
+        let output_dir = sub
+            .get_one::<String>("output")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| db_option_ext.get_project_output_dir().join("v3_history"));
+        let stats = export_dbnum_instances_v3_at_anchor(
+            dbnum,
+            &output_dir,
+            Arc::new((**db_option_ext).clone()),
+            sub.get_flag("verbose"),
+            transform_config,
+            &anchor,
+        )
+        .await?;
+        let summary = serde_json::json!({
+            "format": format,
+            "dbnum": dbnum,
+            "requested_sesno": sesno,
+            "resolved_sesno": anchor.resolved_sesno,
+            "exact": anchor.exact,
+            "source": anchor.source,
+            "anchored_at": anchor.anchored_at,
+            "output_file": stats.output_filename,
+            "bran_group_count": stats.bran_group_count,
+            "equi_group_count": stats.equi_group_count,
+            "ungrouped_count": stats.ungrouped_count,
+            "total_component_instances": stats.total_component_instances,
+            "total_tubing_instances": stats.total_tubing_instances,
+            "transform_count": stats.transform_count,
+            "aabb_count": stats.aabb_count,
+            "elapsed_ms": stats.elapsed.as_millis(),
+        });
+        if sub.get_flag("json") {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            println!(
+                "historical export dbnum={} requested_sesno={} resolved_sesno={} exact={} source={} anchored_at={} output={}",
+                dbnum,
+                sesno,
+                anchor.resolved_sesno,
+                anchor.exact,
+                anchor.source,
+                anchor.anchored_at,
+                stats.output_filename
+            );
+        }
+        Ok(())
+    }
+}
+
+pub async fn handle_repair_missing_meshes_command(
+    matches: &ArgMatches,
+    db_option_ext: &DbOptionExt,
+) -> anyhow::Result<bool> {
+    let Some(sub) = matches.subcommand_matches("repair-missing-meshes") else {
+        return Ok(false);
+    };
+    #[cfg(not(feature = "gen_model"))]
+    {
+        let _ = (sub, db_option_ext);
+        anyhow::bail!(
+            "repair-missing-meshes 需要 gen_model feature（sync-cli 瘦构建不含网格生成管线）"
+        );
+    }
+    #[cfg(feature = "gen_model")]
+    {
+        use crate::version_management::missing_mesh_repair::{
+            ModelMissingMeshRepairRequest, repair_missing_meshes,
+        };
+        let request = ModelMissingMeshRepairRequest {
+            project_name: sub
+                .get_one::<String>("project")
+                .cloned()
+                .unwrap_or_else(|| db_option_ext.inner.project_name.clone()),
+            dbnum: *sub.get_one::<u32>("dbnum").expect("required by clap"),
+            report_file: PathBuf::from(
+                sub.get_one::<String>("report-file")
+                    .expect("required by clap"),
+            ),
+            mesh_root: sub
+                .get_one::<String>("mesh-root")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    db_option_ext
+                        .inner
+                        .meshes_path
+                        .as_deref()
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| PathBuf::from("./assets/meshes")),
+            limit: sub.get_one::<usize>("limit").copied(),
+            dry_run: sub.get_flag("dry-run"),
+            retry_bad: sub.get_flag("retry-bad"),
+        };
+        let response = repair_missing_meshes(db_option_ext, request).await?;
+        if sub.get_flag("json") {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        } else {
+            println!(
+                "repaired missing meshes dbnum={} attempted={} generated={} still_missing={} report={} action={}",
+                response.dbnum,
+                response.attempted_hashes,
+                response.generated_hashes,
+                response.still_missing_hashes,
+                response.report_file.display(),
+                response.recommended_action
+            );
+        }
+        Ok(true)
+    }
+}
+
+async fn handle_resolve_anchor_command(sub: &ArgMatches) -> anyhow::Result<()> {
+    let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+    let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+    crate::versioned_db::database::ensure_sesno_version_anchor_schema().await?;
+    let hit = aios_core::resolve_data_anchor(dbnum, sesno)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("未找到 dbnum={dbnum} sesno<={sesno} 的 data version anchor")
+        })?;
+    if sub.get_flag("exact-only") && !hit.exact {
+        anyhow::bail!(
+            "exact-only: 无精确数据锚点 dbnum={dbnum} sesno={sesno}；最近不大于为 sesno={} anchored_at={}",
+            hit.sesno,
+            hit.anchored_at
+        );
+    }
+    if sub.get_flag("json") {
+        println!("{}", serde_json::to_string_pretty(&hit)?);
+    } else {
+        println!(
+            "data anchor dbnum={} requested_sesno={} resolved_sesno={} exact={} source={} anchored_at={}",
+            dbnum,
+            sesno,
+            hit.sesno,
+            hit.exact,
+            hit.source.as_deref().unwrap_or("unknown"),
+            hit.anchored_at
+        );
+    }
+    Ok(())
+}
+
+async fn handle_history_command(
+    history: &ArgMatches,
+    _db_option_ext: &DbOptionExt,
+) -> anyhow::Result<()> {
+    match history.subcommand() {
+        Some(("snapshot", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let refno = parse_history_refno(sub.get_one::<String>("refno"), pe_key)?;
+            match aios_core::snapshot_at(refno, sesno, Some(dbnum), pe_key).await {
+                Ok(snapshot) if sub.get_flag("json") => {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?)
+                }
+                Ok(snapshot) => {
+                    println!(
+                        "snapshot pe_key={} requested_sesno={} resolved_sesno={} exact={} exists={} anchored_at={}",
+                        snapshot.pe_key,
+                        snapshot.requested_sesno,
+                        snapshot.resolved_sesno,
+                        snapshot.exact_anchor,
+                        snapshot.exists,
+                        snapshot.anchored_at
+                    );
+                }
+                Err(error) => anyhow::bail!("{}", aios_core::format_history_error(&error)),
+            }
+        }
+        Some(("timeline", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required by clap");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required by clap");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let refno = parse_history_refno(sub.get_one::<String>("refno"), pe_key)?;
+            match aios_core::timeline_with_pe_key(refno, from_sesno, to_sesno, dbnum, pe_key).await
+            {
+                Ok(points) if sub.get_flag("json") => {
+                    println!("{}", serde_json::to_string_pretty(&points)?)
+                }
+                Ok(points) => {
+                    for point in points {
+                        println!(
+                            "sesno={} changed={} exists={} hash={} at={}",
+                            point.sesno,
+                            point.changed_from_prev,
+                            point.exists,
+                            point.content_hash,
+                            point.anchored_at
+                        );
+                    }
+                }
+                Err(error) => anyhow::bail!("{}", aios_core::format_history_error(&error)),
+            }
+        }
+        Some(("diff", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required by clap");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required by clap");
+            let pe_key = sub.get_one::<String>("pe-key").map(String::as_str);
+            let mut refnos = Vec::new();
+            if let Some(csv) = sub.get_one::<String>("refnos") {
+                for value in csv
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let owned = value.to_string();
+                    refnos.push(parse_history_refno(Some(&owned), None)?);
+                }
+            } else if pe_key.is_some() {
+                refnos.push(parse_history_refno(None, pe_key)?);
+            }
+            if refnos.is_empty() {
+                anyhow::bail!("--refnos or --pe-key is required");
+            }
+            match aios_core::diff_range_with_pe_keys(&refnos, from_sesno, to_sesno, dbnum, pe_key)
+                .await
+            {
+                Ok(rows) if sub.get_flag("json") => {
+                    println!("{}", serde_json::to_string_pretty(&rows)?)
+                }
+                Ok(rows) => {
+                    for row in rows {
+                        println!(
+                            "{:?} refno={} changes={}",
+                            row.kind,
+                            row.refno_u64,
+                            row.changes.len()
+                        );
+                    }
+                }
+                Err(error) => anyhow::bail!("{}", aios_core::format_history_error(&error)),
+            }
+        }
+        Some(("model-snapshot", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+            let sesno = *sub.get_one::<u32>("sesno").expect("required by clap");
+            let refno = parse_history_refno(sub.get_one::<String>("refno"), None)?;
+            match aios_core::model_snapshot_at(refno, sesno, dbnum).await {
+                Ok(snapshot) if sub.get_flag("json") => {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?)
+                }
+                Ok(snapshot) => {
+                    println!(
+                        "model snapshot refno={} requested_sesno={} resolved_sesno={} exact={} source={} exists={} anchored_at={}",
+                        snapshot.refno_u64,
+                        snapshot.requested_sesno,
+                        snapshot.anchor.sesno,
+                        snapshot.anchor.exact,
+                        snapshot.anchor.source.as_deref().unwrap_or("unknown"),
+                        snapshot.exists,
+                        snapshot.anchor.anchored_at
+                    );
+                }
+                Err(error) => anyhow::bail!("{}", aios_core::format_history_error(&error)),
+            }
+        }
+        Some(("model-diff", sub)) => {
+            let dbnum = *sub.get_one::<u32>("dbnum").expect("required by clap");
+            let from_sesno = *sub.get_one::<u32>("from-sesno").expect("required by clap");
+            let to_sesno = *sub.get_one::<u32>("to-sesno").expect("required by clap");
+            let refnos =
+                parse_history_refnos(sub.get_one::<String>("refnos").expect("required by clap"))?;
+            match aios_core::model_diff(&refnos, from_sesno, to_sesno, dbnum).await {
+                Ok(rows) if sub.get_flag("json") => {
+                    println!("{}", serde_json::to_string_pretty(&rows)?)
+                }
+                Ok(rows) => {
+                    for row in rows {
+                        println!(
+                            "model diff refno={} kind={:?} from={}->{}({},{}) to={}->{}({},{}) changes={}",
+                            row.refno_u64,
+                            row.kind,
+                            row.from_requested_sesno,
+                            row.from_anchor.sesno,
+                            row.from_anchor.source.as_deref().unwrap_or("unknown"),
+                            row.from_anchor.anchored_at,
+                            row.to_requested_sesno,
+                            row.to_anchor.sesno,
+                            row.to_anchor.source.as_deref().unwrap_or("unknown"),
+                            row.to_anchor.anchored_at,
+                            row.changes.len()
+                        );
+                    }
+                }
+                Err(error) => anyhow::bail!("{}", aios_core::format_history_error(&error)),
+            }
+        }
+        _ => unreachable!("history subcommand_required by clap"),
+    }
+    Ok(())
+}
+
+fn parse_history_refnos(raw: &str) -> anyhow::Result<Vec<aios_core::RefnoEnum>> {
+    let mut refnos = Vec::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let owned = value.to_string();
+        refnos.push(parse_history_refno(Some(&owned), None)?);
+    }
+    if refnos.is_empty() {
+        anyhow::bail!("--refnos must contain at least one refno");
+    }
+    Ok(refnos)
+}
+
+fn parse_history_refno(
+    refno: Option<&String>,
+    pe_key: Option<&str>,
+) -> anyhow::Result<aios_core::RefnoEnum> {
+    use std::str::FromStr;
+    if let Some(refno) = refno {
+        let normalized = refno.trim().trim_start_matches('/').replace('\\', "/");
+        return aios_core::RefnoEnum::from_str(&normalized)
+            .map_err(|error| anyhow::anyhow!("invalid --refno '{refno}': {error}"));
+    }
+    if pe_key.is_some() {
+        return Ok(aios_core::RefnoEnum::from(aios_core::RefU64(0)));
+    }
+    anyhow::bail!("--refno or --pe-key is required")
+}

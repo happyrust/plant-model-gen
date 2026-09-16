@@ -1,0 +1,615 @@
+//! Review form (review_forms table) lifecycle management.
+//!
+//! SurrealQL 风格对齐 `.cursor/skills/plant-surrealdb` 中的通用约定：
+//! - 只取标量列表时优先 `SELECT VALUE`；
+//! - 逻辑删除用显式 `(deleted IS NONE OR deleted = false)`（旧行无 `deleted` 视为未删）；
+//! - 能用单次 `UPDATE … WHERE` 完成的不要先 `SELECT` 再写（减少往返）。
+
+use crate::web_api::review_db::{await_review_ddl, await_review_query, fresh_review_db};
+use std::fs;
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use tokio::sync::OnceCell;
+use tracing::warn;
+
+use super::types::{
+    ReviewForm, ReviewFormRow, derive_review_form_status_from_task_status, review_form_from_row,
+};
+use crate::web_api::review_api::{
+    ReviewAttachment, ReviewComponent, ReviewTask, WorkflowStep, hydrate_task_attachments,
+};
+
+/// `review_tasks` 未软删过滤片段（可选 `bool` 字段：勿单独用 `deleted = false` 排除「字段缺失」旧数据）
+pub const REVIEW_TASK_ACTIVE_SQL: &str = "(deleted IS NONE OR deleted = false)";
+
+// ============================================================================
+// Schema
+// ============================================================================
+
+/// schema DDL 进程级单次成功守卫，避免每次 create/submit/sync 重跑 DEFINE 触发 SurrealDB schema 锁竞争。
+static REVIEW_FORMS_SCHEMA_READY: OnceCell<()> = OnceCell::const_new();
+
+async fn ensure_review_forms_schema_inner() -> anyhow::Result<()> {
+    let db = fresh_review_db().await?;
+    await_review_ddl(
+        "review.forms.ensure_schema",
+        db.query(
+            r#"
+            DEFINE TABLE IF NOT EXISTS review_forms SCHEMAFULL;
+            DEFINE FIELD IF NOT EXISTS form_id ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS project_id ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS user_id ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS role ON TABLE review_forms TYPE none | string;
+            DEFINE FIELD IF NOT EXISTS requester_id ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS source ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS status ON TABLE review_forms TYPE string;
+            DEFINE FIELD IF NOT EXISTS task_created ON TABLE review_forms TYPE bool DEFAULT false;
+            DEFINE FIELD IF NOT EXISTS deleted ON TABLE review_forms TYPE bool DEFAULT false;
+            DEFINE FIELD IF NOT EXISTS created_at ON TABLE review_forms TYPE datetime;
+            DEFINE FIELD IF NOT EXISTS updated_at ON TABLE review_forms TYPE datetime DEFAULT time::now();
+            DEFINE FIELD IF NOT EXISTS deleted_at ON TABLE review_forms TYPE option<datetime>;
+            DEFINE INDEX IF NOT EXISTS idx_form_id ON TABLE review_forms FIELDS form_id UNIQUE;
+            "#,
+        ),
+    )
+    .await
+        .map_err(|error| {
+            warn!("ensure_review_forms_schema DEFINE failed: {}", error);
+            error
+        })?;
+    Ok(())
+}
+
+async fn ensure_review_forms_schema() -> anyhow::Result<()> {
+    REVIEW_FORMS_SCHEMA_READY
+        .get_or_try_init(|| async { ensure_review_forms_schema_inner().await })
+        .await?;
+    Ok(())
+}
+
+pub async fn warm_review_forms_schema() -> anyhow::Result<()> {
+    ensure_review_forms_schema().await
+}
+
+pub fn review_forms_schema_ready() -> bool {
+    REVIEW_FORMS_SCHEMA_READY.get().is_some()
+}
+
+fn warn_review_forms_schema_not_ready(operation: &str) {
+    if !review_forms_schema_ready() {
+        warn!(
+            "[REVIEW_FORM.schema] operation={} schema warmup is not ready; continuing without request-path DDL",
+            operation
+        );
+    }
+}
+
+// ============================================================================
+// CRUD
+// ============================================================================
+
+pub async fn get_review_form_by_form_id(form_id: &str) -> anyhow::Result<Option<ReviewForm>> {
+    warn_review_forms_schema_not_ready("get_review_form_by_form_id");
+
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.forms.by_form_id",
+        db.query(
+            r#"
+            SELECT * FROM review_forms
+            WHERE form_id = $form_id
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            "get_review_form_by_form_id SELECT failed: form_id={}, error={}",
+            form_id, error
+        );
+        error
+    })?;
+
+    let rows: Vec<ReviewFormRow> = response.take(0)?;
+    Ok(rows.into_iter().next().map(review_form_from_row))
+}
+
+pub async fn ensure_review_form_stub(
+    form_id: &str,
+    project_id: &str,
+    requester_id: &str,
+    requester_role: Option<&str>,
+    source: &str,
+) -> anyhow::Result<ReviewForm> {
+    warn_review_forms_schema_not_ready("ensure_review_form_stub");
+    let normalized_role = requester_role
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase());
+
+    if let Some(existing) = get_review_form_by_form_id(form_id).await? {
+        if existing.status == "deleted" {
+            anyhow::bail!("form_id={} 对应主单据已删除，禁止重新打开", form_id);
+        }
+
+        let db = fresh_review_db().await?;
+        await_review_query(
+            "review.forms.stub_update",
+            db.query(
+                r#"
+                UPDATE review_forms
+                SET
+                    project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
+                    user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
+                    requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+                    role = IF string::len(string::trim($role)) > 0 THEN $role ELSE role END,
+                    source = $source,
+                    deleted = false,
+                    updated_at = time::now()
+                WHERE form_id = $form_id
+                "#,
+            )
+            .bind(("form_id", form_id.to_string()))
+            .bind(("project_id", project_id.trim().to_string()))
+            .bind(("requester_id", requester_id.trim().to_string()))
+            .bind(("role", normalized_role.clone().unwrap_or_default()))
+            .bind(("source", source.trim().to_string())),
+        )
+        .await
+            .map_err(|error| {
+                warn!(
+                    "ensure_review_form_stub UPDATE failed: form_id={}, error={}",
+                    form_id, error
+                );
+                error
+            })?;
+
+        return get_review_form_by_form_id(form_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("form_id={} 主单据更新后读取失败", form_id));
+    }
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.stub_create",
+        db.query(
+            r#"
+            CREATE review_forms CONTENT {
+                form_id: $form_id,
+                project_id: $project_id,
+                user_id: $requester_id,
+                requester_id: $requester_id,
+                role: IF string::len(string::trim($role)) > 0 THEN $role ELSE NONE END,
+                source: $source,
+                status: 'blank',
+                task_created: false,
+                deleted: false,
+                created_at: time::now(),
+                updated_at: time::now(),
+                deleted_at: NONE
+            }
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .bind(("project_id", project_id.trim().to_string()))
+        .bind(("requester_id", requester_id.trim().to_string()))
+        .bind(("role", normalized_role.unwrap_or_default()))
+        .bind(("source", source.trim().to_string())),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            "ensure_review_form_stub CREATE failed: form_id={}, error={}",
+            form_id, error
+        );
+        error
+    })?;
+
+    get_review_form_by_form_id(form_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("form_id={} 主单据创建后读取失败", form_id))
+}
+
+pub async fn sync_review_form_with_task_status(
+    form_id: &str,
+    project_id: Option<&str>,
+    requester_id: Option<&str>,
+    source: &str,
+    task_status: &str,
+) -> anyhow::Result<()> {
+    let _ = ensure_review_form_stub(
+        form_id,
+        project_id.unwrap_or_default(),
+        requester_id.unwrap_or_default(),
+        None,
+        source,
+    )
+    .await?;
+
+    let form_status = derive_review_form_status_from_task_status(task_status);
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.sync_task_status",
+        db.query(
+            r#"
+            UPDATE review_forms
+            SET
+                project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
+                user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
+                requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+                source = $source,
+                task_created = true,
+                status = $status,
+                deleted = false,
+                deleted_at = NONE,
+                updated_at = time::now()
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string()))
+        .bind(("project_id", project_id.unwrap_or_default().trim().to_string()))
+        .bind(("requester_id", requester_id.unwrap_or_default().trim().to_string()))
+        .bind(("source", source.trim().to_string()))
+        .bind(("status", form_status)),
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn mark_review_form_deleted(form_id: &str) -> anyhow::Result<()> {
+    warn_review_forms_schema_not_ready("mark_review_form_deleted");
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.mark_deleted",
+        db.query(
+            r#"
+            UPDATE review_forms
+            SET
+                status = 'deleted',
+                task_created = false,
+                deleted = true,
+                deleted_at = time::now(),
+                updated_at = time::now()
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize, SurrealValue)]
+struct ReviewAttachmentDeleteRow {
+    file_id: Option<String>,
+    file_ext: Option<String>,
+}
+
+async fn query_review_task_ids_by_form_id(form_id: &str) -> anyhow::Result<Vec<String>> {
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct ReviewTaskIdRow {
+        id: surrealdb_types::RecordId,
+    }
+
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.forms.task_ids_by_form",
+        db.query(
+            r#"
+            SELECT id FROM review_tasks
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    let rows: Vec<ReviewTaskIdRow> = response.take(0)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| match row.id.key {
+            surrealdb_types::RecordIdKey::String(value) => value,
+            other => format!("{:?}", other),
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+async fn query_review_attachment_delete_rows(
+    form_id: &str,
+) -> anyhow::Result<Vec<ReviewAttachmentDeleteRow>> {
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.forms.attachment_delete_rows",
+        db.query(
+            r#"
+            SELECT file_id, file_ext FROM review_attachment
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    Ok(response.take(0)?)
+}
+
+fn remove_review_attachment_file(file_id: &str, file_ext: Option<&str>) -> anyhow::Result<()> {
+    let file_id = file_id.trim();
+    if file_id.is_empty() {
+        return Ok(());
+    }
+
+    let upload_dir = std::path::Path::new("assets/review_attachments");
+    let mut candidates = Vec::new();
+
+    if let Some(ext) = file_ext
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+    {
+        candidates.push(upload_dir.join(format!("{}.{}", file_id, ext)));
+    }
+
+    for ext in ["png", "jpg", "jpeg", "gif", "pdf", "bin"] {
+        let path = upload_dir.join(format!("{}.{}", file_id, ext));
+        if !candidates.iter().any(|candidate| candidate == &path) {
+            candidates.push(path);
+        }
+    }
+
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+
+        match fs::remove_file(&candidate) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                anyhow::bail!("删除附件文件失败 {}: {}", candidate.display(), error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// PMS 入站删除：主单软删 + 清理 form 主链 + 关联 review_comments + severity。
+pub async fn soft_delete_review_bundle(form_id: &str) -> anyhow::Result<()> {
+    warn_review_forms_schema_not_ready("soft_delete_review_bundle");
+    let review_form = get_review_form_by_form_id(form_id).await?;
+    if review_form.is_none() {
+        anyhow::bail!("form_id={} 不存在", form_id);
+    }
+
+    let task_ids = query_review_task_ids_by_form_id(form_id).await?;
+    let attachments = query_review_attachment_delete_rows(form_id).await?;
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.soft_delete_tasks",
+        db.query(
+            r#"
+            UPDATE review_tasks SET
+                deleted = true,
+                deleted_at = time::now(),
+                updated_at = time::now(),
+                status = 'deleted'
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    mark_review_form_deleted(form_id).await?;
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.delete_form_models",
+        db.query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_form_model WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    // 清理关联 review_comments + severity（在删除 review_records 之前提取 annotation_ids）
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.delete_related_comments",
+        db.query(
+            r#"
+            LET $records = SELECT annotations, cloud_annotations, rect_annotations, obb_annotations
+                FROM review_records WHERE form_id = $form_id;
+            LET $anno_ids = array::distinct(array::flatten([
+                array::flatten($records.annotations.*.id ?? []),
+                array::flatten($records.cloud_annotations.*.id ?? []),
+                array::flatten($records.rect_annotations.*.id ?? []),
+                array::flatten($records.obb_annotations.*.id ?? [])
+            ]));
+            DELETE review_comments WHERE annotation_id IN $anno_ids;
+            DELETE review_annotation_severity WHERE annotation_id IN $anno_ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    crate::web_api::review_annotation_state::delete_annotation_states_by_form_id(form_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "soft_delete_review_bundle: failed to clean review_annotation_states for form_id={}: {}",
+                form_id, e
+            );
+        });
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.delete_records",
+        db.query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_records WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    if !task_ids.is_empty() {
+        let db = fresh_review_db().await?;
+        await_review_query(
+            "review.forms.delete_workflow_history",
+            db.query(
+                r#"
+                LET $ids = SELECT VALUE id FROM review_workflow_history WHERE task_id IN $task_ids;
+                DELETE $ids;
+                "#,
+            )
+            .bind(("task_ids", task_ids)),
+        )
+        .await?;
+    }
+
+    for attachment in &attachments {
+        remove_review_attachment_file(
+            attachment.file_id.as_deref().unwrap_or_default(),
+            attachment.file_ext.as_deref(),
+        )?;
+    }
+
+    let db = fresh_review_db().await?;
+    await_review_query(
+        "review.forms.delete_attachments",
+        db.query(
+            r#"
+            LET $ids = SELECT VALUE id FROM review_attachment WHERE form_id = $form_id;
+            DELETE $ids;
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Task lookup by form_id (used by embed_url & workflow_sync)
+// ============================================================================
+
+pub async fn find_task_by_form_id(form_id: &str) -> anyhow::Result<Option<ReviewTask>> {
+    #[derive(Debug, serde::Deserialize, SurrealValue)]
+    struct TaskRow {
+        id: surrealdb_types::RecordId,
+        form_id: Option<String>,
+        title: Option<String>,
+        description: Option<String>,
+        model_name: Option<String>,
+        status: Option<String>,
+        priority: Option<String>,
+        requester_id: Option<String>,
+        requester_name: Option<String>,
+        checker_id: Option<String>,
+        checker_name: Option<String>,
+        approver_id: Option<String>,
+        approver_name: Option<String>,
+        reviewer_id: Option<String>,
+        reviewer_name: Option<String>,
+        components: Option<Vec<ReviewComponent>>,
+        attachments: Option<Vec<ReviewAttachment>>,
+        review_comment: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
+        updated_at: Option<surrealdb::types::Datetime>,
+        due_date: Option<surrealdb::types::Datetime>,
+        current_node: Option<String>,
+        workflow_history: Option<Vec<WorkflowStep>>,
+        return_reason: Option<String>,
+    }
+
+    fn to_millis(value: Option<surrealdb::types::Datetime>) -> Option<i64> {
+        value.map(|dt| dt.timestamp_millis())
+    }
+
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.forms.find_task_by_form_id",
+        db.query(&format!(
+            r#"
+            SELECT * FROM review_tasks
+            WHERE form_id = $form_id
+              AND {}
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            "#,
+            REVIEW_TASK_ACTIVE_SQL
+        ))
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    let rows: Vec<TaskRow> = response.take(0)?;
+    let task = rows.into_iter().next().map(|row| {
+        let id = match row.id.key {
+            surrealdb::types::RecordIdKey::String(value) => value,
+            other => format!("{:?}", other),
+        };
+        let checker_id = row
+            .checker_id
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| row.reviewer_id.clone())
+            .unwrap_or_default();
+        let checker_name = row
+            .checker_name
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| row.reviewer_name.clone())
+            .unwrap_or_default();
+
+        ReviewTask {
+            id,
+            form_id: row.form_id.unwrap_or_default(),
+            title: row.title.unwrap_or_default(),
+            description: row.description.unwrap_or_default(),
+            model_name: row.model_name.unwrap_or_default(),
+            status: row.status.unwrap_or_else(|| "draft".to_string()),
+            priority: row.priority.unwrap_or_else(|| "medium".to_string()),
+            requester_id: row.requester_id.unwrap_or_default(),
+            requester_name: row.requester_name.unwrap_or_default(),
+            checker_id: checker_id.clone(),
+            checker_name: checker_name.clone(),
+            approver_id: row.approver_id.unwrap_or_default(),
+            approver_name: row.approver_name.unwrap_or_default(),
+            reviewer_id: row.reviewer_id.unwrap_or_else(|| checker_id),
+            reviewer_name: row.reviewer_name.unwrap_or_else(|| checker_name),
+            components: row.components.unwrap_or_default(),
+            attachments: row.attachments,
+            review_comment: row.review_comment,
+            created_at: to_millis(row.created_at).unwrap_or_default(),
+            updated_at: to_millis(row.updated_at).unwrap_or_default(),
+            due_date: to_millis(row.due_date),
+            current_node: row.current_node.unwrap_or_else(|| "sj".to_string()),
+            workflow_history: row.workflow_history.unwrap_or_default(),
+            return_reason: row.return_reason,
+        }
+    });
+
+    if let Some(task) = task {
+        return Ok(Some(hydrate_task_attachments(task).await));
+    }
+
+    Ok(None)
+}

@@ -1,0 +1,7619 @@
+//! Review API - 校审管理 API
+//!
+//! 实现提资单、确认记录、评论、附件等完整的 CRUD 操作
+//!
+//! `review_tasks` 软删过滤：凡出现 `(deleted IS NONE OR deleted = false)` 的语句须与
+//! `platform_api::REVIEW_TASK_ACTIVE_SQL` 保持同步（见 plant-surrealdb 技能：可选 bool / 逻辑删除）。
+
+use axum::{
+    Router,
+    extract::{Json, Multipart, Path, Query},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use surrealdb::types::{self as surrealdb_types, SurrealValue};
+use tracing::{info, warn};
+
+use crate::web_api::jwt_auth::{TokenClaims, generate_form_id};
+use crate::web_api::platform_api::{
+    annotation_check::{
+        AnnotationCheckOptions, annotation_check_failed_response, build_annotation_check_context,
+        evaluate_annotation_check,
+    },
+    derive_review_form_status_from_task_status, mark_review_form_deleted,
+    sync_review_form_with_task_status,
+};
+use crate::web_api::review_annotation_state::sync_annotation_states_from_snapshot;
+use crate::web_api::review_db::{
+    await_review_query, await_review_query_long, fresh_review_db,
+    review_workflow_history_schema_ready,
+};
+use axum::extract::Extension;
+use std::collections::HashSet;
+use tokio::time::{Duration, timeout};
+
+// ============================================================================
+// Request/Response Types
+// ============================================================================
+
+/// 创建提资单请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskRequest {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub model_name: String,
+    /// 校核人 ID（三段审批第二段，jd 节点负责人）
+    pub checker_id: Option<String>,
+    /// 校核人姓名（可选，不传则回退到 checker_id/reviewer_id）
+    #[serde(default)]
+    pub checker_name: Option<String>,
+    /// 审核人 ID（三段审批第三段，sh 节点负责人）
+    pub approver_id: Option<String>,
+    /// 审核人姓名（可选，不传则回退到 approver_id）
+    #[serde(default)]
+    pub approver_name: Option<String>,
+    /// 兼容旧字段：语义等同 checker_id
+    #[serde(default)]
+    pub reviewer_id: String,
+    /// 外部传入的 form_id（若不传则后端生成）
+    pub form_id: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    #[serde(default)]
+    pub components: Vec<ReviewComponent>,
+    pub due_date: Option<i64>,
+    pub attachments: Option<Vec<ReviewAttachment>>,
+}
+
+fn default_priority() -> String {
+    "medium".to_string()
+}
+
+/// 更新提资单请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskRequest {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub priority: Option<String>,
+    pub components: Option<Vec<ReviewComponent>>,
+    pub due_date: Option<i64>,
+    pub attachments: Option<Vec<ReviewAttachment>>,
+}
+
+/// 审核操作请求
+#[derive(Debug, Deserialize)]
+pub struct ReviewActionRequest {
+    pub comment: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// 提交到下一节点请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitToNextRequest {
+    pub comment: Option<String>,
+    pub operator_id: Option<String>,
+    pub operator_name: Option<String>,
+}
+
+/// 驳回请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnRequest {
+    pub target_node: String, // 目标节点: sj/jd/sh
+    pub reason: String,      // 驳回原因
+    pub operator_id: Option<String>,
+    pub operator_name: Option<String>,
+}
+
+/// 工作流步骤
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowStep {
+    pub node: String,            // 节点: sj/jd/sh/pz
+    pub action: String,          // 动作: submit/return/approve/reject
+    pub operator_id: String,     // 操作人ID
+    pub operator_name: String,   // 操作人姓名
+    pub comment: Option<String>, // 备注
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+    pub timestamp: i64, // 时间戳
+}
+
+/// 工作流节点顺序常量
+pub const WORKFLOW_NODES: [&str; 4] = ["sj", "jd", "sh", "pz"];
+
+/// 获取节点显示名称
+pub fn get_node_display_name(node: &str) -> &'static str {
+    match node {
+        "sj" => "编制",
+        "jd" => "校对",
+        "sh" => "审核",
+        "pz" => "批准",
+        _ => "未知",
+    }
+}
+
+struct InternalWorkflowMutationWrite {
+    task_id: String,
+    form_id: Option<String>,
+    project_id: String,
+    requester_id: String,
+    next_node: String,
+    next_status: &'static str,
+    return_reason: Option<String>,
+    history_from_node: String,
+    history_target_node: Option<String>,
+    history_action: String,
+    actor_id: String,
+    actor_role: Option<String>,
+    actor_name: String,
+    comment: Option<String>,
+}
+
+async fn apply_internal_workflow_mutation_transaction(
+    write: InternalWorkflowMutationWrite,
+) -> Result<(), (StatusCode, String)> {
+    if !review_workflow_history_schema_ready() {
+        warn!(
+            "[REVIEW_API.workflow_mutation] workflow history schema warmup is not ready; using current database schema without blocking request"
+        );
+    }
+
+    let form_id = write
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let form_status = derive_review_form_status_from_task_status(write.next_status);
+    let sql = r#"
+        BEGIN TRANSACTION;
+
+        LET $updated_task = UPDATE review_tasks SET
+            current_node = $next_node,
+            status = $status,
+            return_reason = $return_reason,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id AND (deleted IS NONE OR deleted = false);
+        IF array::len($updated_task) = 0 {
+            THROW "INTERNAL_WORKFLOW_TASK_NOT_FOUND";
+        };
+
+        LET $updated_form = UPDATE review_forms SET
+            project_id = IF string::len(string::trim($project_id)) > 0 THEN $project_id ELSE project_id END,
+            user_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE user_id END,
+            requester_id = IF string::len(string::trim($requester_id)) > 0 THEN $requester_id ELSE requester_id END,
+            source = 'plant3d-internal',
+            task_created = true,
+            status = $form_status,
+            deleted = false,
+            deleted_at = NONE,
+            updated_at = time::now()
+        WHERE form_id = $form_id;
+        IF string::len(string::trim($form_id)) > 0 AND array::len($updated_form) = 0 {
+            THROW "INTERNAL_REVIEW_FORM_NOT_FOUND";
+        };
+
+        CREATE review_workflow_history CONTENT {
+            task_id: $task_id,
+            form_id: $form_id,
+            node: $history_from_node,
+            target_node: $history_target_node,
+            action: $history_action,
+            operator_id: $actor_id,
+            operator_name: $actor_name,
+            actor_id: $actor_id,
+            actor_role: $actor_role,
+            actor_name: $actor_name,
+            source: 'plant3d-internal',
+            comment: $comment,
+            timestamp: time::now(),
+            created_at: time::now()
+        };
+
+        COMMIT TRANSACTION;
+    "#;
+
+    let form_id_for_error = form_id.clone();
+    let db = fresh_review_db().await.map_err(|error| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("获取校审数据库独立连接失败: {}", error),
+        )
+    })?;
+    await_review_query(
+        "review.workflow_mutation",
+        db.query(sql)
+            .bind(("task_id", write.task_id))
+            .bind(("form_id", form_id))
+            .bind(("project_id", write.project_id))
+            .bind(("requester_id", write.requester_id))
+            .bind(("next_node", write.next_node))
+            .bind(("status", write.next_status))
+            .bind(("return_reason", write.return_reason))
+            .bind(("form_status", form_status))
+            .bind(("history_from_node", write.history_from_node))
+            .bind(("history_target_node", write.history_target_node))
+            .bind(("history_action", write.history_action))
+            .bind(("actor_id", write.actor_id))
+            .bind(("actor_role", write.actor_role))
+            .bind(("actor_name", write.actor_name))
+            .bind(("comment", write.comment)),
+    )
+    .await
+    .and_then(|response| response.check().map_err(anyhow::Error::from))
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("INTERNAL_WORKFLOW_TASK_NOT_FOUND") {
+            return (
+                StatusCode::CONFLICT,
+                "单据状态已变化，请刷新后重试".to_string(),
+            );
+        }
+        if message.contains("INTERNAL_REVIEW_FORM_NOT_FOUND") {
+            return (
+                StatusCode::CONFLICT,
+                format!("未找到 review_forms 主单据，form_id={}", form_id_for_error),
+            );
+        }
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "事务写入 review_tasks/review_forms/review_workflow_history 失败: {}",
+                message
+            ),
+        )
+    })?;
+
+    Ok(())
+}
+
+/// 组件信息
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewComponent {
+    pub id: String,
+    pub name: String,
+    pub ref_no: String,
+    #[serde(default)]
+    pub r#type: String,
+}
+
+/// 附件信息
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAttachment {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub size: Option<i64>,
+    pub mime_type: Option<String>,
+    /// 上传时间（毫秒时间戳）；旧数据可能缺失
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_at: Option<i64>,
+}
+
+/// 提资单
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTask {
+    pub id: String,
+    #[serde(default)]
+    pub form_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub model_name: String,
+    #[serde(default = "default_status")]
+    pub status: String,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    pub requester_id: String,
+    pub requester_name: String,
+    /// 校核人 ID（jd 节点负责人）
+    #[serde(default)]
+    pub checker_id: String,
+    #[serde(default)]
+    pub checker_name: String,
+    /// 审核人 ID（sh 节点负责人）
+    #[serde(default)]
+    pub approver_id: String,
+    #[serde(default)]
+    pub approver_name: String,
+    /// 兼容旧字段（语义等同 checker_id）
+    #[serde(default)]
+    pub reviewer_id: String,
+    #[serde(default)]
+    pub reviewer_name: String,
+    #[serde(default)]
+    pub components: Vec<ReviewComponent>,
+    pub attachments: Option<Vec<ReviewAttachment>>,
+    pub review_comment: Option<String>,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+    pub created_at: i64,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+    pub updated_at: i64,
+    #[serde(serialize_with = "serialize_optional_beijing_datetime_millis")]
+    pub due_date: Option<i64>,
+    #[serde(default = "default_current_node")]
+    pub current_node: String,
+    #[serde(default)]
+    pub workflow_history: Vec<WorkflowStep>,
+    pub return_reason: Option<String>,
+}
+
+fn default_current_node() -> String {
+    "sj".to_string()
+}
+
+fn default_status() -> String {
+    "draft".to_string()
+}
+
+pub(crate) fn format_beijing_datetime_millis(millis: i64) -> String {
+    let Some(utc_dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis) else {
+        return String::new();
+    };
+    let Some(beijing_offset) = chrono::FixedOffset::east_opt(8 * 3600) else {
+        return String::new();
+    };
+
+    utc_dt
+        .with_timezone(&beijing_offset)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+pub(crate) fn serialize_beijing_datetime_millis<S>(
+    millis: &i64,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format_beijing_datetime_millis(*millis))
+}
+
+pub(crate) fn serialize_optional_beijing_datetime_millis<S>(
+    millis: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match millis {
+        Some(value) => serializer.serialize_some(&format_beijing_datetime_millis(*value)),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskResolvedNames {
+    requester_name: String,
+    checker_name: String,
+    approver_name: String,
+    reviewer_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateTaskResolvedAssignees {
+    checker_id: String,
+    reviewer_id: String,
+    approver_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssigneeValidation {
+    External,
+    InternalDeferred,
+    InternalStrict,
+}
+
+fn preferred_name(value: Option<&str>, fallback: &str) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn normalize_create_task_human_code(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let valid = trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+        && trimmed
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false);
+
+    valid.then(|| trimmed.to_string())
+}
+
+fn resolve_create_task_human_code_field(
+    field_name: &str,
+    value: Option<&str>,
+) -> Result<String, String> {
+    let trimmed = value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{field_name} 缺少 PMS HumanCode，不能使用旧内部默认账号"))?;
+
+    normalize_create_task_human_code(trimmed)
+        .ok_or_else(|| format!("{field_name} 必须是 PMS HumanCode，不能使用旧内部账号: {trimmed}"))
+}
+
+fn resolve_create_task_human_code_or_defer(
+    field_name: &str,
+    value: Option<&str>,
+    allow_deferred_assignee: bool,
+) -> Result<String, String> {
+    if !allow_deferred_assignee {
+        return resolve_create_task_human_code_field(field_name, value);
+    }
+
+    let Some(trimmed) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(String::new());
+    };
+
+    if let Some(human_code) = normalize_create_task_human_code(trimmed) {
+        return Ok(human_code);
+    }
+
+    warn!(
+        "[REVIEW_API.create_task] {}={} 不是 PMS HumanCode；显式 form_id 草稿先置空，等待 workflow/sync 写入真实负责人",
+        field_name, trimmed
+    );
+    Ok(String::new())
+}
+
+fn resolve_create_task_external_field(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn resolve_create_task_assignees(
+    request: &CreateTaskRequest,
+    validation: AssigneeValidation,
+) -> Result<CreateTaskResolvedAssignees, String> {
+    if validation == AssigneeValidation::External {
+        let checker_id = resolve_create_task_external_field(
+            request
+                .checker_id
+                .as_deref()
+                .or(Some(request.reviewer_id.as_str())),
+        );
+        let approver_id = resolve_create_task_external_field(request.approver_id.as_deref());
+
+        return Ok(CreateTaskResolvedAssignees {
+            reviewer_id: checker_id.clone(),
+            checker_id,
+            approver_id,
+        });
+    }
+
+    let allow_deferred = validation == AssigneeValidation::InternalDeferred;
+    let checker_id = resolve_create_task_human_code_or_defer(
+        "checker_id",
+        request
+            .checker_id
+            .as_deref()
+            .or(Some(request.reviewer_id.as_str())),
+        allow_deferred,
+    )?;
+    let approver_id = resolve_create_task_human_code_or_defer(
+        "approver_id",
+        request.approver_id.as_deref(),
+        allow_deferred,
+    )?;
+
+    Ok(CreateTaskResolvedAssignees {
+        reviewer_id: checker_id.clone(),
+        checker_id,
+        approver_id,
+    })
+}
+
+fn resolve_create_task_names(
+    claims: &TokenClaims,
+    request: &CreateTaskRequest,
+    checker_id: &str,
+    approver_id: &str,
+) -> CreateTaskResolvedNames {
+    let requester_name = preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str());
+    let checker_name = preferred_name(request.checker_name.as_deref(), checker_id);
+    let approver_name = preferred_name(request.approver_name.as_deref(), approver_id);
+
+    CreateTaskResolvedNames {
+        requester_name,
+        checker_name: checker_name.clone(),
+        approver_name,
+        reviewer_name: checker_name,
+    }
+}
+
+/// 任务列表响应
+#[derive(Debug, Serialize)]
+pub struct TaskListResponse {
+    pub success: bool,
+    pub tasks: Vec<ReviewTask>,
+    pub total: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// 单个任务响应
+#[derive(Debug, Serialize)]
+pub struct TaskResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<ReviewTask>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// 操作响应
+#[derive(Debug, Serialize)]
+pub struct ActionResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// 查询参数
+#[derive(Debug, Deserialize)]
+pub struct TaskListQuery {
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    pub requester_id: Option<String>,
+    pub checker_id: Option<String>,
+    pub approver_id: Option<String>,
+    pub reviewer_id: Option<String>,
+    #[serde(alias = "formId")]
+    pub form_id: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+// ============================================================================
+// Database Row Types
+// ============================================================================
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct TaskRow {
+    id: surrealdb::types::RecordId,
+    form_id: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    model_name: Option<String>,
+    status: Option<String>,
+    priority: Option<String>,
+    requester_id: Option<String>,
+    requester_name: Option<String>,
+    checker_id: Option<String>,
+    checker_name: Option<String>,
+    approver_id: Option<String>,
+    approver_name: Option<String>,
+    reviewer_id: Option<String>,
+    reviewer_name: Option<String>,
+    components: Option<Vec<ReviewComponent>>,
+    attachments: Option<Vec<ReviewAttachment>>,
+    review_comment: Option<String>,
+    created_at: Option<surrealdb::types::Datetime>,
+    updated_at: Option<surrealdb::types::Datetime>,
+    /// Historical writes stored RFC3339 strings (see `create_task` /
+    /// `update_task`), while newer rows may store native `time::*` datetime.
+    /// Accept the dynamic SurrealDB `Value` here so deserialization does not
+    /// fail the entire page when a single legacy row carries a string.
+    due_date: Option<surrealdb_types::Value>,
+    current_node: Option<String>,
+    workflow_history: Option<Vec<WorkflowStep>>,
+    return_reason: Option<String>,
+}
+
+impl TaskRow {
+    fn to_review_task(self) -> ReviewTask {
+        let id = match &self.id.key {
+            surrealdb::types::RecordIdKey::String(s) => s.clone(),
+            other => format!("{:?}", other),
+        };
+        let checker_id = self
+            .checker_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.reviewer_id.clone())
+            .unwrap_or_default();
+        let checker_name = self
+            .checker_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.reviewer_name.clone())
+            .unwrap_or_default();
+        ReviewTask {
+            id,
+            form_id: self.form_id.unwrap_or_default(),
+            title: self.title.unwrap_or_default(),
+            description: self.description.unwrap_or_default(),
+            model_name: self.model_name.unwrap_or_default(),
+            status: self.status.unwrap_or_else(default_status),
+            priority: self.priority.unwrap_or_else(default_priority),
+            requester_id: self.requester_id.unwrap_or_default(),
+            requester_name: self.requester_name.unwrap_or_default(),
+            checker_id: checker_id.clone(),
+            checker_name: checker_name.clone(),
+            approver_id: self.approver_id.unwrap_or_default(),
+            approver_name: self.approver_name.unwrap_or_default(),
+            reviewer_id: self.reviewer_id.unwrap_or_else(|| checker_id),
+            reviewer_name: self.reviewer_name.unwrap_or_else(|| checker_name),
+            components: self.components.unwrap_or_default(),
+            attachments: self.attachments,
+            review_comment: self.review_comment,
+            created_at: datetime_to_millis(&self.created_at),
+            updated_at: datetime_to_millis(&self.updated_at),
+            due_date: flexible_value_to_millis(self.due_date.as_ref()),
+            current_node: self.current_node.unwrap_or_else(default_current_node),
+            workflow_history: self.workflow_history.unwrap_or_default(),
+            return_reason: self.return_reason,
+        }
+    }
+}
+
+fn normalize_record_id_string(raw: String) -> String {
+    raw.rsplit(':').next().unwrap_or(raw.as_str()).to_string()
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Object(map) => map
+            .get("id")
+            .and_then(value_to_string)
+            .or_else(|| map.get("key").and_then(value_to_string))
+            .or_else(|| map.get("value").and_then(value_to_string))
+            .map(normalize_record_id_string),
+        _ => None,
+    }
+}
+
+fn value_to_timestamp_millis(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::String(s) => s.parse::<i64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis())
+        }),
+        Value::Object(map) => map
+            .get("$surrealdb::private::sql::Datetime")
+            .and_then(value_to_timestamp_millis)
+            .or_else(|| map.get("datetime").and_then(value_to_timestamp_millis))
+            .or_else(|| map.get("value").and_then(value_to_timestamp_millis)),
+        _ => None,
+    }
+}
+
+fn component_from_value(value: &Value) -> ReviewComponent {
+    let map = value.as_object();
+
+    ReviewComponent {
+        id: map
+            .and_then(|entry| entry.get("id"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        name: map
+            .and_then(|entry| entry.get("name"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        ref_no: map
+            .and_then(|entry| entry.get("ref_no").or_else(|| entry.get("refNo")))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        r#type: map
+            .and_then(|entry| entry.get("type"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+    }
+}
+
+fn attachment_from_value(value: &Value) -> ReviewAttachment {
+    let map = value.as_object();
+
+    ReviewAttachment {
+        id: map
+            .and_then(|entry| entry.get("id"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        name: map
+            .and_then(|entry| entry.get("name"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        url: map
+            .and_then(|entry| entry.get("url"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        size: map
+            .and_then(|entry| entry.get("size"))
+            .and_then(value_to_timestamp_millis),
+        mime_type: map
+            .and_then(|entry| entry.get("mime_type").or_else(|| entry.get("mimeType")))
+            .and_then(value_to_string),
+        uploaded_at: map
+            .and_then(|entry| entry.get("uploaded_at").or_else(|| entry.get("uploadedAt")))
+            .and_then(value_to_timestamp_millis),
+    }
+}
+
+/// 校审附件允许的扩展名白名单（与前端 FileUploadSection acceptTypes 保持一致）
+const REVIEW_ATTACHMENT_ALLOWED_EXTENSIONS: &[&str] = &[
+    "pdf", "dwg", "dxf", "xls", "xlsx", "csv", "doc", "docx", "png", "jpg", "jpeg",
+];
+
+/// 单文件大小上限（50MB）
+const REVIEW_ATTACHMENT_MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+
+/// 请求体上限（50MB 文件 + multipart 报文开销余量）
+pub(crate) const REVIEW_ATTACHMENT_BODY_LIMIT_BYTES: usize = 52 * 1024 * 1024;
+
+fn mime_type_for_extension(ext: &str) -> Option<String> {
+    let normalized = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    let mime = match normalized.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        "csv" => "text/csv",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "dwg" => "image/vnd.dwg",
+        "dxf" => "image/vnd.dxf",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+/// 对可在线预览的格式做文件头（magic bytes）校验，防止伪装文件借在线预览执行。
+/// 返回 false 表示声明的扩展名与实际内容不匹配。
+fn attachment_content_matches_extension(ext: &str, data: &[u8]) -> bool {
+    match ext {
+        "pdf" => data.starts_with(b"%PDF-"),
+        "png" => data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        "jpg" | "jpeg" => data.starts_with(&[0xFF, 0xD8, 0xFF]),
+        // 其余格式（Office/CAD/CSV）不做内容校验，仅下载查看，不参与在线预览
+        _ => true,
+    }
+}
+
+pub(crate) async fn query_review_attachments_by_form_id(
+    form_id: &str,
+) -> anyhow::Result<Vec<ReviewAttachment>> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct AttachmentRow {
+        file_id: Option<String>,
+        download_url: Option<String>,
+        description: Option<String>,
+        file_ext: Option<String>,
+        file_name: Option<String>,
+        file_size: Option<i64>,
+        mime_type: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
+    }
+
+    let db = fresh_review_db().await?;
+    let mut response = await_review_query(
+        "review.attachments.by_form_id",
+        db.query(
+            r#"
+            SELECT file_id, download_url, description, file_ext,
+                   file_name, file_size, mime_type, created_at
+            FROM review_attachment
+            WHERE form_id = $form_id
+            "#,
+        )
+        .bind(("form_id", form_id.to_string())),
+    )
+    .await?;
+
+    let rows: Vec<AttachmentRow> = response.take(0).unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let display_name = row
+                .file_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    row.description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("未命名附件")
+                .to_string();
+            let ext_mime = row.file_ext.as_deref().and_then(mime_type_for_extension);
+            ReviewAttachment {
+                id: row.file_id.unwrap_or_default(),
+                name: display_name,
+                url: row.download_url.unwrap_or_default(),
+                size: row.file_size,
+                mime_type: row
+                    .mime_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .or(ext_mime),
+                uploaded_at: row.created_at.as_ref().map(|dt| dt.timestamp_millis()),
+            }
+        })
+        .filter(|attachment| !attachment.id.trim().is_empty() || !attachment.url.trim().is_empty())
+        .collect())
+}
+
+pub(crate) async fn hydrate_task_attachments(mut task: ReviewTask) -> ReviewTask {
+    let form_id = task.form_id.trim().to_string();
+    if form_id.is_empty() {
+        return task;
+    }
+
+    let workflow_attachments = match query_review_attachments_by_form_id(&form_id).await {
+        Ok(items) => items,
+        Err(error) => {
+            warn!(
+                "Failed to query review_attachment rows for task={} form_id={}: {}",
+                task.id, form_id, error
+            );
+            Vec::new()
+        }
+    };
+
+    if workflow_attachments.is_empty() {
+        return task;
+    }
+
+    let mut merged = std::collections::BTreeMap::<String, ReviewAttachment>::new();
+
+    for attachment in task.attachments.unwrap_or_default() {
+        let key = if !attachment.id.trim().is_empty() {
+            attachment.id.clone()
+        } else {
+            attachment.url.clone()
+        };
+        if !key.trim().is_empty() {
+            merged.insert(key, attachment);
+        }
+    }
+
+    for attachment in workflow_attachments {
+        let key = if !attachment.id.trim().is_empty() {
+            attachment.id.clone()
+        } else {
+            attachment.url.clone()
+        };
+        if !key.trim().is_empty() {
+            merged.insert(key, attachment);
+        }
+    }
+
+    task.attachments = Some(merged.into_values().collect());
+    task
+}
+
+fn workflow_step_from_value(value: &Value) -> WorkflowStep {
+    let map = value.as_object();
+
+    WorkflowStep {
+        node: map
+            .and_then(|entry| entry.get("node"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        action: map
+            .and_then(|entry| entry.get("action"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        operator_id: map
+            .and_then(|entry| entry.get("operator_id").or_else(|| entry.get("operatorId")))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        operator_name: map
+            .and_then(|entry| {
+                entry
+                    .get("operator_name")
+                    .or_else(|| entry.get("operatorName"))
+            })
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        comment: map
+            .and_then(|entry| entry.get("comment"))
+            .and_then(value_to_string),
+        timestamp: map
+            .and_then(|entry| entry.get("timestamp"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+    }
+}
+
+fn review_task_from_value(value: Value) -> Option<ReviewTask> {
+    if let Ok(row) = serde_json::from_value::<TaskRow>(value.clone()) {
+        return Some(row.to_review_task());
+    }
+
+    let map = value.as_object()?;
+    let checker_id = map
+        .get("checker_id")
+        .or_else(|| map.get("checkerId"))
+        .and_then(value_to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            map.get("reviewer_id")
+                .or_else(|| map.get("reviewerId"))
+                .and_then(value_to_string)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    let checker_name = map
+        .get("checker_name")
+        .or_else(|| map.get("checkerName"))
+        .and_then(value_to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            map.get("reviewer_name")
+                .or_else(|| map.get("reviewerName"))
+                .and_then(value_to_string)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default();
+    let reviewer_id = map
+        .get("reviewer_id")
+        .or_else(|| map.get("reviewerId"))
+        .and_then(value_to_string)
+        .unwrap_or_else(|| checker_id.clone());
+    let reviewer_name = map
+        .get("reviewer_name")
+        .or_else(|| map.get("reviewerName"))
+        .and_then(value_to_string)
+        .unwrap_or_else(|| checker_name.clone());
+    let components = map
+        .get("components")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(component_from_value).collect())
+        .unwrap_or_default();
+    let attachments = map
+        .get("attachments")
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(attachment_from_value).collect::<Vec<_>>());
+    let workflow_history = map
+        .get("workflow_history")
+        .or_else(|| map.get("workflowHistory"))
+        .and_then(|value| value.as_array())
+        .map(|items| items.iter().map(workflow_step_from_value).collect())
+        .unwrap_or_default();
+
+    Some(ReviewTask {
+        id: map.get("id").and_then(value_to_string).unwrap_or_default(),
+        form_id: map
+            .get("form_id")
+            .or_else(|| map.get("formId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        title: map
+            .get("title")
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        description: map
+            .get("description")
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        model_name: map
+            .get("model_name")
+            .or_else(|| map.get("modelName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        status: map
+            .get("status")
+            .and_then(value_to_string)
+            .unwrap_or_else(default_status),
+        priority: map
+            .get("priority")
+            .and_then(value_to_string)
+            .unwrap_or_else(default_priority),
+        requester_id: map
+            .get("requester_id")
+            .or_else(|| map.get("requesterId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        requester_name: map
+            .get("requester_name")
+            .or_else(|| map.get("requesterName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        checker_id,
+        checker_name,
+        approver_id: map
+            .get("approver_id")
+            .or_else(|| map.get("approverId"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        approver_name: map
+            .get("approver_name")
+            .or_else(|| map.get("approverName"))
+            .and_then(value_to_string)
+            .unwrap_or_default(),
+        reviewer_id,
+        reviewer_name,
+        components,
+        attachments,
+        review_comment: map
+            .get("review_comment")
+            .or_else(|| map.get("reviewComment"))
+            .and_then(value_to_string),
+        created_at: map
+            .get("created_at")
+            .or_else(|| map.get("createdAt"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+        updated_at: map
+            .get("updated_at")
+            .or_else(|| map.get("updatedAt"))
+            .and_then(value_to_timestamp_millis)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+        due_date: map
+            .get("due_date")
+            .or_else(|| map.get("dueDate"))
+            .and_then(value_to_timestamp_millis),
+        current_node: map
+            .get("current_node")
+            .or_else(|| map.get("currentNode"))
+            .and_then(value_to_string)
+            .unwrap_or_else(default_current_node),
+        workflow_history,
+        return_reason: map
+            .get("return_reason")
+            .or_else(|| map.get("returnReason"))
+            .and_then(value_to_string),
+    })
+}
+
+fn review_tasks_from_values(values: Vec<Value>) -> (Vec<ReviewTask>, usize) {
+    let mut parse_failures = 0;
+    let tasks = values
+        .into_iter()
+        .filter_map(|value| match review_task_from_value(value.clone()) {
+            Some(task) => Some(task),
+            None => {
+                parse_failures += 1;
+                warn!("Skipping unreadable review task row: {}", value);
+                None
+            }
+        })
+        .collect();
+
+    (tasks, parse_failures)
+}
+
+async fn query_review_task_page(
+    where_clause: &str,
+    bindings: &[(&'static str, String)],
+    limit: i64,
+    offset: i64,
+) -> anyhow::Result<Vec<ReviewTask>> {
+    let db = fresh_review_db().await?;
+    let data_sql = format!(
+        "SELECT * FROM review_tasks {} ORDER BY created_at DESC LIMIT {} START {}",
+        where_clause, limit, offset
+    );
+    let mut q = db.query(&data_sql);
+    for (name, value) in bindings {
+        q = q.bind((*name, value.clone()));
+    }
+
+    let mut response = await_review_query_long("review.tasks.page", q).await?;
+    let rows: Vec<TaskRow> = match response.take(0) {
+        Ok(rows) => rows,
+        Err(deser_err) => {
+            warn!(
+                "Failed to deserialize review_tasks page (limit={}, offset={}): {}",
+                limit, offset, deser_err
+            );
+            Vec::new()
+        }
+    };
+    Ok(rows.into_iter().map(|row| row.to_review_task()).collect())
+}
+
+/// Maximum number of single-row probes allowed when the bulk page query returns
+/// zero rows but `count()` reports rows exist. The fallback is a defensive net
+/// against partial-deserialize edge cases — historically it was bounded by
+/// `total`, which collapsed under large datasets (e.g. 200+ rows triggered
+/// 200+ serial ws queries, exhausting the SurrealDB ws channel and dead-locking
+/// every subsequent /api/review/* request). Capping the probe count keeps the
+/// recovery cheap even when deserialization is broken.
+const REVIEW_TASK_FALLBACK_PROBE_CAP: i64 = 50;
+
+async fn recover_review_task_page_with_row_probes(
+    where_clause: &str,
+    bindings: &[(&'static str, String)],
+    offset: i64,
+    limit: i64,
+    total: i64,
+) -> (Vec<ReviewTask>, usize) {
+    let mut recovered = Vec::new();
+    let mut skipped_rows = 0usize;
+    let mut probe_offset = offset.max(0);
+    let probe_end = total.max(0);
+    let max_probe_count = limit.max(0).min(REVIEW_TASK_FALLBACK_PROBE_CAP);
+    let probe_budget_end = probe_offset.saturating_add(max_probe_count);
+
+    while probe_offset < probe_end
+        && probe_offset < probe_budget_end
+        && (recovered.len() as i64) < max_probe_count
+    {
+        match query_review_task_page(where_clause, bindings, 1, probe_offset).await {
+            Ok(mut rows) if !rows.is_empty() => recovered.push(rows.remove(0)),
+            Ok(_) => skipped_rows += 1,
+            Err(error) => {
+                warn!(
+                    "Failed to probe review task row at offset {} during fallback recovery: {}",
+                    probe_offset, error
+                );
+                skipped_rows += 1;
+                break;
+            }
+        }
+        probe_offset += 1;
+    }
+
+    if probe_offset < probe_end && (recovered.len() as i64) >= max_probe_count {
+        warn!(
+            "Review task fallback recovery hit probe cap {} (total={}, requested_limit={}); returning partial page to avoid ws channel exhaustion",
+            max_probe_count, total, limit
+        );
+    }
+
+    (recovered, skipped_rows)
+}
+
+fn datetime_to_millis(dt: &Option<surrealdb::types::Datetime>) -> i64 {
+    dt.as_ref()
+        .map(|d| d.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+/// Converts a dynamic SurrealDB `Value` into millis-since-epoch, accepting
+/// both native `Datetime` (current writers) and RFC3339 strings (legacy
+/// writers in `create_task` / `update_task`).
+fn flexible_value_to_millis(value: Option<&surrealdb_types::Value>) -> Option<i64> {
+    match value? {
+        surrealdb_types::Value::None | surrealdb_types::Value::Null => None,
+        surrealdb_types::Value::Datetime(dt) => Some(dt.timestamp_millis()),
+        surrealdb_types::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                chrono::DateTime::parse_from_rfc3339(trimmed)
+                    .ok()
+                    .map(|dt| dt.timestamp_millis())
+            }
+        }
+        surrealdb_types::Value::Number(n) => match n {
+            surrealdb_types::Number::Int(i) => Some(*i),
+            surrealdb_types::Number::Float(f) => Some(*f as i64),
+            surrealdb_types::Number::Decimal(d) => d.to_string().parse::<i64>().ok(),
+        },
+        other => {
+            warn!(
+                "flexible_value_to_millis: unsupported variant for due_date-like field: {:?}",
+                other
+            );
+            None
+        }
+    }
+}
+
+fn parse_datetime(s: &Option<String>) -> i64 {
+    s.as_ref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+fn parse_datetime_value(dt: &Option<surrealdb::types::Datetime>) -> i64 {
+    dt.as_ref()
+        .map(|value| value.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+struct TaskRecordContext {
+    form_id: String,
+    current_node: String,
+    requester_id: String,
+    checker_id: String,
+    reviewer_id: String,
+    approver_id: String,
+}
+
+async fn lookup_task_record_context(id: &str) -> anyhow::Result<Option<TaskRecordContext>> {
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct TaskContextRow {
+        form_id: Option<String>,
+        current_node: Option<String>,
+        requester_id: Option<String>,
+        checker_id: Option<String>,
+        reviewer_id: Option<String>,
+        approver_id: Option<String>,
+    }
+
+    let db = fresh_review_db().await?;
+    let mut resp = await_review_query(
+        "review.tasks.context",
+        db.query(
+            "SELECT form_id, current_node, requester_id, checker_id, reviewer_id, approver_id FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1",
+        )
+        .bind(("id", id.to_string())),
+    )
+    .await?;
+    let rows: Vec<TaskContextRow> = resp.take(0).unwrap_or_default();
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(form_id) = normalize_optional_string(row.form_id) else {
+        return Ok(None);
+    };
+    let current_node =
+        normalize_optional_string(row.current_node).unwrap_or_else(default_current_node);
+    Ok(Some(TaskRecordContext {
+        form_id,
+        current_node,
+        requester_id: normalize_optional_string(row.requester_id).unwrap_or_default(),
+        checker_id: normalize_optional_string(row.checker_id).unwrap_or_default(),
+        reviewer_id: normalize_optional_string(row.reviewer_id).unwrap_or_default(),
+        approver_id: normalize_optional_string(row.approver_id).unwrap_or_default(),
+    }))
+}
+
+fn current_node_owner_for_task_row<'a>(
+    task: &'a TaskRow,
+    current_node: &str,
+) -> (&'a str, &'static str) {
+    match current_node {
+        "sj" => (
+            task.requester_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default(),
+            "requester",
+        ),
+        "jd" => {
+            let checker_id = task
+                .checker_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            if !checker_id.is_empty() {
+                (checker_id, "checker")
+            } else {
+                (
+                    task.reviewer_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or_default(),
+                    "reviewer",
+                )
+            }
+        }
+        "sh" | "pz" => (
+            task.approver_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default(),
+            "approver",
+        ),
+        _ => ("", "none"),
+    }
+}
+
+/// 当 JWT user_id 与节点指定的 owner_id 不一致时，给调用方一条能定位真正问题的错误消息。
+///
+/// 设计前提（外部驱动模式 / PMS 集成）：
+/// - 创建 task 时 PMS **不需要** 显式传 checker_id / approver_id；
+/// - 节点 owner 由 PMS 在每次 `POST /api/review/workflow/sync` 调用时通过
+///   `next_step.assignee_id` 显式同步给 plant3d；
+/// - plant3d 只负责按 next_step 记录与校验，不维护任何 owner 命名空间。
+///
+/// 因此能撞到这条错误的真实场景几乎只有一种：调用方走了**内部**
+/// `/api/review/tasks/{id}/{submit,return,approve,reject}` 路径，而那条路径
+/// 要求 `claims.user_id == task.<owner>_id` 完全相等（按内部 mode 设计）。
+/// 把当前实际值打出来 + 指引切到 `/workflow/sync` 才是有用的诊断。
+fn format_owner_mismatch_error(
+    operator_user: &str,
+    current_node: &str,
+    owner_id: &str,
+    owner_source: &'static str,
+) -> String {
+    let node_name = get_node_display_name(current_node);
+    if owner_id.is_empty() {
+        return format!(
+            "权限不足：当前节点「{}」({}) 的 {} 字段为空，无法识别本节点负责人；\
+             当前 JWT user_id={}。外部驱动模式下节点负责人由 PMS 在 \
+             sync(active/agree/return) 调用时通过 next_step.assignee_id 显式同步给 plant3d；\
+             若该 task 尚未经过对应 sync，请改用 POST /api/review/workflow/sync 推进流程。",
+            node_name, current_node, owner_source, operator_user
+        );
+    }
+    format!(
+        "权限不足：用户 {} 不是「{}」({}) 节点的负责人（节点指定的 {} = {}）。\
+         该接口仅供内部模式使用，要求 JWT user_id 与 task.{}_id 完全一致。\
+         外部驱动模式（PMS 嵌入态）下，状态变更必须经过 \
+         POST /api/review/workflow/sync，由 PMS 显式声明 actor 并通过 next_step 推进；\
+         浏览器侧的 /tasks/{{id}}/{{submit,return,approve,reject}} 不适用于外部驱动场景。",
+        operator_user, node_name, current_node, owner_source, owner_id, owner_source
+    )
+}
+
+/// 任务写操作的操作者授权。
+///
+/// 背景：`review_auth_middleware` 只做认证不做授权；`submit_to_next_node` /
+/// `return_to_node` / 附件上传各自内联了操作者校验，但任务本身的增删改、
+/// start-review、cancel 这些旁路写操作此前完全不校验操作者，等于“持任意有效
+/// token 即可改他人单子”。这里统一补上。
+///
+/// 授权策略（必须兼容双驱动模式，不能把外部 PMS 驱动的正常调用挡掉）：
+/// - 内部模式：task 配置了节点负责人时，要求 `claims.user_id` 为**当前节点负责人**
+///   或**发起人**（requester）之一；
+/// - 外部驱动模式：task 的 requester/checker/approver/reviewer **全部为空**
+///   （PMS 不在 plant3d 侧维护 owner 命名空间，owner 由 PMS 每次 sync 显式声明），
+///   本侧无从判定 owner，放行以保持与现状一致，授权由 PMS 侧负责；
+/// - task 不存在或已删除 → Err(404)。
+async fn authorize_task_write(
+    id: &str,
+    claims: &TokenClaims,
+) -> Result<TaskRow, (StatusCode, String)> {
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+    let db = fresh_review_db().await.map_err(|e| {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("连接校审数据库超时: {}", e),
+        )
+    })?;
+    let mut resp = await_review_query(
+        "review.tasks.authorize.get",
+        db.query(get_sql).bind(("id", id.to_string())),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("查询任务失败: {}", e),
+        )
+    })?;
+    let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+    let task = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("任务不存在或已删除: {}", id)))?;
+
+    let current_node = task
+        .current_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sj")
+        .to_string();
+    let (owner_ref, _owner_source) = current_node_owner_for_task_row(&task, &current_node);
+    let owner_id = owner_ref.to_string();
+
+    let field = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or("").to_string();
+    let requester = field(&task.requester_id);
+    let checker = field(&task.checker_id);
+    let approver = field(&task.approver_id);
+    let reviewer = field(&task.reviewer_id);
+
+    // 外部驱动模式：本侧没有任何 owner 可判定，放行（授权在 PMS 侧）。
+    let any_owner_configured = [&requester, &checker, &approver, &reviewer]
+        .iter()
+        .any(|s| !s.is_empty());
+    if !any_owner_configured {
+        return Ok(task);
+    }
+
+    let actor = claims.user_id.trim();
+    if !actor.is_empty() && (actor == owner_id || actor == requester) {
+        Ok(task)
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "权限不足：用户 {} 既不是任务发起人（{}）也不是当前节点「{}」负责人（{}），无权执行该写操作。\
+                 外部驱动（PMS 嵌入态）请改用 POST /api/review/workflow/sync 推进。",
+                if actor.is_empty() { "<空>" } else { actor },
+                if requester.is_empty() {
+                    "<空>"
+                } else {
+                    requester.as_str()
+                },
+                current_node,
+                if owner_id.is_empty() {
+                    "<空>"
+                } else {
+                    owner_id.as_str()
+                },
+            ),
+        ))
+    }
+}
+
+fn current_node_owner_for_task_context<'a>(
+    context: &'a TaskRecordContext,
+    current_node: &str,
+) -> (&'a str, &'static str) {
+    match current_node {
+        "sj" => (context.requester_id.trim(), "requester"),
+        "jd" => {
+            let checker_id = context.checker_id.trim();
+            if !checker_id.is_empty() {
+                (checker_id, "checker")
+            } else {
+                (context.reviewer_id.trim(), "reviewer")
+            }
+        }
+        "sh" | "pz" => (context.approver_id.trim(), "approver"),
+        _ => ("", "none"),
+    }
+}
+
+fn record_id_to_string(id: surrealdb::types::RecordId) -> String {
+    match id.key {
+        surrealdb::types::RecordIdKey::String(value) => value,
+        other => format!("{:?}", other),
+    }
+}
+
+fn json_scalar_to_string(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn json_value_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let id = map.get("id").and_then(Value::as_str).unwrap_or_default();
+            let created_at = map
+                .get("createdAt")
+                .or_else(|| map.get("created_at"))
+                .map(json_scalar_to_string)
+                .unwrap_or_default();
+            let kind = map.get("kind").and_then(Value::as_str).unwrap_or_default();
+            format!("{}|{}|{}|{}", id, created_at, kind, value)
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn normalize_snapshot_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            let mut normalized = values
+                .into_iter()
+                .map(normalize_snapshot_json)
+                .collect::<Vec<_>>();
+            if normalized.iter().all(Value::is_string) {
+                normalized.sort_by(|a, b| {
+                    a.as_str()
+                        .unwrap_or_default()
+                        .cmp(b.as_str().unwrap_or_default())
+                });
+            } else if normalized.iter().all(Value::is_object) {
+                normalized.sort_by(|a, b| json_value_sort_key(a).cmp(&json_value_sort_key(b)));
+            }
+            Value::Array(normalized)
+        }
+        Value::Object(map) => {
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut normalized = serde_json::Map::new();
+            for (key, child) in entries {
+                normalized.insert(key, normalize_snapshot_json(child));
+            }
+            Value::Object(normalized)
+        }
+        other => other,
+    }
+}
+
+fn build_confirmed_record_slot_key(form_id: &str, current_node: &str, operator_id: &str) -> String {
+    format!(
+        "{}::{}::{}",
+        form_id.trim(),
+        current_node.trim(),
+        operator_id.trim()
+    )
+}
+
+fn build_confirmed_record_stable_id(slot_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(slot_key.as_bytes());
+    format!("slot-{}", hex::encode(hasher.finalize()))
+}
+
+fn build_confirmed_record_snapshot_hash(
+    record_type: &str,
+    annotations: &[serde_json::Value],
+    cloud_annotations: &[serde_json::Value],
+    rect_annotations: &[serde_json::Value],
+    obb_annotations: &[serde_json::Value],
+    measurements: &[serde_json::Value],
+    dimension_document: Option<&serde_json::Value>,
+    note: &str,
+) -> String {
+    let normalized = normalize_snapshot_json(serde_json::json!({
+        "type": record_type,
+        "annotations": annotations,
+        "cloudAnnotations": cloud_annotations,
+        "rectAnnotations": rect_annotations,
+        "obbAnnotations": obb_annotations,
+        "measurements": measurements,
+        "dimensionDocument": dimension_document,
+        "note": note,
+    }));
+    let serialized = serde_json::to_string(&normalized).unwrap_or_else(|_| normalized.to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(serialized.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DimensionDocumentVersionPlan {
+    Preserve {
+        version: u64,
+    },
+    Create {
+        next_version: u64,
+    },
+    Update {
+        base_version: u64,
+        next_version: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DimensionDocumentVersionConflict {
+    latest_version: u64,
+}
+
+fn plan_dimension_document_version(
+    record_exists: bool,
+    existing_version: Option<u64>,
+    has_dimension_document: bool,
+    base_version: u64,
+) -> Result<DimensionDocumentVersionPlan, DimensionDocumentVersionConflict> {
+    let latest_version = existing_version.unwrap_or(0);
+    if !has_dimension_document {
+        return Ok(DimensionDocumentVersionPlan::Preserve {
+            version: latest_version,
+        });
+    }
+    if !record_exists {
+        return if base_version == 0 {
+            Ok(DimensionDocumentVersionPlan::Create { next_version: 1 })
+        } else {
+            Err(DimensionDocumentVersionConflict { latest_version: 0 })
+        };
+    }
+    if base_version != latest_version {
+        return Err(DimensionDocumentVersionConflict { latest_version });
+    }
+    Ok(DimensionDocumentVersionPlan::Update {
+        base_version,
+        next_version: base_version + 1,
+    })
+}
+
+async fn lookup_task_form_id(id: &str) -> Option<String> {
+    lookup_task_record_context(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|context| context.form_id)
+}
+
+// ============================================================================
+// Routes
+// ============================================================================
+
+pub fn create_review_api_routes() -> Router {
+    use crate::web_api::jwt_auth::{REVIEW_AUTH_CONFIG, review_auth_middleware};
+    use axum::extract::DefaultBodyLimit;
+    use axum::middleware;
+
+    // 注意：这里不再挂 ensure_review_primary_db_context 前置中间件。
+    // 各 handler 已统一使用 fresh_review_db() 建立独立连接；继续在每个请求前
+    // 触碰可能已锁死的全局 ws 连接正是历史上 /api/review/* 整体 504 的直接诱因。
+
+    Router::new()
+        // 提资单 CRUD
+        .route("/api/review/tasks", post(create_task))
+        .route("/api/review/tasks", get(list_tasks))
+        .route("/api/review/tasks/{id}", get(get_task))
+        .route("/api/review/tasks/{id}", patch(update_task))
+        .route("/api/review/tasks/{id}", delete(delete_task))
+        // 审核操作
+        .route("/api/review/tasks/{id}/start-review", post(start_review))
+        .route("/api/review/tasks/{id}/approve", post(approve_task))
+        .route("/api/review/tasks/{id}/reject", post(reject_task))
+        .route("/api/review/tasks/{id}/cancel", post(cancel_task))
+        .route("/api/review/tasks/{id}/history", get(get_task_history))
+        // 多级审批流程 API
+        .route("/api/review/tasks/{id}/submit", post(submit_to_next_node))
+        .route("/api/review/tasks/{id}/return", post(return_to_node))
+        .route("/api/review/tasks/{id}/workflow", get(get_workflow_history))
+        // 确认记录 CRUD（修复路由冲突）
+        .route("/api/review/records", post(create_record))
+        .route(
+            "/api/review/records/by-task/{task_id}",
+            get(get_records_by_task),
+        )
+        .route(
+            "/api/review/records/item/{record_id}",
+            delete(delete_record),
+        )
+        .route(
+            "/api/review/records/clear-task/{task_id}",
+            delete(clear_records_by_task),
+        )
+        // 评论 CRUD（修复路由冲突）
+        .route("/api/review/comments", post(create_comment))
+        .route(
+            "/api/review/comments/by-annotation/{annotation_id}",
+            get(get_comments_by_annotation),
+        )
+        .route(
+            "/api/review/comments/item/{comment_id}",
+            delete(delete_comment).patch(edit_comment),
+        )
+        // 批注轻量字段（表格内联编辑）
+        .route(
+            "/api/review/annotations/{annotation_id}",
+            patch(update_annotation_basic_fields),
+        )
+        // 批注严重度（问题严重程度，与评论并列但语义不同）
+        .route(
+            "/api/review/annotations/{annotation_id}/severity",
+            patch(update_annotation_severity),
+        )
+        // 附件 API（上传路由单独放宽 body 限制：50MB 文件 + multipart 开销）
+        .route(
+            "/api/review/attachments",
+            post(upload_attachment)
+                .layer(DefaultBodyLimit::max(REVIEW_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/review/attachments/{attachment_id}",
+            delete(delete_attachment),
+        )
+        // 驳回重新流转
+        .route("/api/review/tasks/returned", get(list_returned_tasks))
+        .route(
+            "/api/review/tasks/batch-reactivate",
+            post(batch_reactivate_tasks),
+        )
+        // 同步 API
+        .route("/api/review/sync/export", post(export_review_data))
+        .route("/api/review/sync/import", post(import_review_data))
+        // 用户 API
+        .route("/api/users", get(list_users))
+        .route("/api/users/me", get(get_current_user))
+        .route("/api/users/reviewers", get(get_reviewers))
+        // 校审相关 API 默认强制 JWT；联调时可通过 review_auth.enabled=false 临时关闭
+        .layer(middleware::from_fn_with_state(
+            REVIEW_AUTH_CONFIG.clone(),
+            review_auth_middleware,
+        ))
+        // 健康探针：注册在 .layer() 之后，绕过 JWT 与业务中间件，供部署探针 / PMS 预检使用。
+        // 不改变 /api/health 的站点存活语义，只回答“校审数据库当前是否可查询”。
+        .route("/api/review/health", get(review_health))
+}
+
+/// GET /api/review/health - 校审数据库健康探针
+///
+/// 使用独立连接执行最小查询；不经过 JWT / 校审中间件。
+async fn review_health() -> Response {
+    let started = std::time::Instant::now();
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.health] connect failed elapsed_ms={} error={}",
+                started.elapsed().as_millis(),
+                error
+            );
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "database": "unreachable",
+                    "operation": "review.health.connect",
+                    "elapsedMs": started.elapsed().as_millis() as u64,
+                    "message": format!("校审数据库连接失败: {}", error),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match await_review_query("review.health.probe", db.query("RETURN 1")).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "database": "healthy",
+                "elapsedMs": started.elapsed().as_millis() as u64,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.health] probe failed elapsed_ms={} error={}",
+                started.elapsed().as_millis(),
+                error
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "database": "unhealthy",
+                    "operation": "review.health.probe",
+                    "elapsedMs": started.elapsed().as_millis() as u64,
+                    "message": format!("校审数据库查询失败: {}", error),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 提资单 CRUD
+// ============================================================================
+
+/// POST /api/review/tasks - 创建提资单
+async fn create_task(
+    Extension(claims): Extension<TokenClaims>,
+    Json(request): Json<CreateTaskRequest>,
+) -> impl IntoResponse {
+    let started = std::time::Instant::now();
+    let request_form_id_hint = request
+        .form_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "<auto>".to_string());
+    info!(
+        "[REVIEW_API.create_task] start form_id_hint={} actor_id={} actor_role={:?} title={} components={} reviewer_id={} checker_id={:?} approver_id={:?}",
+        request_form_id_hint,
+        claims.user_id,
+        claims.role,
+        request.title,
+        request.components.len(),
+        request.reviewer_id,
+        request.checker_id.as_deref().unwrap_or(""),
+        request.approver_id.as_deref().unwrap_or(""),
+    );
+
+    let task_id = format!("task-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let requester_id = claims.user_id.clone();
+
+    let form_id_was_provided = request
+        .form_id
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let assignee_validation =
+        if !matches!(claims.workflow_mode.as_deref(), Some("manual" | "internal")) {
+            AssigneeValidation::External
+        } else if form_id_was_provided {
+            AssigneeValidation::InternalDeferred
+        } else {
+            AssigneeValidation::InternalStrict
+        };
+
+    let assignees = match resolve_create_task_assignees(&request, assignee_validation) {
+        Ok(assignees) => assignees,
+        Err(message) => {
+            warn!("Rejecting review task create request: {}", message);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(message),
+                }),
+            );
+        }
+    };
+    let checker_id = assignees.checker_id.clone();
+    let approver_id = assignees.approver_id.clone();
+    let resolved_names =
+        resolve_create_task_names(&claims, &request, checker_id.as_str(), approver_id.as_str());
+    let requester_name = resolved_names.requester_name.clone();
+
+    let form_id = request
+        .form_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(generate_form_id);
+
+    // form_id 唯一性兜底：调用方显式传了 form_id 时（PMS 嵌入态、外部流程驱动），
+    // 若已有非 deleted 的 review_task 关联同一 form_id，直接返回该 task 并复用，
+    // 避免在 SJ 驳回回到 sj 节点后重复 createReviewTask 累积重复 task 数据
+    // （bug-resubmit-creates-duplicate-task simulator 场景）。
+    // 同时给 review_workflow_history 写一条 action='resubmit' 事件，保持 form_id 全生命周期可追溯。
+    if form_id_was_provided {
+        let db = match fresh_review_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                warn!(
+                    "[REVIEW_API.create_task] DEDUP_CONNECT_FAIL form_id={} actor_id={} elapsed_ms={} reason={}（继续走 CREATE 路径）",
+                    form_id,
+                    claims.user_id,
+                    started.elapsed().as_millis(),
+                    e
+                );
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(TaskResponse {
+                        success: false,
+                        task: None,
+                        error_message: Some(format!("连接校审数据库超时: {}", e)),
+                    }),
+                );
+            }
+        };
+        match await_review_query(
+            "review.create_task.dedup",
+            db.query(
+                "SELECT * FROM review_tasks WHERE form_id = $form_id AND (deleted IS NONE OR deleted = false) ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(("form_id", form_id.clone())),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+                if let Some(row) = rows.into_iter().next() {
+                    let existing = row.to_review_task();
+                    info!(
+                        "[REVIEW_API.create_task] DEDUP_REUSE form_id={} existing_task_id={} existing_node={} existing_status={} actor_id={} elapsed_ms={} reason=同 form_id 已存在非删除 task，复用现有 task 不新建",
+                        form_id,
+                        existing.id,
+                        existing.current_node,
+                        existing.status,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
+                    if !review_workflow_history_schema_ready() {
+                        warn!(
+                            "[REVIEW_API.create_task] workflow history schema warmup is not ready; resubmit history write uses current schema"
+                        );
+                    }
+                    let history_sql = r#"
+                        CREATE review_workflow_history CONTENT {
+                            task_id: $task_id,
+                            form_id: $form_id,
+                            node: $from_node,
+                            target_node: $target_node,
+                            action: 'resubmit',
+                            actor_id: $actor_id,
+                            actor_role: $actor_role,
+                            actor_name: $actor_name,
+                            source: $source,
+                            comment: $comment,
+                            created_at: time::now()
+                        }
+                    "#;
+                    let actor_role_resubmit = claims
+                        .role
+                        .as_ref()
+                        .map(|r| r.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    if let Err(e) = await_review_query(
+                        "review.create_task.resubmit_history",
+                        db.query(history_sql)
+                            .bind(("task_id", existing.id.clone()))
+                            .bind(("form_id", Some(form_id.clone())))
+                            .bind(("from_node", existing.current_node.clone()))
+                            .bind(("target_node", Some("jd".to_string())))
+                            .bind(("actor_id", claims.user_id.clone()))
+                            .bind(("actor_role", actor_role_resubmit))
+                            .bind(("actor_name", requester_name.clone()))
+                            .bind(("source", "plant3d-internal".to_string()))
+                            .bind(("comment", Some("再次发起编校审（form_id 复用）".to_string()))),
+                    )
+                    .await
+                    .and_then(|response| response.check().map_err(anyhow::Error::from))
+                    {
+                        warn!(
+                            "[REVIEW_API.create_task] FAIL form_id={} existing_task_id={} actor_id={} elapsed_ms={} reason=resubmit_history_error: {}",
+                            form_id,
+                            existing.id,
+                            claims.user_id,
+                            started.elapsed().as_millis(),
+                            e
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(TaskResponse {
+                                success: false,
+                                task: None,
+                                error_message: Some(format!(
+                                    "写入 review_workflow_history 失败: {}",
+                                    e
+                                )),
+                            }),
+                        );
+                    }
+                    return (
+                        StatusCode::OK,
+                        Json(TaskResponse {
+                            success: true,
+                            task: Some(existing),
+                            error_message: None,
+                        }),
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[REVIEW_API.create_task] DEDUP_QUERY_FAIL form_id={} actor_id={} elapsed_ms={} reason={}（继续走 CREATE 路径，不阻塞调用方）",
+                    form_id,
+                    claims.user_id,
+                    started.elapsed().as_millis(),
+                    e
+                );
+            }
+        }
+    }
+
+    let sql = r#"
+        CREATE ONLY review_tasks SET
+            id = $id,
+            form_id = $form_id,
+            title = $title,
+            description = $description,
+            model_name = $model_name,
+            status = 'draft',
+            priority = $priority,
+            requester_id = $requester_id,
+            requester_name = $requester_name,
+            checker_id = $checker_id,
+            checker_name = $checker_name,
+            approver_id = $approver_id,
+            approver_name = $approver_name,
+            reviewer_id = $reviewer_id,
+            reviewer_name = $reviewer_name,
+            components = $components,
+            attachments = $attachments,
+            due_date = $due_date,
+            current_node = 'sj',
+            workflow_history = [],
+            created_at = time::now(),
+            updated_at = time::now()
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let result = await_review_query(
+        "review.create_task.insert",
+        db.query(sql)
+            .bind(("id", task_id.clone()))
+            .bind(("form_id", form_id.clone()))
+            .bind(("title", request.title.clone()))
+            .bind(("description", request.description.clone()))
+            .bind(("model_name", request.model_name.clone()))
+            .bind(("priority", request.priority.clone()))
+            .bind(("requester_id", requester_id.clone()))
+            .bind(("requester_name", requester_name.clone()))
+            .bind(("checker_id", checker_id.clone()))
+            .bind(("checker_name", resolved_names.checker_name.clone()))
+            .bind(("approver_id", approver_id.clone()))
+            .bind(("approver_name", resolved_names.approver_name.clone()))
+            .bind(("reviewer_id", assignees.reviewer_id.clone()))
+            .bind(("reviewer_name", resolved_names.reviewer_name.clone()))
+            .bind(("components", request.components.clone()))
+            .bind(("attachments", request.attachments.clone()))
+            .bind((
+                "due_date",
+                request
+                    .due_date
+                    .map(|d| chrono::DateTime::from_timestamp_millis(d).map(|dt| dt.to_rfc3339()))
+                    .flatten(),
+            )),
+    )
+    .await;
+
+    match result {
+        Ok(_response) => {
+            // CREATE 成功，无需解析响应（避免 datetime 反序列化问题）
+            info!(
+                "[REVIEW_API.create_task] OK task_id={} form_id={} actor_id={} elapsed_ms={}",
+                task_id,
+                form_id,
+                claims.user_id,
+                started.elapsed().as_millis()
+            );
+
+            let mut seen_refnos = HashSet::new();
+            for comp in &request.components {
+                let refno = comp.ref_no.trim();
+                if refno.is_empty() || !seen_refnos.insert(refno.to_string()) {
+                    continue;
+                }
+                match await_review_query(
+                    "review.form_model.backfill_create",
+                    db.query(
+                        r#"
+                        CREATE ONLY review_form_model SET
+                            form_id = $form_id,
+                            model_refno = $model_refno,
+                            created_at = time::now()
+                        "#,
+                    )
+                    .bind(("form_id", form_id.clone()))
+                    .bind(("model_refno", refno.to_string())),
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        "Failed to backfill review_form_model after create_task, form_id={}, refno={}: {}",
+                        form_id, refno, error
+                    ),
+                }
+            }
+
+            match timeout(
+                Duration::from_secs(2),
+                sync_review_form_with_task_status(
+                    form_id.as_str(),
+                    Some(request.model_name.as_str()),
+                    Some(requester_id.as_str()),
+                    "create_task_backfill",
+                    "draft",
+                ),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    "Failed to sync review_forms after create_task, form_id={}: {}",
+                    form_id, error
+                ),
+                Err(_) => warn!(
+                    "Timed out syncing review_forms after create_task, form_id={}",
+                    form_id
+                ),
+            }
+
+            let task = ReviewTask {
+                id: task_id,
+                form_id: form_id.clone(),
+                title: request.title,
+                description: request.description,
+                model_name: request.model_name,
+                status: "draft".to_string(),
+                priority: request.priority,
+                requester_id,
+                requester_name,
+                checker_id: checker_id.clone(),
+                checker_name: resolved_names.checker_name.clone(),
+                approver_id: approver_id.clone(),
+                approver_name: resolved_names.approver_name.clone(),
+                reviewer_id: assignees.reviewer_id,
+                reviewer_name: resolved_names.reviewer_name.clone(),
+                components: request.components,
+                attachments: request.attachments,
+                review_comment: None,
+                created_at: chrono::Utc::now().timestamp_millis(),
+                updated_at: chrono::Utc::now().timestamp_millis(),
+                due_date: request.due_date,
+                current_node: "sj".to_string(),
+                workflow_history: vec![],
+                return_reason: None,
+            };
+            (
+                StatusCode::OK,
+                Json(TaskResponse {
+                    success: true,
+                    task: Some(task),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.create_task] FAIL form_id={} actor_id={} elapsed_ms={} reason={}",
+                form_id,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("创建提资单失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// GET /api/review/tasks - 获取任务列表
+async fn list_tasks(Query(query): Query<TaskListQuery>) -> impl IntoResponse {
+    info!("Listing review tasks");
+
+    let mut conditions: Vec<&'static str> = vec!["(deleted IS NONE OR deleted = false)"];
+    let mut bindings: Vec<(&'static str, String)> = vec![];
+
+    if let Some(ref status) = query.status {
+        if status != "all" {
+            conditions.push("status = $status");
+            bindings.push(("status", status.clone()));
+        }
+    }
+    if let Some(ref priority) = query.priority {
+        if priority != "all" {
+            conditions.push("priority = $priority");
+            bindings.push(("priority", priority.clone()));
+        }
+    }
+    if let Some(ref requester_id) = query.requester_id {
+        conditions.push("requester_id = $requester_id");
+        bindings.push(("requester_id", requester_id.clone()));
+    }
+    if let Some(ref checker_id) = query.checker_id {
+        conditions.push("(checker_id = $checker_id OR reviewer_id = $checker_id)");
+        bindings.push(("checker_id", checker_id.clone()));
+    }
+    if let Some(ref approver_id) = query.approver_id {
+        conditions.push("approver_id = $approver_id");
+        bindings.push(("approver_id", approver_id.clone()));
+    }
+    if let Some(ref reviewer_id) = query.reviewer_id {
+        conditions.push("(reviewer_id = $reviewer_id OR checker_id = $reviewer_id)");
+        bindings.push(("reviewer_id", reviewer_id.clone()));
+    }
+    if let Some(ref form_id) = query.form_id {
+        let trimmed = form_id.trim();
+        if !trimmed.is_empty() {
+            conditions.push("form_id = $form_id");
+            bindings.push(("form_id", trimmed.to_string()));
+        }
+    }
+
+    let where_clause = format!("WHERE {}", conditions.join(" AND "));
+
+    let limit = query.limit.unwrap_or(100);
+    let offset = query.offset.unwrap_or(0);
+
+    let count_sql = format!(
+        "SELECT count() AS total FROM review_tasks {} GROUP ALL",
+        where_clause
+    );
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task list: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskListResponse {
+                    success: false,
+                    tasks: vec![],
+                    total: 0,
+                    error_message: Some(format!("获取任务列表失败: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&count_sql);
+    for (name, value) in &bindings {
+        q = q.bind((*name, value.clone()));
+    }
+
+    match await_review_query_long("review.tasks.count", q).await {
+        Ok(mut response) => {
+            #[derive(Debug, serde::Deserialize, SurrealValue)]
+            struct CountRow {
+                total: i64,
+            }
+            let count_rows: Vec<CountRow> = response.take(0).unwrap_or_default();
+            let total = count_rows.first().map(|r| r.total).unwrap_or(0);
+
+            let mut tasks =
+                match query_review_task_page(&where_clause, &bindings, limit, offset).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        warn!("Failed to query review task page: {}", error);
+                        Vec::new()
+                    }
+                };
+            let mut skipped_rows = 0usize;
+
+            if tasks.is_empty() && total > 0 && limit > 1 {
+                warn!(
+                    "Review task page returned empty rows despite total={} (offset={}, limit={}); probing individual rows for recovery",
+                    total, offset, limit
+                );
+                let (recovered_rows, recovered_skips) = recover_review_task_page_with_row_probes(
+                    &where_clause,
+                    &bindings,
+                    offset,
+                    limit,
+                    total,
+                )
+                .await;
+                tasks = recovered_rows;
+                skipped_rows = recovered_skips;
+            }
+
+            let total = total.saturating_sub(skipped_rows as i64);
+
+            (
+                StatusCode::OK,
+                Json(TaskListResponse {
+                    success: true,
+                    tasks,
+                    total,
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to list tasks: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskListResponse {
+                    success: false,
+                    tasks: vec![],
+                    total: 0,
+                    error_message: Some(format!("获取任务列表失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// GET /api/review/tasks/:id - 获取任务详情
+async fn get_task(Path(id): Path<String>) -> impl IntoResponse {
+    info!("Getting task: {}", id);
+
+    // 使用 record::id(id) 提取 key 进行比较
+    let sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task detail: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("获取任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match await_review_query("review.tasks.get", db.query(sql).bind(("id", id.clone()))).await {
+        Ok(mut response) => {
+            let rows: Vec<TaskRow> = response.take(0).unwrap_or_default();
+            if let Some(row) = rows.into_iter().next() {
+                let task = hydrate_task_attachments(row.to_review_task()).await;
+                (
+                    StatusCode::OK,
+                    Json(TaskResponse {
+                        success: true,
+                        task: Some(task),
+                        error_message: None,
+                    }),
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(TaskResponse {
+                        success: false,
+                        task: None,
+                        error_message: Some(format!("任务不存在或已删除: {}", id)),
+                    }),
+                )
+            }
+        }
+        Err(e) => {
+            warn!("Failed to get task: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("获取任务失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// PATCH /api/review/tasks/:id - 更新任务
+async fn update_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateTaskRequest>,
+) -> impl IntoResponse {
+    let started = std::time::Instant::now();
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.update_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(TaskResponse {
+                success: false,
+                task: None,
+                error_message: Some(message),
+            }),
+        );
+    }
+    info!(
+        "[REVIEW_API.update_task] start task_id={} fields_set=[title={} description={} priority={} components={} due_date={} attachments={}]",
+        id,
+        request.title.is_some(),
+        request.description.is_some(),
+        request.priority.is_some(),
+        request.components.is_some(),
+        request.due_date.is_some(),
+        request.attachments.is_some(),
+    );
+
+    let mut updates = vec!["updated_at = time::now()"];
+
+    if request.title.is_some() {
+        updates.push("title = $title");
+    }
+    if request.description.is_some() {
+        updates.push("description = $description");
+    }
+    if request.priority.is_some() {
+        updates.push("priority = $priority");
+    }
+    if request.components.is_some() {
+        updates.push("components = $components");
+    }
+    if request.due_date.is_some() {
+        updates.push("due_date = $due_date");
+    }
+    if request.attachments.is_some() {
+        updates.push("attachments = $attachments");
+    }
+
+    let sql = format!(
+        "UPDATE review_tasks SET {} WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
+        updates.join(", ")
+    );
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&sql).bind(("id", id.clone()));
+
+    if let Some(ref title) = request.title {
+        q = q.bind(("title", title.clone()));
+    }
+    if let Some(ref description) = request.description {
+        q = q.bind(("description", description.clone()));
+    }
+    if let Some(ref priority) = request.priority {
+        q = q.bind(("priority", priority.clone()));
+    }
+    if let Some(ref components) = request.components {
+        q = q.bind(("components", components.clone()));
+    }
+    if let Some(due_date) = request.due_date {
+        let dt = chrono::DateTime::from_timestamp_millis(due_date).map(|d| d.to_rfc3339());
+        q = q.bind(("due_date", dt));
+    }
+    if let Some(ref attachments) = request.attachments {
+        q = q.bind(("attachments", attachments.clone()));
+    }
+
+    match await_review_query("review.tasks.update", q).await {
+        Ok(_) => {
+            // 返回更新后的任务
+            let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)";
+            if let Ok(mut resp) = await_review_query(
+                "review.tasks.update_get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
+            {
+                let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+                if let Some(row) = rows.into_iter().next() {
+                    let task = row.to_review_task();
+                    info!(
+                        "[REVIEW_API.update_task] OK task_id={} form_id={} status={} current_node={} elapsed_ms={}",
+                        id,
+                        task.form_id,
+                        task.status,
+                        task.current_node,
+                        started.elapsed().as_millis()
+                    );
+                    return (
+                        StatusCode::OK,
+                        Json(TaskResponse {
+                            success: true,
+                            task: Some(task),
+                            error_message: None,
+                        }),
+                    );
+                }
+            }
+            warn!(
+                "[REVIEW_API.update_task] OK_BUT_LOST task_id={} elapsed_ms={} reason=updated但读取失败",
+                id,
+                started.elapsed().as_millis()
+            );
+            (
+                StatusCode::OK,
+                Json(TaskResponse {
+                    success: true,
+                    task: None,
+                    error_message: Some("更新成功但无法读取任务（可能已删除）".to_string()),
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.update_task] FAIL task_id={} elapsed_ms={} reason={}",
+                id,
+                started.elapsed().as_millis(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    success: false,
+                    task: None,
+                    error_message: Some(format!("更新任务失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// DELETE /api/review/tasks/:id - 软删除任务（与 PMS 入站删除一致；不向 PMS 回调）
+async fn delete_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let started = std::time::Instant::now();
+    info!("[REVIEW_API.delete_task] start task_id={}", id);
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.delete_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
+    let form_id = lookup_task_form_id(&id).await;
+
+    let soft_sql = r#"
+        UPDATE review_tasks SET
+            deleted = true,
+            deleted_at = time::now(),
+            updated_at = time::now(),
+            status = 'deleted'
+        WHERE record::id(id) = $id
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.tasks.delete",
+        db.query(soft_sql).bind(("id", id.clone())),
+    )
+    .await
+    {
+        Ok(_) => {
+            if let Some(form_id) = form_id.as_deref() {
+                if let Err(error) = mark_review_form_deleted(form_id).await {
+                    warn!(
+                        "[REVIEW_API.delete_task] WARN form_sync_failed task_id={} form_id={} reason={}",
+                        id, form_id, error
+                    );
+                }
+            }
+            info!(
+                "[REVIEW_API.delete_task] OK task_id={} form_id={:?} elapsed_ms={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                started.elapsed().as_millis()
+            );
+            (
+                StatusCode::OK,
+                Json(ActionResponse {
+                    success: true,
+                    message: Some("任务已软删除".to_string()),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.delete_task] FAIL task_id={} form_id={:?} elapsed_ms={} reason={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                started.elapsed().as_millis(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("软删除任务失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 审核操作
+// ============================================================================
+
+/// POST /api/review/tasks/:id/start-review - 开始审核（兼容旧 API，映射到 jd 节点）
+async fn start_review(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // 堵旁门：start-review 会把任务从 sj 推进到 jd，此前不校验操作者，等于绕过
+    // submit_to_next_node 的节点负责人校验直接推进状态机。这里补上同源授权。
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.start_review] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
+    update_task_status(id, "in_review".to_string(), Some("jd".to_string()), None).await
+}
+
+/// POST /api/review/tasks/:id/approve - 通过审核（兼容旧 API，映射到 approved + pz 节点）
+async fn approve_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<ReviewActionRequest>,
+) -> impl IntoResponse {
+    submit_to_next_node(
+        Extension(claims),
+        Path(id),
+        Json(SubmitToNextRequest {
+            comment: request.comment,
+            operator_id: None,
+            operator_name: None,
+        }),
+    )
+    .await
+}
+
+/// POST /api/review/tasks/:id/reject - 驳回审核（兼容旧 API，驳回到 sj 节点）
+async fn reject_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<ReviewActionRequest>,
+) -> impl IntoResponse {
+    return_to_node(
+        Extension(claims),
+        Path(id),
+        Json(ReturnRequest {
+            target_node: "sj".to_string(),
+            reason: request
+                .comment
+                .or(request.reason)
+                .unwrap_or_else(|| "驳回".to_string()),
+            operator_id: None,
+            operator_name: None,
+        }),
+    )
+    .await
+}
+
+/// POST /api/review/tasks/:id/cancel - 取消任务
+async fn cancel_task(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<ReviewActionRequest>,
+) -> impl IntoResponse {
+    if let Err((status, message)) = authorize_task_write(&id, &claims).await {
+        warn!(
+            "[REVIEW_API.cancel_task] DENY task_id={} actor_id={} reason={}",
+            id, claims.user_id, message
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(message),
+            }),
+        );
+    }
+    update_task_status(id, "cancelled".to_string(), None, request.reason).await
+}
+
+async fn update_task_status(
+    id: String,
+    status: String,
+    target_node: Option<String>,
+    comment: Option<String>,
+) -> (StatusCode, Json<ActionResponse>) {
+    let started = std::time::Instant::now();
+    info!(
+        "[REVIEW_API.update_task_status] start task_id={} new_status={} target_node={:?} comment_len={}",
+        id,
+        status,
+        target_node,
+        comment.as_deref().map(|s| s.len()).unwrap_or(0)
+    );
+    let form_id = lookup_task_form_id(&id).await;
+
+    let sql = match (&target_node, &comment) {
+        (Some(_), Some(_)) => {
+            "UPDATE review_tasks SET status = $status, current_node = $node, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
+        }
+        (Some(_), None) => {
+            "UPDATE review_tasks SET status = $status, current_node = $node, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
+        }
+        (None, Some(_)) => {
+            "UPDATE review_tasks SET status = $status, review_comment = $comment, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
+        }
+        (None, None) => {
+            "UPDATE review_tasks SET status = $status, updated_at = time::now() WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)"
+        }
+    };
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db
+        .query(sql)
+        .bind(("id", id.clone()))
+        .bind(("status", status.clone()));
+
+    if let Some(ref node) = target_node {
+        q = q.bind(("node", node.clone()));
+    }
+    if let Some(ref c) = comment {
+        q = q.bind(("comment", c.clone()));
+    }
+
+    match await_review_query("review.tasks.status_update", q).await {
+        Ok(_) => {
+            if let Some(form_id) = form_id.as_deref() {
+                if let Err(error) = sync_review_form_with_task_status(
+                    form_id,
+                    None,
+                    None,
+                    "create_task_backfill",
+                    status.as_str(),
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to sync review_forms after status update, form_id={}: {}",
+                        form_id, error
+                    );
+                }
+            }
+            if !review_workflow_history_schema_ready() {
+                warn!(
+                    "[REVIEW_API.update_task_status] workflow history schema warmup is not ready; history write uses current schema"
+                );
+            }
+            let history_sql = r#"
+                CREATE review_history CONTENT {
+                    task_id: $task_id,
+                    form_id: $form_id,
+                    action: $action,
+                    user_id: 'system',
+                    user_name: '系统',
+                    source: 'plant3d-internal',
+                    comment: $comment,
+                    timestamp: time::now(),
+                    created_at: time::now()
+                }
+            "#;
+            let log_task_id = id.clone();
+            let _ = await_review_query(
+                "review.tasks.status_history",
+                db.query(history_sql)
+                    .bind(("task_id", id))
+                    .bind(("form_id", form_id.clone()))
+                    .bind(("action", status.clone()))
+                    .bind(("comment", comment)),
+            )
+            .await;
+
+            info!(
+                "[REVIEW_API.update_task_status] OK task_id={} form_id={:?} new_status={} target_node={:?} elapsed_ms={}",
+                log_task_id,
+                form_id.as_deref().unwrap_or(""),
+                status,
+                target_node,
+                started.elapsed().as_millis()
+            );
+
+            (
+                StatusCode::OK,
+                Json(ActionResponse {
+                    success: true,
+                    message: Some(format!("任务状态已更新为: {}", status)),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.update_task_status] FAIL task_id={} form_id={:?} new_status={} target_node={:?} elapsed_ms={} reason={}",
+                id,
+                form_id.as_deref().unwrap_or(""),
+                status,
+                target_node,
+                started.elapsed().as_millis(),
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("更新状态失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// GET /api/review/tasks/:id/history - 获取审核历史
+async fn get_task_history(Path(id): Path<String>) -> impl IntoResponse {
+    info!("Getting task history: {}", id);
+
+    #[derive(Debug, Serialize)]
+    struct HistoryItem {
+        id: String,
+        task_id: String,
+        action: String,
+        user_id: String,
+        user_name: String,
+        comment: Option<String>,
+        #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+        timestamp: i64,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct HistoryResponse {
+        success: bool,
+        history: Vec<HistoryItem>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct HistoryRow {
+        id: surrealdb::types::RecordId,
+        task_id: Option<String>,
+        action: Option<String>,
+        operator_id: Option<String>,
+        operator_name: Option<String>,
+        comment: Option<String>,
+        timestamp: Option<surrealdb::types::Datetime>,
+    }
+
+    let sql =
+        "SELECT * FROM review_workflow_history WHERE task_id = $task_id ORDER BY timestamp DESC";
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for task history: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryResponse {
+                    success: false,
+                    history: vec![],
+                    error_message: Some(format!("获取历史失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match await_review_query(
+        "review.tasks.history",
+        db.query(sql).bind(("task_id", id.clone())),
+    )
+    .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<HistoryRow> = response.take(0).unwrap_or_default();
+            let history: Vec<HistoryItem> = rows
+                .into_iter()
+                .map(|r| HistoryItem {
+                    id: format!("{:?}", r.id.key),
+                    task_id: r.task_id.unwrap_or_default(),
+                    action: r.action.unwrap_or_default(),
+                    user_id: r.operator_id.unwrap_or_default(),
+                    user_name: r.operator_name.unwrap_or_default(),
+                    comment: r.comment,
+                    timestamp: parse_datetime_value(&r.timestamp),
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(HistoryResponse {
+                    success: true,
+                    history,
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to get task history: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HistoryResponse {
+                    success: false,
+                    history: vec![],
+                    error_message: Some(format!("获取历史失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 确认记录 CRUD
+// ============================================================================
+
+/// 确认记录数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedRecordData {
+    pub task_id: String,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub r#type: String,
+    #[serde(default)]
+    pub annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub cloud_annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub rect_annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub obb_annotations: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub measurements: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub dimension_document: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dimension_document_base_version: u64,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedRecordResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<ConfirmedRecordWithMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<Vec<ConfirmedRecordWithMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedRecordWithMeta {
+    pub id: String,
+    pub task_id: String,
+    pub form_id: String,
+    pub r#type: String,
+    pub annotations: Vec<serde_json::Value>,
+    pub cloud_annotations: Vec<serde_json::Value>,
+    pub rect_annotations: Vec<serde_json::Value>,
+    pub obb_annotations: Vec<serde_json::Value>,
+    pub measurements: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension_document: Option<serde_json::Value>,
+    pub dimension_document_version: u64,
+    pub note: String,
+    pub confirmed_at: i64,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct ReviewRecordRow {
+    id: surrealdb::types::RecordId,
+    task_id: Option<String>,
+    form_id: Option<String>,
+    r#type: Option<String>,
+    annotations: Option<Vec<serde_json::Value>>,
+    cloud_annotations: Option<Vec<serde_json::Value>>,
+    rect_annotations: Option<Vec<serde_json::Value>>,
+    obb_annotations: Option<Vec<serde_json::Value>>,
+    measurements: Option<Vec<serde_json::Value>>,
+    dimension_document: Option<serde_json::Value>,
+    dimension_document_version: Option<u64>,
+    note: Option<String>,
+    confirmed_at: Option<surrealdb::types::Datetime>,
+    current_node: Option<String>,
+    operator_id: Option<String>,
+    operator_name: Option<String>,
+    slot_key: Option<String>,
+    snapshot_hash: Option<String>,
+}
+
+fn confirmed_record_with_meta_from_row(row: ReviewRecordRow) -> ConfirmedRecordWithMeta {
+    ConfirmedRecordWithMeta {
+        id: record_id_to_string(row.id),
+        task_id: row.task_id.unwrap_or_default(),
+        form_id: row.form_id.unwrap_or_default(),
+        r#type: row.r#type.unwrap_or_else(|| "batch".to_string()),
+        annotations: row.annotations.unwrap_or_default(),
+        cloud_annotations: row.cloud_annotations.unwrap_or_default(),
+        rect_annotations: row.rect_annotations.unwrap_or_default(),
+        obb_annotations: row.obb_annotations.unwrap_or_default(),
+        measurements: row.measurements.unwrap_or_default(),
+        dimension_document: row.dimension_document,
+        dimension_document_version: row.dimension_document_version.unwrap_or(0),
+        note: row.note.unwrap_or_default(),
+        confirmed_at: parse_datetime_value(&row.confirmed_at),
+    }
+}
+
+/// POST /api/review/records - 保存确认记录
+async fn create_record(
+    Extension(claims): Extension<TokenClaims>,
+    Json(request): Json<ConfirmedRecordData>,
+) -> impl IntoResponse {
+    info!("Creating confirmed record for task: {}", request.task_id);
+
+    let task_context = match lookup_task_record_context(&request.task_id).await {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+            warn!(
+                "Failed to resolve task context for confirmed record: task_id={}",
+                request.task_id
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(
+                        "保存记录失败：未找到当前校审任务，无法解析 form_id 与流程节点".to_string(),
+                    ),
+                }),
+            );
+        }
+        Err(error) => {
+            warn!(
+                "[REVIEW_API.records.create] task context failed: task_id={}, error={}",
+                request.task_id, error
+            );
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!(
+                        "review.records.create.task_context: 连接校审数据库超时: {}",
+                        error
+                    )),
+                }),
+            );
+        }
+    };
+
+    let operator_id = claims.user_id.trim().to_string();
+    if operator_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some("保存记录失败：当前用户身份无效".to_string()),
+            }),
+        );
+    }
+
+    let current_node = task_context.current_node.clone();
+    let (owner_id, owner_source) =
+        current_node_owner_for_task_context(&task_context, &current_node);
+    if owner_id.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some(format!(
+                    "保存记录失败：当前「{}」节点未配置负责人",
+                    get_node_display_name(&current_node)
+                )),
+            }),
+        );
+    }
+    // NOTE: owner match is intentionally NOT relaxed for external workflow mode.
+    // Review records represent confirmed model-level data (annotations, measurements),
+    // and their authorship must match the node owner for audit trail integrity.
+    // External workflow relaxation only applies to workflow/sync flow transitions.
+    if owner_id != operator_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ConfirmedRecordResponse {
+                success: false,
+                record: None,
+                records: None,
+                error_message: Some(format!(
+                    "保存记录失败：当前用户 {} 不是 {} 节点负责人 {}",
+                    operator_id, owner_source, owner_id
+                )),
+            }),
+        );
+    }
+    let form_id = task_context.form_id;
+    let operator_name = preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str());
+    let record_type = if request.r#type.trim().is_empty() {
+        "batch".to_string()
+    } else {
+        request.r#type.trim().to_string()
+    };
+    let note = request.note.trim().to_string();
+    let slot_key = build_confirmed_record_slot_key(&form_id, &current_node, &operator_id);
+    let record_id = build_confirmed_record_stable_id(&slot_key);
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let existing_row = match await_review_query(
+        "review.records.existing",
+        db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+            .bind(("id", record_id.clone())),
+    )
+    .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            warn!("Failed to query existing confirmed record: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("查询已确认记录失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let record_existed = existing_row.is_some();
+    let dimension_version_plan = match plan_dimension_document_version(
+        record_existed,
+        existing_row
+            .as_ref()
+            .and_then(|row| row.dimension_document_version),
+        request.dimension_document.is_some(),
+        request.dimension_document_base_version,
+    ) {
+        Ok(plan) => plan,
+        Err(conflict) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: existing_row.map(confirmed_record_with_meta_from_row),
+                    records: None,
+                    error_message: Some(format!(
+                        "尺寸文档版本冲突：当前版本为 {}，请刷新后确认是否重放本地修改",
+                        conflict.latest_version
+                    )),
+                }),
+            );
+        }
+    };
+
+    let effective_dimension_document = request.dimension_document.as_ref().or_else(|| {
+        existing_row
+            .as_ref()
+            .and_then(|row| row.dimension_document.as_ref())
+    });
+    let snapshot_hash = build_confirmed_record_snapshot_hash(
+        &record_type,
+        &request.annotations,
+        &request.cloud_annotations,
+        &request.rect_annotations,
+        &request.obb_annotations,
+        &request.measurements,
+        effective_dimension_document,
+        &note,
+    );
+
+    if let Some(existing_row) = existing_row {
+        if existing_row.snapshot_hash.as_deref() == Some(snapshot_hash.as_str()) {
+            info!(
+                "Confirmed record no-op: task_id={}, slot_key={}",
+                request.task_id, slot_key
+            );
+            match await_review_query(
+                "review.records.refresh_noop",
+                db.query(
+                    r#"
+                    UPDATE type::record('review_records', $id) MERGE {
+                        task_id: $task_id,
+                        form_id: $form_id,
+                        type: $type,
+                        annotations: $annotations,
+                        cloud_annotations: $cloud_annotations,
+                        rect_annotations: $rect_annotations,
+                        obb_annotations: $obb_annotations,
+                        measurements: $measurements,
+                        note: $note,
+                        current_node: $current_node,
+                        operator_id: $operator_id,
+                        operator_name: $operator_name,
+                        slot_key: $slot_key,
+                        snapshot_hash: $snapshot_hash
+                    } RETURN AFTER
+                    "#,
+                )
+                .bind(("id", record_id.clone()))
+                .bind(("task_id", request.task_id.clone()))
+                .bind(("form_id", form_id.clone()))
+                .bind(("type", record_type.clone()))
+                .bind(("annotations", request.annotations.clone()))
+                .bind(("cloud_annotations", request.cloud_annotations.clone()))
+                .bind(("rect_annotations", request.rect_annotations.clone()))
+                .bind(("obb_annotations", request.obb_annotations.clone()))
+                .bind(("measurements", request.measurements.clone()))
+                .bind(("note", note.clone()))
+                .bind(("current_node", current_node.clone()))
+                .bind(("operator_id", operator_id.clone()))
+                .bind(("operator_name", operator_name.clone()))
+                .bind(("slot_key", slot_key.clone()))
+                .bind(("snapshot_hash", snapshot_hash.clone())),
+            )
+            .await
+            {
+                Ok(mut response) => {
+                    let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+                    let row = rows.into_iter().next().unwrap_or(existing_row);
+                    return (
+                        StatusCode::OK,
+                        Json(ConfirmedRecordResponse {
+                            success: true,
+                            record: Some(confirmed_record_with_meta_from_row(row)),
+                            records: None,
+                            error_message: None,
+                        }),
+                    );
+                }
+                Err(e) => {
+                    warn!("Failed to refresh no-op confirmed record context: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: None,
+                            records: None,
+                            error_message: Some(format!("更新已确认记录上下文失败: {}", e)),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    let write_sql = match dimension_version_plan {
+        DimensionDocumentVersionPlan::Update { .. } => {
+            r#"
+            UPDATE type::record('review_records', $id) MERGE {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                dimension_document: $dimension_document,
+                dimension_document_version: $next_dimension_document_version,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            }
+            WHERE (
+                dimension_document_version = $base_dimension_document_version
+                OR (
+                    dimension_document_version = NONE
+                    AND $base_dimension_document_version = 0
+                )
+            )
+            RETURN AFTER
+            "#
+        }
+        DimensionDocumentVersionPlan::Preserve { .. } if record_existed => {
+            r#"
+            UPDATE type::record('review_records', $id) MERGE {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            } RETURN AFTER
+            "#
+        }
+        DimensionDocumentVersionPlan::Create { .. }
+        | DimensionDocumentVersionPlan::Preserve { .. } => {
+            r#"
+            CREATE ONLY type::record('review_records', $id) CONTENT {
+                task_id: $task_id,
+                form_id: $form_id,
+                type: $type,
+                annotations: $annotations,
+                cloud_annotations: $cloud_annotations,
+                rect_annotations: $rect_annotations,
+                obb_annotations: $obb_annotations,
+                measurements: $measurements,
+                dimension_document: $dimension_document,
+                dimension_document_version: $next_dimension_document_version,
+                note: $note,
+                current_node: $current_node,
+                operator_id: $operator_id,
+                operator_name: $operator_name,
+                slot_key: $slot_key,
+                snapshot_hash: $snapshot_hash,
+                confirmed_at: time::now()
+            } RETURN AFTER
+            "#
+        }
+    };
+    let (base_dimension_document_version, next_dimension_document_version) =
+        match dimension_version_plan {
+            DimensionDocumentVersionPlan::Preserve { version } => (version, version),
+            DimensionDocumentVersionPlan::Create { next_version } => (0, next_version),
+            DimensionDocumentVersionPlan::Update {
+                base_version,
+                next_version,
+            } => (base_version, next_version),
+        };
+
+    let sync_form_id = form_id.clone();
+    let sync_node = current_node.clone();
+    let sync_operator_id = operator_id.clone();
+    let sync_operator_name = operator_name.clone();
+    let sync_role = claims.role.clone().unwrap_or_default();
+
+    match await_review_query(
+        "review.records.write",
+        db.query(write_sql)
+            .bind(("id", record_id.clone()))
+            .bind(("task_id", request.task_id.clone()))
+            .bind(("form_id", form_id))
+            .bind(("type", record_type))
+            .bind(("annotations", request.annotations.clone()))
+            .bind(("cloud_annotations", request.cloud_annotations.clone()))
+            .bind(("rect_annotations", request.rect_annotations.clone()))
+            .bind(("obb_annotations", request.obb_annotations.clone()))
+            .bind(("measurements", request.measurements.clone()))
+            .bind(("dimension_document", request.dimension_document.clone()))
+            .bind((
+                "base_dimension_document_version",
+                base_dimension_document_version,
+            ))
+            .bind((
+                "next_dimension_document_version",
+                next_dimension_document_version,
+            ))
+            .bind(("note", note))
+            .bind(("current_node", current_node))
+            .bind(("operator_id", operator_id))
+            .bind(("operator_name", operator_name))
+            .bind(("slot_key", slot_key))
+            .bind(("snapshot_hash", snapshot_hash)),
+    )
+    .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+            if let Some(row) = rows.into_iter().next() {
+                sync_annotation_states_from_snapshot(
+                    &sync_form_id,
+                    &request.task_id,
+                    &sync_node,
+                    &sync_operator_id,
+                    &sync_operator_name,
+                    &sync_role,
+                    &request.annotations,
+                    &request.cloud_annotations,
+                    &request.rect_annotations,
+                )
+                .await;
+
+                (
+                    StatusCode::OK,
+                    Json(ConfirmedRecordResponse {
+                        success: true,
+                        record: Some(confirmed_record_with_meta_from_row(row)),
+                        records: None,
+                        error_message: None,
+                    }),
+                )
+            } else {
+                warn!(
+                    "Confirmed record write returned empty result: task_id={}, record_id={}",
+                    request.task_id, record_id
+                );
+                if matches!(
+                    dimension_version_plan,
+                    DimensionDocumentVersionPlan::Update { .. }
+                ) {
+                    let latest = await_review_query(
+                        "review.records.reload_conflict",
+                        db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+                            .bind(("id", record_id.clone())),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|mut response| {
+                        response
+                            .take::<Vec<ReviewRecordRow>>(0)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().next())
+                    });
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: latest.map(confirmed_record_with_meta_from_row),
+                            records: None,
+                            error_message: Some(
+                                "尺寸文档版本冲突，请刷新后确认是否重放本地修改".to_string(),
+                            ),
+                        }),
+                    )
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: None,
+                            records: None,
+                            error_message: Some("保存记录失败：数据库未返回确认记录".to_string()),
+                        }),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to write record: {}", e);
+            if matches!(
+                dimension_version_plan,
+                DimensionDocumentVersionPlan::Create { .. }
+            ) {
+                let latest = await_review_query(
+                    "review.records.reload_create_conflict",
+                    db.query("SELECT * FROM review_records WHERE record::id(id) = $id LIMIT 1")
+                        .bind(("id", record_id)),
+                )
+                .await
+                .ok()
+                .and_then(|mut response| {
+                    response
+                        .take::<Vec<ReviewRecordRow>>(0)
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                });
+                if latest.is_some() {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(ConfirmedRecordResponse {
+                            success: false,
+                            record: latest.map(confirmed_record_with_meta_from_row),
+                            records: None,
+                            error_message: Some(
+                                "尺寸文档版本冲突，请刷新后确认是否重放本地修改".to_string(),
+                            ),
+                        }),
+                    );
+                }
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("保存记录失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// GET /api/review/records/:task_id - 获取任务的确认记录
+async fn get_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
+    info!("Getting records for task: {}", task_id);
+
+    let sql = "SELECT * FROM review_records WHERE task_id = $task_id ORDER BY confirmed_at DESC";
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for records: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("获取记录失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    match await_review_query(
+        "review.records.by_task",
+        db.query(sql).bind(("task_id", task_id)),
+    )
+    .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+            let records: Vec<ConfirmedRecordWithMeta> = rows
+                .into_iter()
+                .map(confirmed_record_with_meta_from_row)
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(ConfirmedRecordResponse {
+                    success: true,
+                    record: None,
+                    records: Some(records),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to get records: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ConfirmedRecordResponse {
+                    success: false,
+                    record: None,
+                    records: None,
+                    error_message: Some(format!("获取记录失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// DELETE /api/review/records/:record_id - 删除记录
+async fn delete_record(Path(record_id): Path<String>) -> impl IntoResponse {
+    info!("Deleting record: {}", record_id);
+
+    let sql = "DELETE [type::record('review_records', $id)]";
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.records.delete",
+        db.query(sql).bind(("id", record_id)),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some("记录已删除".to_string()),
+                error_message: None,
+            }),
+        ),
+        Err(e) => {
+            warn!("Failed to delete record: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("删除记录失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// DELETE /api/review/records/task/:task_id - 清空任务的所有记录
+async fn clear_records_by_task(Path(task_id): Path<String>) -> impl IntoResponse {
+    info!("Clearing records for task: {}", task_id);
+
+    let sql = r#"
+        LET $ids = SELECT VALUE id FROM review_records WHERE task_id = $task_id;
+        DELETE $ids;
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.records.clear_task",
+        db.query(sql).bind(("task_id", task_id)),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some("记录已清空".to_string()),
+                error_message: None,
+            }),
+        ),
+        Err(e) => {
+            warn!("Failed to clear records: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("清空记录失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 评论 CRUD
+// ============================================================================
+
+/// 评论数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationComment {
+    pub id: String,
+    pub annotation_id: String,
+    pub annotation_type: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub author_role: String,
+    pub content: String,
+    pub reply_to_id: Option<String>,
+    #[serde(serialize_with = "serialize_beijing_datetime_millis")]
+    pub created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCommentRequest {
+    pub annotation_id: String,
+    pub annotation_type: String,
+    pub author_id: String,
+    pub author_name: String,
+    pub author_role: String,
+    pub content: String,
+    pub reply_to_id: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub workflow_node: Option<String>,
+    #[serde(default)]
+    pub review_round: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommentResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<AnnotationComment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comments: Option<Vec<AnnotationComment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommentQuery {
+    pub r#type: Option<String>,
+    pub form_id: Option<String>,
+    pub task_id: Option<String>,
+}
+
+/// POST /api/review/comments - 添加评论
+async fn create_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Json(request): Json<CreateCommentRequest>,
+) -> impl IntoResponse {
+    info!("Creating comment for annotation: {}", request.annotation_id);
+
+    let author_id = claims.user_id.clone();
+    let author_name = claims.user_name.clone();
+    let author_role = claims
+        .role
+        .clone()
+        .unwrap_or_else(|| request.author_role.clone());
+
+    let comment_id = format!("comment-{}", uuid::Uuid::new_v4());
+
+    let form_id = request.form_id.as_deref().unwrap_or("").trim().to_string();
+    let task_id = request.task_id.as_deref().unwrap_or("").trim().to_string();
+    let workflow_node = request
+        .workflow_node
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let review_round = request.review_round.unwrap_or(0);
+
+    let sql = r#"
+        CREATE review_comments CONTENT {
+            id: $id,
+            annotation_id: $annotation_id,
+            annotation_type: $annotation_type,
+            author_id: $author_id,
+            author_name: $author_name,
+            author_role: $author_role,
+            content: $content,
+            reply_to_id: $reply_to_id,
+            form_id: $form_id,
+            task_id: $task_id,
+            workflow_node: $workflow_node,
+            review_round: $review_round,
+            created_at: time::now()
+        }
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.comments.create",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("annotation_id", request.annotation_id.clone()))
+            .bind(("annotation_type", request.annotation_type.clone()))
+            .bind(("author_id", author_id.clone()))
+            .bind(("author_name", author_name.clone()))
+            .bind(("author_role", author_role.clone()))
+            .bind(("content", request.content.clone()))
+            .bind(("reply_to_id", request.reply_to_id.clone()))
+            .bind(("form_id", form_id))
+            .bind(("task_id", task_id))
+            .bind(("workflow_node", workflow_node))
+            .bind(("review_round", review_round)),
+    )
+    .await
+    {
+        Ok(_) => {
+            let comment = AnnotationComment {
+                id: comment_id,
+                annotation_id: request.annotation_id,
+                annotation_type: request.annotation_type,
+                author_id,
+                author_name,
+                author_role,
+                content: request.content,
+                reply_to_id: request.reply_to_id,
+                created_at: chrono::Utc::now().timestamp_millis(),
+            };
+            (
+                StatusCode::OK,
+                Json(CommentResponse {
+                    success: true,
+                    comment: Some(comment),
+                    comments: None,
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to create comment: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("创建评论失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// GET /api/review/comments/:annotation_id - 获取批注评论
+async fn get_comments_by_annotation(
+    Path(annotation_id): Path<String>,
+    Query(query): Query<CommentQuery>,
+) -> impl IntoResponse {
+    info!("Getting comments for annotation: {}", annotation_id);
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CommentRow {
+        id: surrealdb::types::RecordId,
+        annotation_id: Option<String>,
+        annotation_type: Option<String>,
+        author_id: Option<String>,
+        author_name: Option<String>,
+        author_role: Option<String>,
+        content: Option<String>,
+        reply_to_id: Option<String>,
+        created_at: Option<surrealdb::types::Datetime>,
+    }
+
+    let mut conditions = vec!["annotation_id = $annotation_id".to_string()];
+    conditions.push("(deleted IS NONE OR deleted = false)".to_string());
+    if query.r#type.is_some() {
+        conditions.push("annotation_type = $type".to_string());
+    }
+    if query.form_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+        conditions.push("form_id = $form_id".to_string());
+    }
+    if query.task_id.as_ref().is_some_and(|s| !s.trim().is_empty()) {
+        conditions.push("task_id = $task_id".to_string());
+    }
+    let sql = format!(
+        "SELECT * FROM review_comments WHERE {} ORDER BY created_at ASC",
+        conditions.join(" AND ")
+    );
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect fresh review db for comments: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("获取评论失败: {}", e)),
+                }),
+            );
+        }
+    };
+    let mut q = db.query(&sql).bind(("annotation_id", annotation_id));
+    if let Some(ref t) = query.r#type {
+        q = q.bind(("type", t.clone()));
+    }
+    if let Some(ref fid) = query.form_id {
+        let fid = fid.trim();
+        if !fid.is_empty() {
+            q = q.bind(("form_id", fid.to_string()));
+        }
+    }
+    if let Some(ref tid) = query.task_id {
+        let tid = tid.trim();
+        if !tid.is_empty() {
+            q = q.bind(("task_id", tid.to_string()));
+        }
+    }
+
+    match await_review_query("review.comments.by_annotation", q).await {
+        Ok(mut response) => {
+            let rows: Vec<CommentRow> = response.take(0).unwrap_or_default();
+            let comments: Vec<AnnotationComment> = rows
+                .into_iter()
+                .map(|r| AnnotationComment {
+                    id: format!("{:?}", r.id.key),
+                    annotation_id: r.annotation_id.unwrap_or_default(),
+                    annotation_type: r.annotation_type.unwrap_or_default(),
+                    author_id: r.author_id.unwrap_or_default(),
+                    author_name: r.author_name.unwrap_or_default(),
+                    author_role: r.author_role.unwrap_or_default(),
+                    content: r.content.unwrap_or_default(),
+                    reply_to_id: r.reply_to_id,
+                    created_at: parse_datetime_value(&r.created_at),
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(CommentResponse {
+                    success: true,
+                    comment: None,
+                    comments: Some(comments),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to get comments: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(CommentResponse {
+                    success: false,
+                    comment: None,
+                    comments: None,
+                    error_message: Some(format!("获取评论失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+/// PATCH /api/review/comments/item/:comment_id - 编辑评论（仅作者本人）
+async fn edit_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(comment_id): Path<String>,
+    Json(body): Json<EditCommentRequest>,
+) -> impl IntoResponse {
+    info!("Editing comment: {}", comment_id);
+
+    let sql = r#"
+        LET $comment = SELECT * FROM type::record('review_comments', $id);
+        IF $comment[0].author_id != $author_id {
+            THROW "仅评论作者本人可编辑";
+        };
+        UPDATE type::record('review_comments', $id) SET
+            content = $content,
+            updated_at = time::now()
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.comments.edit",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("author_id", claims.user_id.clone()))
+            .bind(("content", body.content.clone())),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some("评论已更新".to_string()),
+                error_message: None,
+            }),
+        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("仅评论作者本人可编辑") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            warn!("Failed to edit comment {}: {}", comment_id, msg);
+            (
+                status,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(msg),
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditCommentRequest {
+    pub content: String,
+}
+
+/// DELETE /api/review/comments/:comment_id - 软删除评论（仅作者或管理员）
+async fn delete_comment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(comment_id): Path<String>,
+) -> impl IntoResponse {
+    info!("Soft-deleting comment: {}", comment_id);
+
+    let user_id = claims.user_id.trim().to_string();
+    let is_admin = claims
+        .role
+        .as_deref()
+        .map(|r| r.eq_ignore_ascii_case("admin"))
+        .unwrap_or(false);
+
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CommentOwnerRow {
+        author_id: Option<String>,
+    }
+
+    let lookup_sql = "SELECT author_id FROM type::record('review_comments', $id)";
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    let owner = match await_review_query(
+        "review.comments.delete_lookup",
+        db.query(lookup_sql).bind(("id", comment_id.clone())),
+    )
+    .await
+    {
+        Ok(mut response) => {
+            let rows: Vec<CommentOwnerRow> = response.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            warn!("Failed to look up comment {} for delete: {}", comment_id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("查询评论失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let Some(owner) = owner else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some("评论不存在".to_string()),
+            }),
+        );
+    };
+
+    let author_id = owner.author_id.unwrap_or_default();
+    if !is_admin && author_id != user_id {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some("仅评论作者或管理员可删除".to_string()),
+            }),
+        );
+    }
+
+    let sql = r#"
+        UPDATE type::record('review_comments', $id) SET
+            deleted = true,
+            deleted_at = time::now(),
+            deleted_by = $user_id
+    "#;
+
+    match await_review_query(
+        "review.comments.delete",
+        db.query(sql)
+            .bind(("id", comment_id.clone()))
+            .bind(("user_id", user_id)),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some("评论已删除".to_string()),
+                error_message: None,
+            }),
+        ),
+        Err(e) => {
+            warn!("Failed to soft-delete comment {}: {}", comment_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("删除评论失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 批注轻量字段 / 错误标记
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct AnnotationSeverityTypeQuery {
+    /// 批注类型：text | cloud | rect | obb
+    pub r#type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationSeverityBody {
+    /// `principle` | `general` | `drawing` | null（null 清空）
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnnotationSeverityResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+fn is_valid_annotation_type(t: &str) -> bool {
+    matches!(t, "text" | "cloud" | "rect" | "obb")
+}
+
+fn is_valid_annotation_severity(s: &str) -> bool {
+    matches!(s, "principle" | "general" | "drawing")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationBasicFieldsBody {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub form_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnnotationBasicFieldsResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+fn normalize_optional_scope(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn patch_annotation_array<F>(items: &mut [Value], annotation_id: &str, apply: &mut F) -> bool
+where
+    F: FnMut(&mut serde_json::Map<String, Value>) -> bool,
+{
+    let mut changed = false;
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(id) = obj.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if id == annotation_id {
+            changed |= apply(obj);
+        }
+    }
+    changed
+}
+
+async fn patch_annotation_records<F>(
+    annotation_id: &str,
+    annotation_type: &str,
+    form_id: Option<String>,
+    task_id: Option<String>,
+    mut apply: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&mut serde_json::Map<String, Value>) -> bool,
+{
+    if form_id.is_none() && task_id.is_none() {
+        return Err("formId/taskId 至少需要提供一个".to_string());
+    }
+
+    let mut filters = Vec::new();
+    if task_id.is_some() {
+        filters.push("task_id = $task_id");
+    }
+    if form_id.is_some() {
+        filters.push("form_id = $form_id");
+    }
+    let sql = format!(
+        "SELECT * FROM review_records WHERE {} ORDER BY confirmed_at DESC",
+        filters.join(" AND ")
+    );
+
+    let db = fresh_review_db()
+        .await
+        .map_err(|error| format!("连接校审数据库失败: {}", error))?;
+    let mut query = db.query(sql);
+    if let Some(task_id) = task_id.as_ref() {
+        query = query.bind(("task_id", task_id.clone()));
+    }
+    if let Some(form_id) = form_id.as_ref() {
+        query = query.bind(("form_id", form_id.clone()));
+    }
+
+    let mut response = await_review_query("review.annotations.patch_records.select", query)
+        .await
+        .map_err(|error| format!("查询确认记录失败: {}", error))?;
+    let rows: Vec<ReviewRecordRow> = response.take(0).unwrap_or_default();
+
+    let mut updated = 0usize;
+    for row in rows {
+        let record_id = record_id_to_string(row.id);
+        let mut annotations = row.annotations.unwrap_or_default();
+        let mut cloud_annotations = row.cloud_annotations.unwrap_or_default();
+        let mut rect_annotations = row.rect_annotations.unwrap_or_default();
+        let mut obb_annotations = row.obb_annotations.unwrap_or_default();
+
+        let changed = match annotation_type {
+            "text" => patch_annotation_array(&mut annotations, annotation_id, &mut apply),
+            "cloud" => patch_annotation_array(&mut cloud_annotations, annotation_id, &mut apply),
+            "rect" => patch_annotation_array(&mut rect_annotations, annotation_id, &mut apply),
+            "obb" => patch_annotation_array(&mut obb_annotations, annotation_id, &mut apply),
+            _ => false,
+        };
+        if !changed {
+            continue;
+        }
+
+        let update_sql = r#"
+            UPDATE type::record('review_records', $id) SET
+                annotations = $annotations,
+                cloud_annotations = $cloud_annotations,
+                rect_annotations = $rect_annotations,
+                obb_annotations = $obb_annotations
+        "#;
+        await_review_query(
+            "review.annotations.patch_records.update",
+            db.query(update_sql)
+                .bind(("id", record_id))
+                .bind(("annotations", annotations))
+                .bind(("cloud_annotations", cloud_annotations))
+                .bind(("rect_annotations", rect_annotations))
+                .bind(("obb_annotations", obb_annotations)),
+        )
+        .await
+        .map_err(|error| format!("更新确认记录失败: {}", error))?;
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+/// PATCH /api/review/annotations/{annotation_id}?type=...
+///
+/// 只更新标题/描述，不修改几何字段。
+async fn update_annotation_basic_fields(
+    Path(annotation_id): Path<String>,
+    Query(query): Query<AnnotationSeverityTypeQuery>,
+    Json(body): Json<AnnotationBasicFieldsBody>,
+) -> impl IntoResponse {
+    if !is_valid_annotation_type(&query.r#type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some(format!(
+                    "非法的批注类型: {}（仅支持 text|cloud|rect|obb）",
+                    query.r#type
+                )),
+            }),
+        );
+    }
+
+    let title = match body.title {
+        Some(value) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(AnnotationBasicFieldsResponse {
+                        success: false,
+                        title: None,
+                        description: None,
+                        updated_at: None,
+                        error_message: Some("标题不能为空".to_string()),
+                    }),
+                );
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let description = body.description.map(|value| value.trim().to_string());
+
+    if title.is_none() && description.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some("没有可更新的字段".to_string()),
+            }),
+        );
+    }
+
+    let form_id = normalize_optional_scope(&body.form_id);
+    let task_id = normalize_optional_scope(&body.task_id);
+    let title_for_patch = title.clone();
+    let description_for_patch = description.clone();
+
+    match patch_annotation_records(
+        annotation_id.trim(),
+        query.r#type.trim(),
+        form_id,
+        task_id,
+        move |obj| {
+            let mut changed = false;
+            if let Some(title) = title_for_patch.as_ref() {
+                if obj.get("title").and_then(Value::as_str) != Some(title.as_str()) {
+                    obj.insert("title".to_string(), Value::String(title.clone()));
+                    changed = true;
+                }
+            }
+            if let Some(description) = description_for_patch.as_ref() {
+                if obj.get("description").and_then(Value::as_str) != Some(description.as_str()) {
+                    obj.insert(
+                        "description".to_string(),
+                        Value::String(description.clone()),
+                    );
+                    changed = true;
+                }
+            }
+            changed
+        },
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(AnnotationBasicFieldsResponse {
+                success: true,
+                title,
+                description,
+                updated_at: Some(chrono::Utc::now().timestamp_millis()),
+                error_message: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AnnotationBasicFieldsResponse {
+                success: false,
+                title: None,
+                description: None,
+                updated_at: None,
+                error_message: Some(error),
+            }),
+        ),
+    }
+}
+
+/// PATCH /api/review/annotations/{annotation_id}/severity?type=...
+///
+/// 持久化到 `review_annotation_severity` 表，并同步当前 form/task 的确认记录 JSON。
+async fn update_annotation_severity(
+    Path(annotation_id): Path<String>,
+    Query(query): Query<AnnotationSeverityTypeQuery>,
+    Json(body): Json<AnnotationSeverityBody>,
+) -> impl IntoResponse {
+    info!(
+        "PATCH /api/review/annotations/{}/severity type={} severity={:?}",
+        annotation_id, query.r#type, body.severity
+    );
+
+    if !is_valid_annotation_type(&query.r#type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AnnotationSeverityResponse {
+                success: false,
+                severity: None,
+                updated_at: None,
+                error_message: Some(format!(
+                    "非法的批注类型: {}（仅支持 text|cloud|rect|obb）",
+                    query.r#type
+                )),
+            }),
+        );
+    }
+
+    if let Some(ref s) = body.severity {
+        if !is_valid_annotation_severity(s) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!(
+                        "非法的严重度: {}（仅支持 principle|general|drawing，或 null 清空）",
+                        s
+                    )),
+                }),
+            );
+        }
+    }
+
+    let form_id = normalize_optional_scope(&body.form_id);
+    let task_id = normalize_optional_scope(&body.task_id);
+    let record_id = format!(
+        "{}:{}:{}:{}",
+        form_id.as_deref().unwrap_or_default(),
+        task_id.as_deref().unwrap_or_default(),
+        annotation_id,
+        query.r#type
+    );
+    let sql = r#"
+        UPSERT review_annotation_severity:[$form_id, $task_id, $annotation_id, $annotation_type] CONTENT {
+            form_id: $form_id,
+            task_id: $task_id,
+            annotation_id: $annotation_id,
+            annotation_type: $annotation_type,
+            severity: $severity,
+            updated_at: time::now()
+        }
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+    match await_review_query(
+        "review.annotations.severity",
+        db.query(sql)
+            .bind(("form_id", form_id.clone().unwrap_or_default()))
+            .bind(("task_id", task_id.clone().unwrap_or_default()))
+            .bind(("annotation_id", annotation_id.clone()))
+            .bind(("annotation_type", query.r#type.clone()))
+            .bind(("severity", body.severity.clone())),
+    )
+    .await
+    {
+        Ok(_) => {
+            let severity_for_patch = body.severity.clone();
+            if let Err(error) = patch_annotation_records(
+                annotation_id.trim(),
+                query.r#type.trim(),
+                form_id,
+                task_id,
+                move |obj| {
+                    let previous = obj.get("severity").and_then(Value::as_str);
+                    match severity_for_patch.as_ref() {
+                        Some(severity) if previous != Some(severity.as_str()) => {
+                            obj.insert("severity".to_string(), Value::String(severity.clone()));
+                            true
+                        }
+                        None if obj.contains_key("severity") => {
+                            obj.remove("severity");
+                            true
+                        }
+                        _ => false,
+                    }
+                },
+            )
+            .await
+            {
+                warn!(
+                    "Severity persisted but review_records patch failed for {}: {}",
+                    record_id, error
+                );
+            }
+            let updated_at = chrono::Utc::now().timestamp_millis();
+            info!(
+                "Severity persisted for {} ({})",
+                record_id,
+                body.severity.as_deref().unwrap_or("null")
+            );
+            (
+                StatusCode::OK,
+                Json(AnnotationSeverityResponse {
+                    success: true,
+                    severity: body.severity,
+                    updated_at: Some(updated_at),
+                    error_message: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to persist severity for {}: {}", record_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AnnotationSeverityResponse {
+                    success: false,
+                    severity: None,
+                    updated_at: None,
+                    error_message: Some(format!("保存严重度失败: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Handlers - 用户 API
+// ============================================================================
+
+/// 用户信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,
+    pub username: String,
+    pub name: String,
+    pub email: String,
+    pub role: String,
+    pub department: Option<String>,
+    pub avatar: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserListResponse {
+    pub success: bool,
+    pub users: Vec<User>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<User>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserListQuery {
+    pub role: Option<String>,
+    pub status: Option<String>,
+}
+
+fn build_mock_review_users() -> Vec<User> {
+    vec![
+        User {
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
+            name: "王设计师".to_string(),
+            email: "sj@company.com".to_string(),
+            role: "designer".to_string(),
+            department: Some("设计部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "JH".to_string(),
+            username: "JH".to_string(),
+            name: "张校对员".to_string(),
+            email: "jh@company.com".to_string(),
+            role: "proofreader".to_string(),
+            department: Some("质量部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "SH".to_string(),
+            username: "SH".to_string(),
+            name: "李审核员".to_string(),
+            email: "sh@company.com".to_string(),
+            role: "reviewer".to_string(),
+            department: Some("技术部".to_string()),
+            avatar: None,
+        },
+        User {
+            id: "PZ".to_string(),
+            username: "PZ".to_string(),
+            name: "陈经理".to_string(),
+            email: "pz@company.com".to_string(),
+            role: "manager".to_string(),
+            department: Some("工程部".to_string()),
+            avatar: None,
+        },
+    ]
+}
+
+fn default_mock_user() -> User {
+    build_mock_review_users()
+        .into_iter()
+        .find(|user| user.role == "designer")
+        .unwrap_or(User {
+            id: "SJ".to_string(),
+            username: "SJ".to_string(),
+            name: "王设计师".to_string(),
+            email: "sj@company.com".to_string(),
+            role: "designer".to_string(),
+            department: Some("设计部".to_string()),
+            avatar: None,
+        })
+}
+
+fn map_claim_role_to_user_role(role: Option<&str>) -> String {
+    match role.unwrap_or("viewer") {
+        "sj" => "designer".to_string(),
+        "jd" => "proofreader".to_string(),
+        "sh" => "reviewer".to_string(),
+        "pz" => "manager".to_string(),
+        "admin" => "admin".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn current_user_from_claims(claims: &crate::web_api::jwt_auth::TokenClaims) -> User {
+    build_mock_review_users()
+        .into_iter()
+        .find(|user| user.id == claims.user_id)
+        .unwrap_or(User {
+            id: claims.user_id.clone(),
+            username: claims.user_id.clone(),
+            name: preferred_name(Some(claims.user_name.as_str()), claims.user_id.as_str()),
+            email: format!("{}@example.com", claims.user_id),
+            role: map_claim_role_to_user_role(claims.role.as_deref()),
+            department: None,
+            avatar: None,
+        })
+}
+
+// ============================================================================
+// Handlers - 驳回任务批量重新流转
+// ============================================================================
+
+/// GET /api/review/tasks/returned — 列出处于 sj/draft 状态的驳回任务
+async fn list_returned_tasks() -> impl IntoResponse {
+    let sql = r#"
+        SELECT record::id(id) AS id, form_id, title, status, current_node,
+               requester_id, requester_name, checker_id, checker_name,
+               return_reason, updated_at
+        FROM review_tasks
+        WHERE (deleted IS NONE OR deleted = false)
+          AND current_node = 'sj'
+          AND status = 'draft'
+        ORDER BY updated_at DESC
+    "#;
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for returned tasks: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("数据库连接失败: {}", e),
+                    "tasks": [],
+                })),
+            );
+        }
+    };
+
+    match await_review_query("review.tasks.returned", db.query(sql)).await {
+        Ok(mut response) => {
+            let rows: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
+            info!("[RETURNED_TASKS] 查询到 {} 条驳回任务", rows.len());
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "count": rows.len(),
+                    "tasks": rows,
+                })),
+            )
+        }
+        Err(e) => {
+            warn!("Failed to query returned tasks: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("查询驳回任务失败: {}", e),
+                    "tasks": [],
+                })),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchReactivateRequest {
+    task_ids: Vec<String>,
+    target_checker_id: Option<String>,
+    target_checker_name: Option<String>,
+}
+
+/// POST /api/review/tasks/batch-reactivate — 批量将 sj/draft 任务推进到 jd/submitted
+async fn batch_reactivate_tasks(Json(request): Json<BatchReactivateRequest>) -> impl IntoResponse {
+    if request.task_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "task_ids 不能为空",
+                "results": [],
+            })),
+        );
+    }
+
+    info!(
+        "[BATCH_REACTIVATE] 批量重新流转 {} 条任务",
+        request.task_ids.len()
+    );
+
+    let update_sql = r#"
+        UPDATE review_tasks SET
+            current_node = 'jd',
+            status = 'submitted',
+            checker_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE checker_id END,
+            checker_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE checker_name END,
+            reviewer_id = IF string::len(string::trim($checker_id)) > 0 THEN $checker_id ELSE reviewer_id END,
+            reviewer_name = IF string::len(string::trim($checker_name)) > 0 THEN $checker_name ELSE reviewer_name END,
+            return_reason = NONE,
+            updated_at = time::now()
+        WHERE record::id(id) = $task_id
+          AND (deleted IS NONE OR deleted = false)
+          AND current_node = 'sj'
+          AND status = 'draft'
+    "#;
+
+    let checker_id = request.target_checker_id.unwrap_or_default();
+    let checker_name = request.target_checker_name.unwrap_or_default();
+
+    let mut results = Vec::new();
+    let mut success_count = 0usize;
+    let mut skip_count = 0usize;
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("连接校审数据库超时: {}", e),
+                    "results": [],
+                })),
+            );
+        }
+    };
+
+    for task_id in &request.task_ids {
+        let trimmed = task_id.trim();
+        if trimmed.is_empty() {
+            skip_count += 1;
+            continue;
+        }
+
+        match await_review_query(
+            "review.tasks.batch_reactivate",
+            db.query(update_sql)
+                .bind(("task_id", trimmed.to_string()))
+                .bind(("checker_id", checker_id.clone()))
+                .bind(("checker_name", checker_name.clone())),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!("[BATCH_REACTIVATE] 任务 {} 已推进到 jd/submitted", trimmed);
+                results.push(serde_json::json!({
+                    "task_id": trimmed,
+                    "status": "reactivated",
+                }));
+                success_count += 1;
+            }
+            Err(e) => {
+                warn!("[BATCH_REACTIVATE] 任务 {} 推进失败: {}", trimmed, e);
+                results.push(serde_json::json!({
+                    "task_id": trimmed,
+                    "status": "failed",
+                    "error": format!("{}", e),
+                }));
+            }
+        }
+    }
+
+    info!(
+        "[BATCH_REACTIVATE] 完成: success={}, skipped={}, total={}",
+        success_count,
+        skip_count,
+        request.task_ids.len()
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "message": format!(
+                "批量重新流转完成: {} 成功, {} 跳过, {} 总计",
+                success_count, skip_count, request.task_ids.len()
+            ),
+            "success_count": success_count,
+            "skip_count": skip_count,
+            "results": results,
+        })),
+    )
+}
+
+/// GET /api/users - 获取用户列表
+async fn list_users(Query(query): Query<UserListQuery>) -> impl IntoResponse {
+    info!("Listing users");
+
+    let mock_users = build_mock_review_users();
+
+    let users = if let Some(ref role) = query.role {
+        mock_users.into_iter().filter(|u| &u.role == role).collect()
+    } else {
+        mock_users
+    };
+
+    (
+        StatusCode::OK,
+        Json(UserListResponse {
+            success: true,
+            users,
+            error_message: None,
+        }),
+    )
+}
+
+/// GET /api/users/me - 获取当前用户
+async fn get_current_user(request: axum::extract::Request) -> impl IntoResponse {
+    // 尝试从 JWT Claims 获取用户信息
+    use crate::web_api::jwt_auth::TokenClaims;
+
+    if let Some(claims) = request.extensions().get::<TokenClaims>() {
+        let user = current_user_from_claims(claims);
+        return (
+            StatusCode::OK,
+            Json(UserResponse {
+                success: true,
+                user: Some(user),
+                error_message: None,
+            }),
+        );
+    }
+
+    // 如果没有 JWT，返回 mock 用户
+    let user = default_mock_user();
+
+    (
+        StatusCode::OK,
+        Json(UserResponse {
+            success: true,
+            user: Some(user),
+            error_message: None,
+        }),
+    )
+}
+
+/// GET /api/users/reviewers - 获取审核人员列表
+async fn get_reviewers() -> impl IntoResponse {
+    info!("Getting reviewers");
+
+    let reviewers = build_mock_review_users()
+        .into_iter()
+        .filter(|user| {
+            matches!(
+                user.role.as_str(),
+                "proofreader" | "reviewer" | "manager" | "admin"
+            )
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(UserListResponse {
+            success: true,
+            users: reviewers,
+            error_message: None,
+        }),
+    )
+}
+
+// ============================================================================
+// Handlers - 多级审批流程
+// ============================================================================
+
+/// 获取下一个节点
+fn get_next_node(current: &str) -> Option<&'static str> {
+    match current {
+        "sj" => Some("jd"),
+        "jd" => Some("sh"),
+        "sh" => Some("pz"),
+        "pz" => None, // 已是最后节点
+        _ => None,
+    }
+}
+
+/// 验证是否可以驳回到目标节点
+fn can_return_to(current: &str, target: &str) -> bool {
+    let current_idx = WORKFLOW_NODES.iter().position(|&n| n == current);
+    let target_idx = WORKFLOW_NODES.iter().position(|&n| n == target);
+    match (current_idx, target_idx) {
+        (Some(c), Some(t)) => t < c,
+        _ => false,
+    }
+}
+
+/// POST /api/review/tasks/:id/submit - 提交到下一节点
+async fn submit_to_next_node(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<SubmitToNextRequest>,
+) -> Response {
+    let started = std::time::Instant::now();
+    info!(
+        "[REVIEW_API.submit_to_next_node] start task_id={} actor_id={} actor_role={:?} comment_len={}",
+        id,
+        claims.user_id,
+        claims.role,
+        request.comment.as_deref().map(|s| s.len()).unwrap_or(0),
+    );
+
+    // 1. 获取当前任务
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+    let task_result = match fresh_review_db().await {
+        Ok(db) => {
+            await_review_query(
+                "review.tasks.submit.get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+
+    let task_row = match task_result {
+        Ok(mut resp) => {
+            let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+            match rows.into_iter().next() {
+                Some(row) => row,
+                None => {
+                    warn!(
+                        "[REVIEW_API.submit_to_next_node] FAIL task_id={} actor_id={} elapsed_ms={} reason=task_not_found",
+                        id,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ActionResponse {
+                            success: false,
+                            message: None,
+                            error_message: Some(format!("任务不存在或已删除: {}", id)),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.submit_to_next_node] FAIL task_id={} actor_id={} elapsed_ms={} reason=query_task_error: {}",
+                id,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("查询任务失败: {}", e)),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let current_node = task_row
+        .current_node
+        .clone()
+        .unwrap_or_else(|| "sj".to_string());
+
+    // 1.1 权限校验：检查当前用户是否为本节点负责人
+    let operator_user = &claims.user_id;
+    let (owner_id, owner_source) = current_node_owner_for_task_row(&task_row, &current_node);
+    if owner_id.is_empty() || owner_id != operator_user {
+        warn!(
+            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} owner_id={} owner_source={} elapsed_ms={} reason=permission_denied",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            operator_user,
+            current_node,
+            owner_id,
+            owner_source,
+            started.elapsed().as_millis()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(format_owner_mismatch_error(
+                    operator_user,
+                    &current_node,
+                    owner_id,
+                    owner_source,
+                )),
+            }),
+        )
+            .into_response();
+    }
+
+    let annotation_check = match evaluate_annotation_check(
+        &build_annotation_check_context(
+            id.clone(),
+            task_row.form_id.clone().unwrap_or_default(),
+            current_node.clone(),
+        ),
+        AnnotationCheckOptions {
+            current_node: Some(current_node.clone()),
+            intent: Some("submit_next".to_string()),
+            included_types: None,
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err((status, message)) => {
+            return (
+                status,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(message),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if !annotation_check.passed {
+        return (
+            StatusCode::CONFLICT,
+            Json(annotation_check_failed_response(annotation_check)),
+        )
+            .into_response();
+    }
+
+    // 2. 操作人信息
+    let op_id = if claims.user_id.is_empty() {
+        request
+            .operator_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("system")
+    } else {
+        &claims.user_id
+    };
+    let op_name = request
+        .operator_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(op_id);
+
+    // 3. 判断是否为最终节点批准，还是向下流转
+    let (next_node_str, next_status, action_label) = if current_node == "pz" {
+        // pz 是最终节点：批准完成
+        ("pz".to_string(), "approved", "approve")
+    } else {
+        match get_next_node(&current_node) {
+            Some(n) => {
+                let status = match n {
+                    "jd" => "submitted",
+                    "sh" | "pz" => "in_review",
+                    _ => "submitted",
+                };
+                (n.to_string(), status, "submit")
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ActionResponse {
+                        success: false,
+                        message: None,
+                        error_message: Some("当前已是最后节点，无法继续提交".to_string()),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let actor_role = claims
+        .role
+        .as_ref()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Err((status, e)) =
+        apply_internal_workflow_mutation_transaction(InternalWorkflowMutationWrite {
+            task_id: id.clone(),
+            form_id: task_row.form_id.clone(),
+            project_id: task_row.model_name.clone().unwrap_or_default(),
+            requester_id: task_row.requester_id.clone().unwrap_or_default(),
+            next_node: next_node_str.clone(),
+            next_status,
+            return_reason: None,
+            history_from_node: current_node.clone(),
+            history_target_node: Some(next_node_str.clone()),
+            history_action: action_label.to_string(),
+            actor_id: op_id.to_string(),
+            actor_role,
+            actor_name: op_name.to_string(),
+            comment: request.comment,
+        })
+        .await
+    {
+        warn!(
+            "[REVIEW_API.submit_to_next_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} next_node={} elapsed_ms={} reason=workflow_transaction_error: {}",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            next_node_str,
+            started.elapsed().as_millis(),
+            e
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(e),
+            }),
+        )
+            .into_response();
+    }
+
+    let from_name = get_node_display_name(&current_node);
+
+    info!(
+        "[REVIEW_API.submit_to_next_node] OK task_id={} form_id={:?} actor_id={} from_node={} to_node={} new_status={} action_label={} elapsed_ms={}",
+        id,
+        task_row.form_id.as_deref().unwrap_or(""),
+        claims.user_id,
+        current_node,
+        next_node_str,
+        next_status,
+        action_label,
+        started.elapsed().as_millis()
+    );
+
+    if current_node == "pz" {
+        (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some(format!("「{}」已批准，审批流程完成", from_name)),
+                error_message: None,
+            }),
+        )
+            .into_response()
+    } else {
+        let to_name = get_node_display_name(&next_node_str);
+        (
+            StatusCode::OK,
+            Json(ActionResponse {
+                success: true,
+                message: Some(format!("已从「{}」提交到「{}」", from_name, to_name)),
+                error_message: None,
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/review/tasks/:id/return - 驳回到指定节点
+async fn return_to_node(
+    Extension(claims): Extension<TokenClaims>,
+    Path(id): Path<String>,
+    Json(request): Json<ReturnRequest>,
+) -> impl IntoResponse {
+    let started = std::time::Instant::now();
+    info!(
+        "[REVIEW_API.return_to_node] start task_id={} target_node={} actor_id={} actor_role={:?} reason_len={}",
+        id,
+        request.target_node,
+        claims.user_id,
+        claims.role,
+        request.reason.len()
+    );
+
+    // 1. 获取当前任务
+    let get_sql = "SELECT * FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+    let task_result = match fresh_review_db().await {
+        Ok(db) => {
+            await_review_query(
+                "review.tasks.return.get",
+                db.query(get_sql).bind(("id", id.clone())),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+
+    let task_row = match task_result {
+        Ok(mut resp) => {
+            let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+            match rows.into_iter().next() {
+                Some(row) => row,
+                None => {
+                    warn!(
+                        "[REVIEW_API.return_to_node] FAIL task_id={} target_node={} actor_id={} elapsed_ms={} reason=task_not_found",
+                        id,
+                        request.target_node,
+                        claims.user_id,
+                        started.elapsed().as_millis()
+                    );
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(ActionResponse {
+                            success: false,
+                            message: None,
+                            error_message: Some(format!("任务不存在或已删除: {}", id)),
+                        }),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[REVIEW_API.return_to_node] FAIL task_id={} target_node={} actor_id={} elapsed_ms={} reason=query_task_error: {}",
+                id,
+                request.target_node,
+                claims.user_id,
+                started.elapsed().as_millis(),
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    success: false,
+                    message: None,
+                    error_message: Some(format!("查询任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let current_node = task_row
+        .current_node
+        .clone()
+        .unwrap_or_else(|| "sj".to_string());
+
+    // 1.1 权限校验
+    let operator_user = &claims.user_id;
+    let (owner_id, owner_source) = current_node_owner_for_task_row(&task_row, &current_node);
+    if owner_id.is_empty() || owner_id != operator_user {
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} target_node={} actor_id={} current_node={} owner_id={} owner_source={} elapsed_ms={} reason=permission_denied",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            request.target_node,
+            operator_user,
+            current_node,
+            owner_id,
+            owner_source,
+            started.elapsed().as_millis()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(format_owner_mismatch_error(
+                    operator_user,
+                    &current_node,
+                    owner_id,
+                    owner_source,
+                )),
+            }),
+        );
+    }
+
+    // 2. 验证目标节点
+    if !can_return_to(&current_node, &request.target_node) {
+        let from_name = get_node_display_name(&current_node);
+        let to_name = get_node_display_name(&request.target_node);
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} current_node={} target_node={} elapsed_ms={} reason=invalid_target_transition",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            request.target_node,
+            started.elapsed().as_millis()
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(format!("无法从「{}」驳回到「{}」", from_name, to_name)),
+            }),
+        );
+    }
+
+    // 3. 更新任务节点和驳回原因
+    let next_status = match request.target_node.as_str() {
+        "sj" => "draft",
+        "jd" => "submitted",
+        "sh" | "pz" => "in_review",
+        _ => "draft",
+    };
+
+    let op_id = if claims.user_id.is_empty() {
+        request
+            .operator_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("system")
+    } else {
+        &claims.user_id
+    };
+    let op_name = request
+        .operator_name
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(op_id);
+    let actor_role_return = claims
+        .role
+        .as_ref()
+        .map(|r| r.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Err((status, e)) =
+        apply_internal_workflow_mutation_transaction(InternalWorkflowMutationWrite {
+            task_id: id.clone(),
+            form_id: task_row.form_id.clone(),
+            project_id: task_row.model_name.clone().unwrap_or_default(),
+            requester_id: task_row.requester_id.clone().unwrap_or_default(),
+            next_node: request.target_node.clone(),
+            next_status,
+            return_reason: Some(request.reason.clone()),
+            history_from_node: current_node.clone(),
+            history_target_node: Some(request.target_node.clone()),
+            history_action: "return".to_string(),
+            actor_id: op_id.to_string(),
+            actor_role: actor_role_return,
+            actor_name: op_name.to_string(),
+            comment: Some(request.reason.clone()),
+        })
+        .await
+    {
+        warn!(
+            "[REVIEW_API.return_to_node] FAIL task_id={} form_id={:?} actor_id={} from_node={} target_node={} elapsed_ms={} reason=workflow_transaction_error: {}",
+            id,
+            task_row.form_id.as_deref().unwrap_or(""),
+            claims.user_id,
+            current_node,
+            request.target_node,
+            started.elapsed().as_millis(),
+            e
+        );
+        return (
+            status,
+            Json(ActionResponse {
+                success: false,
+                message: None,
+                error_message: Some(e),
+            }),
+        );
+    }
+
+    let from_name = get_node_display_name(&current_node);
+    let to_name = get_node_display_name(&request.target_node);
+
+    info!(
+        "[REVIEW_API.return_to_node] OK task_id={} form_id={:?} actor_id={} from_node={} target_node={} new_status={} elapsed_ms={}",
+        id,
+        task_row.form_id.as_deref().unwrap_or(""),
+        claims.user_id,
+        current_node,
+        request.target_node,
+        next_status,
+        started.elapsed().as_millis()
+    );
+
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            success: true,
+            message: Some(format!("已从「{}」驳回到「{}」", from_name, to_name)),
+            error_message: None,
+        }),
+    )
+}
+
+/// 工作流历史响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowHistoryResponse {
+    pub success: bool,
+    pub current_node: String,
+    pub current_node_name: String,
+    pub history: Vec<WorkflowStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// GET /api/review/tasks/:id/workflow - 获取工作流历史
+async fn get_workflow_history(Path(id): Path<String>) -> impl IntoResponse {
+    info!("Getting workflow history for task {}", id);
+
+    // 1. 获取当前任务的节点信息
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct CurrentNodeRow {
+        current_node: Option<String>,
+    }
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!(
+                "Failed to connect fresh review db for workflow history: {}",
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WorkflowHistoryResponse {
+                    success: false,
+                    current_node: String::new(),
+                    current_node_name: String::new(),
+                    history: vec![],
+                    error_message: Some(format!("查询任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let get_sql = "SELECT current_node FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+    let current_node = match await_review_query(
+        "review.workflow.current_node",
+        db.query(get_sql).bind(("id", id.clone())),
+    )
+    .await
+    {
+        Ok(mut resp) => {
+            let rows: Vec<CurrentNodeRow> = resp.take(0).unwrap_or_default();
+            match rows.into_iter().next() {
+                Some(row) => row.current_node.unwrap_or_else(|| "sj".to_string()),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(WorkflowHistoryResponse {
+                            success: false,
+                            current_node: String::new(),
+                            current_node_name: String::new(),
+                            history: vec![],
+                            error_message: Some(format!("任务不存在: {}", id)),
+                        }),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(WorkflowHistoryResponse {
+                    success: false,
+                    current_node: String::new(),
+                    current_node_name: String::new(),
+                    history: vec![],
+                    error_message: Some(format!("查询任务失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    // 2. 查询工作流历史
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct WorkflowRow {
+        task_id: Option<String>,
+        node: Option<String>,
+        action: Option<String>,
+        operator_id: Option<String>,
+        operator_name: Option<String>,
+        comment: Option<String>,
+        timestamp: Option<surrealdb::types::Datetime>,
+    }
+
+    let history_sql = r#"
+        SELECT * FROM review_workflow_history
+        WHERE task_id = $task_id
+        ORDER BY timestamp ASC
+    "#;
+
+    let history = match await_review_query(
+        "review.workflow.history",
+        db.query(history_sql).bind(("task_id", id.clone())),
+    )
+    .await
+    {
+        Ok(mut resp) => {
+            let rows: Vec<WorkflowRow> = resp.take(0).unwrap_or_default();
+            rows.into_iter()
+                .map(|r| WorkflowStep {
+                    node: r.node.unwrap_or_default(),
+                    action: r.action.unwrap_or_default(),
+                    operator_id: r.operator_id.unwrap_or_default(),
+                    operator_name: r.operator_name.unwrap_or_default(),
+                    comment: r.comment,
+                    timestamp: r
+                        .timestamp
+                        .map(|dt| dt.timestamp_millis())
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+                })
+                .collect()
+        }
+        Err(e) => {
+            warn!("Failed to get workflow history: {}", e);
+            vec![]
+        }
+    };
+
+    let current_node_name = get_node_display_name(&current_node).to_string();
+
+    (
+        StatusCode::OK,
+        Json(WorkflowHistoryResponse {
+            success: true,
+            current_node: current_node.clone(),
+            current_node_name,
+            history,
+            error_message: None,
+        }),
+    )
+}
+
+// ============================================================================
+// Handlers - 附件管理
+// ============================================================================
+
+/// 附件上传响应
+#[derive(Debug, Serialize)]
+pub struct AttachmentUploadResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<ReviewAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// 附件接口统一错误响应：结构化 JSON，带操作名、耗时和 formId/taskId 便于诊断。
+fn attachment_error_response(
+    status: StatusCode,
+    message: String,
+    operation: &'static str,
+    started: std::time::Instant,
+    form_id: Option<&str>,
+    task_id: Option<&str>,
+) -> Response {
+    warn!(
+        "[REVIEW_API.attachment] FAIL op={} status={} elapsed_ms={} form_id={:?} task_id={:?} reason={}",
+        operation,
+        status.as_u16(),
+        started.elapsed().as_millis(),
+        form_id,
+        task_id,
+        message
+    );
+    (
+        status,
+        Json(serde_json::json!({
+            "success": false,
+            "error_message": message,
+            "operation": operation,
+            "elapsedMs": started.elapsed().as_millis() as u64,
+            "formId": form_id,
+            "taskId": task_id,
+        })),
+    )
+        .into_response()
+}
+
+/// 上传/删除共用的任务上下文行（权限判断 + 附件投影维护）
+#[derive(Debug, Deserialize, SurrealValue)]
+struct AttachmentTaskContextRow {
+    logical_id: Option<String>,
+    form_id: Option<String>,
+    components: Option<Vec<ReviewComponent>>,
+    requester_id: Option<String>,
+    current_node: Option<String>,
+    attachments: Option<Vec<ReviewAttachment>>,
+}
+
+const ATTACHMENT_TASK_CONTEXT_BY_ID_SQL: &str = "SELECT record::id(id) AS logical_id, form_id, components, requester_id, current_node, attachments \
+     FROM review_tasks WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false) LIMIT 1";
+
+const ATTACHMENT_TASK_CONTEXT_BY_FORM_SQL: &str = "SELECT record::id(id) AS logical_id, form_id, components, requester_id, current_node, attachments \
+     FROM review_tasks WHERE form_id = $form_id AND (deleted IS NONE OR deleted = false) ORDER BY created_at ASC LIMIT 1";
+
+/// 已有任务的附件编辑权限：仅任务发起人在 sj（设计）节点可上传/删除。
+/// 返回 None 表示允许；Some(message) 表示拒绝原因。
+fn attachment_edit_denied_reason(
+    claims: &TokenClaims,
+    task: &AttachmentTaskContextRow,
+) -> Option<String> {
+    let current_node = task
+        .current_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sj");
+    if current_node != "sj" {
+        return Some(format!(
+            "当前任务位于「{}」节点，仅设计（sj）节点允许编辑附件；其余节点只能查看和下载",
+            current_node
+        ));
+    }
+    let requester_id = task
+        .requester_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if requester_id.is_empty() || requester_id != claims.user_id {
+        return Some(format!(
+            "仅任务发起人可编辑附件（发起人={}，当前用户={}）",
+            if requester_id.is_empty() {
+                "<未记录>"
+            } else {
+                requester_id
+            },
+            claims.user_id
+        ));
+    }
+    None
+}
+
+/// POST /api/review/attachments - 上传附件
+///
+/// 校验顺序（先验证、后落盘）：
+/// 1. multipart 解析（请求体超限 → 413，不再静默丢字段）
+/// 2. 单文件 ≤ 50MB → 413
+/// 3. 扩展名白名单 → 415；PDF/PNG/JPEG 文件头校验 → 415
+/// 4. 解析并验证 formId/taskId 与上传权限 → 400/403
+/// 5. 落盘 → 入库 → 同步 review_tasks.attachments 投影；
+///    入库/投影失败回滚已写文件与记录，避免孤儿文件。
+async fn upload_attachment(
+    Extension(claims): Extension<TokenClaims>,
+    mut multipart: Multipart,
+) -> Response {
+    let started = std::time::Instant::now();
+    info!("Uploading attachment");
+
+    fn normalize_attachment_file_type(raw: Option<&str>) -> String {
+        let normalized = raw
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| "file".to_string());
+
+        match normalized.as_str() {
+            "markup" | "file" => normalized,
+            _ => "file".to_string(),
+        }
+    }
+
+    let mut task_id: Option<String> = None;
+    let mut form_id: Option<String> = None;
+    let mut model_refnos: Option<Vec<String>> = None;
+    let mut file_type: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut file_name: Option<String> = None;
+    let mut file_data: Option<Vec<u8>> = None;
+
+    // 解析 multipart 表单：显式处理解析错误（请求体超限返回 413，而不是静默丢字段后报“缺少文件”）
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                let status = error.status();
+                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "文件超过 50MB 上限".to_string()
+                } else {
+                    format!("附件表单解析失败: {}", error)
+                };
+                return attachment_error_response(
+                    status,
+                    message,
+                    "review.attachments.parse_multipart",
+                    started,
+                    form_id.as_deref(),
+                    task_id.as_deref(),
+                );
+            }
+        };
+
+        let name: String = field.name().unwrap_or("").to_string();
+        let field_name = name.trim().to_ascii_lowercase();
+
+        match field_name.as_str() {
+            "taskid" | "task_id" => {
+                if let Ok(text) = field.text().await {
+                    task_id = Some(text);
+                }
+            }
+            "formid" | "form_id" => {
+                if let Ok(text) = field.text().await {
+                    form_id = Some(text);
+                }
+            }
+            "modelrefnos" | "model_refnos" => {
+                if let Ok(text) = field.text().await {
+                    // 支持 JSON 数组或逗号分隔字符串
+                    if let Ok(v) = serde_json::from_str::<Vec<String>>(&text) {
+                        model_refnos = Some(v);
+                    } else {
+                        let items = text
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>();
+                        model_refnos = Some(items);
+                    }
+                }
+            }
+            "type" | "filetype" | "file_type" => {
+                if let Ok(text) = field.text().await {
+                    file_type = Some(text);
+                }
+            }
+            "description" => {
+                if let Ok(text) = field.text().await {
+                    description = Some(text);
+                }
+            }
+            "file" => {
+                file_name = field.file_name().map(|s: &str| s.to_string());
+                match field.bytes().await {
+                    Ok(bytes) => file_data = Some(bytes.to_vec()),
+                    Err(error) => {
+                        let status = error.status();
+                        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                            "文件超过 50MB 上限".to_string()
+                        } else {
+                            format!("附件内容读取失败: {}", error)
+                        };
+                        return attachment_error_response(
+                            status,
+                            message,
+                            "review.attachments.read_file",
+                            started,
+                            form_id.as_deref(),
+                            task_id.as_deref(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 验证必要字段
+    let file_name = match file_name {
+        Some(name) => name,
+        None => {
+            return attachment_error_response(
+                StatusCode::BAD_REQUEST,
+                "缺少文件".to_string(),
+                "review.attachments.validate",
+                started,
+                form_id.as_deref(),
+                task_id.as_deref(),
+            );
+        }
+    };
+
+    let file_data = match file_data {
+        Some(data) => data,
+        None => {
+            return attachment_error_response(
+                StatusCode::BAD_REQUEST,
+                "文件数据为空".to_string(),
+                "review.attachments.validate",
+                started,
+                form_id.as_deref(),
+                task_id.as_deref(),
+            );
+        }
+    };
+
+    // 单文件大小限制（服务端强制，独立于请求体限制）
+    if file_data.len() > REVIEW_ATTACHMENT_MAX_FILE_BYTES {
+        return attachment_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "文件超过 50MB 上限（当前 {:.1}MB）",
+                file_data.len() as f64 / 1024.0 / 1024.0
+            ),
+            "review.attachments.validate_size",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
+        );
+    }
+
+    // 扩展名白名单（与前端一致），并统一规范化为小写
+    let file_ext = std::path::Path::new(&file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !REVIEW_ATTACHMENT_ALLOWED_EXTENSIONS.contains(&file_ext.as_str()) {
+        return attachment_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!(
+                "不支持的文件类型「.{}」，允许：PDF、DWG、DXF、XLS/XLSX、CSV、DOC/DOCX、PNG、JPG/JPEG",
+                file_ext
+            ),
+            "review.attachments.validate_ext",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
+        );
+    }
+
+    // 可在线预览格式做文件头校验，禁止伪装文件进入在线预览
+    if !attachment_content_matches_extension(&file_ext, &file_data) {
+        return attachment_error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("文件内容与扩展名「.{}」不匹配，已拒绝", file_ext),
+            "review.attachments.validate_magic",
+            started,
+            form_id.as_deref(),
+            task_id.as_deref(),
+        );
+    }
+
+    // 先解析并验证 formId/taskId 与权限，再落盘
+    let trimmed_task_id = task_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let mut resolved_form_id = form_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let mut resolved_model_refnos = model_refnos.unwrap_or_default();
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return attachment_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("校审附件服务暂不可用（连接数据库超时）: {}", e),
+                "review.attachments.connect",
+                started,
+                resolved_form_id.as_deref(),
+                trimmed_task_id.as_deref(),
+            );
+        }
+    };
+
+    // 已有任务：反查任务上下文（form_id / refnos / 权限 / 附件投影）
+    let mut task_context: Option<AttachmentTaskContextRow> = None;
+    if let Some(tid) = trimmed_task_id.as_deref() {
+        match await_review_query(
+            "review.attachments.task_lookup",
+            db.query(ATTACHMENT_TASK_CONTEXT_BY_ID_SQL)
+                .bind(("id", tid.to_string())),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<AttachmentTaskContextRow> = resp.take(0).unwrap_or_default();
+                task_context = rows.into_iter().next();
+            }
+            Err(e) => {
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("校审附件服务暂不可用（任务查询超时）: {}", e),
+                    "review.attachments.task_lookup",
+                    started,
+                    resolved_form_id.as_deref(),
+                    trimmed_task_id.as_deref(),
+                );
+            }
+        }
+    }
+
+    if let Some(task) = task_context.as_ref() {
+        // 已有任务：后端强制执行编辑权限（仅发起人 + sj 节点）
+        if let Some(reason) = attachment_edit_denied_reason(&claims, task) {
+            return attachment_error_response(
+                StatusCode::FORBIDDEN,
+                reason,
+                "review.attachments.permission",
+                started,
+                resolved_form_id.as_deref(),
+                trimmed_task_id.as_deref(),
+            );
+        }
+
+        if resolved_form_id.is_none() {
+            resolved_form_id = task
+                .form_id
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+        }
+        if resolved_model_refnos.is_empty() {
+            let mut set = HashSet::<String>::new();
+            if let Some(comps) = task.components.as_ref() {
+                for c in comps {
+                    let refno = c.ref_no.trim();
+                    if !refno.is_empty() {
+                        set.insert(refno.to_string());
+                    }
+                }
+            }
+            resolved_model_refnos = set.into_iter().collect();
+        }
+    }
+    // 创建任务前上传（仅 formId）：已认证设计人员即可，claims 由 JWT 中间件保证存在
+
+    let resolved_form_id = match resolved_form_id {
+        Some(v) => v,
+        None => {
+            return attachment_error_response(
+                StatusCode::BAD_REQUEST,
+                "缺少 formId（且无法由 taskId 反查）".to_string(),
+                "review.attachments.validate_lineage",
+                started,
+                None,
+                trimmed_task_id.as_deref(),
+            );
+        }
+    };
+
+    let resolved_file_type = normalize_attachment_file_type(file_type.as_deref());
+
+    let resolved_description = description
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| file_name.clone());
+
+    // 生成附件 ID；存储文件名只使用附件 UUID + 规范化扩展名，原始文件名仅作显示元数据
+    let attachment_id = format!("att-{}", uuid::Uuid::new_v4());
+    let stored_name = format!("{}.{}", attachment_id, file_ext);
+    let file_ext_with_dot = format!(".{}", file_ext);
+    let resolved_mime = mime_type_for_extension(&file_ext);
+
+    // 确保上传目录存在
+    let upload_dir = "assets/review_attachments";
+    if let Err(e) = std::fs::create_dir_all(upload_dir) {
+        return attachment_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("创建上传目录失败: {}", e),
+            "review.attachments.mkdir",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
+        );
+    }
+
+    // 保存文件（校验全部通过后才落盘）
+    let file_path = format!("{}/{}", upload_dir, stored_name);
+    if let Err(e) = std::fs::write(&file_path, &file_data) {
+        return attachment_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("保存文件失败: {}", e),
+            "review.attachments.write_file",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
+        );
+    }
+
+    // 失败回滚：删除已写文件，避免孤儿文件
+    let rollback_file = |reason: &str| {
+        if let Err(remove_error) = std::fs::remove_file(&file_path) {
+            warn!(
+                "[REVIEW_API.upload_attachment] rollback file failed path={} reason={} remove_error={}",
+                file_path, reason, remove_error
+            );
+        }
+    };
+
+    let file_size = file_data.len() as i64;
+    let url = format!("/files/review_attachments/{}", stored_name);
+    let uploaded_at_millis = chrono::Utc::now().timestamp_millis();
+
+    let insert_sql = r#"
+        CREATE review_attachment CONTENT {
+            form_id: $form_id,
+            model_refnos: $model_refnos,
+            file_id: $file_id,
+            file_type: $file_type,
+            download_url: $download_url,
+            description: $description,
+            file_ext: $file_ext,
+            file_name: $file_name,
+            file_size: $file_size,
+            mime_type: $mime_type,
+            created_at: time::now()
+        }
+    "#;
+
+    if let Err(e) = await_review_query(
+        "review.attachments.insert",
+        db.query(insert_sql)
+            .bind(("form_id", resolved_form_id.clone()))
+            .bind(("model_refnos", resolved_model_refnos))
+            .bind(("file_id", attachment_id.clone()))
+            .bind(("file_type", resolved_file_type))
+            .bind(("download_url", url.clone()))
+            .bind(("description", resolved_description))
+            .bind(("file_ext", file_ext_with_dot))
+            .bind(("file_name", file_name.clone()))
+            .bind(("file_size", file_size))
+            .bind(("mime_type", resolved_mime.clone())),
+    )
+    .await
+    {
+        rollback_file("insert review_attachment failed");
+        return attachment_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("附件入库失败（已回滚文件）: {}", e),
+            "review.attachments.insert",
+            started,
+            Some(resolved_form_id.as_str()),
+            trimmed_task_id.as_deref(),
+        );
+    }
+
+    // 创建附件记录
+    let attachment = ReviewAttachment {
+        id: attachment_id.clone(),
+        name: file_name,
+        url,
+        size: Some(file_size),
+        mime_type: resolved_mime,
+        uploaded_at: Some(uploaded_at_millis),
+    };
+
+    // 上传到已有任务：同步 review_tasks.attachments 兼容投影
+    if let Some(task) = task_context.as_ref() {
+        if let Some(task_logical_id) = task
+            .logical_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut projected = task.attachments.clone().unwrap_or_default();
+            projected.retain(|item| item.id != attachment.id);
+            projected.push(attachment.clone());
+
+            if let Err(e) = await_review_query(
+                "review.attachments.project_to_task",
+                db.query(
+                    "UPDATE review_tasks SET attachments = $attachments, updated_at = time::now() \
+                     WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
+                )
+                .bind(("attachments", projected))
+                .bind(("id", task_logical_id.to_string())),
+            )
+            .await
+            {
+                // 投影失败时回滚附件行 + 文件，保持“上传成功=各处可见”的一致性
+                let _ = await_review_query(
+                    "review.attachments.insert_rollback",
+                    db.query("DELETE review_attachment WHERE file_id = $file_id")
+                        .bind(("file_id", attachment_id.clone())),
+                )
+                .await;
+                rollback_file("project to review_tasks.attachments failed");
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("附件任务投影更新失败（已回滚）: {}", e),
+                    "review.attachments.project_to_task",
+                    started,
+                    Some(resolved_form_id.as_str()),
+                    trimmed_task_id.as_deref(),
+                );
+            }
+        }
+    }
+
+    info!(
+        "[REVIEW_API.upload_attachment] OK id={} form_id={} task_id={:?} size={} elapsed_ms={}",
+        attachment_id,
+        resolved_form_id,
+        trimmed_task_id,
+        file_size,
+        started.elapsed().as_millis()
+    );
+
+    (
+        StatusCode::OK,
+        Json(AttachmentUploadResponse {
+            success: true,
+            attachment: Some(attachment),
+            error_message: None,
+        }),
+    )
+        .into_response()
+}
+
+/// DELETE /api/review/attachments/:attachment_id - 删除附件
+///
+/// 一致性删除：数据库记录 → review_tasks.attachments 投影 → 磁盘文件。
+/// 任一步失败返回明确错误，避免界面显示“已删除”但文件/记录仍残留。
+/// 权限：附件关联任务存在时，仅任务发起人且当前节点为 sj 可删除。
+async fn delete_attachment(
+    Extension(claims): Extension<TokenClaims>,
+    Path(attachment_id): Path<String>,
+) -> Response {
+    let started = std::time::Instant::now();
+    info!("Deleting attachment: {}", attachment_id);
+
+    let upload_dir = "assets/review_attachments";
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            return attachment_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("校审附件服务暂不可用（连接数据库超时）: {}", e),
+                "review.attachments.delete_connect",
+                started,
+                None,
+                None,
+            );
+        }
+    };
+
+    // 读取附件记录（扩展名来自数据库，不再依赖固定扩展名数组猜测）
+    #[derive(Debug, Deserialize, SurrealValue)]
+    struct AttachmentLookupRow {
+        file_ext: Option<String>,
+        form_id: Option<String>,
+    }
+
+    let attachment_row: Option<AttachmentLookupRow> = match await_review_query(
+        "review.attachments.delete_lookup",
+        db.query(
+            "SELECT file_ext, form_id FROM review_attachment WHERE file_id = $file_id LIMIT 1",
+        )
+        .bind(("file_id", attachment_id.clone())),
+    )
+    .await
+    {
+        Ok(mut resp) => {
+            let rows: Vec<AttachmentLookupRow> = resp.take(0).unwrap_or_default();
+            rows.into_iter().next()
+        }
+        Err(e) => {
+            return attachment_error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("校审附件服务暂不可用（附件查询超时）: {}", e),
+                "review.attachments.delete_lookup",
+                started,
+                None,
+                None,
+            );
+        }
+    };
+
+    let attachment_row = match attachment_row {
+        Some(row) => row,
+        None => {
+            return attachment_error_response(
+                StatusCode::NOT_FOUND,
+                format!("附件不存在或已删除: {}", attachment_id),
+                "review.attachments.delete_lookup",
+                started,
+                None,
+                None,
+            );
+        }
+    };
+
+    let form_id = attachment_row
+        .form_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // 附件关联任务存在时，强制执行编辑权限（仅发起人 + sj 节点）
+    let mut task_context: Option<AttachmentTaskContextRow> = None;
+    if let Some(fid) = form_id.as_deref() {
+        match await_review_query(
+            "review.attachments.delete_task_lookup",
+            db.query(ATTACHMENT_TASK_CONTEXT_BY_FORM_SQL)
+                .bind(("form_id", fid.to_string())),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<AttachmentTaskContextRow> = resp.take(0).unwrap_or_default();
+                task_context = rows.into_iter().next();
+            }
+            Err(e) => {
+                return attachment_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("校审附件服务暂不可用（任务查询超时）: {}", e),
+                    "review.attachments.delete_task_lookup",
+                    started,
+                    form_id.as_deref(),
+                    None,
+                );
+            }
+        }
+    }
+
+    if let Some(task) = task_context.as_ref() {
+        if let Some(reason) = attachment_edit_denied_reason(&claims, task) {
+            return attachment_error_response(
+                StatusCode::FORBIDDEN,
+                reason,
+                "review.attachments.delete_permission",
+                started,
+                form_id.as_deref(),
+                task.logical_id.as_deref(),
+            );
+        }
+    }
+
+    // 1) 删除数据库记录
+    if let Err(e) = await_review_query(
+        "review.attachments.delete",
+        db.query("DELETE review_attachment WHERE file_id = $file_id")
+            .bind(("file_id", attachment_id.clone())),
+    )
+    .await
+    {
+        return attachment_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("附件记录删除失败: {}", e),
+            "review.attachments.delete",
+            started,
+            form_id.as_deref(),
+            None,
+        );
+    }
+
+    // 2) 同步 review_tasks.attachments 投影（防止 hydrate 时从投影“复活”已删附件）
+    if let Some(task) = task_context.as_ref() {
+        if let Some(task_logical_id) = task
+            .logical_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let mut projected = task.attachments.clone().unwrap_or_default();
+            let before = projected.len();
+            projected.retain(|item| item.id != attachment_id);
+            if projected.len() != before {
+                if let Err(e) = await_review_query(
+                    "review.attachments.delete_project",
+                    db.query(
+                        "UPDATE review_tasks SET attachments = $attachments, updated_at = time::now() \
+                         WHERE record::id(id) = $id AND (deleted IS NONE OR deleted = false)",
+                    )
+                    .bind(("attachments", projected))
+                    .bind(("id", task_logical_id.to_string())),
+                )
+                .await
+                {
+                    return attachment_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "附件记录已删除，但任务附件投影更新失败，请刷新后重试: {}",
+                            e
+                        ),
+                        "review.attachments.delete_project",
+                        started,
+                        form_id.as_deref(),
+                        Some(task_logical_id),
+                    );
+                }
+            }
+        }
+    }
+
+    // 3) 删除磁盘文件：优先数据库记录的扩展名；缺失时按附件 ID 前缀扫描目录兜底
+    let mut file_paths_to_delete: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(ext) = attachment_row
+        .file_ext
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let normalized = ext.trim_start_matches('.');
+        file_paths_to_delete.push(
+            std::path::PathBuf::from(upload_dir).join(format!("{}.{}", attachment_id, normalized)),
+        );
+    } else if let Ok(entries) = std::fs::read_dir(upload_dir) {
+        let prefix = format!("{}.", attachment_id);
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .map(|name| name.starts_with(&prefix))
+                .unwrap_or(false)
+            {
+                file_paths_to_delete.push(entry.path());
+            }
+        }
+    }
+
+    let mut removed_any_file = false;
+    for path in &file_paths_to_delete {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            return attachment_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "附件记录已删除，但磁盘文件删除失败（{}）: {}",
+                    path.display(),
+                    e
+                ),
+                "review.attachments.delete_file",
+                started,
+                form_id.as_deref(),
+                None,
+            );
+        }
+        removed_any_file = true;
+    }
+
+    info!(
+        "[REVIEW_API.delete_attachment] OK id={} form_id={:?} removed_file={} elapsed_ms={}",
+        attachment_id,
+        form_id,
+        removed_any_file,
+        started.elapsed().as_millis()
+    );
+
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            success: true,
+            message: Some(if removed_any_file {
+                "附件已删除".to_string()
+            } else {
+                "附件记录已清除（磁盘文件不存在）".to_string()
+            }),
+            error_message: None,
+        }),
+    )
+        .into_response()
+}
+
+// ============================================================================
+// Handlers - 同步接口
+// ============================================================================
+
+/// 导出请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    pub task_ids: Option<Vec<String>>,
+    pub include_attachments: Option<bool>,
+    pub include_comments: Option<bool>,
+    pub include_records: Option<bool>,
+}
+
+/// 导出响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResponse {
+    pub success: bool,
+    pub tasks: Vec<ReviewTask>,
+    pub comments: Option<Vec<AnnotationComment>>,
+    pub records: Option<Vec<ConfirmedRecordWithMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// POST /api/review/sync/export - 导出校审数据
+async fn export_review_data(Json(request): Json<ExportRequest>) -> impl IntoResponse {
+    info!("Exporting review data");
+
+    let (sql, use_ids_param) = if let Some(ref ids) = request.task_ids {
+        if ids.is_empty() {
+            (
+                "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) ORDER BY created_at DESC LIMIT 100".to_string(),
+                false,
+            )
+        } else {
+            (
+                "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) AND record::id(id) IN $task_ids".to_string(),
+                true,
+            )
+        }
+    } else {
+        (
+            "SELECT * FROM review_tasks WHERE (deleted IS NONE OR deleted = false) ORDER BY created_at DESC LIMIT 100".to_string(),
+            false,
+        )
+    };
+
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for export: {}", e);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ExportResponse {
+                    success: false,
+                    tasks: vec![],
+                    comments: None,
+                    records: None,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let mut q = db.query(&sql);
+    if use_ids_param {
+        q = q.bind(("task_ids", request.task_ids.clone().unwrap_or_default()));
+    }
+
+    let tasks: Vec<ReviewTask> = match await_review_query("review.sync.export.tasks", q).await {
+        Ok(mut resp) => {
+            let rows: Vec<TaskRow> = resp.take(0).unwrap_or_default();
+            rows.into_iter().map(|r| r.to_review_task()).collect()
+        }
+        Err(e) => {
+            warn!("Failed to export tasks: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ExportResponse {
+                    success: false,
+                    tasks: vec![],
+                    comments: None,
+                    records: None,
+                    error_message: Some(format!("导出失败: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+
+    // 可选导出评论（当前评论不和 task_id 直接关联，这里按“全量导出”处理）
+    let include_comments = request.include_comments.unwrap_or(false);
+    let comments: Option<Vec<AnnotationComment>> = if include_comments {
+        #[derive(Debug, Deserialize, SurrealValue)]
+        struct CommentRow {
+            id: surrealdb::types::RecordId,
+            annotation_id: Option<String>,
+            annotation_type: Option<String>,
+            author_id: Option<String>,
+            author_name: Option<String>,
+            author_role: Option<String>,
+            content: Option<String>,
+            reply_to_id: Option<String>,
+            created_at: Option<surrealdb::types::Datetime>,
+        }
+
+        let sql = "SELECT * FROM review_comments ORDER BY created_at ASC LIMIT 10000";
+        match await_review_query_long("review.sync.export.comments", db.query(sql)).await {
+            Ok(mut resp) => {
+                let rows: Vec<CommentRow> = resp.take(0).unwrap_or_default();
+                Some(
+                    rows.into_iter()
+                        .map(|r| AnnotationComment {
+                            id: format!("{:?}", r.id.key),
+                            annotation_id: r.annotation_id.unwrap_or_default(),
+                            annotation_type: r.annotation_type.unwrap_or_default(),
+                            author_id: r.author_id.unwrap_or_default(),
+                            author_name: r.author_name.unwrap_or_default(),
+                            author_role: r.author_role.unwrap_or_default(),
+                            content: r.content.unwrap_or_default(),
+                            reply_to_id: r.reply_to_id,
+                            created_at: parse_datetime_value(&r.created_at),
+                        })
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                warn!("Failed to export comments: {}", e);
+                Some(vec![])
+            }
+        }
+    } else {
+        None
+    };
+
+    // 可选导出确认记录（按 task_id 过滤）
+    let include_records = request.include_records.unwrap_or(false);
+    let records: Option<Vec<ConfirmedRecordWithMeta>> = if include_records {
+        if task_ids.is_empty() {
+            Some(vec![])
+        } else {
+            let sql = "SELECT * FROM review_records WHERE task_id IN $task_ids ORDER BY confirmed_at ASC LIMIT 10000";
+            match await_review_query_long(
+                "review.sync.export.records",
+                db.query(sql).bind(("task_ids", task_ids)),
+            )
+            .await
+            {
+                Ok(mut resp) => {
+                    let rows: Vec<ReviewRecordRow> = resp.take(0).unwrap_or_default();
+                    Some(
+                        rows.into_iter()
+                            .map(confirmed_record_with_meta_from_row)
+                            .collect(),
+                    )
+                }
+                Err(e) => {
+                    warn!("Failed to export records: {}", e);
+                    Some(vec![])
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(ExportResponse {
+            success: true,
+            tasks,
+            comments,
+            records,
+            error_message: None,
+        }),
+    )
+}
+
+/// 导入请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportRequest {
+    pub tasks: Vec<ReviewTask>,
+    pub overwrite: Option<bool>,
+}
+
+/// 导入响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportResponse {
+    pub success: bool,
+    pub imported_count: i32,
+    pub skipped_count: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// POST /api/review/sync/import - 导入校审数据
+async fn import_review_data(Json(request): Json<ImportRequest>) -> impl IntoResponse {
+    info!("Importing {} review tasks", request.tasks.len());
+
+    let overwrite = request.overwrite.unwrap_or(false);
+    let mut imported = 0;
+    let mut skipped = 0;
+    let db = match fresh_review_db().await {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to connect review db for import: {}", e);
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ImportResponse {
+                    success: false,
+                    imported_count: 0,
+                    skipped_count: 0,
+                    error_message: Some(format!("连接校审数据库超时: {}", e)),
+                }),
+            );
+        }
+    };
+
+    for task in request.tasks {
+        // 检查任务是否已存在
+        let check_sql = "SELECT id FROM review_tasks WHERE record::id(id) = $id";
+        let exists = match await_review_query(
+            "review.sync.import.exists",
+            db.query(check_sql).bind(("id", task.id.clone())),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+                !rows.is_empty()
+            }
+            Err(_) => false,
+        };
+
+        if exists && !overwrite {
+            skipped += 1;
+            continue;
+        }
+
+        // 插入或更新任务
+        let sql = if exists {
+            r#"UPDATE review_tasks SET
+                title = $title,
+                description = $description,
+                status = $status,
+                priority = $priority,
+                form_id = $form_id,
+                current_node = $current_node,
+                updated_at = time::now()
+            WHERE record::id(id) = $id"#
+        } else {
+            r#"CREATE review_tasks SET
+                id = $id,
+                form_id = $form_id,
+                title = $title,
+                description = $description,
+                model_name = $model_name,
+                status = $status,
+                priority = $priority,
+                requester_id = $requester_id,
+                requester_name = $requester_name,
+                reviewer_id = $reviewer_id,
+                reviewer_name = $reviewer_name,
+                current_node = $current_node,
+                created_at = time::now(),
+                updated_at = time::now()"#
+        };
+
+        let result = await_review_query(
+            "review.sync.import.upsert_task",
+            db.query(sql)
+                .bind(("id", task.id.clone()))
+                .bind(("form_id", task.form_id.clone()))
+                .bind(("title", task.title.clone()))
+                .bind(("description", task.description.clone()))
+                .bind(("model_name", task.model_name.clone()))
+                .bind(("status", task.status.clone()))
+                .bind(("priority", task.priority.clone()))
+                .bind(("requester_id", task.requester_id.clone()))
+                .bind(("requester_name", task.requester_name.clone()))
+                .bind(("reviewer_id", task.reviewer_id.clone()))
+                .bind(("reviewer_name", task.reviewer_name.clone()))
+                .bind(("current_node", task.current_node.clone())),
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                if !task.form_id.trim().is_empty() {
+                    if let Err(error) = sync_review_form_with_task_status(
+                        task.form_id.as_str(),
+                        Some(task.model_name.as_str()),
+                        Some(task.requester_id.as_str()),
+                        "import_backfill",
+                        task.status.as_str(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to sync review_forms during import, form_id={}: {}",
+                            task.form_id, error
+                        );
+                    }
+                }
+
+                // 同步写入 review_form_model（用于 workflow/sync 汇总）
+                if !task.form_id.trim().is_empty() {
+                    for comp in &task.components {
+                        if comp.ref_no.trim().is_empty() {
+                            continue;
+                        }
+                        let _ = await_review_query(
+                            "review.form_model.backfill_import",
+                            db.query(
+                                r#"
+                                CREATE ONLY review_form_model SET
+                                    form_id = $form_id,
+                                    model_refno = $model_refno,
+                                    created_at = time::now()
+                                "#,
+                            )
+                            .bind(("form_id", task.form_id.clone()))
+                            .bind(("model_refno", comp.ref_no.clone())),
+                        )
+                        .await;
+                    }
+                }
+                imported += 1;
+            }
+            Err(e) => {
+                warn!("Failed to import task {}: {}", task.id, e);
+                skipped += 1;
+            }
+        }
+    }
+
+    info!(
+        "Import complete: {} imported, {} skipped",
+        imported, skipped
+    );
+
+    (
+        StatusCode::OK,
+        Json(ImportResponse {
+            success: true,
+            imported_count: imported,
+            skipped_count: skipped,
+            error_message: None,
+        }),
+    )
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{self, Body},
+        extract::Extension,
+        http::{Request, StatusCode},
+    };
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    use crate::web_api::jwt_auth::TokenClaims;
+
+    #[test]
+    fn test_get_next_node() {
+        assert_eq!(get_next_node("sj"), Some("jd"));
+        assert_eq!(get_next_node("jd"), Some("sh"));
+        assert_eq!(get_next_node("sh"), Some("pz"));
+        assert_eq!(get_next_node("pz"), None);
+        assert_eq!(get_next_node("unknown"), None);
+        assert_eq!(get_next_node(""), None);
+    }
+
+    #[test]
+    fn test_can_return_to() {
+        assert!(can_return_to("jd", "sj"));
+        assert!(can_return_to("sh", "sj"));
+        assert!(can_return_to("sh", "jd"));
+        assert!(can_return_to("pz", "sj"));
+        assert!(can_return_to("pz", "jd"));
+        assert!(can_return_to("pz", "sh"));
+
+        assert!(!can_return_to("sj", "jd"));
+        assert!(!can_return_to("sj", "sj"));
+        assert!(!can_return_to("jd", "sh"));
+        assert!(!can_return_to("jd", "jd"));
+        assert!(!can_return_to("unknown", "sj"));
+        assert!(!can_return_to("sj", "unknown"));
+    }
+
+    #[test]
+    fn test_get_node_display_name() {
+        assert_eq!(get_node_display_name("sj"), "编制");
+        assert_eq!(get_node_display_name("jd"), "校对");
+        assert_eq!(get_node_display_name("sh"), "审核");
+        assert_eq!(get_node_display_name("pz"), "批准");
+        assert_eq!(get_node_display_name("invalid"), "未知");
+    }
+
+    #[test]
+    fn test_workflow_nodes_order() {
+        assert_eq!(WORKFLOW_NODES, ["sj", "jd", "sh", "pz"]);
+        assert_eq!(WORKFLOW_NODES.len(), 4);
+    }
+
+    #[test]
+    fn test_default_values() {
+        assert_eq!(default_priority(), "medium");
+        assert_eq!(default_status(), "draft");
+        assert_eq!(default_current_node(), "sj");
+    }
+
+    #[test]
+    fn test_task_row_to_review_task_compat() {
+        let row = TaskRow {
+            id: surrealdb::types::RecordId {
+                table: "review_tasks".to_string().into(),
+                key: surrealdb::types::RecordIdKey::String("task-123".to_string()),
+            },
+            form_id: Some("form-456".to_string()),
+            title: Some("Test Task".to_string()),
+            description: None,
+            model_name: Some("Model A".to_string()),
+            status: Some("draft".to_string()),
+            priority: Some("high".to_string()),
+            requester_id: Some("user-1".to_string()),
+            requester_name: Some("张三".to_string()),
+            checker_id: None,
+            checker_name: None,
+            approver_id: Some("user-3".to_string()),
+            approver_name: Some("王五".to_string()),
+            reviewer_id: Some("user-2".to_string()),
+            reviewer_name: Some("李四".to_string()),
+            components: None,
+            attachments: None,
+            review_comment: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            current_node: Some("jd".to_string()),
+            workflow_history: None,
+            return_reason: None,
+        };
+
+        let task = row.to_review_task();
+
+        assert_eq!(task.id, "task-123");
+        assert_eq!(task.form_id, "form-456");
+        assert_eq!(task.title, "Test Task");
+        assert_eq!(task.model_name, "Model A");
+        assert_eq!(task.status, "draft");
+        assert_eq!(task.priority, "high");
+        assert_eq!(task.current_node, "jd");
+        // checker_id 为空时应回退到 reviewer_id
+        assert_eq!(task.checker_id, "user-2");
+        assert_eq!(task.checker_name, "李四");
+        assert_eq!(task.approver_id, "user-3");
+        assert_eq!(task.approver_name, "王五");
+        // reviewer 字段兼容
+        assert_eq!(task.reviewer_id, "user-2");
+        assert_eq!(task.reviewer_name, "李四");
+    }
+
+    #[test]
+    fn test_task_row_to_review_task_checker_preferred() {
+        let row = TaskRow {
+            id: surrealdb::types::RecordId {
+                table: "review_tasks".to_string().into(),
+                key: surrealdb::types::RecordIdKey::String("task-789".to_string()),
+            },
+            form_id: None,
+            title: Some("Task with checker".to_string()),
+            description: None,
+            model_name: None,
+            status: None,
+            priority: None,
+            requester_id: None,
+            requester_name: None,
+            checker_id: Some("checker-1".to_string()),
+            checker_name: Some("校核员".to_string()),
+            approver_id: Some("approver-1".to_string()),
+            approver_name: Some("审核员".to_string()),
+            reviewer_id: Some("old-reviewer".to_string()),
+            reviewer_name: Some("旧审核人".to_string()),
+            components: None,
+            attachments: None,
+            review_comment: None,
+            created_at: None,
+            updated_at: None,
+            due_date: None,
+            current_node: None,
+            workflow_history: None,
+            return_reason: None,
+        };
+
+        let task = row.to_review_task();
+
+        // checker_id 有值时优先使用
+        assert_eq!(task.checker_id, "checker-1");
+        assert_eq!(task.checker_name, "校核员");
+        assert_eq!(task.approver_id, "approver-1");
+        // reviewer 字段仍保留原值
+        assert_eq!(task.reviewer_id, "old-reviewer");
+        assert_eq!(task.reviewer_name, "旧审核人");
+        // 默认值回退
+        assert_eq!(task.status, "draft");
+        assert_eq!(task.priority, "medium");
+        assert_eq!(task.current_node, "sj");
+    }
+
+    #[test]
+    fn test_resolve_create_task_names_prefers_explicit_names_and_claim_user_name() {
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "designer_001".to_string(),
+            user_name: "张设计".to_string(),
+            role: Some("sj".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+        let request = CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: Some("checker-001".to_string()),
+            checker_name: Some("李校核".to_string()),
+            approver_id: Some("approver-001".to_string()),
+            approver_name: Some("王审核".to_string()),
+            reviewer_id: "reviewer-legacy".to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        };
+
+        let names = resolve_create_task_names(&claims, &request, "checker-001", "approver-001");
+
+        assert_eq!(names.requester_name, "张设计");
+        assert_eq!(names.checker_name, "李校核");
+        assert_eq!(names.approver_name, "王审核");
+        assert_eq!(names.reviewer_name, "李校核");
+    }
+
+    #[test]
+    fn test_resolve_create_task_names_falls_back_to_ids_when_names_missing() {
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "designer_001".to_string(),
+            user_name: "".to_string(),
+            role: Some("sj".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+        let request = CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: Some("checker-001".to_string()),
+            checker_name: Some("".to_string()),
+            approver_id: Some("approver-001".to_string()),
+            approver_name: None,
+            reviewer_id: "reviewer-legacy".to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        };
+
+        let names = resolve_create_task_names(&claims, &request, "checker-001", "approver-001");
+
+        assert_eq!(names.requester_name, "designer_001");
+        assert_eq!(names.checker_name, "checker-001");
+        assert_eq!(names.approver_name, "approver-001");
+        assert_eq!(names.reviewer_name, "checker-001");
+    }
+
+    fn create_task_request_for_assignee_tests(
+        checker_id: Option<&str>,
+        reviewer_id: &str,
+        approver_id: Option<&str>,
+    ) -> CreateTaskRequest {
+        CreateTaskRequest {
+            title: "Task".to_string(),
+            description: "".to_string(),
+            model_name: "Model".to_string(),
+            checker_id: checker_id.map(str::to_string),
+            checker_name: None,
+            approver_id: approver_id.map(str::to_string),
+            approver_name: None,
+            reviewer_id: reviewer_id.to_string(),
+            form_id: None,
+            priority: "medium".to_string(),
+            components: vec![],
+            due_date: None,
+            attachments: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_accepts_human_codes() {
+        let request = create_task_request_for_assignee_tests(Some("JH"), "", Some("SH"));
+
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::InternalStrict)
+            .expect("HumanCode assignees pass");
+
+        assert_eq!(assignees.checker_id, "JH");
+        assert_eq!(assignees.reviewer_id, "JH");
+        assert_eq!(assignees.approver_id, "SH");
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_legacy_internal_ids() {
+        let checker_request =
+            create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
+        let checker_error =
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+        assert!(checker_error.contains("PMS HumanCode"));
+
+        let approver_request =
+            create_task_request_for_assignee_tests(Some("JH"), "", Some("manager_001"));
+        let approver_error =
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+        assert!(approver_error.contains("PMS HumanCode"));
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_rejects_missing_required_assignees() {
+        let checker_request = create_task_request_for_assignee_tests(None, "", Some("SH"));
+        let checker_error =
+            resolve_create_task_assignees(&checker_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
+        assert!(checker_error.contains("checker_id"));
+
+        let approver_request = create_task_request_for_assignee_tests(Some("JH"), "", None);
+        let approver_error =
+            resolve_create_task_assignees(&approver_request, AssigneeValidation::InternalStrict)
+                .unwrap_err();
+        assert!(approver_error.contains("approver_id"));
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_defers_missing_form_id_draft_assignees() {
+        let request = create_task_request_for_assignee_tests(None, "", None);
+
+        let assignees =
+            resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
+                .expect("form_id draft can defer next-node assignees");
+
+        assert_eq!(assignees.checker_id, "");
+        assert_eq!(assignees.reviewer_id, "");
+        assert_eq!(assignees.approver_id, "");
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_drops_legacy_ids_for_form_id_draft() {
+        let request =
+            create_task_request_for_assignee_tests(Some("proofreader_001"), "", Some("SH"));
+
+        let assignees =
+            resolve_create_task_assignees(&request, AssigneeValidation::InternalDeferred)
+                .expect("form_id draft can ignore legacy placeholder assignees");
+
+        assert_eq!(assignees.checker_id, "");
+        assert_eq!(assignees.reviewer_id, "");
+        assert_eq!(assignees.approver_id, "SH");
+    }
+
+    #[test]
+    fn test_resolve_create_task_assignees_external_preserves_raw_ids() {
+        let request = create_task_request_for_assignee_tests(
+            Some("proofreader_001"),
+            "",
+            Some("manager_001"),
+        );
+
+        let assignees = resolve_create_task_assignees(&request, AssigneeValidation::External)
+            .expect("external workflow treats assignees as pass-through data");
+
+        assert_eq!(assignees.checker_id, "proofreader_001");
+        assert_eq!(assignees.reviewer_id, "proofreader_001");
+        assert_eq!(assignees.approver_id, "manager_001");
+    }
+
+    #[test]
+    fn test_review_task_from_value_falls_back_for_legacy_row_shapes() {
+        let raw = json!({
+            "id": { "tb": "review_tasks", "id": "task-legacy-1" },
+            "form_id": "FORM-LEGACY-001",
+            "title": "Legacy Task",
+            "description": "legacy payload",
+            "model_name": "Legacy Model",
+            "status": "submitted",
+            "priority": "medium",
+            "requester_id": "designer_001",
+            "requester_name": "Designer",
+            "checker_id": "user-002",
+            "checker_name": "Reviewer",
+            "approver_id": "manager_001",
+            "approver_name": "Manager",
+            "reviewer_id": "user-002",
+            "reviewer_name": "Reviewer",
+            "components": [
+                {
+                    "id": "comp-1",
+                    "name": "Pipe-1",
+                    "refNo": "17496_248588",
+                    "type": "pipe"
+                }
+            ],
+            "attachments": {
+                "legacy": true
+            },
+            "created_at": "2026-03-18T15:00:00Z",
+            "updated_at": "2026-03-18T15:01:00Z",
+            "current_node": "jd",
+            "workflow_history": "legacy-string-payload"
+        });
+
+        let task = review_task_from_value(raw).expect("legacy row should still normalize");
+
+        assert_eq!(task.id, "task-legacy-1");
+        assert_eq!(task.form_id, "FORM-LEGACY-001");
+        assert_eq!(task.requester_id, "designer_001");
+        assert_eq!(task.checker_id, "user-002");
+        assert_eq!(task.current_node, "jd");
+        assert_eq!(task.workflow_history.len(), 0);
+        assert!(task.created_at > 0);
+        assert!(task.updated_at >= task.created_at);
+    }
+
+    #[test]
+    fn test_review_tasks_from_values_keeps_pages_readable_when_one_row_is_legacy() {
+        let values = vec![
+            json!({
+                "id": { "tb": "review_tasks", "id": "task-good-1" },
+                "title": "Good Task",
+                "description": "ok",
+                "model_name": "Model A",
+                "status": "submitted",
+                "priority": "high",
+                "requester_id": "designer_001",
+                "requester_name": "Designer",
+                "checker_id": "user-002",
+                "checker_name": "Reviewer",
+                "approver_id": "manager_001",
+                "approver_name": "Manager",
+                "created_at": 1773845013517i64,
+                "updated_at": 1773845013518i64,
+                "current_node": "jd",
+                "components": [],
+                "workflow_history": []
+            }),
+            json!({
+                "id": { "tb": "review_tasks", "id": "task-legacy-2" },
+                "title": "Legacy Task",
+                "description": "legacy",
+                "model_name": "Model B",
+                "status": "draft",
+                "priority": "medium",
+                "requester_id": "designer_001",
+                "requester_name": "Designer",
+                "checker_id": "user-002",
+                "checker_name": "Reviewer",
+                "approver_id": "manager_001",
+                "approver_name": "Manager",
+                "created_at": "2026-03-18T15:00:00Z",
+                "updated_at": "2026-03-18T15:01:00Z",
+                "current_node": "sj",
+                "components": [],
+                "workflow_history": "legacy-string-payload"
+            }),
+        ];
+
+        let (tasks, parse_failures) = review_tasks_from_values(values);
+
+        assert_eq!(parse_failures, 0);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "task-good-1");
+        assert_eq!(tasks[1].id, "task-legacy-2");
+    }
+
+    #[test]
+    fn test_build_mock_review_users_matches_frontend_contract() {
+        let users = build_mock_review_users();
+        let ids = users
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&"SJ"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
+        assert!(ids.contains(&"PZ"));
+        assert!(!ids.contains(&"designer_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
+    }
+
+    #[test]
+    fn test_build_mock_reviewers_only_returns_review_capable_roles() {
+        let reviewers = build_mock_review_users()
+            .into_iter()
+            .filter(|user| {
+                matches!(
+                    user.role.as_str(),
+                    "proofreader" | "reviewer" | "manager" | "admin"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(reviewers.len(), 3);
+        assert!(reviewers.iter().all(|user| user.id != "SJ"));
+        assert!(reviewers.iter().any(|user| user.id == "JH"));
+        assert!(reviewers.iter().any(|user| user.id == "SH"));
+        assert!(reviewers.iter().any(|user| user.id == "PZ"));
+    }
+
+    #[test]
+    fn test_default_mock_user_matches_frontend_designer_contract() {
+        let user = default_mock_user();
+
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
+        assert_eq!(user.role, "designer");
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_returns_frontend_designer_contract_without_claims() {
+        let app = Router::new().route("/api/users/me", get(get_current_user));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "SJ");
+        assert_eq!(user.username, "SJ");
+        assert_eq!(user.role, "designer");
+    }
+
+    #[tokio::test]
+    async fn test_get_reviewers_returns_only_review_capable_users() {
+        let app = Router::new().route("/api/users/reviewers", get(get_reviewers));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/reviewers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserListResponse = serde_json::from_slice(&body).unwrap();
+        let ids = payload
+            .users
+            .iter()
+            .map(|user| user.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(payload.users.len(), 3);
+        assert!(!ids.contains(&"designer_001"));
+        assert!(!ids.contains(&"proofreader_001"));
+        assert!(!ids.contains(&"reviewer_001"));
+        assert!(!ids.contains(&"manager_001"));
+        assert!(ids.contains(&"JH"));
+        assert!(ids.contains(&"SH"));
+        assert!(ids.contains(&"PZ"));
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_maps_pz_claim_to_explicit_pz_user() {
+        let app = Router::new().route("/api/users/me", get(get_current_user));
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "PZ".to_string(),
+            user_name: "PZ批准人".to_string(),
+            role: Some("pz".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .extension(claims)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "PZ");
+        assert_eq!(user.username, "PZ");
+        assert_eq!(user.name, "陈经理");
+        assert_eq!(user.role, "manager");
+        assert_eq!(user.email, "pz@company.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_current_user_uses_token_claims_when_present() {
+        let app = Router::new().route("/api/users/me", get(get_current_user));
+        let claims = TokenClaims {
+            project_id: "project-123".to_string(),
+            user_id: "SH".to_string(),
+            user_name: "李审核员".to_string(),
+            role: Some("sh".to_string()),
+            workflow_mode: None,
+            legacy_form_id: None,
+            exp: 4_102_444_800,
+            iat: 1_704_067_200,
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users/me")
+                    .extension(claims)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: UserResponse = serde_json::from_slice(&body).unwrap();
+        let user = payload.user.expect("expected current user payload");
+
+        assert_eq!(user.id, "SH");
+        assert_eq!(user.username, "SH");
+        assert_eq!(user.name, "李审核员");
+        assert_eq!(user.role, "reviewer");
+        assert_eq!(user.email, "sh@company.com");
+    }
+
+    #[test]
+    fn test_confirmed_record_dimension_contract_is_camel_case_and_legacy_safe() {
+        let legacy: ConfirmedRecordData = serde_json::from_value(json!({
+            "taskId": "task-legacy",
+            "type": "batch",
+            "annotations": [],
+            "cloudAnnotations": [],
+            "rectAnnotations": [],
+            "obbAnnotations": [],
+            "measurements": [],
+            "note": ""
+        }))
+        .expect("legacy confirmed record request");
+        assert_eq!(legacy.dimension_document, None);
+        assert_eq!(legacy.dimension_document_base_version, 0);
+
+        let document = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc-1",
+            "records": []
+        });
+        let request: ConfirmedRecordData = serde_json::from_value(json!({
+            "taskId": "task-dimension",
+            "type": "batch",
+            "annotations": [],
+            "cloudAnnotations": [],
+            "rectAnnotations": [],
+            "obbAnnotations": [],
+            "measurements": [],
+            "dimensionDocument": document,
+            "dimensionDocumentBaseVersion": 4,
+            "note": ""
+        }))
+        .expect("dimension confirmed record request");
+        assert_eq!(request.dimension_document.as_ref(), Some(&document));
+        assert_eq!(request.dimension_document_base_version, 4);
+
+        let serialized = serde_json::to_value(request).expect("serialize confirmed record request");
+        assert_eq!(serialized.get("dimensionDocument"), Some(&document));
+        assert_eq!(
+            serialized
+                .get("dimensionDocumentBaseVersion")
+                .and_then(Value::as_u64),
+            Some(4)
+        );
+        assert!(serialized.get("dimension_document").is_none());
+    }
+
+    #[test]
+    fn test_dimension_document_version_plan_covers_create_update_stale_and_legacy_preserve() {
+        assert_eq!(
+            plan_dimension_document_version(false, None, true, 0),
+            Ok(DimensionDocumentVersionPlan::Create { next_version: 1 })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(1), true, 1),
+            Ok(DimensionDocumentVersionPlan::Update {
+                base_version: 1,
+                next_version: 2,
+            })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(2), true, 1),
+            Err(DimensionDocumentVersionConflict { latest_version: 2 })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, None, true, 0),
+            Ok(DimensionDocumentVersionPlan::Update {
+                base_version: 0,
+                next_version: 1,
+            })
+        );
+        assert_eq!(
+            plan_dimension_document_version(true, Some(7), false, 0),
+            Ok(DimensionDocumentVersionPlan::Preserve { version: 7 })
+        );
+    }
+
+    #[test]
+    fn test_dimension_document_changes_confirmed_record_snapshot_hash() {
+        let document_a = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc",
+            "records": [{ "id": "dimension-a" }]
+        });
+        let document_b = json!({
+            "schemaVersion": 1,
+            "documentId": "dimension-doc",
+            "records": [{ "id": "dimension-b" }]
+        });
+
+        let hash_a = build_confirmed_record_snapshot_hash(
+            "batch",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&document_a),
+            "",
+        );
+        let hash_b = build_confirmed_record_snapshot_hash(
+            "batch",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            Some(&document_b),
+            "",
+        );
+
+        assert_ne!(hash_a, hash_b);
+    }
+}

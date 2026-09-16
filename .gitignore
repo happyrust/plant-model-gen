@@ -1,0 +1,227 @@
+# ═══════════════════════════════════════════════════════════════
+# Build artifacts & binaries
+# ═══════════════════════════════════════════════════════════════
+/target/
+target/
+target-check/
+target-run-boolean*/
+target-run-debug-model/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# ═══════════════════════════════════════════════════════════════
+# IDE & OS
+# ═══════════════════════════════════════════════════════════════
+.idea/
+.DS_Store
+D:
+d:
+.ace-tool/
+.codegraph/
+rustc-ice-*.txt
+
+# ═══════════════════════════════════════════════════════════════
+# Node.js
+# ═══════════════════════════════════════════════════════════════
+node_modules/
+
+# ═══════════════════════════════════════════════════════════════
+# Python
+# ═══════════════════════════════════════════════════════════════
+__pycache__/
+*.pyc
+
+# ═══════════════════════════════════════════════════════════════
+# Database files
+# ═══════════════════════════════════════════════════════════════
+*.db
+*.sqlite*
+*.db-shm
+*.db-wal
+ams-8009-test.db
+ams-demo.db/
+ams-test.db/
+ams-8020.db
+ams-8021.db
+surreal-8010.kv
+data/test_db/
+data/surrealkv/
+data.rdb.kv
+data.rdb/
+# RocksDB 实例目录（验证/基线产物，用 db-data/run_*.ps1 重跑生成，勿入库）
+*.rdb/
+cmd/ams-8009-test.db/
+scripts/db/ams-8009-test.db/
+scripts/db/ams-demo.db/
+
+# Generated admin site runtime, configs, logs, and local secrets
+/runtime/admin_sites/
+
+# SurrealKV
+db-data/*.skv
+db-data/version-test.skv/
+.surreal.pid
+*.pid
+
+# ═══════════════════════════════════════════════════════════════
+# Assets & model output
+# ═══════════════════════════════════════════════════════════════
+/assets/
+/asset/
+models/
+output/
+test_output/
+final.obj
+*.obj
+*.3dm
+*.xkt
+*.cache
+all_attr_info.json
+
+# ═══════════════════════════════════════════════════════════════
+# Logs & temporary files
+# ═══════════════════════════════════════════════════════════════
+logs/
+*.log
+*.log.*
+debug_*.log
+failed_sql_batch_*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+tmp/
+temp/
+.cache/
+nul
+/.tmp*
+/target_*/
+/target-*/
+/=ro
+/=ro&immutable=1
+
+# Local verification and packaged runtime output
+/runtime/*
+!/runtime/admin_verify/
+!/runtime/admin_verify/**
+!/runtime/local-collab/
+!/runtime/local-collab/**
+# local-collab 里只留配置与启动器；工程副本 / sqlite / 输出都由
+# ../plant-collab-monitor/scripts/local-remote-collab-setup.ps1 重新生成
+/runtime/local-collab/*/project/
+/runtime/local-collab/*/output/
+/runtime/local-collab/*/*.sqlite*
+
+# ═══════════════════════════════════════════════════════════════
+# External binaries & tools
+# ═══════════════════════════════════════════════════════════════
+aios-database.exe
+mqtt-server.exe
+simple-http-server.exe
+simple_grpc
+web_server
+aios-database
+web-test/
+rumqttd-server/
+tools/surrealdb/
+!/src/web_server/
+
+# ═══════════════════════════════════════════════════════════════
+# PDMS IO
+# ═══════════════════════════════════════════════════════════════
+/pdms-io/
+watcher.json
+accel_tree.bin
+
+# ═══════════════════════════════════════════════════════════════
+# External repos & deploy
+# ═══════════════════════════════════════════════════════════════
+docs.surrealdb.com/
+external/rs-core/
+# 仅忽略仓库根下 deploy/（勿写 deploy/，否则会误匹配 shells/deploy/）
+/deploy/
+
+# ═══════════════════════════════════════════════════════════════
+# Archives
+# ═══════════════════════════════════════════════════════════════
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# ═══════════════════════════════════════════════════════════════
+# Generated JSON & traces
+# ═══════════════════════════════════════════════════════════════
+*.json
+!/Cargo.lock
+!/.vscode/*.json
+!/verification/*.json
+!web_console/tsconfig*.json
+!gen-model.code-workspace
+!verification/**/*.json
+chrome_trace_*.json
+
+# ═══════════════════════════════════════════════════════════════
+# Frontend
+# ═══════════════════════════════════════════════════════════════
+frontend/v0-aios-database-management/.next
+npm-cache
+
+# ═══════════════════════════════════════════════════════════════
+# Worktrees
+# ═══════════════════════════════════════════════════════════════
+.worktrees/
+worktrees/
+
+# ═══════════════════════════════════════════════════════════════
+# DB options temp
+# ═══════════════════════════════════════════════════════════════
+db_options/_tmp/
+
+target_check
+# Release build artifacts
+release-build/
+target-debug-24381/
+.cursor/rules/*.bak.*
+.memory/
+history.txt
+
+# 本地测试产物 / 计划草稿
+artifacts/
+.cursor/plans/
+.plannotator/
+
+# ═══════════════════════════════════════════════════════════════
+# AI Agent 工具配置 / 会话过程数据（非项目源码，各工具自行生成）
+# ═══════════════════════════════════════════════════════════════
+/.factory/
+/.trellis/
+/.specify/
+/.agents/
+/.agent/
+/.context/
+/.planning/
+/goals/
+/garden-gpt-image-2/
+/evidence/
+
+# 一次性调试脚本与验证截图（非可复用测试基线）
+/debug_scripts/
+/.ida_scratch/
+/.codex-tmp/
+/verification/*.png
+/verification/**/*.png
+
+# KC-Chat 运行时产物（插件自动生成，请勿入库）
+.cursor/mcp.json
+.cursor/kc-mcp/
+.cursor/kc-mcp-messages/
+.cursor/kc-chat-exports/
+# Added by code-review-graph
+.code-review-graph/

@@ -1,0 +1,2509 @@
+//! CSG 几何体网格生成模块
+//!
+//! 本模块提供基于 CSG（Constructive Solid Geometry）的几何体网格生成功能，包括：
+//! - 实例网格生成（使用 Manifold 库）
+//! - 包围盒（AABB）更新
+//! - 布尔运算处理
+//! - SQLite 空间索引优化支持
+
+use crate::fast_model::export_model::export_glb::export_single_mesh_to_glb;
+use crate::fast_model::gen_model::mesh_state::{
+    flush_aabb_cache, get_cached_or_local_aabb, mesh_exists, mesh_file_exists_in_dir,
+    use_file_mesh_state,
+};
+use crate::fast_model::gen_model::model_record_id::model_refno_id;
+use crate::fast_model::manifold_bool::{
+    apply_cata_neg_boolean_manifold, apply_insts_boolean_manifold,
+};
+use crate::fast_model::query_compat::{query_deep_neg_inst_refnos, query_deep_visible_inst_refnos};
+use crate::fast_model::{EXIST_MESH_GEO_HASHES, utils};
+use crate::fast_model::{debug_model, debug_model_debug, debug_model_warn};
+use crate::options::{DbOptionExt, MeshFormat};
+use crate::{batch_update_err, db_err, deser_err, log_err, query_err};
+use aios_core::SurrealQueryExt;
+use aios_core::accel_tree::acceleration_tree::RStarBoundingBox;
+use aios_core::error::{init_deserialize_error, init_query_error, init_save_database_error};
+use aios_core::geometry::csg::{GeneratedMesh, generate_csg_mesh};
+use aios_core::mesh_precision::MeshPrecisionSettings;
+use aios_core::options::DbOption;
+use aios_core::parsed_data::geo_params_data::PdmsGeoParam;
+use aios_core::shape::pdms_shape::{PlantMesh, RsVec3};
+use aios_core::tool::float_tool::{dvec4_round_3, f64_round};
+use aios_core::{
+    RecordId, RefU64, RefnoEnum, gen_aabb_hash, get_inst_relate_keys, project_primary_db,
+    utils::RecordIdExt,
+};
+use aios_core::{get_db_option, init_test_surreal};
+// 导入几何查询相关的结构体和方法
+use aios_core::{
+    CataNegGroup, GeoParam, GmGeoData, ManiGeoTransQuery, NegInfo, ParamNegInfo, QueryGeoParam,
+    query_geo_params, query_inst_geo_ids,
+};
+// 使用 aios_core 中查询方法的宏
+use aios_core::Transform;
+use aios_core::geometry::ShapeInstancesData;
+use aios_core::query_db;
+use anyhow::anyhow;
+use chrono;
+use dashmap::{DashMap, DashSet};
+use glam::DMat4;
+use itertools::Itertools;
+use log::info;
+use parry3d::bounding_volume::*;
+use parry3d::math::Isometry;
+use parse_pdms_db::parse::round_f32;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use surrealdb::types as surrealdb_types;
+use surrealdb::types::SurrealValue;
+
+/// Mesh Worker 执行报告（可观测容错）
+#[derive(Debug, Clone)]
+pub struct MeshWorkerReport {
+    /// 接收到的批次总数
+    pub batch_count: usize,
+    /// 实际处理（生成 mesh）的几何体数
+    pub total_processed: usize,
+    /// 去重跳过的几何体数
+    pub total_skipped: usize,
+    /// 执行的 DB 更新批次数
+    pub db_update_batches: usize,
+    /// DB 更新失败的批次数
+    pub db_update_failed_batches: usize,
+    /// DB 更新失败涉及的语句数
+    pub db_update_failed_statements: usize,
+    /// 总耗时（毫秒）
+    pub elapsed_ms: u128,
+    /// 是否发生过可恢复降级（DB 写入失败等）
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InstGeoWorkItem {
+    geo_id: RecordId,
+    refno: Option<RefnoEnum>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[surreal(crate = "surrealdb_types")]
+struct PendingInstGeoRow {
+    refno: Option<RefnoEnum>,
+    geo_id: RecordId,
+}
+
+impl MeshWorkerReport {
+    fn new() -> Self {
+        Self {
+            batch_count: 0,
+            total_processed: 0,
+            total_skipped: 0,
+            db_update_batches: 0,
+            db_update_failed_batches: 0,
+            db_update_failed_statements: 0,
+            elapsed_ms: 0,
+            degraded: false,
+        }
+    }
+
+    /// 打印统一 summary
+    pub fn print_summary(&self) {
+        let status = if self.degraded {
+            "⚠️  DEGRADED"
+        } else {
+            "✅ OK"
+        };
+        println!(
+            "╔════════════════════════════════════════╗\n\
+             ║  [mesh_worker_channel] Report  {}  ║\n\
+             ╠════════════════════════════════════════╣\n\
+             ║  处理总数:       {:>8}              ║\n\
+             ║  去重跳过:       {:>8}              ║\n\
+             ║  总批次:         {:>8}              ║\n\
+             ║  DB 更新批次:    {:>8}              ║\n\
+             ║  DB 失败批次:    {:>8}              ║\n\
+             ║  DB 失败语句:    {:>8}              ║\n\
+             ║  总耗时:         {:>8} ms            ║\n\
+             ╚════════════════════════════════════════╝",
+            status,
+            self.total_processed,
+            self.total_skipped,
+            self.batch_count,
+            self.db_update_batches,
+            self.db_update_failed_batches,
+            self.db_update_failed_statements,
+            self.elapsed_ms,
+        );
+    }
+}
+
+/// 并发安全去重器：基于 DashSet 实现，无需外部锁
+///
+/// 所有方法均为 `&self`，可在多个 tokio task 间共享而无需 Mutex。
+pub struct RecentGeoDeduper {
+    set: DashSet<u64>,
+    /// 累计插入（新增）次数
+    pub insert_count: AtomicUsize,
+    /// 累计重复命中次数
+    pub duplicate_count: AtomicUsize,
+}
+
+impl RecentGeoDeduper {
+    pub fn new(_capacity: usize) -> Self {
+        Self {
+            set: DashSet::new(),
+            insert_count: AtomicUsize::new(0),
+            duplicate_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// 尝试插入。返回 true 表示新增（未重复），false 表示重复。
+    /// 并发安全，无需外部锁。
+    pub fn insert(&self, value: u64) -> bool {
+        if !self.set.insert(value) {
+            self.duplicate_count.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.insert_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// 批量预加载已知 ID（不计入 insert_count）
+    pub fn preload(&self, ids: impl IntoIterator<Item = u64>) {
+        for id in ids {
+            self.set.insert(id);
+        }
+    }
+
+    /// 获取当前去重集大小
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+/// 从已预加载的 AABB 缓存中获取 mesh geo ID（u64），用于预加载去重器。
+/// 不再扫描磁盘上的 glb 文件。
+pub fn query_existing_meshed_inst_geo_ids() -> Vec<u64> {
+    let start = std::time::Instant::now();
+    let mesh_dir = aios_core::get_db_option().get_meshes_path();
+    let mut ids: Vec<u64> = EXIST_MESH_GEO_HASHES
+        .iter()
+        .filter_map(|kv| {
+            let geo_hash = kv.key().parse::<u64>().ok()?;
+            mesh_file_exists_in_dir(&mesh_dir, geo_hash).then_some(geo_hash)
+        })
+        .collect();
+
+    ids.sort_unstable();
+    ids.dedup();
+
+    debug_model!(
+        "📂 从 AABB 缓存预加载完成: {} 个当前磁盘存在的唯一 geo hash, 耗时 {} ms",
+        ids.len(),
+        start.elapsed().as_millis(),
+    );
+    ids
+}
+
+/// SQL flush 阈值
+const MAX_UPDATE_STMTS_PER_FLUSH: usize = 200;
+const MAX_UPDATE_SQL_BYTES: usize = 512 * 1024;
+
+/// 将累积的 UPDATE 语句 flush 到 SurrealDB，返回 (成功, 失败语句数)
+async fn flush_update_stmts(stmts: &mut Vec<String>, report: &mut MeshWorkerReport) {
+    if stmts.is_empty() {
+        return;
+    }
+    let stmt_count = stmts.len();
+    let sql = stmts.join("");
+    stmts.clear();
+
+    report.db_update_batches += 1;
+    match project_primary_db().query(&sql).await {
+        Ok(_) => {}
+        Err(e) => {
+            report.db_update_failed_batches += 1;
+            report.db_update_failed_statements += stmt_count;
+            report.degraded = true;
+            let preview: String = sql.chars().take(500).collect();
+            eprintln!(
+                "[mesh_worker_channel] DB flush 失败: {} 条语句, error={}, sql_preview={}",
+                stmt_count, e, preview
+            );
+        }
+    }
+}
+
+/// 检查是否需要 flush（达到语句数或字节数阈值）
+fn should_flush(stmts: &[String]) -> bool {
+    if stmts.len() >= MAX_UPDATE_STMTS_PER_FLUSH {
+        return true;
+    }
+    let total_bytes: usize = stmts.iter().map(|s| s.len()).sum();
+    total_bytes >= MAX_UPDATE_SQL_BYTES
+}
+
+/// 内存直传的 Mesh 生成任务（无需查 DB）
+#[derive(Debug, Clone)]
+pub struct MeshTask {
+    /// inst_geo 的唯一 ID（去重 key，对应 EleInstGeo.geo_hash）
+    pub geo_hash: u64,
+    /// 几何参数（直接用于 CSG 生成）
+    pub geo_param: PdmsGeoParam,
+    /// 是否为负实体（负实体 mesh 存入 neg/ 子目录）
+    pub is_neg: bool,
+}
+
+/// 单个 geo_hash 的 mesh 生成结果
+///
+/// 用于在 mesh 生成完成后，将结果合并到 inst_geo 的 INSERT 语句中，
+/// 消除先 INSERT 再 UPDATE meshed 的两步写入竞态。
+#[derive(Debug, Clone)]
+pub struct MeshResult {
+    pub meshed: bool,
+    pub bad: bool,
+    pub aabb_hash: Option<u64>,
+    pub pts_hashes: Vec<u64>,
+}
+
+impl MeshResult {
+    /// 生成失败时的默认结果
+    pub fn failed() -> Self {
+        Self {
+            meshed: true,
+            bad: true,
+            aabb_hash: None,
+            pts_hashes: vec![],
+        }
+    }
+
+    /// 生成 UPDATE inst_geo SQL（供向后兼容的 channel worker 使用）
+    pub fn to_update_sql(&self, geo_hash: &str) -> String {
+        if self.bad {
+            return format!("UPDATE inst_geo:⟨{}⟩ SET bad=true, meshed=true;", geo_hash);
+        }
+        let aabb_part = self
+            .aabb_hash
+            .map(|h| format!(", aabb = aabb:⟨{}⟩", h))
+            .unwrap_or_default();
+        let pts_part = if self.pts_hashes.is_empty() {
+            String::new()
+        } else {
+            let refs: Vec<String> = self
+                .pts_hashes
+                .iter()
+                .map(|h| format!("vec3:⟨{}⟩", h))
+                .collect();
+            format!(", pts=[{}]", refs.join(","))
+        };
+        format!(
+            "update inst_geo:⟨{}⟩ set meshed = true{}{};",
+            geo_hash, aabb_part, pts_part
+        )
+    }
+
+    /// 生成 inst_geo INSERT JSON 中的 mesh 附加字段片段
+    ///
+    /// 返回如 `,'meshed':true,'aabb':aabb:⟨hash⟩,'pts':[vec3:⟨...⟩]`
+    pub fn to_insert_fields(&self) -> String {
+        let mut s = format!(", 'meshed': {}", self.meshed);
+        if self.bad {
+            s.push_str(", 'bad': true");
+        }
+        if let Some(h) = self.aabb_hash {
+            s.push_str(&format!(", 'aabb': aabb:⟨{}⟩", h));
+        }
+        if !self.pts_hashes.is_empty() {
+            let refs: Vec<String> = self
+                .pts_hashes
+                .iter()
+                .map(|h| format!("vec3:⟨{}⟩", h))
+                .collect();
+            s.push_str(&format!(", 'pts': [{}]", refs.join(",")));
+        }
+        s
+    }
+}
+
+/// 从 ShapeInstancesData 中提取 MeshTask 列表
+///
+/// 遍历 `inst_geos_map`，收集每个 `EleInstGeo` 的 `(geo_hash, geo_param)`。
+/// 只取 `geo_param` 非默认值的记录（等价于 DB 中 `param != NONE`）。
+pub fn extract_mesh_tasks(data: &ShapeInstancesData) -> Vec<MeshTask> {
+    let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+    for inst_geo_data in data.inst_geos_map.values() {
+        for inst in &inst_geo_data.insts {
+            if matches!(inst.geo_param, PdmsGeoParam::Unknown) {
+                continue;
+            }
+            if seen.insert(inst.geo_hash) {
+                tasks.push(MeshTask {
+                    geo_hash: inst.geo_hash,
+                    geo_param: inst.geo_param.clone(),
+                    is_neg: inst.is_neg(),
+                });
+            }
+        }
+    }
+    tasks
+}
+
+/// 批量生成一组 MeshTask 的 mesh，返回 geo_hash → MeshResult 映射
+///
+/// 在 insert_handle 中内联调用，mesh 完成后再将结果合并到 inst_geo 的 INSERT 中，
+/// 消除先 INSERT 再 UPDATE meshed 的竞态。
+///
+/// `deduper` / `aabb_map` / `pts_json_map` 跨批次共享，由调用方持有。
+pub async fn generate_meshes_for_batch(
+    tasks: &[MeshTask],
+    db_option: &DbOption,
+    deduper: &RecentGeoDeduper,
+    aabb_map: &Arc<DashMap<String, Aabb>>,
+    pts_json_map: &Arc<DashMap<u64, String>>,
+) -> HashMap<u64, MeshResult> {
+    let mesh_dir = db_option.get_meshes_path();
+    let precision = db_option.mesh_precision().clone();
+    let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
+
+    let lod_dir = mesh_dir.join(format!("lod_{:?}", precision.default_lod));
+    let manifold_dir = mesh_dir.join("manifold");
+    let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+
+    let mut results = HashMap::new();
+    let mut skipped_by_cache = 0usize;
+    let (new_tasks, deduped_hashes) = dedup_classify_tasks(tasks, deduper);
+
+    for geo_hash in deduped_hashes {
+        // 第一层去重：跨批次内存去重命中后，仅做缓存/本地文件判断，不再执行 CSG。
+        if let Some(cached) = get_cached_or_local_aabb(geo_hash) {
+            let h = gen_aabb_hash(&cached);
+            aabb_map.entry(h.to_string()).or_insert(cached);
+            results.insert(
+                geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: Some(h),
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+        } else if mesh_exists(geo_hash) {
+            results.insert(
+                geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: None,
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+        }
+    }
+
+    for task in new_tasks {
+        // 第二层去重：检查预加载缓存（EXIST_MESH_GEO_HASHES）
+        // 如果该 geo_hash 的 mesh 文件已存在，跳过 CSG 生成；有 AABB 则复用，无则仅标记已完成
+        if let Some(cached) = get_cached_or_local_aabb(task.geo_hash) {
+            let h = gen_aabb_hash(&cached);
+            aabb_map.entry(h.to_string()).or_insert(cached);
+            results.insert(
+                task.geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: Some(h),
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+            continue;
+        }
+        if mesh_exists(task.geo_hash) {
+            results.insert(
+                task.geo_hash,
+                MeshResult {
+                    meshed: true,
+                    bad: false,
+                    aabb_hash: None,
+                    pts_hashes: vec![],
+                },
+            );
+            skipped_by_cache += 1;
+            continue;
+        }
+
+        let mesh_id = task.geo_hash.to_string();
+        let geo_type_name = task.geo_param.type_name();
+        let profile = precision.profile_for_geo(geo_type_name);
+        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let lod_settings = profile.csg_settings;
+        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+
+        let geo_param_for_mesh = if task.geo_param.is_reuse_unit() {
+            task.geo_param.to_unit_param()
+        } else {
+            task.geo_param.clone()
+        };
+
+        let mr = match generate_csg_mesh(
+            &geo_param_for_mesh,
+            &lod_settings,
+            non_scalable_geo,
+            false,
+            None,
+        ) {
+            Some(csg_mesh) => {
+                match handle_csg_mesh(
+                    &lod_dir,
+                    &manifold_dir,
+                    &mesh_id,
+                    &mesh_filename,
+                    csg_mesh,
+                    aabb_map,
+                    pts_json_map,
+                    &inst_aabb_map,
+                    &mesh_formats,
+                    task.is_neg,
+                )
+                .await
+                {
+                    Ok(mr) => mr,
+                    Err(e) => {
+                        debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                        MeshResult::failed()
+                    }
+                }
+            }
+            None => {
+                debug_model_warn!(
+                    "CSG mesh 返回 None for {} (type={})",
+                    mesh_id,
+                    geo_type_name
+                );
+                MeshResult::failed()
+            }
+        };
+
+        results.insert(task.geo_hash, mr);
+    }
+
+    if skipped_by_cache > 0 {
+        debug_model_debug!(
+            "[mesh_batch] 跳过已缓存: {} / 总计: {} / 新生成: {}",
+            skipped_by_cache,
+            tasks.len(),
+            results.len() - skipped_by_cache
+        );
+    }
+
+    results
+}
+
+/// Phase 1: 使用 deduper 进行分类，避免长时间持锁。
+///
+/// 返回两个集合：
+/// - `new_tasks`: 需要执行 CSG 的任务
+/// - `deduped_hashes`: 本批次内已去重命中的 geo_hash
+pub fn dedup_classify_tasks(
+    tasks: &[MeshTask],
+    deduper: &RecentGeoDeduper,
+) -> (Vec<MeshTask>, HashSet<u64>) {
+    let mut new_tasks = Vec::new();
+    let mut deduped_hashes = HashSet::new();
+
+    for task in tasks {
+        if deduper.insert(task.geo_hash) {
+            new_tasks.push(task.clone());
+        } else {
+            deduped_hashes.insert(task.geo_hash);
+        }
+    }
+
+    (new_tasks, deduped_hashes)
+}
+
+/// 在数据库中生成网格模型并更新包围盒
+///
+/// 该函数按批次处理参考号，依次执行：
+/// 1. 生成实例网格文件
+/// 2. 更新实例关联的包围盒数据
+///
+/// # 参数
+///
+/// * `option` - 数据库选项，包含网格路径、精度设置等配置
+/// * `refnos` - 需要处理的参考号数组
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示执行是否成功
+pub async fn gen_meshes_in_db(
+    option: Option<Arc<DbOption>>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    let replace_exist = false; // replace_exist 已废弃，覆盖模式由 pre_cleanup_for_regen 替代
+    // let time = std::time::Instant::now();
+    let dir = option
+        .as_ref()
+        .map(|x| x.get_meshes_path())
+        .unwrap_or("assets/meshes".into());
+
+    // Check if the directory exists, if not, create it
+    if !std::path::Path::new(&dir).exists() {
+        std::fs::create_dir_all(&dir)?;
+    }
+    let precision = Arc::new(
+        option
+            .as_ref()
+            .map(|opt| opt.mesh_precision().clone())
+            .unwrap_or_else(|| get_db_option().mesh_precision().clone()),
+    );
+    for chunk in refnos.chunks(100) {
+        // 生成模型文件
+        gen_inst_meshes(
+            &dir,
+            &precision,
+            chunk,
+            replace_exist,
+            &[MeshFormat::PdmsMesh],
+        )
+        .await
+        .unwrap();
+        // println!(
+        //     "gen_inst_meshes finished: {} ms",
+        //     time.elapsed().as_millis()
+        // );
+    }
+    Ok(())
+}
+
+/// 查询需要执行 catalog 级布尔运算的实例列表
+async fn query_pending_cata_boolean(
+    limit: usize,
+    replace_exist: bool,
+    scope_refnos: Option<&[RefnoEnum]>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    if let Some(scope_refnos) = scope_refnos {
+        if scope_refnos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pending = Vec::new();
+        for chunk in scope_refnos.chunks(200) {
+            if pending.len() >= limit {
+                break;
+            }
+            let pe_keys = chunk.iter().map(|r| r.to_pe_key()).join(",");
+            let filter_booled = if replace_exist {
+                String::new()
+            } else {
+                "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = []"
+                    .to_string()
+            };
+            let sql = format!(
+                r#"SELECT VALUE in
+FROM [{pe_keys}]->inst_relate
+WHERE has_cata_neg = true
+  {filter_booled}
+LIMIT {limit};"#,
+            );
+            let rows: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await?;
+            pending.extend(rows);
+        }
+        pending.truncate(limit);
+        return Ok(pending);
+    }
+
+    let filter_booled = if replace_exist {
+        String::new()
+    } else {
+        // 非覆盖模式下：跳过已成功写入 inst_relate_cata_bool 的实例，避免重复计算
+        // 子查询无记录时返回 []，直接判断 = [] 即可；[] = NONE 为假会错误排除本应保留的行
+        "AND (SELECT status FROM $parent.out->inst_relate_cata_bool WHERE status = 'Success' LIMIT 1) = []"
+            .to_string()
+    };
+
+    let sql = format!(
+        r#"SELECT VALUE in
+	FROM inst_relate
+	WHERE has_cata_neg = true
+	  {filter_booled}
+	LIMIT {limit};"#,
+    );
+
+    let refnos: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await?;
+    Ok(refnos)
+}
+
+/// 扫描关系表，提取指向正实体的目标 refno（去重后返回）
+async fn query_relation_targets(table: &str) -> anyhow::Result<Vec<RefnoEnum>> {
+    let sql = format!(
+        r#"SELECT VALUE out
+FROM {table}
+GROUP BY out;"#
+    );
+    let refnos: Vec<RefnoEnum> = project_primary_db().query_take(&sql, 0).await?;
+    Ok(refnos)
+}
+
+/// 聚合 neg_relate 与 ngmr_relate 的目标集合（去重）
+async fn query_relation_targets_combined() -> anyhow::Result<HashSet<RefnoEnum>> {
+    let neg_targets = query_relation_targets("neg_relate").await?;
+    let ngmr_targets = query_relation_targets("ngmr_relate").await?;
+    let mut candidates: HashSet<RefnoEnum> = HashSet::new();
+    candidates.extend(neg_targets.iter().copied());
+    candidates.extend(ngmr_targets.iter().copied());
+
+    println!(
+        "[boolean_worker] 关系扫描: neg_targets={} ngmr_targets={} unique_targets={}",
+        neg_targets.len(),
+        ngmr_targets.len(),
+        candidates.len()
+    );
+
+    Ok(candidates)
+}
+
+fn apply_boolean_scope_filter(
+    candidates: &mut HashSet<RefnoEnum>,
+    scope_refnos: Option<&[RefnoEnum]>,
+) {
+    let Some(scope_refnos) = scope_refnos else {
+        return;
+    };
+    let scope: HashSet<RefnoEnum> = scope_refnos.iter().copied().collect();
+    candidates.retain(|refno| scope.contains(refno));
+    println!(
+        "[boolean_worker] scoped relation filter: scope={} remaining_targets={}",
+        scope.len(),
+        candidates.len()
+    );
+}
+
+/// 查询需要执行实例级布尔运算的实例列表
+///
+/// 直接从 neg_relate/ngmr_relate 的 out 字段获取目标，不依赖 inst_relate_aabb
+/// 因为某些元素（如 STWALL）没有自己的几何体但需要被切割
+///
+/// - replace_exist=true: 返回所有候选，忽略已处理状态（强制重新布尔）
+/// - replace_exist=false: 过滤掉已成功处理的，避免重复计算
+async fn query_pending_inst_boolean(
+    limit: usize,
+    replace_exist: bool,
+    candidates: &HashSet<RefnoEnum>,
+) -> anyhow::Result<Vec<RefnoEnum>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 覆盖模式：直接返回所有候选，忽略已处理状态
+    if replace_exist {
+        let pending: Vec<RefnoEnum> = candidates.iter().copied().take(limit).collect();
+        return Ok(pending);
+    }
+
+    // 非覆盖模式：过滤掉已成功处理的
+    const CHUNK_SIZE: usize = 200;
+
+    let candidates_vec: Vec<RefnoEnum> = candidates.iter().copied().collect();
+    let mut pending: Vec<RefnoEnum> = Vec::new();
+
+    for chunk in candidates_vec.chunks(CHUNK_SIZE) {
+        if pending.len() >= limit {
+            break;
+        }
+
+        let chunk_keys = chunk
+            .iter()
+            .map(|r| r.to_pe_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT VALUE refno FROM inst_relate_bool WHERE refno IN [{}] AND status = 'Success';",
+            chunk_keys
+        );
+
+        let success_refnos: Vec<RefnoEnum> = project_primary_db()
+            .query_take(&sql, 0)
+            .await
+            .unwrap_or_default();
+
+        let success_set: HashSet<RefnoEnum> = success_refnos.into_iter().collect();
+
+        for candidate in chunk {
+            if !success_set.contains(candidate) {
+                pending.push(*candidate);
+            }
+        }
+    }
+
+    pending.truncate(limit);
+    Ok(pending)
+}
+
+/// 查询需要生成 mesh 的 inst_geo 记录的 id
+/// db 模式条件：meshed = false, param != NONE, bad != true
+/// file 模式条件：param != NONE, bad != true，再按本地 mesh 存在性过滤
+/// 返回 inst_geo 的 id 列表（geo_hash）
+async fn query_pending_mesh_geo_ids(
+    limit: usize,
+    replace_exist: bool,
+) -> anyhow::Result<Vec<RecordId>> {
+    if use_file_mesh_state() {
+        let sql = format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {}",
+            limit
+        );
+        let ids: Vec<RecordId> = project_primary_db().query_take(&sql, 0).await?;
+        let filtered = if replace_exist {
+            ids
+        } else {
+            ids.into_iter()
+                .filter(|id| !mesh_exists(id.to_mesh_id().parse::<u64>().unwrap_or(0)))
+                .collect()
+        };
+        return Ok(filtered);
+    }
+
+    // 注意：这里的查询用于“状态收敛式”的 worker（replace_exist=false）。
+    // replace_exist=true 会走“快照遍历”分支，避免反复扫描相同的前 N 条记录。
+    let sql = if replace_exist {
+        format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {}",
+            limit
+        )
+    } else {
+        format!(
+            "SELECT value id FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true ORDER BY id LIMIT {}",
+            limit
+        )
+    };
+
+    let ids: Vec<RecordId> = project_primary_db().query_take(&sql, 0).await?;
+    Ok(ids)
+}
+
+/// 查询待处理 mesh 的总数（不限制数量）
+async fn query_total_pending_mesh_count(replace_exist: bool) -> anyhow::Result<usize> {
+    if use_file_mesh_state() {
+        let sql = "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id"
+            .to_string();
+        let ids: Vec<RecordId> = project_primary_db().query_take(&sql, 0).await?;
+        let count = if replace_exist {
+            ids.len()
+        } else {
+            ids.into_iter()
+                .filter(|id| !mesh_exists(id.to_mesh_id().parse::<u64>().unwrap_or(0)))
+                .count()
+        };
+        return Ok(count);
+    }
+
+    let sql = if replace_exist {
+        "SELECT VALUE count() FROM inst_geo WHERE param != NONE AND bad != true GROUP ALL"
+            .to_string()
+    } else {
+        "SELECT VALUE count() FROM inst_geo WHERE meshed != true AND param != NONE AND bad != true GROUP ALL".to_string()
+    };
+
+    let counts: Vec<i64> = project_primary_db().query_take(&sql, 0).await?;
+    Ok(counts.first().copied().unwrap_or(0) as usize)
+}
+
+/// replace_exist=true 时，先按分页“快照”收集需要处理的 inst_geo ids，避免循环中重复扫描同一批数据。
+async fn snapshot_mesh_geo_ids_for_replace(batch_size: usize) -> anyhow::Result<Vec<RecordId>> {
+    let mut all: Vec<RecordId> = Vec::new();
+    let mut start = 0usize;
+
+    loop {
+        // SurrealQL 分页：START + LIMIT，配合 ORDER BY 保证稳定性。
+        // 说明：此阶段只做“读取快照”，避免后续生成过程中 bad/meshed 更新影响分页结果。
+        let sql = format!(
+            "SELECT value id FROM inst_geo WHERE param != NONE AND bad != true ORDER BY id LIMIT {} START {}",
+            batch_size, start
+        );
+
+        let mut page: Vec<RecordId> = project_primary_db().query_take(&sql, 0).await?;
+        if page.is_empty() {
+            break;
+        }
+        start += page.len();
+        all.append(&mut page);
+    }
+
+    Ok(all)
+}
+
+async fn query_candidate_inst_geo_ids_for_refnos(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<Vec<PendingInstGeoRow>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const CHUNK_SIZE: usize = 200;
+    let mut rows = Vec::new();
+
+    for chunk in refnos.chunks(CHUNK_SIZE) {
+        let inst_relate_keys = chunk
+            .iter()
+            .map(|refno| model_refno_id("inst_relate", *refno))
+            .join(",");
+        let sql = format!(
+            r#"
+            SELECT
+                in as refno,
+                record::id(out) as geo_id
+            FROM [{inst_relate_keys}]
+            WHERE out != NONE
+              AND visible
+              AND out.param != NONE
+              AND out.bad != true;
+            "#
+        );
+        let mut chunk_rows: Vec<PendingInstGeoRow> =
+            project_primary_db().query_take(&sql, 0).await?;
+        rows.append(&mut chunk_rows);
+    }
+
+    Ok(rows)
+}
+
+/// 基于 inst_geo 状态的 Mesh 生成 Worker（已废弃）
+///
+/// 按批次扫描需要生成 mesh 的 inst_geo 记录，直接基于 geo_id 生成网格。
+///
+/// **已废弃**：请使用 [`run_mesh_worker_from_channel`]，该函数通过内存数据直传
+/// 避免了 DB 轮询，与 insert_handle 并行执行，性能更优。
+#[deprecated(note = "使用 run_mesh_worker_from_channel 替代，避免 DB 轮询")]
+pub async fn run_mesh_worker(db_option: Arc<DbOption>, batch_size: usize) -> anyhow::Result<()> {
+    let batch_size = batch_size.max(1);
+    let replace_exist = false; // replace_exist 已废弃
+    let mut round = 0usize;
+    let mut total_processed = 0usize;
+    let mut stalled_rounds = 0usize;
+    let mut last_pending: Option<HashSet<String>> = None;
+
+    // 获取 mesh 生成所需的配置
+    let mesh_dir = db_option.get_meshes_path();
+    if !mesh_dir.exists() {
+        std::fs::create_dir_all(&mesh_dir)?;
+    }
+
+    let precision = db_option.mesh_precision().clone();
+    let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
+
+    // 性能优化：启动前扫描 meshes 目录预加载已有 geo hash 到内存，避免后续重复生成。
+    crate::fast_model::preload_mesh_cache();
+
+    // 🔥 查询待处理的总数，用于显示进度
+    let total_count = query_total_pending_mesh_count(replace_exist).await?;
+    println!(
+        "╔════════════════════════════════════════╗\n\
+         ║  [mesh_worker] 开始处理 Mesh 生成      ║\n\
+         ╠════════════════════════════════════════╣\n\
+         ║  待处理总数: {:>8}                  ║\n\
+         ║  批次大小:   {:>8}                  ║\n\
+         ║  替换模式:   {:>8}                  ║\n\
+         ╚════════════════════════════════════════╝",
+        total_count, batch_size, replace_exist
+    );
+
+    if total_count == 0 {
+        println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+        return Ok(());
+    }
+
+    let worker_start = std::time::Instant::now();
+
+    // replace_exist=true：不能用“状态收敛式扫描”，否则会反复拿到相同的前 N 条记录，表现为“死循环”。
+    // 这里改为“快照遍历”：先收集一份 ids 列表，再分批处理一遍即可。
+    if replace_exist {
+        let all_geo_ids = snapshot_mesh_geo_ids_for_replace(batch_size).await?;
+        let total_count = all_geo_ids.len();
+
+        if total_count == 0 {
+            println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+            return Ok(());
+        }
+
+        for chunk in all_geo_ids.chunks(batch_size) {
+            round += 1;
+
+            let progress_pct = if total_count > 0 {
+                (total_processed as f64 / total_count as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+
+            println!(
+                "[mesh_worker] 📊 进度: [{}/{}] ({:.1}%) | 轮次 {} | 本批 {} 个 (replace snapshot)",
+                total_processed,
+                total_count,
+                progress_pct,
+                round,
+                chunk.len()
+            );
+
+            let t = std::time::Instant::now();
+            gen_inst_meshes_by_geo_ids(&mesh_dir, &precision, chunk, &mesh_formats).await?;
+            println!(
+                "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
+                round,
+                chunk.len(),
+                t.elapsed().as_millis()
+            );
+
+            total_processed += chunk.len();
+        }
+
+        let total_time = worker_start.elapsed();
+        let avg_speed = if total_time.as_secs() > 0 {
+            total_processed as f64 / total_time.as_secs_f64()
+        } else {
+            total_processed as f64
+        };
+
+        println!(
+            "╔════════════════════════════════════════╗\n\
+             ║  [mesh_worker] Mesh 生成完成           ║\n\
+             ╠════════════════════════════════════════╣\n\
+             ║  处理总数:   {:>8}                  ║\n\
+             ║  总轮次:     {:>8}                  ║\n\
+             ║  总耗时:     {:>8} ms              ║\n\
+             ║  平均速度:   {:>8.1} 个/秒          ║\n\
+             ╚════════════════════════════════════════╝",
+            total_processed,
+            round,
+            total_time.as_millis(),
+            avg_speed
+        );
+
+        return Ok(());
+    }
+
+    loop {
+        let round_start = std::time::Instant::now();
+        let pending_geo_ids = query_pending_mesh_geo_ids(batch_size, replace_exist).await?;
+
+        let pending: HashSet<_> = pending_geo_ids.iter().map(|id| id.to_raw()).collect();
+
+        if pending.is_empty() {
+            println!("[mesh_worker] 没有待处理 mesh 任务，退出");
+            break;
+        }
+
+        // 检测是否卡住（连续多轮处理相同的 geo_ids）
+        if let Some(prev) = &last_pending {
+            if *prev == pending {
+                stalled_rounds += 1;
+            } else {
+                stalled_rounds = 0;
+            }
+        }
+        last_pending = Some(pending.clone());
+
+        round += 1;
+
+        // 🔥 计算并显示进度
+        let progress_pct = if total_count > 0 {
+            (total_processed as f64 / total_count as f64 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        println!(
+            "[mesh_worker] 📊 进度: [{}/{}] ({:.1}%) | 轮次 {} | 本批 {} 个",
+            total_processed,
+            total_count,
+            progress_pct,
+            round,
+            pending_geo_ids.len()
+        );
+
+        if !pending_geo_ids.is_empty() {
+            let t = std::time::Instant::now();
+            // 直接基于 geo_ids 生成 mesh
+            gen_inst_meshes_by_geo_ids(&mesh_dir, &precision, &pending_geo_ids, &mesh_formats)
+                .await?;
+
+            println!(
+                "[mesh_worker] ✅ 轮次 {} 完成: {} 个，用时 {} ms",
+                round,
+                pending_geo_ids.len(),
+                t.elapsed().as_millis()
+            );
+        }
+
+        total_processed += pending_geo_ids.len();
+
+        // 如果连续3轮 pending 集合未变化，可能卡住了
+        if stalled_rounds >= 3 {
+            let sample: Vec<_> = pending.iter().take(5).cloned().collect();
+            if replace_exist {
+                // replace_exist=true 时 stall 是预期的（已处理的记录会再次被查询到）
+                println!(
+                    "[mesh_worker] replace_exist=true 模式下检测到 stall，已完成 {} 个，退出",
+                    total_processed
+                );
+                break;
+            } else {
+                return Err(anyhow!(
+                    "[mesh_worker] 连续 {} 轮 pending 集合未变化，疑似卡住；示例 geo_id: {:?}",
+                    stalled_rounds + 1,
+                    sample
+                ));
+            }
+        }
+    }
+
+    let total_time = worker_start.elapsed();
+    let avg_speed = if total_time.as_secs() > 0 {
+        total_processed as f64 / total_time.as_secs_f64()
+    } else {
+        total_processed as f64
+    };
+
+    println!(
+        "╔════════════════════════════════════════╗\n\
+         ║  [mesh_worker] Mesh 生成完成           ║\n\
+         ╠════════════════════════════════════════╣\n\
+         ║  处理总数:   {:>8}                  ║\n\
+         ║  总轮次:     {:>8}                  ║\n\
+         ║  总耗时:     {:>8} ms              ║\n\
+         ║  平均速度:   {:>8.1} 个/秒          ║\n\
+         ╚════════════════════════════════════════╝",
+        total_processed,
+        round,
+        total_time.as_millis(),
+        avg_speed
+    );
+
+    Ok(())
+}
+
+// [foyer-removal] cache-only mesh worker 函数已禁用
+/*
+pub async fn run_mesh_worker_from_cache_manager(
+    cache_manager: &crate::fast_model::instance_cache::InstanceCacheManager,
+    mesh_dir: &Path,
+    precision: &MeshPrecisionSettings,
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<usize> { unimplemented!() }
+
+pub async fn run_mesh_worker_from_cache(
+    cache_dir: &Path,
+    mesh_dir: &Path,
+    precision: &MeshPrecisionSettings,
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<usize> { unimplemented!() }
+*/
+
+/// 基于 Channel 的 Mesh 生成 Worker（内存数据驱动，无 DB 轮询）
+///
+/// 从 `flume::Receiver<Vec<MeshTask>>` 接收 mesh 任务，直接使用内存中的几何参数
+/// 调用 `generate_csg_mesh` 生成网格，无需查询数据库获取 param。
+///
+/// 去重：内部维护 `RecentGeoDeduper`（有界 200,000）跟踪已处理的 `geo_hash`，跳过重复任务。
+///
+/// 容错：DB 更新失败属于"可恢复错误"，计数并置 `degraded=true`，继续后续批次。
+/// 目录创建失败等"不可恢复错误"仍返回 `Err`。
+pub async fn run_mesh_worker_from_channel(
+    receiver: flume::Receiver<Vec<MeshTask>>,
+    db_option: Arc<DbOption>,
+    sql_writer: Option<Arc<super::sql_file_writer::SqlFileWriter>>,
+) -> anyhow::Result<MeshWorkerReport> {
+    let deferred = sql_writer.is_some();
+    let use_file_state = use_file_mesh_state();
+    let mesh_dir = db_option.get_meshes_path();
+    if !mesh_dir.exists() {
+        std::fs::create_dir_all(&mesh_dir)?;
+    }
+
+    let precision = db_option.mesh_precision().clone();
+    let mesh_formats = crate::options::get_db_option_ext().mesh_formats.clone();
+
+    crate::fast_model::preload_mesh_cache();
+
+    let lod_dir = mesh_dir.join(format!("lod_{:?}", precision.default_lod));
+    if !lod_dir.exists() {
+        std::fs::create_dir_all(&lod_dir)?;
+    }
+
+    let manifold_dir = mesh_dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
+    }
+
+    let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+    let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+    let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+
+    let deduper = RecentGeoDeduper::new(200_000);
+    let mut report = MeshWorkerReport::new();
+    let worker_start = std::time::Instant::now();
+
+    println!(
+        "╔════════════════════════════════════════╗\n\
+         ║  [mesh_worker_channel] 开始处理 Mesh   ║\n\
+         ║  模式: Manifold-first（manifold 单独目录）║\n\
+         ╚════════════════════════════════════════╝"
+    );
+
+    while let Ok(tasks) = receiver.recv_async().await {
+        report.batch_count += 1;
+        let batch_start = std::time::Instant::now();
+        let mut batch_new = 0usize;
+        let mut update_stmts: Vec<String> = Vec::new();
+
+        for task in &tasks {
+            if !deduper.insert(task.geo_hash) {
+                report.total_skipped += 1;
+                continue;
+            }
+
+            let geo_type_name = task.geo_param.type_name();
+            let profile = precision.profile_for_geo(geo_type_name);
+            let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+            let mesh_id = task.geo_hash.to_string();
+            let lod_settings = profile.csg_settings;
+            let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+
+            let geo_param_for_mesh = if task.geo_param.is_reuse_unit() {
+                task.geo_param.to_unit_param()
+            } else {
+                task.geo_param.clone()
+            };
+
+            let mesh_result = match generate_csg_mesh(
+                &geo_param_for_mesh,
+                &lod_settings,
+                non_scalable_geo,
+                false,
+                None,
+            ) {
+                Some(csg_mesh) => {
+                    match handle_csg_mesh(
+                        &lod_dir,
+                        &manifold_dir,
+                        &mesh_id,
+                        &mesh_filename,
+                        csg_mesh,
+                        &aabb_map,
+                        &pts_json_map,
+                        &inst_aabb_map,
+                        &mesh_formats,
+                        task.is_neg,
+                    )
+                    .await
+                    {
+                        Ok(mr) => mr,
+                        Err(e) => {
+                            debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                            MeshResult::failed()
+                        }
+                    }
+                }
+                None => {
+                    debug_model_warn!(
+                        "CSG mesh 返回 None for {} (type={})",
+                        mesh_id,
+                        geo_type_name
+                    );
+                    MeshResult::failed()
+                }
+            };
+
+            if !use_file_state {
+                update_stmts.push(mesh_result.to_update_sql(&mesh_id));
+            }
+            batch_new += 1;
+
+            // 检查阈值，满足则立即 flush
+            if should_flush(&update_stmts) {
+                if let Some(ref sw) = sql_writer {
+                    let _ = sw.write_statements(&update_stmts);
+                    update_stmts.clear();
+                } else {
+                    flush_update_stmts(&mut update_stmts, &mut report).await;
+                }
+            }
+        }
+
+        // batch 结束后 final flush
+        if use_file_state {
+            update_stmts.clear();
+        } else if let Some(ref sw) = sql_writer {
+            let _ = sw.write_statements(&update_stmts);
+            update_stmts.clear();
+        } else {
+            flush_update_stmts(&mut update_stmts, &mut report).await;
+        }
+
+        report.total_processed += batch_new;
+
+        println!(
+            "[mesh_worker_channel] 📊 批次 {} | 新增 {} 个 | 跳过 {} | 累计 {} | 用时 {} ms",
+            report.batch_count,
+            batch_new,
+            report.total_skipped,
+            report.total_processed,
+            batch_start.elapsed().as_millis()
+        );
+    }
+
+    // 保存 aabb 和 pts 数据
+    if use_file_state {
+        flush_aabb_cache();
+    } else if let Some(ref sw) = sql_writer {
+        // defer 模式：将 INSERT IGNORE 写入 .surql 文件
+        // aabb
+        if !aabb_map.is_empty() {
+            let keys: Vec<String> = aabb_map.iter().map(|kv| kv.key().clone()).collect();
+            for chunk in keys.chunks(300) {
+                let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                for k in chunk {
+                    let v = aabb_map.get(k).unwrap();
+                    let d = serde_json::to_string(v.value()).unwrap();
+                    let id_key = if k.starts_with("aabb:") {
+                        k.to_string()
+                    } else {
+                        format!("aabb:⟨{}⟩", k)
+                    };
+                    rows.push(format!("{{'id':{id_key}, 'd':{d}}}"));
+                }
+                let sql = format!("INSERT IGNORE INTO aabb [{}]", rows.join(","));
+                let _ = sw.write_statement(&sql);
+            }
+        }
+        // vec3
+        if !pts_json_map.is_empty() {
+            let keys: Vec<u64> = pts_json_map.iter().map(|kv| *kv.key()).collect();
+            for chunk in keys.chunks(100) {
+                let mut rows: Vec<String> = Vec::with_capacity(chunk.len());
+                for &k in chunk {
+                    let v = pts_json_map.get(&k).unwrap();
+                    rows.push(format!("{{'id':vec3:⟨{}⟩, 'd':{}}}", k, v.value()));
+                }
+                let sql = format!("INSERT IGNORE INTO vec3 [{}]", rows.join(","));
+                let _ = sw.write_statement(&sql);
+            }
+        }
+        println!(
+            "[mesh_worker_channel] deferred: aabb={} pts={} 条写入 .surql",
+            aabb_map.len(),
+            pts_json_map.len()
+        );
+    } else {
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    }
+
+    report.elapsed_ms = worker_start.elapsed().as_millis();
+
+    // 打印去重器统计
+    let dup = deduper
+        .duplicate_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if dup > 0 {
+        println!(
+            "[mesh_worker_channel] 去重器统计: 新增={}, 重复={}",
+            deduper
+                .insert_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dup
+        );
+    }
+
+    report.print_summary();
+
+    Ok(report)
+}
+
+/// 基于 inst_relate 状态的布尔运算 Worker
+///
+/// 扫描需要布尔运算的实例（catalog & 实例级），只执行一次。
+/// 注意：此函数应在 mesh_worker 完成后调用，确保所有 mesh 已生成。
+/// file 模式以本地 GLB + aabb_cache.rkyv 为前置状态源；db 模式仍兼容历史查询口径。
+pub async fn run_boolean_worker(
+    db_option: Arc<DbOption>,
+    batch_size: usize,
+    scope_refnos: Option<&[RefnoEnum]>,
+) -> anyhow::Result<()> {
+    let batch_size = batch_size.max(1);
+    let replace_exist = false; // replace_exist 已废弃
+    let mut relation_targets = query_relation_targets_combined().await?;
+    apply_boolean_scope_filter(&mut relation_targets, scope_refnos);
+
+    let start = std::time::Instant::now();
+
+    // 查询所有待处理的布尔任务
+    let cata_refnos = query_pending_cata_boolean(batch_size, replace_exist, scope_refnos).await?;
+    let inst_refnos =
+        query_pending_inst_boolean(batch_size, replace_exist, &relation_targets).await?;
+
+    if cata_refnos.is_empty() && inst_refnos.is_empty() {
+        println!("[boolean_worker] 没有待处理布尔任务");
+        return Ok(());
+    }
+
+    println!(
+        "[boolean_worker] 待处理: catalog={} inst={}",
+        cata_refnos.len(),
+        inst_refnos.len()
+    );
+
+    // 执行 catalog 级布尔运算
+    if !cata_refnos.is_empty() {
+        let t = std::time::Instant::now();
+        booleans_meshes_in_db(Some(db_option.clone()), &cata_refnos).await?;
+        println!(
+            "[boolean_worker] catalog 布尔完成: {} 个，用时 {} ms",
+            cata_refnos.len(),
+            t.elapsed().as_millis()
+        );
+    }
+
+    // 执行实例级布尔运算
+    if !inst_refnos.is_empty() {
+        let t = std::time::Instant::now();
+        booleans_meshes_in_db(Some(db_option.clone()), &inst_refnos).await?;
+        println!(
+            "[boolean_worker] inst 布尔完成: {} 个，用时 {} ms",
+            inst_refnos.len(),
+            t.elapsed().as_millis()
+        );
+    }
+
+    let total = cata_refnos.len() + inst_refnos.len();
+    println!(
+        "[boolean_worker] 布尔运算完成: 共处理 {} 个，用时 {} ms",
+        total,
+        start.elapsed().as_millis()
+    );
+
+    Ok(())
+}
+
+///执行布尔运算的部分
+pub async fn booleans_meshes_in_db(
+    option: Option<Arc<DbOption>>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    let replace_exist = false; // replace_exist 已废弃
+
+    for chunk in refnos.chunks(100) {
+        apply_cata_neg_boolean_manifold(chunk, replace_exist).await?;
+        apply_insts_boolean_manifold(chunk, replace_exist).await?;
+    }
+    Ok(())
+}
+
+/// 处理网格并更新数据库
+///
+/// # 参数
+/// * `option` - 数据库选项，包含网格路径和是否替换现有网格等配置
+/// * `refnos` - 需要处理的引用号列表
+///
+/// # 返回值
+/// * `anyhow::Result<()>` - 执行结果
+pub async fn process_meshes_update_db(
+    option: Option<Arc<DbOption>>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    let replace_exist = false; // replace_exist 已废弃
+    let time = std::time::Instant::now();
+    let dir = option
+        .as_ref()
+        .map(|x| x.get_meshes_path())
+        .unwrap_or("assets/meshes".into());
+    let precision = Arc::new(
+        option
+            .as_ref()
+            .map(|opt| opt.mesh_precision().clone())
+            .unwrap_or_else(|| get_db_option().mesh_precision().clone()),
+    );
+    // dbg!(&target_refnos);
+    // 生成模型文件
+    gen_inst_meshes(
+        &dir,
+        &precision,
+        &refnos,
+        replace_exist,
+        &[MeshFormat::PdmsMesh],
+    )
+    .await
+    .unwrap();
+    println!(
+        "gen_inst_meshes finished: {} ms",
+        time.elapsed().as_millis()
+    );
+
+    apply_cata_neg_boolean_manifold(&refnos, replace_exist).await?;
+    apply_insts_boolean_manifold(&refnos, replace_exist).await?;
+
+    Ok(())
+}
+
+/// BRAN 专用的网格处理函数
+///
+/// BRAN 类型不需要：
+/// - 查找子节点（没有 deep 遍历）
+/// - 布尔运算（没有负实体计算）
+///
+/// # 参数
+/// * `option` - 数据库选项
+/// * `refnos` - BRAN 类型的 refno 列表
+#[cfg_attr(
+    feature = "profile",
+    tracing::instrument(skip_all, name = "process_meshes_bran")
+)]
+pub async fn process_meshes_bran(
+    option: Option<Arc<DbOptionExt>>,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+
+    let replace_exist = false; // replace_exist 已废弃
+    let time = std::time::Instant::now();
+    let dir = option
+        .as_ref()
+        .map(|x| Path::new(x.inner.meshes_path.as_deref().unwrap_or("assets/meshes")).to_path_buf())
+        .unwrap_or_else(|| "assets/meshes".into());
+    let precision = option
+        .as_ref()
+        .map(|opt| opt.inner.mesh_precision.clone())
+        .unwrap_or_else(|| {
+            crate::options::get_db_option_ext()
+                .inner
+                .mesh_precision
+                .clone()
+        });
+    let mesh_formats = option
+        .as_ref()
+        .map(|opt| opt.mesh_formats.clone())
+        .unwrap_or_else(|| crate::options::get_db_option_ext().mesh_formats.clone());
+
+    // 生成模型文件
+    gen_inst_meshes(&dir, &precision, &refnos, replace_exist, &mesh_formats).await?;
+    println!(
+        "[BRAN] gen_inst_meshes finished: {} ms",
+        time.elapsed().as_millis()
+    );
+
+    // BRAN 不需要布尔运算，直接返回
+    Ok(())
+}
+
+/// 使用默认数据库选项更新深层模型网格数据
+///
+/// # 参数
+///
+/// * `refnos` - 参考号数组
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示更新是否成功
+pub async fn process_meshes_update_db_deep_default(refnos: &[RefnoEnum]) -> anyhow::Result<()> {
+    let dboption = crate::options::get_db_option_ext();
+    process_meshes_update_db_deep(&dboption, refnos).await
+}
+
+/// 使用指定数据库选项更新深层模型网格数据
+///
+/// # 参数
+///
+/// * `dboption` - 数据库选项
+/// * `refnos` - 参考号数组
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示更新是否成功
+pub async fn process_meshes_update_db_deep(
+    dboption: &DbOptionExt,
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<()> {
+    if !refnos.is_empty() {
+        // 确保 mesh根目录存在
+        let dir = Path::new(
+            dboption
+                .inner
+                .meshes_path
+                .as_deref()
+                .unwrap_or("assets/meshes"),
+        )
+        .to_path_buf();
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+        }
+
+        let precision = &dboption.inner.mesh_precision;
+        let replace_exist = false; // replace_exist 已废弃
+        let mesh_formats = &dboption.mesh_formats;
+        println!("📊 更新模型结点数量: {}", refnos.len());
+        let time = std::time::Instant::now();
+
+        for (idx, &refno) in refnos.iter().enumerate() {
+            println!(
+                "\n🔄 [{}/{}] 处理模型结点: {}",
+                idx + 1,
+                refnos.len(),
+                refno
+            );
+
+            // 使用 match 来捕获错误并继续处理其他 refno
+            let result: anyhow::Result<()> = async {
+                let mut target_visible_refnos = vec![];
+                let mut update_refnos =
+                    query_deep_visible_inst_refnos(refno).await.map_err(|e| {
+                        eprintln!("⚠️  查询可见实例失败 (refno: {}): {}", refno, e);
+                        e
+                    })?;
+                target_visible_refnos.extend(update_refnos.clone());
+
+                let neg_refnos = query_deep_neg_inst_refnos(refno).await.map_err(|e| {
+                    eprintln!("⚠️  查询负实例失败 (refno: {}): {}", refno, e);
+                    e
+                })?;
+                update_refnos.extend(neg_refnos.clone());
+
+                if update_refnos.is_empty() {
+                    println!("跳过空的 update_refnos for refno: {}", refno);
+                    return Ok(());
+                }
+
+                println!("  📦 实际需要更新模型结点数量: {}", update_refnos.len());
+
+                if dboption.gen_mesh {
+                    // 生成模型文件
+                    let mesh_time = std::time::Instant::now();
+                    gen_inst_meshes(&dir, precision, &update_refnos, replace_exist, mesh_formats)
+                        .await
+                        .map_err(|e| {
+                            eprintln!("❌ gen_inst_meshes 失败 (refno: {}): {}", refno, e);
+                            anyhow::anyhow!("生成网格失败 for refno {}: {}", refno, e)
+                        })?;
+                    debug_model!(
+                        "  ✅ gen_inst_meshes 完成: {} ms",
+                        mesh_time.elapsed().as_millis()
+                    );
+                }
+
+                if target_visible_refnos.is_empty() {
+                    println!("跳过空的 target_visible_refnos for refno: {}", refno);
+                    return Ok(());
+                }
+
+                if dboption.apply_boolean_operation {
+                    let bool_time = std::time::Instant::now();
+
+                    // 过滤掉 BRAN 类型，BRAN 不需要布尔运算
+                    let boolean_refnos = {
+                        let refno_keys: Vec<String> = target_visible_refnos
+                            .iter()
+                            .map(|r| r.to_pe_key())
+                            .collect();
+                        if refno_keys.is_empty() {
+                            Vec::new()
+                        } else {
+                            let refno_keys = refno_keys.join(",");
+                            let sql =
+                                format!("SELECT value id FROM [{refno_keys}] WHERE noun != 'BRAN'");
+                            project_primary_db()
+                                .query_take::<Vec<RefnoEnum>>(&sql, 0)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    eprintln!("SQL error in CSG mesh boolean query: {}", e);
+                                    Vec::new()
+                                })
+                        }
+                    };
+
+                    if boolean_refnos.is_empty() {
+                        debug_model!("  跳过布尔运算：全部为 BRAN 类型");
+                    } else {
+                        // 生成元件库内部几何体的负实体运算（catalog-level: 同一元件库内的正负几何体布尔）
+                        apply_cata_neg_boolean_manifold(&boolean_refnos, replace_exist)
+                            .await
+                            .map_err(|e| {
+                                eprintln!(
+                                    "❌ apply_cata_neg_boolean_manifold 失败 (refno: {}): {}",
+                                    refno, e
+                                );
+                                e
+                            })?;
+                        // 实例级布尔运算（instance-level: 通过 ngmr 关系切割的正实体）
+                        // 传入正实体列表，函数内部会查询它们关联的负实体
+                        apply_insts_boolean_manifold(&boolean_refnos, replace_exist)
+                            .await
+                            .map_err(|e| {
+                                eprintln!(
+                                    "❌ apply_insts_boolean_manifold 失败 (refno: {}): {}",
+                                    refno, e
+                                );
+                                e
+                            })?;
+                        debug_model!("  ✅ 布尔运算完成: {} ms", bool_time.elapsed().as_millis());
+                    }
+                }
+
+                Ok(())
+            }
+            .await;
+
+            // 如果处理失败，打印错误但继续处理下一个 refno
+            if let Err(e) = result {
+                eprintln!("❌ 处理 refno {} 失败: {}", refno, e);
+                eprintln!("   继续处理下一个节点...\n");
+            } else {
+                println!("✅ 成功处理 refno: {}", refno);
+            }
+        }
+        println!("\n⏱️  总耗时: {} ms", time.elapsed().as_millis());
+    }
+    Ok(())
+}
+
+/// 直接基于 inst_geo id 列表生成网格数据
+///
+/// 与 `gen_inst_meshes` 不同，此函数直接接收 `inst_geo` 的 RecordId 列表，
+/// 无需通过 refno 查询 inst_relate -> geo_relate 链条。
+///
+/// # 参数
+///
+/// * `dir` - 模型文件目录路径
+/// * `precision` - 网格精度设置
+/// * `geo_ids` - inst_geo 的 RecordId 列表
+/// * `mesh_formats` - 输出的网格格式
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示生成是否成功
+pub async fn gen_inst_meshes_by_geo_ids(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
+    geo_ids: &[RecordId],
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<()> {
+    gen_inst_meshes_by_geo_ids_with_state(
+        dir,
+        precision,
+        geo_ids,
+        mesh_formats,
+        !use_file_mesh_state(),
+    )
+    .await
+}
+
+/// 直接基于 inst_geo id 列表生成网格，并允许调用方显式控制是否回写 mesh 状态。
+///
+/// 默认 file mesh state 路径会跳过 DB 回写，但修复/审计命令需要在不持久化 GLB
+/// body 的前提下记录 success/bad/aabb/pts 状态，避免导出阶段留下无法解释的
+/// `inst_geo` 语义行。
+pub async fn gen_inst_meshes_by_geo_ids_with_state(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
+    geo_ids: &[RecordId],
+    mesh_formats: &[MeshFormat],
+    persist_state: bool,
+) -> anyhow::Result<()> {
+    if geo_ids.is_empty() {
+        return Ok(());
+    }
+
+    // 创建 LOD 子目录
+    let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
+    if !lod_dir.exists() {
+        std::fs::create_dir_all(&lod_dir)?;
+    }
+
+    // 创建 manifold 目录（所有 .manifold 文件统一存放）
+    let manifold_dir = dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
+    }
+
+    // 构建查询的 id 列表
+    let ids_str = geo_ids.iter().map(|id| id.to_raw()).join(",");
+
+    // 查询 inst_geo 的参数
+    let sql = format!(
+        "SELECT id, param, unit_flag ?? false as unit_flag FROM [{}] WHERE param != NONE",
+        ids_str
+    );
+
+    let mut response = project_primary_db().query(&sql).await?;
+    let geo_params: Vec<QueryGeoParam> = response.take(0).unwrap_or_default();
+
+    if geo_params.is_empty() {
+        debug_model_debug!("[gen_inst_meshes_by_geo_ids] 没有找到有效的几何参数");
+        return Ok(());
+    }
+
+    let aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+    let pts_json_map: Arc<DashMap<u64, String>> = Arc::new(DashMap::new());
+    let inst_aabb_map: Arc<DashMap<String, Aabb>> = Arc::new(DashMap::new());
+    let mut update_sql = String::new();
+
+    for g in geo_params {
+        let geo_type_name = g.param.type_name();
+        let profile = precision.profile_for_geo(geo_type_name);
+        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+        let mesh_id = g.id.to_mesh_id();
+
+        // 不需要 refno
+        let mut lod_settings = profile.csg_settings;
+
+        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+
+        // unit_flag=true：按"单位参数"生成可复用 mesh；兼容历史数据（DB 里 param 仍是绝对参数）的情况。
+        let geo_param_for_mesh = if g.param.is_reuse_unit() {
+            g.param.to_unit_param()
+        } else {
+            g.param.clone()
+        };
+
+        let mr = match generate_csg_mesh(
+            &geo_param_for_mesh,
+            &lod_settings,
+            non_scalable_geo,
+            false,
+            None,
+        ) {
+            Some(csg_mesh) => {
+                match handle_csg_mesh(
+                    &lod_dir,
+                    &manifold_dir,
+                    &mesh_id,
+                    &mesh_filename,
+                    csg_mesh,
+                    &aabb_map,
+                    &pts_json_map,
+                    &inst_aabb_map,
+                    mesh_formats,
+                    false,
+                )
+                .await
+                {
+                    Ok(mr) => mr,
+                    Err(e) => {
+                        debug_model_warn!("CSG mesh 生成失败 for {}: {}", mesh_id, e);
+                        MeshResult::failed()
+                    }
+                }
+            }
+            None => {
+                debug_model_warn!(
+                    "CSG mesh 返回 None for {} (type={})",
+                    mesh_id,
+                    geo_type_name
+                );
+                MeshResult::failed()
+            }
+        };
+        update_sql.push_str(&mr.to_update_sql(&mesh_id));
+    }
+
+    // 执行批量更新
+    if persist_state && !update_sql.is_empty() {
+        println!(
+            "[gen_inst_meshes_by_geo_ids] 执行 update_sql ({} bytes)",
+            update_sql.len()
+        );
+        match project_primary_db().query(&update_sql).await {
+            Ok(_) => println!("[gen_inst_meshes_by_geo_ids] update_sql 执行成功"),
+            Err(e) => eprintln!("[gen_inst_meshes_by_geo_ids] 更新数据库失败: {}", e),
+        }
+    } else {
+        println!(
+            "[gen_inst_meshes_by_geo_ids] {}",
+            if persist_state {
+                "update_sql 为空，没有需要更新的记录"
+            } else {
+                "file/state-less 模式：跳过 inst_geo 状态回写"
+            }
+        );
+    }
+
+    if persist_state {
+        // 保存 aabb 和 pts 数据
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    } else {
+        flush_aabb_cache();
+    }
+
+    Ok(())
+}
+
+///
+/// # 参数
+///
+/// * `refnos` - 参考号数组
+/// * `replace_exist` - 是否替换已存在的网格数据
+/// * `dir` - 模型文件目录路径
+///
+/// # 返回值
+///
+/// 返回 `anyhow::Result<()>` 表示生成是否成功
+///
+/// # 侧效与说明
+/// - 并发分批查询 inst_geo 参数并生成网格
+/// - 将网格序列化保存到磁盘（dir/*.mesh）
+/// - db 模式会回写 SurrealDB: inst_geo.meshed/aabb/pts 字段，错误则标记 bad=true
+/// - file 模式只依赖本地 glb + aabb_cache.rkyv，并更新 EXIST_MESH_GEO_HASHES
+pub async fn gen_inst_meshes(
+    dir: &Path,
+    precision: &MeshPrecisionSettings,
+    refnos: &[RefnoEnum],
+    replace_exist: bool,
+    mesh_formats: &[MeshFormat],
+) -> anyhow::Result<()> {
+    let use_file_state = use_file_mesh_state();
+    debug_model_debug!(
+        "gen_inst_meshes start: refnos={}, replace_exist={}, dir={}, mesh_state_source={}",
+        refnos.len(),
+        replace_exist,
+        dir.display(),
+        if use_file_state { "file" } else { "db" }
+    );
+
+    if use_file_state {
+        crate::fast_model::preload_mesh_cache();
+    }
+    // 每批并发处理的 inst_geo 数量上限，控制单批任务规模
+    const PAGE_NUM: usize = 100;
+    // 计数/调试用途（目前未外显）
+    let mut i = 0;
+
+    // 创建 manifold 目录（所有 .manifold 文件统一存放，在 LOD 路径解析前从原始 dir 派生）
+    let manifold_dir = dir.join("manifold");
+    if !manifold_dir.exists() {
+        std::fs::create_dir_all(&manifold_dir)?;
+    }
+
+    // 根据 LOD 级别创建子目录（如果传入的 dir 不是已经包含 lod_ 前缀）
+    let dir = if let Some(dir_name) = dir.file_name() {
+        let dir_str = dir_name.to_string_lossy();
+        // 如果目录名已经是 lod_XX 格式，直接使用
+        if dir_str.starts_with("lod_") {
+            dir.to_path_buf()
+        } else {
+            // 否则创建 LOD 子目录
+            let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
+            if !lod_dir.exists() {
+                std::fs::create_dir_all(&lod_dir)?;
+            }
+            lod_dir
+        }
+    } else {
+        // 如果无法获取目录名，创建 LOD 子目录
+        let lod_dir = dir.join(format!("lod_{:?}", precision.default_lod));
+        if !lod_dir.exists() {
+            std::fs::create_dir_all(&lod_dir)?;
+        }
+        lod_dir
+    };
+
+    // 使用结构化的 query_inst_geo_ids API 查询几何 ID
+    // 根据 replace_exist 决定是否跳过已生成或异常的几何：
+    // - replace_exist=true：不过滤 aabb/meshed，允许覆盖，但仍过滤 bad
+    // - replace_exist=false：旧逻辑只会捞出 aabb 为空的未 meshed 几何。
+    //   对于“GLB 已生成、aabb 已回写、但 meshed 仍为空”的历史数据，需要额外补捞，
+    //   否则这些 geo 会永久卡在未收敛状态，并在某些导出/增量链路里继续被漏掉。
+    let mut inst_geo_targets: Vec<InstGeoWorkItem> = if use_file_state {
+        match query_candidate_inst_geo_ids_for_refnos(refnos).await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|row| InstGeoWorkItem {
+                    geo_id: row.geo_id,
+                    refno: row.refno,
+                })
+                .collect(),
+            Err(e) => {
+                debug_model_debug!(
+                    "query_candidate_inst_geo_ids_for_refnos failed for refnos={:?}: {}. This is normal for objects without geometry (e.g., FLOOR, or pipe tubing).",
+                    refnos,
+                    e
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        match query_inst_geo_ids(refnos, replace_exist).await {
+            Ok(ids) => ids
+                .into_iter()
+                .map(|row| InstGeoWorkItem {
+                    geo_id: row.geo_id,
+                    refno: row.refno,
+                })
+                .collect(),
+            Err(e) => {
+                debug_model_debug!(
+                    "query_inst_geo_ids failed for refnos={:?}: {}. This is normal for objects without geometry (e.g., FLOOR, or pipe tubing).",
+                    refnos,
+                    e
+                );
+                return Ok(());
+            }
+        }
+    };
+
+    if use_file_state && !replace_exist {
+        inst_geo_targets.retain(|row| {
+            row.geo_id
+                .to_mesh_id()
+                .parse::<u64>()
+                .ok()
+                .map(|geo_hash| !mesh_exists(geo_hash))
+                .unwrap_or(true)
+        });
+    } else if !replace_exist {
+        let mut stale_rows = query_unmeshed_inst_geo_ids_for_refnos(refnos).await?;
+        if !stale_rows.is_empty() {
+            debug_model_debug!(
+                "gen_inst_meshes supplement stale meshed rows: {}",
+                stale_rows.len()
+            );
+            inst_geo_targets.extend(stale_rows.drain(..).map(|row| InstGeoWorkItem {
+                geo_id: row.geo_id,
+                refno: row.refno,
+            }));
+        }
+    }
+
+    let mut seen_geo_ids = HashSet::new();
+    inst_geo_targets.retain(|row| seen_geo_ids.insert(row.geo_id.to_raw()));
+
+    debug_model_debug!(
+        "gen_inst_meshes fetched inst_geo_ids: {}",
+        inst_geo_targets.len()
+    );
+    // println!("inst_geo_ids: {:?}", &inst_geo_targets);
+    // 无可处理对象则直接返回
+    if inst_geo_targets.is_empty() {
+        debug_model_debug!(
+            "[WARN] gen_inst_meshes: inst_geo_ids empty for refnos={:?}",
+            refnos
+        );
+        return Ok(());
+    }
+    let mut tasks = vec![];
+    // 线程安全缓存：aabb_map 用于累积 aabb；pts_json_map 用于存储端点 JSON（去重）
+    let aabb_map = Arc::new(DashMap::new());
+    let pts_json_map = Arc::new(DashMap::new());
+    let inst_aabb_map = Arc::new(DashMap::new());
+
+    // 分批并发处理 inst_geo
+    for (chunk_idx, chunk) in inst_geo_targets.chunks(PAGE_NUM).enumerate() {
+        debug_model_debug!(
+            "gen_inst_meshes chunk {} processing {} inst_geo ids",
+            chunk_idx,
+            chunk.len()
+        );
+        // 将本批次 inst_geo id 合并为 SurrealDB in 子查询集合，并构建 refno 映射
+        let chunk_records: Vec<(String, Option<RefnoEnum>)> = chunk
+            .iter()
+            .map(|result| (result.geo_id.to_raw(), result.refno.clone()))
+            .collect();
+        let ids = chunk_records.iter().map(|(raw, _)| raw.as_str()).join(",");
+        let chunk_refno_map: HashMap<String, Option<RefnoEnum>> =
+            chunk_records.into_iter().collect();
+        // 克隆所需上下文到异步任务中
+        let dir = dir.clone();
+        let manifold_dir = manifold_dir.clone();
+        let aabb_map = aabb_map.clone();
+        let pts_json_map = pts_json_map.clone();
+        let precision = Arc::new(precision.clone()); // Clone Arc<MeshPrecisionSettings>
+        let inst_aabb_map = inst_aabb_map.clone();
+        let chunk_refno_map = chunk_refno_map.clone();
+        let mesh_formats = mesh_formats.to_vec();
+        // 每批一个异步任务：查询参数 -> CSG 网格化 -> 回写
+        let task = tokio::spawn(async move {
+            // 查询本批所有 inst_geo 的参数
+            let sql = format!(
+                "select id, param, unit_flag ?? false as unit_flag from [{}] where param != NONE",
+                ids
+            );
+            match project_primary_db().query(&sql).await {
+                Ok(mut response) => {
+                    let result: Vec<QueryGeoParam> = response.take(0).unwrap();
+                    i += 1;
+                    let mut update_sql = String::new();
+
+                    // 遍历每个几何参数并使用 CSG 生成网格
+                    for g in result {
+                        debug_model_debug!("gen mesh param: {:?}", &g.param);
+                        let geo_type_name = g.param.type_name();
+                        let profile = precision.profile_for_geo(geo_type_name);
+                        let non_scalable_geo = precision.is_non_scalable_geo(geo_type_name);
+                        let mesh_id = g.id.to_mesh_id();
+                        let geo_raw = g.id.to_raw();
+                        let refno_for_mesh: Option<RefnoEnum> =
+                            chunk_refno_map.get(&geo_raw).cloned().flatten();
+
+                        // 统一使用 CSG 方式生成网格
+                        let mut lod_settings = profile.csg_settings;
+
+                        let mesh_filename = format!("{}_{:?}", mesh_id, precision.default_lod);
+
+                        match generate_csg_mesh(
+                            &g.param,
+                            &lod_settings,
+                            non_scalable_geo,
+                            false,
+                            refno_for_mesh,
+                        ) {
+                            Some(csg_mesh) => {
+                                let mr = match handle_csg_mesh(
+                                    &dir,
+                                    &manifold_dir,
+                                    &mesh_id,
+                                    &mesh_filename,
+                                    csg_mesh,
+                                    &aabb_map,
+                                    &pts_json_map,
+                                    &inst_aabb_map,
+                                    &mesh_formats,
+                                    false,
+                                )
+                                .await
+                                {
+                                    Ok(mr) => mr,
+                                    Err(e) => {
+                                        debug_model_warn!(
+                                            "CSG mesh generation failed for {}: {}",
+                                            mesh_id,
+                                            e
+                                        );
+                                        MeshResult::failed()
+                                    }
+                                };
+                                update_sql.push_str(&mr.to_update_sql(&mesh_id));
+                            }
+                            None => {
+                                // CSG 生成失败
+                                let failed_refnos = aios_core::query_refnos_by_geo_hash(&mesh_id)
+                                    .await
+                                    .unwrap_or_default();
+                                debug_model_warn!(
+                                    "{:?} CSG mesh generation not supported for type: {}",
+                                    failed_refnos,
+                                    geo_type_name
+                                );
+                                // 标记 bad，避免后续重复尝试
+                                update_sql.push_str(&format!(
+                                    "update inst_geo:⟨{}⟩ set bad=true;",
+                                    mesh_id
+                                ));
+                            }
+                        }
+                    }
+                    if !update_sql.is_empty() {
+                        // 批量回写 SurrealDB（使用一个语句拼接多条 update）
+                        println!("准备执行批量更新 SQL，长度: {}", update_sql.len());
+                        match project_primary_db().query(&update_sql).await {
+                            Ok(_) => {
+                                println!("✅ 批量更新成功");
+                            }
+                            Err(e) => {
+                                let ctx = crate::fast_model::error_macros::ErrorContext {
+                                    location: format!("{}:{}", file!(), line!()),
+                                    error_msg: e.to_string(),
+                                    extra_info: vec![(
+                                        "📄 SQL (前500字符)".to_string(),
+                                        update_sql.chars().take(500).collect::<String>(),
+                                    )],
+                                };
+                                ctx.print("gen_inst_meshes 批量更新失败");
+                                init_save_database_error(
+                                    &update_sql,
+                                    &std::panic::Location::caller().to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                // 本批次查询失败：记录错误并继续其他批次
+                Err(e) => {
+                    init_query_error(&sql, e, &std::panic::Location::caller().to_string());
+                }
+            }
+        });
+        tasks.push(task);
+    }
+
+    // 等待所有批次任务完成
+    match futures::future::try_join_all(tasks).await {
+        Ok(_) => {}
+        Err(e) => {
+            dbg!(e);
+        }
+    }
+
+    // 用新生成的 aabb 更新内存缓存，避免重复计算
+    for result in inst_geo_targets {
+        let h = result.geo_id.to_mesh_id();
+        if let Some(aabb) = inst_aabb_map.get(&h) {
+            EXIST_MESH_GEO_HASHES.insert(h.clone(), *aabb);
+        }
+    }
+
+    if !use_file_state {
+        // 旧 DB 状态源下，仍需持久化点集与 aabb 实体。
+        utils::save_pts_to_surreal(&pts_json_map).await;
+        utils::save_aabb_to_surreal(&aabb_map).await;
+    }
+
+    // 持久化 AABB 缓存到 meshes/aabb_cache.rkyv
+    flush_aabb_cache();
+
+    Ok(())
+}
+
+async fn query_unmeshed_inst_geo_ids_for_refnos(
+    refnos: &[RefnoEnum],
+) -> anyhow::Result<Vec<PendingInstGeoRow>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const CHUNK_SIZE: usize = 200;
+    let mut rows = Vec::new();
+
+    for chunk in refnos.chunks(CHUNK_SIZE) {
+        let inst_relate_keys = chunk
+            .iter()
+            .map(|refno| model_refno_id("inst_relate", *refno))
+            .join(",");
+        let sql = format!(
+            r#"
+            SELECT
+                in as refno,
+                record::id(out) as geo_id
+            FROM [{inst_relate_keys}]
+            WHERE out != NONE
+              AND visible
+              AND out.param != NONE
+              AND out.bad != true
+              AND out.meshed != true;
+            "#
+        );
+        let mut chunk_rows: Vec<PendingInstGeoRow> =
+            project_primary_db().query_take(&sql, 0).await?;
+        rows.append(&mut chunk_rows);
+    }
+
+    Ok(rows)
+}
+
+async fn handle_csg_mesh(
+    dir: &Path,
+    manifold_dir: &Path,
+    inst_key: &str,
+    mesh_id: &str,
+    mut generated: GeneratedMesh,
+    aabb_map: &Arc<DashMap<String, Aabb>>,
+    pts_json_map: &Arc<DashMap<u64, String>>,
+    inst_aabb_map: &Arc<DashMap<String, Aabb>>,
+    mesh_formats: &[MeshFormat],
+    is_neg: bool,
+) -> anyhow::Result<MeshResult> {
+    if generated.mesh.aabb.is_none() {
+        generated.mesh.aabb = generated.aabb;
+    }
+    let mesh_aabb = generated
+        .mesh
+        .aabb
+        .ok_or_else(|| anyhow!("CSG mesh 缺少有效的 AABB"))?;
+
+    let pts_hashes = derive_csg_point_hashes(&generated.mesh, pts_json_map);
+
+    let mesh_base_path = dir.join(mesh_id);
+
+    // ── AABB 计算（正负实体都需要，布尔查询依赖 inst_geo.aabb） ──
+    let aabb_hash = gen_aabb_hash(&mesh_aabb);
+    aabb_map.entry(aabb_hash.to_string()).or_insert(mesh_aabb);
+    if !EXIST_MESH_GEO_HASHES.contains_key(inst_key) {
+        EXIST_MESH_GEO_HASHES.insert(inst_key.to_string(), mesh_aabb);
+    }
+    inst_aabb_map.insert(inst_key.to_string(), mesh_aabb);
+
+    if is_neg {
+        // 负实体：保存 .manifold + AABB，不生成 GLB
+        // CSG 生成的 mesh 本身就是 manifold，直接保存原始数据。
+        use aios_core::csg::manifold::ManifoldMeshRust;
+        let flat_verts: Vec<f32> = generated
+            .mesh
+            .vertices
+            .iter()
+            .flat_map(|v| [v.x, v.y, v.z])
+            .collect();
+        let raw = ManifoldMeshRust {
+            vertices: flat_verts,
+            indices: generated.mesh.indices.clone(),
+        };
+        if !raw.indices.is_empty() {
+            let manifold_path = manifold_dir.join(format!("{}_m.manifold", mesh_id));
+            if let Err(e) = raw.save_to_file(&manifold_path) {
+                debug_model_warn!("   ⚠️ 保存 _m.manifold 失败: {} - {}", mesh_id, e);
+            }
+        }
+        return Ok(MeshResult {
+            meshed: true,
+            bad: false,
+            aabb_hash: Some(aabb_hash),
+            pts_hashes,
+        });
+    }
+
+    // ── 正实体：同时生成 GLB（兼容现有渲染流程） ──
+    let glb_path = mesh_base_path.with_extension("glb");
+    if let Err(e) = export_single_mesh_to_glb(&generated.mesh, &glb_path) {
+        debug_model_warn!("   ⚠️ 生成 GLB 失败: {} - {}", mesh_id, e);
+    } else {
+        #[cfg(feature = "convex-decomposition")]
+        {
+            let precompute = std::env::var("AIOS_PRECOMPUTE_CONVEX")
+                .ok()
+                .map(|v| {
+                    let v = v.trim();
+                    v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+                })
+                .unwrap_or(false);
+
+            if precompute && !matches!(inst_key, "1" | "2" | "3") {
+                let base_mesh_dir = crate::fast_model::convex_decomp::normalize_base_mesh_dir(dir);
+                if let Err(e) = crate::fast_model::convex_decomp::build_and_save_convex_from_glb(
+                    &base_mesh_dir,
+                    inst_key,
+                )
+                .await
+                {
+                    debug_model_warn!("[convex] 预计算失败: geo_hash={}, error={}", inst_key, e);
+                }
+            }
+        }
+    }
+
+    if mesh_formats.contains(&MeshFormat::Obj) {
+        let obj_path = mesh_base_path.with_extension("obj");
+        if let Err(e) = generated.mesh.export_obj(false, obj_path.to_str().unwrap()) {
+            debug_model_warn!("   ⚠️ 生成 OBJ 失败: {} - {}", mesh_id, e);
+        }
+    }
+
+    Ok(MeshResult {
+        meshed: true,
+        bad: false,
+        aabb_hash: Some(aabb_hash),
+        pts_hashes,
+    })
+}
+
+fn derive_csg_point_hashes(mesh: &PlantMesh, pts_json_map: &Arc<DashMap<u64, String>>) -> Vec<u64> {
+    let mut hashes = HashSet::new();
+    for vertex in &mesh.vertices {
+        let rs_vec = RsVec3(*vertex);
+        let hash = rs_vec.gen_hash();
+        if hashes.insert(hash) && !pts_json_map.contains_key(&hash) {
+            if let Ok(serialized) = serde_json::to_string(&rs_vec) {
+                pts_json_map.insert(hash, serialized);
+            }
+        }
+    }
+    hashes.into_iter().collect()
+}
+
+/// 查询所有 pe_transform 的 refno（仅 world_trans 存在的实例）
+pub async fn fetch_inst_relate_refnos() -> anyhow::Result<Vec<RefnoEnum>> {
+    let sql = "SELECT VALUE record::id(id) FROM pe_transform WHERE world_trans != none";
+    let refno_strings: Vec<String> = project_primary_db().query_take(sql, 0).await?;
+    let refnos = refno_strings
+        .into_iter()
+        .filter_map(|refno| {
+            RefnoEnum::from_str(&refno)
+                .or_else(|_| RefnoEnum::from_str(&refno.replace('_', "/")))
+                .ok()
+        })
+        .collect();
+    Ok(refnos)
+}
+
+async fn filter_missing_inst_aabb(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pe_keys: Vec<String> = refnos.iter().map(|r| r.to_pe_key()).collect();
+    if pe_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT VALUE refno FROM inst_relate_aabb WHERE refno IN [{}]",
+        pe_keys.join(",")
+    );
+
+    let existing: Vec<RefnoEnum> = project_primary_db()
+        .query_take(&sql, 0)
+        .await
+        .unwrap_or_default();
+    let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
+
+    let missing = refnos
+        .iter()
+        .cloned()
+        .filter(|r| !existing.contains(r))
+        .collect();
+
+    Ok(missing)
+}
+
+// Database query structures are now imported from aios_core::query_structs
+
+// ========================
+// Scene Tree 集成（替代 inst_relate_aabb）
+// ========================
+
+/// 过滤未在 scene_tree 中标记为已生成的节点
+///
+/// 替代 `filter_missing_inst_aabb`，使用 scene_tree 的 `generated` 字段
+#[cfg(feature = "gen_model")]
+pub async fn filter_missing_scene_node(refnos: &[RefnoEnum]) -> anyhow::Result<Vec<RefnoEnum>> {
+    if refnos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 查询已生成的节点
+    let existing = crate::scene_tree::query_generated_refnos(refnos).await?;
+    let existing: HashSet<RefnoEnum> = existing.into_iter().collect();
+
+    // 返回未生成的节点
+    let missing = refnos
+        .iter()
+        .cloned()
+        .filter(|r| !existing.contains(r))
+        .collect();
+
+    Ok(missing)
+}
+
+/// 使用 scene_tree 更新 AABB 数据
+///
+/// 替代 `update_inst_relate_aabbs_by_refnos`，写入 scene_node 表。
+/// 注：依赖的 `query_aabb_params` 已从 rs-core 移除，当前返回错误。
+#[cfg(feature = "gen_model")]
+pub async fn update_scene_node_aabbs_by_refnos(
+    refnos: &[RefnoEnum],
+    _replace_exist: bool,
+) -> anyhow::Result<()> {
+    if refnos.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("update_scene_node_aabbs_by_refnos 暂不可用：query_aabb_params 已从 rs-core 移除")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deduper_basic_insert_and_duplicate() {
+        let d = RecentGeoDeduper::new(10);
+        assert!(d.insert(1));
+        assert!(d.insert(2));
+        assert!(!d.insert(1)); // 重复
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 2);
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_deduper_concurrent_safe() {
+        let d = RecentGeoDeduper::new(0);
+        // DashSet 无容量限制，所有插入均保留（无 LRU 淘汰）
+        assert!(d.insert(10));
+        assert!(d.insert(20));
+        assert!(d.insert(30));
+        assert!(d.insert(40));
+        assert_eq!(d.len(), 4);
+        // 重复插入返回 false
+        assert!(!d.insert(10));
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_deduper_preload() {
+        let d = RecentGeoDeduper::new(0);
+        d.preload(vec![100, 200, 300]);
+        assert_eq!(d.len(), 3);
+        // preload 的 ID 不计入 insert_count
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 0);
+        // 尝试插入已 preload 的 ID 应返回 false（重复）
+        assert!(!d.insert(100));
+        assert_eq!(d.duplicate_count.load(Ordering::Relaxed), 1);
+        // 插入新 ID 应成功
+        assert!(d.insert(400));
+        assert_eq!(d.insert_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_should_flush_by_stmt_count() {
+        let stmts: Vec<String> = (0..MAX_UPDATE_STMTS_PER_FLUSH)
+            .map(|i| format!("UPDATE x:{};", i))
+            .collect();
+        assert!(should_flush(&stmts));
+
+        let small: Vec<String> = vec!["UPDATE x:1;".to_string()];
+        assert!(!should_flush(&small));
+    }
+
+    #[test]
+    fn test_should_flush_by_byte_size() {
+        // 构造一条超长语句
+        let big_stmt = "X".repeat(MAX_UPDATE_SQL_BYTES + 1);
+        let stmts = vec![big_stmt];
+        assert!(should_flush(&stmts));
+    }
+
+    #[test]
+    fn test_mesh_worker_report_default() {
+        let r = MeshWorkerReport::new();
+        assert_eq!(r.batch_count, 0);
+        assert_eq!(r.total_processed, 0);
+        assert_eq!(r.total_skipped, 0);
+        assert_eq!(r.db_update_batches, 0);
+        assert_eq!(r.db_update_failed_batches, 0);
+        assert_eq!(r.db_update_failed_statements, 0);
+        assert_eq!(r.elapsed_ms, 0);
+        assert!(!r.degraded);
+    }
+
+    #[test]
+    fn test_mesh_worker_report_degraded_flag() {
+        let mut r = MeshWorkerReport::new();
+        r.db_update_failed_batches = 1;
+        r.db_update_failed_statements = 5;
+        r.degraded = true;
+        assert!(r.degraded);
+        // print_summary 不应 panic
+        r.print_summary();
+    }
+}

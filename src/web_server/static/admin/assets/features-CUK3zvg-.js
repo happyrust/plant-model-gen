@@ -1,0 +1,1 @@
+function e(e){return typeof e==`string`?[`1`,`true`,`yes`,`on`].includes(e.trim().toLowerCase()):!1}var t=e(void 0);export{t};

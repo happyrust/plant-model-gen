@@ -1,0 +1,150 @@
+use aios_database::web_server::start_web_server_with_config;
+use clap::{Arg, Command};
+use std::process::Stdio;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let matches = Command::new("aios-web-server")
+        // APP_VERSION：build.rs 注入（RELEASE_VERSION 或 CARGO_PKG_VERSION），与 /version 一致
+        .version(env!("APP_VERSION"))
+        .about("AIOS Web UI Server")
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .short('c')
+                .help("Path to the configuration file (Without extension)")
+                .value_name("CONFIG_PATH")
+                .default_value(if cfg!(target_family = "unix") {
+                    "db_options/DbOption-mac"
+                } else {
+                    "db_options/DbOption"
+                }),
+        )
+        .get_matches();
+
+    // 获取配置文件路径
+    let config_path = matches
+        .get_one::<String>("config")
+        .expect("default value ensures this exists");
+
+    // 设置环境变量，让 rs-core 库使用正确的配置文件
+    unsafe {
+        std::env::set_var("DB_OPTION_FILE", config_path);
+    }
+
+    // 初始化日志，设置更详细的日志级别
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+
+    // 读取配置文件（路径相对于当前工作目录）
+    let config_file = format!("{}.toml", config_path);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config_path_full = cwd.join(&config_file);
+    let config_content = std::fs::read_to_string(&config_file)
+        .unwrap_or_else(|e| panic!("❌ 无法读取配置文件 {} (cwd={:?}): {}", config_file, cwd, e));
+    let db_option: aios_core::options::DbOption = toml::from_str(&config_content)
+        .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
+    // versioned 存储参数是 DbOptionExt 扩展字段（specs/022），从同一 toml 直接提取
+    let (versioned_storage, version_retention) = {
+        let value: toml::Value = toml::from_str(&config_content)
+            .unwrap_or_else(|e| panic!("❌ 配置文件解析失败 {}: {}", config_file, e));
+        let versioned = value
+            .get("versioned_storage")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let retention = value
+            .get("version_retention")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("0")
+            .to_string();
+        (versioned, retention)
+    };
+
+    let ws_cfg = &db_option.web_server;
+    let port_from_config = ws_cfg.port;
+    let port = std::env::var("WEB_SERVER_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(port_from_config);
+
+    println!(
+        "⚙️  配置文件: {} | cwd={} | 端口: {}",
+        config_path_full.display(),
+        cwd.display(),
+        port
+    );
+
+    // 自启动 SurrealDB
+    let _surreal_child = if ws_cfg.auto_start_surreal {
+        let data_path = ws_cfg.effective_data_path(db_option.surrealdb.path.as_deref());
+        let db_uri = aios_database::options::rocksdb_conn_str(
+            data_path,
+            versioned_storage,
+            &version_retention,
+        );
+        println!("🗄️  自启动 SurrealDB...");
+        println!("   - 可执行文件: {}", ws_cfg.surreal_bin);
+        println!("   - 数据路径: {}", db_uri);
+        println!("   - 监听地址: {}", ws_cfg.surreal_bind);
+        println!("   - 用户: {}", ws_cfg.surreal_user);
+
+        let child = std::process::Command::new(&ws_cfg.surreal_bin)
+            .arg("start")
+            .arg("--bind")
+            .arg(&ws_cfg.surreal_bind)
+            .arg("--user")
+            .arg(&ws_cfg.surreal_user)
+            .arg("--pass")
+            .arg(&ws_cfg.surreal_password)
+            .arg(&db_uri)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match child {
+            Ok(child) => {
+                println!("✅ SurrealDB 进程已启动 (PID: {})", child.id());
+                // 覆盖 surrealdb 连接模式为 ws，避免 rocksdb 文件锁冲突
+                let (bind_ip, bind_port) = ws_cfg
+                    .surreal_bind
+                    .split_once(':')
+                    .unwrap_or(("0.0.0.0", "8020"));
+                let conn_ip = if bind_ip == "0.0.0.0" {
+                    aios_database::web_server::get_local_ip_via_udp()
+                        .unwrap_or_else(|_| bind_ip.to_string())
+                } else {
+                    bind_ip.to_string()
+                };
+                unsafe {
+                    std::env::set_var("SURREAL_CONN_MODE", "ws");
+                    std::env::set_var("SURREAL_CONN_IP", conn_ip);
+                    std::env::set_var("SURREAL_CONN_PORT", bind_port);
+                }
+                // 等待 SurrealDB 就绪
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                Some(child)
+            }
+            Err(e) => {
+                eprintln!("❌ 无法启动 SurrealDB: {}", e);
+                eprintln!(
+                    "   请确认 '{}' 在 PATH 中或配置 surreal_bin 为完整路径",
+                    ws_cfg.surreal_bin
+                );
+                return Err(e.into());
+            }
+        }
+    } else {
+        println!("⏭️  跳过 SurrealDB 自启动（auto_start_surreal = false）");
+        None
+    };
+
+    println!("🚀 正在启动 AIOS Web UI 服务器...");
+    let access_host =
+        aios_database::web_server::get_local_ip_via_udp().unwrap_or_else(|_| "0.0.0.0".to_string());
+    println!("📱 访问地址: http://{}:{}", access_host, port);
+
+    start_web_server_with_config(port, Some(config_path)).await?;
+
+    Ok(())
+}

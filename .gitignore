@@ -110,15 +110,8 @@ nul
 /runtime/*
 !/runtime/admin_verify/
 !/runtime/admin_verify/**
-!/runtime/local-collab/
-!/runtime/local-collab/**
-# local-collab 里只留配置与启动器；工程副本 / sqlite / 输出都由
-# ../plant-collab-monitor/scripts/local-remote-collab-setup.ps1 重新生成
-/runtime/local-collab/*/project/
-/runtime/local-collab/*/output/
-/runtime/local-collab/*/*.sqlite*
-# plant-web-server 当站点后端时每站一份的状态目录（PLANT_WEB_RUNTIME_DIR）
-/runtime/local-collab/*/pws-runtime/
+# 本机双站点环境（runtime/local-collab/）2026-09-18 已搬到 ../plant-web-server/runtime/local-collab/，
+# 由 ../plant-collab-monitor/scripts/local-remote-collab-setup.ps1 在那边重新生成；这里不再保留。
 
 # ═══════════════════════════════════════════════════════════════
 # External binaries & tools

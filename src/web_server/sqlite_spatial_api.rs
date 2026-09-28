@@ -11,7 +11,8 @@
 //! ## Endpoints
 //! - `GET /api/sqlite-spatial/query` - 按 refno 或 bbox 查询周边构件
 //! - `GET /api/sqlite-spatial/nearby` - 前端空间查询抽屉契约：按 refno 或点 + 半径查询
-//! - `GET /api/sqlite-spatial/nearest-clearance` - 按 refno 或点查询最近净距
+//! - `GET /api/sqlite-spatial/nearest-clearance` - 按 refno / 点 / BRAN 中心线查询最近净距；
+//!   `group_by=noun` 时按候选 NOUN 分桶并附 `noun_counts`，BRAN 源自动排除自身全部成员
 //! - `GET /api/sqlite-spatial/stats` - 获取索引统计与健康信息
 
 use aios_core::{RefnoEnum, pdms_types::TOTAL_NEG_NOUN_NAMES};
@@ -150,7 +151,8 @@ pub struct SqliteSpatialQueryParams {
     pub nouns: Option<String>,
     /// 专业过滤（逗号分隔，如 "1,3"，空表示不过滤）
     pub spec_values: Option<String>,
-    /// 是否包含自身（mode=refno 时有效，默认 true）
+    /// 是否包含自身（默认 true）。mode=refno 时"自身"是源构件本身；
+    /// mode=bran_centerline 时是 BRAN + 全部 TUBI 段 + 全部成员构件（与 nearest-clearance 同口径）。
     pub include_self: Option<bool>,
     /// 是否包含负实体（默认 false）
     pub include_negative: Option<bool>,
@@ -221,6 +223,9 @@ pub struct SpatialQueryResult {
     /// 完整命中集合按专业分组的计数（不受分页影响）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<SpatialQuerySpecGroup>>,
+    /// 非致命问题（目前只有 `mode=bran_centerline` 预取成员表时会产生），查询照常完成。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
     pub error: Option<String>,
 }
 
@@ -317,6 +322,13 @@ pub struct NearestClearanceQueryParams {
     pub target_nouns: Option<String>,
     /// Comma-separated shortcut groups. wall -> WALL,PANE,GWALL,STWALL; column -> COLU,SCTN,GENSEC.
     pub target_groups: Option<String>,
+    /// Result bucketing. `target_groups` (default): one bucket per resolved group, and at least one
+    /// of target_nouns / target_groups is required. `noun`: one bucket per candidate NOUN; the
+    /// target filters become optional (absent = every NOUN in range, negative-geometry NOUNs
+    /// dropped).
+    pub group_by: Option<String>,
+    /// Comma-separated NOUNs to drop after the target filters (e.g. `WELD,ATTA`).
+    pub exclude_nouns: Option<String>,
     /// Search radius in mm. Default 5000. Valid range: 0 < radius <= 100000.
     pub radius: Option<f32>,
     /// same_dbnum | all_loaded | explicit_dbnums
@@ -325,7 +337,8 @@ pub struct NearestClearanceQueryParams {
     pub dbnums: Option<String>,
     /// Per resolved group result limit. Default 1, clamped to 1..100.
     pub max_per_group: Option<usize>,
-    /// Include the source refno itself when it also matches target filters. Default false.
+    /// Include the source refno itself (and, for a BRAN source, all of its members) when they also
+    /// match target filters. Default false.
     pub include_self: Option<bool>,
     /// Include diagnostic counters.
     pub debug: Option<bool>,
@@ -340,6 +353,11 @@ pub struct NearestClearanceResponse {
     pub query_bbox: Option<AabbDto>,
     pub resolved_filters: Option<NearestClearanceResolvedFilters>,
     pub nearest_by_group: Vec<NearestClearanceGroupResult>,
+    /// 半径内、通过全部过滤的候选按 NOUN 计数（截断到 max_per_group 之前）。
+    /// 前端可直接拿它做类型 facet。
+    pub noun_counts: BTreeMap<String, usize>,
+    /// 因属于源自身（源 refno、BRAN 的 TUBI 段与全部成员构件）而被排除的候选数。
+    pub excluded_self_members: usize,
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<NearestClearanceDebug>,
@@ -366,8 +384,12 @@ pub struct NearestClearanceSource {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct NearestClearanceResolvedFilters {
+    /// 生效的 NOUN 白名单；空表示不限 NOUN（仅 `group_by=noun` 且未给目标过滤时出现）。
     pub target_nouns: Vec<String>,
     pub target_groups: Vec<ResolvedTargetGroup>,
+    /// `target_groups` | `noun`
+    pub group_by: String,
+    pub exclude_nouns: Vec<String>,
     pub scope: String,
     pub dbnums: Option<Vec<u32>>,
     pub radius: f32,
@@ -434,6 +456,7 @@ pub struct NearestClearanceDebug {
     pub scope_filtered: usize,
     pub noun_filtered: usize,
     pub distance_filtered: usize,
+    pub self_filtered: usize,
     pub groups_with_hits: usize,
     pub returned_candidates: usize,
 }
@@ -446,9 +469,92 @@ struct BranCenterlineSegment {
     end: Vec3,
 }
 
+/// 源为 BRAN 时在 async 侧预取好的数据。
+///
+/// 中心线与成员表都来自 SurrealDB，而距离计算跑在 `spawn_blocking` 里，
+/// 所以先在 handler 里取齐再一并交给同步查询。
+#[derive(Debug, Default)]
+struct PreparedBranSource {
+    /// `tubi_relate` 拼出的中心线，按段序排好。
+    centerline: Vec<BranCenterlineSegment>,
+    /// BRAN 的成员构件（ELBO / FLAN / VALV / ATTA / WELD …）。
+    /// TUBI 段不在这里——它们随 `centerline` 里的段 refno 一起进 `self_ids`。
+    member_refnos: Vec<RefnoEnum>,
+    /// 预取阶段的非致命问题（例如成员表取不到），原样并入响应 `warnings`。
+    warnings: Vec<String>,
+}
+
+impl PreparedBranSource {
+    fn from_centerline(centerline: Vec<BranCenterlineSegment>) -> Self {
+        Self {
+            centerline,
+            ..Default::default()
+        }
+    }
+
+    /// BRAN 自身在索引里的 id：全部 TUBI 段 + 全部成员构件（BRAN 本身由调用方按 `refno` 参数插入）。
+    /// 缺任何一类，"离 BRAN 最近的构件"就会被它自己占满。`nearest-clearance` 与 `/query` 共用。
+    fn own_index_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.centerline
+            .iter()
+            .map(|segment| &segment.refno)
+            .chain(self.member_refnos.iter())
+            .filter_map(|refno| refno_str_to_i64(&refno_enum_to_output_refno(refno)))
+    }
+}
+
 enum ClearanceSourceGeometry {
     Aabb(Aabb),
     BranCenterline(Vec<BranCenterlineSegment>),
+}
+
+/// `nearest-clearance` 的结果分桶方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearanceGroupBy {
+    /// 按解析出来的目标组（wall / column / target_nouns）各出一桶。
+    TargetGroups,
+    /// 按候选自身的 NOUN 各出一桶。
+    Noun,
+}
+
+impl ClearanceGroupBy {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClearanceGroupBy::TargetGroups => "target_groups",
+            ClearanceGroupBy::Noun => "noun",
+        }
+    }
+}
+
+/// 目标过滤 + 分桶方式的解析结果。
+#[derive(Debug, Clone)]
+struct ResolvedTargeting {
+    group_by: ClearanceGroupBy,
+    /// 解析出的目标组。`group_by=noun` 且未给任何目标过滤时为空，表示不限 NOUN。
+    groups: Vec<ResolvedTargetGroup>,
+    /// 目标过滤之后再剔除的 NOUN（大写、去重、有序）。
+    exclude_nouns: Vec<String>,
+}
+
+impl ResolvedTargeting {
+    /// 生效的 NOUN 白名单；`None` 表示不限 NOUN。
+    fn noun_filter(&self) -> Option<HashSet<String>> {
+        if self.groups.is_empty() {
+            None
+        } else {
+            Some(union_group_nouns(&self.groups))
+        }
+    }
+
+    /// 白名单按排序后的 Vec 给响应用。
+    fn sorted_target_nouns(&self) -> Vec<String> {
+        let mut nouns = self
+            .noun_filter()
+            .map(|set| set.into_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        nouns.sort();
+        nouns
+    }
 }
 
 // ============================================================================
@@ -586,6 +692,51 @@ async fn fetch_bran_centerline_segments(
     });
 
     Ok(segments)
+}
+
+/// 取 BRAN 的成员构件 refno（ELBO / FLAN / VALV / ATTA / WELD / TEE …）。
+///
+/// 走 `<-pe_owner` 边，不读 `pe.children`：现场 `pe` 的 `children` 字段是 `NONE`
+/// （层级数据源已改为 pe_owner 边，见 `versioned_db::pe_owner_tree`），
+/// `aios_core::get_children_refnos` 在真库上恒返回空，成员排除会静默失效。
+/// 同胞顺序在这里无所谓，所以不带 `ORDER BY id`。
+///
+/// TUBI 不是 PE 元素，不在这里；它们由 `tubi_relate` 的段 refno 覆盖。
+/// 用途只有一个：进 `self_ids`，避免"离 BRAN 最近的构件"被它自己的成员占满。
+async fn fetch_bran_member_refnos(branch_refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    use aios_core::{SUL_DB, SurrealQueryExt};
+
+    ensure_sqlite_spatial_surreal_context().await?;
+    let db_option = aios_core::get_db_option();
+    let sql = format!(
+        "USE NS `{}` DB `{}`;\nSELECT VALUE in FROM {}<-pe_owner;",
+        db_option.surreal_ns,
+        db_option.project_name,
+        branch_refno.to_pe_key()
+    );
+    let mut members: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 1).await?;
+    members.sort();
+    members.dedup();
+    Ok(members)
+}
+
+/// 中心线 + 成员表一起预取；成员表取不到只降级成 warning，不让整次查询失败。
+async fn prepare_bran_source(branch_refno: RefnoEnum) -> anyhow::Result<PreparedBranSource> {
+    let centerline = fetch_bran_centerline_segments(branch_refno).await?;
+    let mut prepared = PreparedBranSource::from_centerline(centerline);
+    match fetch_bran_member_refnos(branch_refno).await {
+        // 有中心线段却一个成员都没有，多半是 pe_owner 边没建（存量站点要先
+        // `model-version rebuild-pe-owner`）。别让降级悄悄发生。
+        Ok(members) if members.is_empty() => prepared.warnings.push(
+            "BRAN 成员表为空（pe_owner 边缺失？），结果可能混入自身构件（TUBI 段仍已排除）"
+                .to_string(),
+        ),
+        Ok(members) => prepared.member_refnos = members,
+        Err(e) => prepared.warnings.push(format!(
+            "BRAN 成员表获取失败，结果可能混入自身构件（TUBI 段仍已排除）: {e}"
+        )),
+    }
+    Ok(prepared)
 }
 
 fn expand_aabb(mut aabb: Aabb, distance: f32) -> Aabb {
@@ -865,6 +1016,7 @@ fn error_spatial_query_result(
         query_bbox,
         filter_options: None,
         groups: None,
+        warnings: None,
         error: Some(error.into()),
     }
 }
@@ -971,6 +1123,7 @@ fn success_spatial_query_result(
         query_bbox,
         filter_options,
         groups,
+        warnings: None,
         error: None,
     }
 }
@@ -991,6 +1144,8 @@ fn error_nearest_clearance_response(
         query_bbox,
         resolved_filters,
         nearest_by_group: vec![],
+        noun_counts: BTreeMap::new(),
+        excluded_self_members: 0,
         warnings: vec![],
         debug,
         error: Some(error.into()),
@@ -1002,6 +1157,8 @@ fn success_nearest_clearance_response(
     query_bbox: AabbDto,
     resolved_filters: NearestClearanceResolvedFilters,
     nearest_by_group: Vec<NearestClearanceGroupResult>,
+    noun_counts: BTreeMap<String, usize>,
+    excluded_self_members: usize,
     warnings: Vec<String>,
     debug: Option<NearestClearanceDebug>,
     distance_method: &'static str,
@@ -1014,6 +1171,8 @@ fn success_nearest_clearance_response(
         query_bbox: Some(query_bbox),
         resolved_filters: Some(resolved_filters),
         nearest_by_group,
+        noun_counts,
+        excluded_self_members,
         warnings,
         debug,
         error: None,
@@ -1064,12 +1223,16 @@ struct NearbyQueryPlan {
     shape: String,
 }
 
-fn normalize_nearby_shape(shape: &Option<String>, mode: &str) -> String {
+fn normalize_nearby_shape(shape: &Option<String>, mode: &str) -> Result<String, String> {
     let value = shape.as_deref().unwrap_or("").trim();
     if value.is_empty() {
-        default_shape_for_mode(mode).to_string()
-    } else {
-        value.to_ascii_lowercase()
+        return Ok(default_shape_for_mode(mode).to_string());
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "cube" => Ok("cube".to_string()),
+        "sphere" => Ok("sphere".to_string()),
+        _ => Err("invalid shape (expected cube or sphere)".to_string()),
     }
 }
 
@@ -1087,6 +1250,20 @@ fn validate_nearby_radius(radius: Option<f32>) -> Result<f32, String> {
 
 fn prepare_nearby_query(mut params: SqliteSpatialQueryParams) -> Result<NearbyQueryPlan, String> {
     let radius = validate_nearby_radius(params.radius)?;
+    params.sort = match params
+        .sort
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" => None,
+        "distance" => Some("distance".to_string()),
+        "name" => Some("name".to_string()),
+        "spec_distance" | "spec_then_distance" => Some("spec_distance".to_string()),
+        _ => return Err("invalid sort (expected distance, name, or spec_distance)".to_string()),
+    };
     let refno = params
         .refno
         .as_deref()
@@ -1097,7 +1274,7 @@ fn prepare_nearby_query(mut params: SqliteSpatialQueryParams) -> Result<NearbyQu
     if let Some(refno) = refno {
         let normalized = normalize_refno_string(&refno)
             .ok_or_else(|| "invalid refno format (expected dbnum_refno)".to_string())?;
-        let shape = normalize_nearby_shape(&params.shape, "refno");
+        let shape = normalize_nearby_shape(&params.shape, "refno")?;
         params.mode = Some("refno".to_string());
         params.refno = Some(normalized.clone());
         params.radius = Some(radius);
@@ -1121,7 +1298,7 @@ fn prepare_nearby_query(mut params: SqliteSpatialQueryParams) -> Result<NearbyQu
         return Err("nearby position contains non-finite value".to_string());
     }
 
-    let shape = normalize_nearby_shape(&params.shape, "position");
+    let shape = normalize_nearby_shape(&params.shape, "position")?;
     params.mode = Some("position".to_string());
     params.radius = Some(radius);
     params.distance = None;
@@ -1208,6 +1385,49 @@ fn parse_refno_enum_for_source(refno: &str) -> Result<RefnoEnum, String> {
     })
 }
 
+fn parse_clearance_group_by(
+    params: &NearestClearanceQueryParams,
+) -> Result<ClearanceGroupBy, String> {
+    let raw = params
+        .group_by
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "" | "target_groups" | "group" | "groups" => Ok(ClearanceGroupBy::TargetGroups),
+        "noun" | "nouns" => Ok(ClearanceGroupBy::Noun),
+        other => Err(format!(
+            "invalid group_by `{other}` (expected target_groups or noun)"
+        )),
+    }
+}
+
+/// 解析目标过滤 + 分桶方式。
+///
+/// - `group_by=target_groups`（默认）：沿用旧口径，target_nouns / target_groups 至少给一个。
+/// - `group_by=noun`：目标过滤可选；都不给就是"半径内所有类型"，此时负几何 NOUN 默认剔除。
+fn resolve_targeting(params: &NearestClearanceQueryParams) -> Result<ResolvedTargeting, String> {
+    let group_by = parse_clearance_group_by(params)?;
+    let groups = resolve_target_groups(params)?;
+    if groups.is_empty() && group_by == ClearanceGroupBy::TargetGroups {
+        return Err(
+            "at least one of target_nouns or target_groups must resolve to NOUN filters (or use group_by=noun)"
+                .to_string(),
+        );
+    }
+    let mut exclude_nouns = parse_csv_upper(&params.exclude_nouns);
+    exclude_nouns.sort();
+    exclude_nouns.dedup();
+    Ok(ResolvedTargeting {
+        group_by,
+        groups,
+        exclude_nouns,
+    })
+}
+
+/// 把 target_groups / target_nouns 解析成目标组；两者都没给时返回空 Vec，
+/// 是否允许为空由 [`resolve_targeting`] 按 `group_by` 决定。
 fn resolve_target_groups(
     params: &NearestClearanceQueryParams,
 ) -> Result<Vec<ResolvedTargetGroup>, String> {
@@ -1249,13 +1469,6 @@ fn resolve_target_groups(
                 nouns,
             });
         }
-    }
-
-    if groups.is_empty() {
-        return Err(
-            "at least one of target_nouns or target_groups must resolve to NOUN filters"
-                .to_string(),
-        );
     }
 
     Ok(groups)
@@ -1377,6 +1590,92 @@ fn candidate_sort_key_scope_rank(
             .unwrap_or(usize::MAX),
         None => 0,
     }
+}
+
+/// 桶内排序：距离 → scope 内 dbnum 优先级 → refno。
+///
+/// 各桶独立截断、互不比较，所以不需要桶间 tiebreaker。
+fn sort_clearance_candidates_nearest_first(
+    candidates: &mut [NearestClearanceCandidate],
+    scope_dbnums: &Option<Vec<u32>>,
+) {
+    candidates.sort_by(|a, b| {
+        a.distance_mm
+            .partial_cmp(&b.distance_mm)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                candidate_sort_key_scope_rank(a, scope_dbnums)
+                    .cmp(&candidate_sort_key_scope_rank(b, scope_dbnums))
+            })
+            .then_with(|| a.refno.cmp(&b.refno))
+    });
+}
+
+/// 把通过全部过滤的候选装进桶里并截断到 `max_per_group`。
+///
+/// - `TargetGroups`：每个解析出来的目标组一桶，桶名 = 组名（wall / column / target_nouns），
+///   桶序 = 请求里的组序；空桶保留并附 warning，前端据此知道"查了但没有"。
+/// - `Noun`：每个出现过的 NOUN 一桶，桶名 = NOUN，`nouns = [NOUN]`；
+///   桶序按各桶最近距离升序再按 NOUN，前端不用再排一遍；没有空桶。
+fn bucket_clearance_candidates(
+    candidates: Vec<(String, NearestClearanceCandidate)>,
+    targeting: &ResolvedTargeting,
+    scope_dbnums: &Option<Vec<u32>>,
+    max_per_group: usize,
+    warnings: &mut Vec<String>,
+) -> Vec<NearestClearanceGroupResult> {
+    let mut nearest_by_group = Vec::new();
+    match targeting.group_by {
+        ClearanceGroupBy::TargetGroups => {
+            for group in targeting.groups.iter() {
+                let group_nouns: HashSet<&str> = group.nouns.iter().map(String::as_str).collect();
+                let mut group_candidates = candidates
+                    .iter()
+                    .filter(|(noun, _candidate)| group_nouns.contains(noun.as_str()))
+                    .map(|(_noun, candidate)| candidate.clone())
+                    .collect::<Vec<_>>();
+                sort_clearance_candidates_nearest_first(&mut group_candidates, scope_dbnums);
+                if group_candidates.is_empty() {
+                    warnings.push(format!("no targets found for group `{}`", group.name));
+                }
+                group_candidates.truncate(max_per_group);
+                nearest_by_group.push(NearestClearanceGroupResult {
+                    group: group.name.clone(),
+                    nouns: group.nouns.clone(),
+                    candidates: group_candidates,
+                });
+            }
+        }
+        ClearanceGroupBy::Noun => {
+            let mut buckets: BTreeMap<String, Vec<NearestClearanceCandidate>> = BTreeMap::new();
+            for (noun, candidate) in candidates {
+                buckets.entry(noun).or_default().push(candidate);
+            }
+            for (noun, mut bucket) in buckets {
+                sort_clearance_candidates_nearest_first(&mut bucket, scope_dbnums);
+                bucket.truncate(max_per_group);
+                nearest_by_group.push(NearestClearanceGroupResult {
+                    group: noun.clone(),
+                    nouns: vec![noun],
+                    candidates: bucket,
+                });
+            }
+            let nearest_distance = |group: &NearestClearanceGroupResult| {
+                group
+                    .candidates
+                    .first()
+                    .map(|candidate| candidate.distance_mm)
+                    .unwrap_or(f32::INFINITY)
+            };
+            nearest_by_group.sort_by(|a, b| {
+                nearest_distance(a)
+                    .partial_cmp(&nearest_distance(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.group.cmp(&b.group))
+            });
+        }
+    }
+    nearest_by_group
 }
 
 fn centerline_segment_aabb(segment: &BranCenterlineSegment) -> Aabb {
@@ -1733,7 +2032,7 @@ pub async fn api_sqlite_spatial_nearest_clearance(
             distance_method,
         ));
     }
-    if let Err(e) = resolve_target_groups(&params) {
+    if let Err(e) = resolve_targeting(&params) {
         return Json(error_nearest_clearance_response(
             e,
             None,
@@ -1754,7 +2053,7 @@ pub async fn api_sqlite_spatial_nearest_clearance(
         ));
     }
 
-    let prepared_centerline = if source_mode == "bran_centerline" {
+    let prepared_bran = if source_mode == "bran_centerline" {
         match params
             .source_refno
             .as_deref()
@@ -1762,8 +2061,8 @@ pub async fn api_sqlite_spatial_nearest_clearance(
             .filter(|value| !value.is_empty())
         {
             Some(source_refno) => match parse_refno_enum_for_source(source_refno) {
-                Ok(branch_refno) => match fetch_bran_centerline_segments(branch_refno).await {
-                    Ok(segments) => Some(segments),
+                Ok(branch_refno) => match prepare_bran_source(branch_refno).await {
+                    Ok(prepared) => Some(prepared),
                     Err(e) => {
                         return Json(error_nearest_clearance_response(
                             format!("fetch BRAN centerline failed: {e}"),
@@ -1808,10 +2107,9 @@ pub async fn api_sqlite_spatial_nearest_clearance(
     } else {
         None
     };
-    let result = tokio::task::spawn_blocking(move || {
-        do_nearest_clearance_query(params, prepared_centerline)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || do_nearest_clearance_query(params, prepared_bran))
+            .await;
     match result {
         Ok(r) => Json(r),
         Err(e) => Json(error_nearest_clearance_response(
@@ -1829,7 +2127,9 @@ pub async fn api_sqlite_spatial_nearest_clearance(
 pub async fn api_sqlite_spatial_query(
     Query(params): Query<SqliteSpatialQueryParams>,
 ) -> Json<SpatialQueryResult> {
-    let prepared_centerline = if parse_mode(&params) == "bran_centerline" {
+    // 中心线 + 成员表一起预取（与 nearest-clearance 同一个 prepare_bran_source）：
+    // include_self=false 时 BRAN 自身、TUBI 段、成员构件才能整组剔掉，而不是只剔 BRAN 一个 id。
+    let prepared_bran = if parse_mode(&params) == "bran_centerline" {
         match params
             .refno
             .as_deref()
@@ -1837,8 +2137,8 @@ pub async fn api_sqlite_spatial_query(
             .filter(|value| !value.is_empty())
         {
             Some(refno) => match parse_refno_enum_for_source(refno) {
-                Ok(branch_refno) => match fetch_bran_centerline_segments(branch_refno).await {
-                    Ok(segments) => Some(segments),
+                Ok(branch_refno) => match prepare_bran_source(branch_refno).await {
+                    Ok(prepared) => Some(prepared),
                     Err(e) => {
                         return Json(error_spatial_query_result(
                             format!("fetch BRAN centerline failed: {e}"),
@@ -1870,7 +2170,7 @@ pub async fn api_sqlite_spatial_query(
 
     // 将 SQLite 阻塞 I/O 放入 blocking 线程池
     let result = tokio::task::spawn_blocking(move || {
-        do_spatial_query(params, fallback_refno_ids, prepared_centerline)
+        do_spatial_query(params, fallback_refno_ids, prepared_bran)
     })
     .await;
     match result {
@@ -1939,7 +2239,7 @@ pub async fn api_sqlite_spatial_nearby(
 
 fn do_nearest_clearance_query(
     params: NearestClearanceQueryParams,
-    prepared_centerline: Option<Vec<BranCenterlineSegment>>,
+    prepared_bran: Option<PreparedBranSource>,
 ) -> NearestClearanceResponse {
     let include_debug = params.debug.unwrap_or(false);
     let source_mode = parse_clearance_source_mode(&params);
@@ -1958,8 +2258,8 @@ fn do_nearest_clearance_query(
             distance_method,
         );
     }
-    let groups = match resolve_target_groups(&params) {
-        Ok(groups) => groups,
+    let targeting = match resolve_targeting(&params) {
+        Ok(targeting) => targeting,
         Err(e) => {
             return error_nearest_clearance_response(
                 e,
@@ -1971,7 +2271,10 @@ fn do_nearest_clearance_query(
             );
         }
     };
-    let all_target_nouns = union_group_nouns(&groups);
+    // None = 不限 NOUN（仅 group_by=noun 且没给目标过滤时）；此时负几何 NOUN 默认剔除，
+    // 显式点名的负几何 NOUN 照常放行。
+    let target_noun_filter = targeting.noun_filter();
+    let exclude_nouns: HashSet<&str> = targeting.exclude_nouns.iter().map(String::as_str).collect();
     let radius = match resolve_clearance_radius(params.radius) {
         Ok(radius) => radius,
         Err(e) => {
@@ -2022,6 +2325,7 @@ fn do_nearest_clearance_query(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let mut self_ids = HashSet::new();
+    let mut warnings = Vec::new();
     let (source, source_geometry, source_dbnum) = if source_mode == "bran_centerline" {
         let Some(source_refno) = source_refno else {
             return error_nearest_clearance_response(
@@ -2044,7 +2348,7 @@ fn do_nearest_clearance_query(
             );
         };
         self_ids.insert(id);
-        let Some(centerline) = prepared_centerline else {
+        let Some(prepared) = prepared_bran else {
             return error_nearest_clearance_response(
                 "BRAN centerline was not prepared",
                 None,
@@ -2054,7 +2358,7 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         };
-        if centerline.is_empty() {
+        if prepared.centerline.is_empty() {
             return error_nearest_clearance_response(
                 "BRAN centerline has no segments",
                 None,
@@ -2064,12 +2368,14 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         }
-        for segment in &centerline {
-            if let Some(segment_id) = refno_str_to_i64(&refno_enum_to_output_refno(&segment.refno))
-            {
-                self_ids.insert(segment_id);
-            }
-        }
+        // 自身 = BRAN + 全部 TUBI 段 + 全部成员构件；缺任何一类，"最近的构件"就会被自己占满。
+        self_ids.extend(prepared.own_index_ids());
+        let PreparedBranSource {
+            centerline,
+            warnings: prepared_warnings,
+            ..
+        } = prepared;
+        warnings.extend(prepared_warnings);
         let bbox = centerline_bbox(&centerline).expect("non-empty centerline has bbox");
         let source = NearestClearanceSource {
             kind: "bran_centerline".to_string(),
@@ -2202,12 +2508,10 @@ fn do_nearest_clearance_query(
     };
 
     let resolved_filters = NearestClearanceResolvedFilters {
-        target_nouns: {
-            let mut nouns = all_target_nouns.iter().cloned().collect::<Vec<_>>();
-            nouns.sort();
-            nouns
-        },
-        target_groups: groups.clone(),
+        target_nouns: targeting.sorted_target_nouns(),
+        target_groups: targeting.groups.clone(),
+        group_by: targeting.group_by.as_str().to_string(),
+        exclude_nouns: targeting.exclude_nouns.clone(),
         scope: scope.clone(),
         dbnums: scope_dbnums.clone(),
         radius,
@@ -2294,6 +2598,7 @@ fn do_nearest_clearance_query(
         debug.rows_examined += 1;
 
         if !include_self && self_ids.contains(&id) {
+            debug.self_filtered += 1;
             continue;
         }
 
@@ -2311,7 +2616,11 @@ fn do_nearest_clearance_query(
             debug.scope_filtered += 1;
             continue;
         }
-        if !all_target_nouns.contains(&noun_upper) {
+        let noun_accepted = match &target_noun_filter {
+            Some(allowed) => allowed.contains(&noun_upper),
+            None => !is_negative_noun(&noun_upper),
+        };
+        if !noun_accepted || exclude_nouns.contains(noun_upper.as_str()) {
             debug.noun_filtered += 1;
             continue;
         }
@@ -2370,40 +2679,24 @@ fn do_nearest_clearance_query(
         ));
     }
 
-    let mut nearest_by_group = Vec::new();
-    let mut warnings = Vec::new();
-    for (group_priority, group) in groups.iter().enumerate() {
-        let group_nouns: HashSet<String> = group.nouns.iter().cloned().collect();
-        let mut group_candidates = candidates
-            .iter()
-            .filter(|(noun, _candidate)| group_nouns.contains(noun))
-            .map(|(_noun, candidate)| candidate.clone())
-            .collect::<Vec<_>>();
+    // 截断前按 NOUN 计数：这是"周围各类型各有多少"的 facet，不受 max_per_group 影响。
+    let mut noun_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (noun, _candidate) in &candidates {
+        *noun_counts.entry(noun.clone()).or_insert(0) += 1;
+    }
 
-        group_candidates.sort_by(|a, b| {
-            a.distance_mm
-                .partial_cmp(&b.distance_mm)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    candidate_sort_key_scope_rank(a, &scope_dbnums)
-                        .cmp(&candidate_sort_key_scope_rank(b, &scope_dbnums))
-                })
-                .then_with(|| group_priority.cmp(&group_priority))
-                .then_with(|| a.refno.cmp(&b.refno))
-        });
-        if group_candidates.is_empty() {
-            warnings.push(format!("no targets found for group `{}`", group.name));
-        }
-        group_candidates.truncate(max_per_group);
-        debug.returned_candidates += group_candidates.len();
-        if !group_candidates.is_empty() {
+    let nearest_by_group = bucket_clearance_candidates(
+        candidates,
+        &targeting,
+        &scope_dbnums,
+        max_per_group,
+        &mut warnings,
+    );
+    for group in &nearest_by_group {
+        debug.returned_candidates += group.candidates.len();
+        if !group.candidates.is_empty() {
             debug.groups_with_hits += 1;
         }
-        nearest_by_group.push(NearestClearanceGroupResult {
-            group: group.name.clone(),
-            nouns: group.nouns.clone(),
-            candidates: group_candidates,
-        });
     }
     if nearest_by_group
         .iter()
@@ -2417,6 +2710,8 @@ fn do_nearest_clearance_query(
         query_bbox,
         resolved_filters,
         nearest_by_group,
+        noun_counts,
+        debug.self_filtered,
         warnings,
         include_debug.then_some(debug),
         distance_method,
@@ -2503,7 +2798,7 @@ fn query_aabbs_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<A
 fn do_spatial_query(
     params: SqliteSpatialQueryParams,
     fallback_refno_ids: Option<Vec<i64>>,
-    prepared_centerline: Option<Vec<BranCenterlineSegment>>,
+    prepared_bran: Option<PreparedBranSource>,
 ) -> SpatialQueryResult {
     let cached = match get_cached_index() {
         Ok(c) => c,
@@ -2518,15 +2813,18 @@ fn do_spatial_query(
     let mode = parse_mode(&params);
     let include_self = params.include_self.unwrap_or(true);
 
-    // 记住 refno 对应的 i64 id（用于 include_self 过滤）
-    let self_id: Option<i64> = if mode == "refno" && !include_self {
-        params
+    // include_self=false 时要剔掉的"自身"：refno 模式是它自己一个 id；
+    // bran_centerline 模式再加上全部 TUBI 段与成员构件（见下）。include_self=true 时集合为空。
+    let mut self_ids: HashSet<i64> = HashSet::new();
+    if !include_self && (mode == "refno" || mode == "bran_centerline") {
+        if let Some(id) = params
             .refno
             .as_deref()
             .and_then(|s| refno_str_to_i64(s.trim()))
-    } else {
-        None
-    };
+        {
+            self_ids.insert(id);
+        }
+    }
 
     let base_aabb = if mode == "position" {
         // position 模式：从 x, y, z, radius 构建 AABB
@@ -2559,7 +2857,7 @@ fn do_spatial_query(
                     cached,
                     vec![Aabb::new([x, y, z].into(), [x, y, z].into())],
                     r,
-                    self_id,
+                    self_ids,
                 );
             }
             _ => {
@@ -2570,20 +2868,34 @@ fn do_spatial_query(
             }
         }
     } else if mode == "bran_centerline" {
-        let Some(centerline) = prepared_centerline else {
+        let Some(prepared) = prepared_bran else {
             return error_spatial_query_result("BRAN centerline was not prepared", None);
         };
-        if centerline.is_empty() {
+        if prepared.centerline.is_empty() {
             return error_spatial_query_result("BRAN centerline has no segments", None);
         }
+        // 自身 = BRAN + 全部 TUBI 段 + 全部成员构件，口径与 nearest-clearance 一致；
+        // 否则半径内最近的一批全是它自己的管子和弯头，distance=0 排在最前。
+        if !include_self {
+            self_ids.extend(prepared.own_index_ids());
+        }
+        let PreparedBranSource {
+            centerline,
+            warnings,
+            ..
+        } = prepared;
         let search_distance = normalized_search_distance(params.distance, params.radius);
-        return query_by_target_geometry(
+        let mut result = query_by_target_geometry(
             params,
             cached,
             QueryTargetGeometry::BranCenterline(centerline),
             search_distance,
-            self_id,
+            self_ids,
         );
+        if result.success && !warnings.is_empty() {
+            result.warnings = Some(warnings);
+        }
+        return result;
     } else if mode == "refno" {
         let refno = params.refno.as_deref().unwrap_or("").trim();
         if refno.is_empty() {
@@ -2602,13 +2914,20 @@ fn do_spatial_query(
                 );
             }
         };
-        let row = query_aabb_row(&conn, id).unwrap_or(None);
+        // 读库失败必须冒泡：吞成 None 会让「查询出错」伪装成「refno 不存在」，
+        // 静默走 fallback 或返回空结果。
+        let row = match query_aabb_row(&conn, id) {
+            Ok(row) => row,
+            Err(e) => {
+                return error_spatial_query_result(format!("query refno aabb failed: {}", e), None);
+            }
+        };
         let Some((minx, miny, minz, maxx, maxy, maxz)) = row else {
             if let Some(ids) = fallback_refno_ids.as_deref() {
                 match query_aabbs_for_ids(&conn, ids) {
                     Ok(aabbs) if !aabbs.is_empty() => {
                         let distance = normalized_search_distance(params.distance, params.radius);
-                        return query_by_target_aabbs(params, cached, aabbs, distance, self_id);
+                        return query_by_target_aabbs(params, cached, aabbs, distance, self_ids);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -2632,7 +2951,7 @@ fn do_spatial_query(
     };
 
     let distance = normalized_search_distance(params.distance, params.radius);
-    query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_id)
+    query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_ids)
 }
 
 fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQueryResult {
@@ -2659,6 +2978,7 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
             params.include_negative.unwrap_or(false),
         )),
         groups: Some(vec![]),
+        warnings: None,
         error: None,
     }
 }
@@ -2931,23 +3251,25 @@ fn query_by_target_aabbs(
     cached: &CachedIndex,
     target_aabbs: Vec<Aabb>,
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: HashSet<i64>,
 ) -> SpatialQueryResult {
     query_by_target_geometry(
         params,
         cached,
         QueryTargetGeometry::Aabbs(target_aabbs),
         search_distance,
-        self_id,
+        self_ids,
     )
 }
 
+/// `self_ids`：要从结果里剔掉的"自身"索引 id（refno 模式是源本身；bran_centerline 模式还包括
+/// 全部 TUBI 段与成员构件）。空集合 = 不剔。
 fn query_by_target_geometry(
     params: SqliteSpatialQueryParams,
     cached: &CachedIndex,
     target_geometry: QueryTargetGeometry,
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: HashSet<i64>,
 ) -> SpatialQueryResult {
     let (page, per_page) = resolve_pagination(&params);
     let hydrate_page = params.per_page_cap_override != Some(REFNOS_HARD_CAP);
@@ -2972,7 +3294,7 @@ fn query_by_target_geometry(
         &params,
         &query_regions,
         search_distance,
-        self_id,
+        &self_ids,
         is_sphere,
     );
 
@@ -2991,7 +3313,7 @@ fn query_by_target_geometry(
             &target_geometry,
             &query_regions,
             search_distance,
-            self_id,
+            &self_ids,
             is_sphere,
         )
     });
@@ -3010,7 +3332,7 @@ fn scan_spatial_results(
     target_geometry: &QueryTargetGeometry,
     query_regions: &[Aabb],
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: &HashSet<i64>,
     is_sphere: bool,
 ) -> Result<SpatialScanOutcome, SpatialQueryResult> {
     let generation = crate::sqlite_index::index_generation();
@@ -3061,11 +3383,9 @@ fn scan_spatial_results(
             aabb: candidate_aabb,
         } = candidate;
 
-        // include_self 过滤
-        if let Some(self_id) = self_id {
-            if id == self_id {
-                continue;
-            }
+        // include_self 过滤：refno 模式只有源本身；bran_centerline 模式还有全部 TUBI 段与成员构件
+        if self_ids.contains(&id) {
+            continue;
         }
 
         if !include_negative && is_negative_noun(&noun) {
@@ -3222,14 +3542,17 @@ fn scan_cache_generation_prefix() -> String {
 /// 「回填名称」，翻页还会在 TTL 内继续读到没有名称的那份快照。
 ///
 /// `preferred_db_prefix` 也要进键：它只由 `params.refno` 决定，而 `refno` 本身没有
-/// 进键（`self_id` 在 `include_self=true` 时是 None），否则两个包围盒完全相同、
+/// 进键（`self_ids` 在 `include_self=true` 时是空集），否则两个包围盒完全相同、
 /// 分属不同库的 refno 会共用快照，同距离时的「同库优先」排序会串。
+///
+/// `self_ids` 按排好序的整组哈希进键：bran_centerline 模式下它是 BRAN + 全部 TUBI 段 + 成员，
+/// 同一走廊 `include_self` 一真一假必须是两份快照。
 fn scan_cache_key(
     index_path: &Path,
     params: &SqliteSpatialQueryParams,
     regions: &[Aabb],
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: &HashSet<i64>,
     is_sphere: bool,
 ) -> String {
     use std::hash::{Hash, Hasher};
@@ -3248,13 +3571,19 @@ fn scan_cache_key(
         }
     }
 
+    let mut self_hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut sorted_self_ids: Vec<i64> = self_ids.iter().copied().collect();
+    sorted_self_ids.sort_unstable();
+    sorted_self_ids.hash(&mut self_hasher);
+
     format!(
-        "{}{}|{:x}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}{}|{:x}|{}|{}:{:x}|{}|{}|{}|{}|{}|{}|{}|{}",
         scan_cache_generation_prefix(),
         index_path.display(),
         hasher.finish(),
         search_distance.to_bits(),
-        self_id.unwrap_or(0),
+        sorted_self_ids.len(),
+        self_hasher.finish(),
         is_sphere,
         params.nouns.as_deref().unwrap_or(""),
         params.spec_values.as_deref().unwrap_or(""),
@@ -4047,6 +4376,31 @@ pub async fn api_sqlite_spatial_nearby_refnos(
 }
 
 // ============================================================================
+// Handler：GET /api/sqlite-spatial/negative-nouns
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct NegativeNounsResult {
+    pub success: bool,
+    /// 全量负实体 noun 清单（大写、去重、排序）
+    pub nouns: Vec<String>,
+}
+
+/// GET /api/sqlite-spatial/negative-nouns
+///
+/// 负实体 noun 的唯一事实源是 rs-core 的 `TOTAL_NEG_NOUN_NAMES`。
+/// 前端不再自带硬编码清单：启动时拉取本端点，查询响应里的
+/// `filter_options.is_negative` 只作增量补充。
+pub async fn api_sqlite_spatial_negative_nouns() -> Json<NegativeNounsResult> {
+    let mut nouns: Vec<String> = negative_nouns().iter().cloned().collect();
+    nouns.sort();
+    Json(NegativeNounsResult {
+        success: true,
+        nouns,
+    })
+}
+
+// ============================================================================
 // Handler：GET /api/sqlite-spatial/stats
 // ============================================================================
 
@@ -4110,10 +4464,46 @@ fn do_spatial_stats() -> SpatialStatsResult {
 #[cfg(all(test, feature = "sqlite-index"))]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::sync::{MutexGuard, TryLockError};
+    use tempfile::TempDir;
 
+    /// 测试专用临时目录：从建目录起一直握着串行锁，直到用例结束才放。
+    ///
+    /// 索引版本号 `sqlite_index::index_generation()` 是进程级的，往 fixture 里写行会把它加一。
+    /// 另一条测试线程若恰好处在扫描与取页之间，就会看到「索引已改写」而整条查询报错、结果为空
+    /// ——并行跑时偶发的那几次失败就是这么来的。所以写 fixture 与跑查询必须互斥，
+    /// 锁不能只包住 `with_test_index` 那一段。
+    struct SerialTempDir {
+        // 先删目录再放锁：字段按声明顺序析构。
+        dir: TempDir,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl SerialTempDir {
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    fn serial_tempdir() -> SerialTempDir {
+        // 某个用例断言失败会让锁中毒；后面的用例照常拿锁，别让一处失败连坐一片。
+        let guard = test_guard()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SerialTempDir {
+            dir: tempfile::tempdir().unwrap(),
+            _guard: guard,
+        }
+    }
+
+    /// 把查询指向给定索引文件。调用方必须已经通过 `serial_tempdir()` 持有串行锁。
     fn with_test_index<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = test_guard().lock().unwrap();
+        match test_guard().try_lock() {
+            Err(TryLockError::WouldBlock) => {}
+            Ok(_) | Err(TryLockError::Poisoned(_)) => {
+                panic!("with_test_index 之前必须先用 serial_tempdir() 拿到串行锁")
+            }
+        }
         clear_test_index_path();
         set_test_index_path(path);
         let result = f();
@@ -4149,6 +4539,8 @@ mod tests {
             z: None,
             target_nouns: None,
             target_groups: None,
+            group_by: None,
+            exclude_nouns: None,
             radius: None,
             scope: None,
             dbnums: None,
@@ -4354,7 +4746,7 @@ mod tests {
     /// id 顺序先到先得、攒满就 break，于是留下的恰好全是最远的那些。
     #[test]
     fn truncated_results_keep_nearest_not_lowest_ids() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4415,7 +4807,7 @@ mod tests {
     /// UNKNOWN / 0 回退，而不是整行丢掉，也不是变成 NaN 包围盒。
     #[test]
     fn fetch_candidates_by_ids_batches_and_tolerates_missing_items() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4456,7 +4848,7 @@ mod tests {
     /// 回填名称之后再查，必须立刻看到新名称，不能在 TTL 内继续读改动前的快照。
     #[test]
     fn name_backfill_invalidates_paged_scan_snapshot() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4491,7 +4883,7 @@ mod tests {
 
     #[test]
     fn bbox_query_returns_refno_strings() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4548,7 +4940,7 @@ mod tests {
 
     #[test]
     fn bbox_query_returns_zero_spec_value_when_missing() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4587,7 +4979,7 @@ mod tests {
 
     #[test]
     fn position_query_defaults_to_sphere_filter() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4637,7 +5029,7 @@ mod tests {
 
     #[test]
     fn refno_query_defaults_to_sphere_filter_and_can_exclude_self() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4697,7 +5089,7 @@ mod tests {
 
     #[test]
     fn spatial_query_excludes_negative_nouns_by_default() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4747,7 +5139,7 @@ mod tests {
 
     #[test]
     fn keyword_filter_matches_name_before_pagination() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4802,7 +5194,7 @@ mod tests {
 
     #[test]
     fn sort_and_spec_groups_are_global_not_page_scoped() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4911,7 +5303,7 @@ mod tests {
 
     #[test]
     fn response_reports_candidate_scale_and_truncation_flags() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4956,7 +5348,7 @@ mod tests {
 
     #[test]
     fn paging_reuses_scan_snapshot_and_keeps_slices_disjoint() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5056,7 +5448,7 @@ mod tests {
 
     #[test]
     fn keyword_filter_matches_refno_and_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5113,7 +5505,7 @@ mod tests {
 
     #[test]
     fn spatial_query_includes_negative_nouns_when_requested() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5170,7 +5562,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_refno_source_returns_wall_and_column_groups() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5198,7 +5590,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_point_source_returns_nearest_targets() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5222,7 +5614,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_radius_changes_returned_set() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5251,7 +5643,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_noun_filter_excludes_nearer_wrong_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5273,7 +5665,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_honors_same_dbnum_and_explicit_dbnums_scope() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5308,7 +5700,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_source_refno_not_found_returns_false() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5328,7 +5720,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_intersecting_aabb_distance_zero_and_intersects_true() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5368,7 +5760,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_bran_centerline_corridor_excludes_far_whole_aabb_hit() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_centerline_corridor_test_index(&db);
 
@@ -5379,7 +5771,10 @@ mod tests {
             params.target_nouns = Some("WALL".to_string());
             params.radius = Some(8.0);
             params.max_per_group = Some(10);
-            do_nearest_clearance_query(params, Some(centerline_fixture()))
+            do_nearest_clearance_query(
+                params,
+                Some(PreparedBranSource::from_centerline(centerline_fixture())),
+            )
         });
 
         assert!(resp.success);
@@ -5402,7 +5797,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_bran_centerline_supports_wall_and_column_groups() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_centerline_corridor_test_index(&db);
 
@@ -5412,7 +5807,10 @@ mod tests {
             params.source_refno = Some("1_100".to_string());
             params.target_groups = Some("wall,column".to_string());
             params.radius = Some(8.0);
-            do_nearest_clearance_query(params, Some(centerline_fixture()))
+            do_nearest_clearance_query(
+                params,
+                Some(PreparedBranSource::from_centerline(centerline_fixture())),
+            )
         });
 
         assert!(resp.success);
@@ -5422,5 +5820,601 @@ mod tests {
         assert_eq!(wall[0].refno, "1_201");
         assert_eq!(column.len(), 1);
         assert_eq!(column[0].refno, "1_202");
+        assert_eq!(
+            resp.resolved_filters.as_ref().unwrap().group_by,
+            "target_groups"
+        );
+        assert_eq!(resp.noun_counts.get("WALL"), Some(&1));
+        assert_eq!(resp.noun_counts.get("COLU"), Some(&1));
+    }
+
+    // ------------------------------------------------------------------
+    // group_by=noun + 排除 BRAN 全部成员
+    // ------------------------------------------------------------------
+
+    /// 中心线与 [`centerline_fixture`] 相同：(0,0,0)→(100,0,0)→(100,100,0)。
+    ///
+    /// 沿线摆的东西分四类：
+    /// - 自身：BRAN 1_100、TUBI 段 1_301、成员 ELBO 1_401 / WELD 1_402（都压在中心线上，距离 0）；
+    /// - 外物：WELD 1_502（2）、FLAN 1_501（3）、WALL 1_201（4）、COLU 1_202（4）、WALL 1_204（5）、SCTN 1_203（6）；
+    /// - 负几何：NBOX 1_601（1），默认要被剔掉；
+    /// - 远处：WALL 1_701（30），半径 10 之外。
+    fn create_bran_members_test_index(path: &std::path::Path) {
+        let idx = SqliteAabbIndex::open(path).unwrap();
+        idx.init_schema().unwrap();
+        let row = |id: i64, noun: &str, spec: i64, b: [f64; 6]| {
+            (
+                id,
+                noun.to_string(),
+                spec,
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+            )
+        };
+        idx.insert_aabbs_with_items_and_spec_values(vec![
+            row(
+                rid(1, 100),
+                "BRAN",
+                0,
+                [-1.0, 101.0, -1.0, 101.0, -1.0, 1.0],
+            ),
+            row(rid(1, 301), "TUBI", 0, [0.0, 100.0, -1.0, 1.0, -1.0, 1.0]),
+            row(rid(1, 401), "ELBO", 0, [99.0, 101.0, -1.0, 1.0, -1.0, 1.0]),
+            row(rid(1, 402), "WELD", 0, [49.0, 51.0, -1.0, 1.0, -1.0, 1.0]),
+            row(rid(1, 502), "WELD", 7, [70.0, 72.0, 2.0, 3.0, -1.0, 1.0]),
+            row(rid(1, 501), "FLAN", 7, [30.0, 32.0, 3.0, 5.0, -1.0, 1.0]),
+            row(rid(1, 201), "WALL", 11, [20.0, 22.0, 4.0, 6.0, -1.0, 1.0]),
+            row(rid(1, 202), "COLU", 13, [94.0, 96.0, 80.0, 82.0, -1.0, 1.0]),
+            row(rid(1, 204), "WALL", 11, [40.0, 42.0, 5.0, 7.0, -1.0, 1.0]),
+            row(rid(1, 203), "SCTN", 13, [60.0, 62.0, 6.0, 8.0, -1.0, 1.0]),
+            row(rid(1, 601), "NBOX", 0, [10.0, 12.0, 1.0, 2.0, -1.0, 1.0]),
+            row(rid(1, 701), "WALL", 11, [10.0, 12.0, 30.0, 32.0, -1.0, 1.0]),
+        ])
+        .unwrap();
+    }
+
+    fn bran_with_members_fixture() -> PreparedBranSource {
+        PreparedBranSource {
+            centerline: centerline_fixture(),
+            member_refnos: vec![RefnoEnum::from("1/401"), RefnoEnum::from("1/402")],
+            warnings: Vec::new(),
+        }
+    }
+
+    fn group_names(resp: &NearestClearanceResponse) -> Vec<&str> {
+        resp.nearest_by_group
+            .iter()
+            .map(|group| group.group.as_str())
+            .collect()
+    }
+
+    fn all_refnos(resp: &NearestClearanceResponse) -> Vec<&str> {
+        resp.nearest_by_group
+            .iter()
+            .flat_map(|group| group.candidates.iter().map(|c| c.refno.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn nearest_clearance_bran_centerline_excludes_all_bran_members() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(10);
+            params.debug = Some(true);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let refnos = all_refnos(&resp);
+        for own in ["1_100", "1_301", "1_401", "1_402"] {
+            assert!(
+                !refnos.contains(&own),
+                "self member {own} leaked into results: {refnos:?}"
+            );
+        }
+        // 成员的 noun 也不该以空桶或计数的形式出现。
+        assert!(!resp.noun_counts.contains_key("ELBO"));
+        assert!(!resp.noun_counts.contains_key("TUBI"));
+        assert!(!resp.noun_counts.contains_key("BRAN"));
+        // 另一条管线的 WELD / FLAN 不是成员，必须保留。
+        assert!(refnos.contains(&"1_502"));
+        assert!(refnos.contains(&"1_501"));
+        // BRAN + TUBI + ELBO + WELD 四个自身 id 都落在走廊里。
+        assert_eq!(resp.excluded_self_members, 4);
+        assert_eq!(resp.debug.as_ref().unwrap().self_filtered, 4);
+    }
+
+    #[test]
+    fn nearest_clearance_include_self_keeps_bran_members() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(10);
+            params.include_self = Some(true);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(resp.excluded_self_members, 0);
+        let elbo = candidates_for_group(&resp, "ELBO");
+        assert_eq!(elbo.len(), 1);
+        assert_eq!(elbo[0].refno, "1_401");
+        assert_eq!(elbo[0].distance_mm, 0.0);
+        assert!(elbo[0].intersects);
+        // 成员 WELD 与外物 WELD 同桶，成员距离 0 排前面。
+        let weld = candidates_for_group(&resp, "WELD");
+        assert_eq!(weld.len(), 2);
+        assert_eq!(weld[0].refno, "1_402");
+        assert_eq!(weld[1].refno, "1_502");
+    }
+
+    #[test]
+    fn nearest_clearance_prepared_warnings_surface_in_response() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.target_groups = Some("wall".to_string());
+            params.radius = Some(10.0);
+            let mut prepared = PreparedBranSource::from_centerline(centerline_fixture());
+            prepared.warnings.push("members unavailable".to_string());
+            do_nearest_clearance_query(params, Some(prepared))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(
+            resp.warnings.first().map(String::as_str),
+            Some("members unavailable")
+        );
+        // 成员表缺失时只排除 BRAN 与 TUBI 段，ELBO/WELD 不再被当作自身。
+        assert_eq!(resp.excluded_self_members, 2);
+    }
+
+    fn bran_centerline_query_params(include_self: Option<bool>) -> SqliteSpatialQueryParams {
+        SqliteSpatialQueryParams {
+            mode: Some("bran_centerline".to_string()),
+            refno: Some("1_100".to_string()),
+            distance: Some(10.0),
+            include_self,
+            per_page: Some(100),
+            ..Default::default()
+        }
+    }
+
+    fn result_refnos(resp: &SpatialQueryResult) -> Vec<String> {
+        resp.results
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| item.refno.clone())
+            .collect()
+    }
+
+    /// `/query?mode=bran_centerline&include_self=false`：自身口径与 nearest-clearance 一致，
+    /// BRAN + TUBI 段 + 成员构件整组剔掉；同一走廊 `include_self` 缺省时它们照旧以 0 距离排在最前，
+    /// 两次查询打同一个索引，缓存键必须分开。
+    #[test]
+    fn spatial_query_bran_centerline_excludes_bran_tubi_and_members_when_include_self_false() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let (with_self, without_self) = with_test_index(&db, || {
+            let with_self = do_spatial_query(
+                bran_centerline_query_params(None),
+                None,
+                Some(bran_with_members_fixture()),
+            );
+            let without_self = do_spatial_query(
+                bran_centerline_query_params(Some(false)),
+                None,
+                Some(bran_with_members_fixture()),
+            );
+            (with_self, without_self)
+        });
+
+        assert!(with_self.success, "{:?}", with_self.error);
+        let refnos = result_refnos(&with_self);
+        for own in ["1_100", "1_301", "1_401", "1_402"] {
+            assert!(
+                refnos.contains(&own.to_string()),
+                "default include_self dropped {own}: {refnos:?}"
+            );
+        }
+        assert_eq!(
+            with_self.results.as_deref().unwrap_or_default()[0].distance,
+            Some(0.0)
+        );
+        assert!(with_self.warnings.is_none());
+
+        assert!(without_self.success, "{:?}", without_self.error);
+        let refnos = result_refnos(&without_self);
+        for own in ["1_100", "1_301", "1_401", "1_402"] {
+            assert!(
+                !refnos.contains(&own.to_string()),
+                "self member {own} leaked: {refnos:?}"
+            );
+        }
+        // 另一条管线的 WELD / FLAN 与墙柱不是自身，保留。
+        for other in ["1_502", "1_501", "1_201", "1_204", "1_203"] {
+            assert!(
+                refnos.contains(&other.to_string()),
+                "{other} missing: {refnos:?}"
+            );
+        }
+        assert_eq!(
+            without_self.total_count.unwrap() + 4,
+            with_self.total_count.unwrap()
+        );
+    }
+
+    /// `/query?mode=refno&include_self=false` 只剔源本身：自身集合从 Option 换成 HashSet 不能改老口径。
+    #[test]
+    fn spatial_query_refno_mode_still_excludes_only_source_itself() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            do_spatial_query(
+                SqliteSpatialQueryParams {
+                    mode: Some("refno".to_string()),
+                    refno: Some("1_100".to_string()),
+                    distance: Some(10.0),
+                    include_self: Some(false),
+                    per_page: Some(100),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let refnos = result_refnos(&resp);
+        assert!(!refnos.contains(&"1_100".to_string()));
+        // TUBI / ELBO 不是 refno 模式的"自身"
+        assert!(refnos.contains(&"1_301".to_string()));
+        assert!(refnos.contains(&"1_401".to_string()));
+    }
+
+    /// 预取阶段的 warning（成员表取不到 / 为空）随 `/query` 响应一起返回，且不影响查询成功。
+    #[test]
+    fn spatial_query_bran_centerline_surfaces_prepared_warnings() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut prepared = PreparedBranSource::from_centerline(centerline_fixture());
+            prepared.warnings.push("members unavailable".to_string());
+            do_spatial_query(
+                bran_centerline_query_params(Some(false)),
+                None,
+                Some(prepared),
+            )
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(
+            resp.warnings.as_deref(),
+            Some(&["members unavailable".to_string()][..])
+        );
+        let refnos = result_refnos(&resp);
+        // 成员表缺失：只剔 BRAN 与 TUBI 段，ELBO / WELD 成员仍在结果里
+        assert!(!refnos.contains(&"1_100".to_string()));
+        assert!(!refnos.contains(&"1_301".to_string()));
+        assert!(refnos.contains(&"1_401".to_string()));
+        assert!(refnos.contains(&"1_402".to_string()));
+    }
+
+    #[test]
+    fn nearest_clearance_group_by_noun_buckets_by_noun_and_orders_by_distance() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let filters = resp.resolved_filters.as_ref().unwrap();
+        assert_eq!(filters.group_by, "noun");
+        assert!(filters.target_nouns.is_empty(), "no filter = unrestricted");
+        assert!(filters.target_groups.is_empty());
+
+        // 桶序：最近距离升序；WALL 与 COLU 同为 4，按 NOUN 名 COLU 先。
+        assert_eq!(
+            group_names(&resp),
+            vec!["WELD", "FLAN", "COLU", "WALL", "SCTN"]
+        );
+        for group in &resp.nearest_by_group {
+            assert_eq!(group.nouns, vec![group.group.clone()]);
+            assert!(
+                !group.candidates.is_empty(),
+                "noun mode never emits empty buckets"
+            );
+            assert!(
+                group
+                    .candidates
+                    .iter()
+                    .all(|c| c.noun.to_uppercase() == group.group),
+                "bucket {} mixed nouns",
+                group.group
+            );
+        }
+        let wall = candidates_for_group(&resp, "WALL");
+        assert_eq!(wall.len(), 2);
+        assert_eq!(wall[0].refno, "1_201");
+        assert_eq!(wall[0].distance_mm, 4.0);
+        assert_eq!(wall[1].refno, "1_204");
+        assert_eq!(wall[1].distance_mm, 5.0);
+        assert!(
+            wall[0].nearest.is_some(),
+            "centerline source still yields endpoints"
+        );
+        assert!(wall[0].annotation.is_some());
+
+        // 负几何 NBOX 离得最近（1）但不点名就不出现；半径外的 WALL 1_701 也不计数。
+        assert!(!resp.noun_counts.contains_key("NBOX"));
+        assert!(!all_refnos(&resp).contains(&"1_701"));
+        let expected_counts: BTreeMap<String, usize> = [
+            ("COLU", 1),
+            ("FLAN", 1),
+            ("SCTN", 1),
+            ("WALL", 2),
+            ("WELD", 1),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(resp.noun_counts, expected_counts);
+        assert!(
+            resp.warnings
+                .iter()
+                .all(|w| !w.starts_with("no targets found for group")),
+            "noun mode has no predefined groups to warn about: {:?}",
+            resp.warnings
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_group_by_noun_max_per_group_applies_per_noun() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(1);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let wall = candidates_for_group(&resp, "WALL");
+        assert_eq!(wall.len(), 1);
+        assert_eq!(wall[0].refno, "1_201");
+        // 计数在截断之前统计。
+        assert_eq!(resp.noun_counts.get("WALL"), Some(&2));
+        assert!(
+            resp.nearest_by_group
+                .iter()
+                .all(|group| group.candidates.len() == 1)
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_group_by_noun_honors_target_filters_and_exclude_nouns() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.target_groups = Some("wall,column".to_string());
+            params.target_nouns = Some("weld, flan".to_string());
+            params.exclude_nouns = Some("weld".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let filters = resp.resolved_filters.as_ref().unwrap();
+        assert_eq!(filters.exclude_nouns, vec!["WELD".to_string()]);
+        assert_eq!(filters.target_groups.len(), 3, "wall, column, target_nouns");
+        assert!(filters.target_nouns.contains(&"FLAN".to_string()));
+        assert!(filters.target_nouns.contains(&"SCTN".to_string()));
+
+        // 目标过滤仍然生效（FLAN 进、其它无关 noun 不进），exclude 再把 WELD 拿掉，
+        // 桶名是 NOUN 而不是 wall / column。
+        assert_eq!(group_names(&resp), vec!["FLAN", "COLU", "WALL", "SCTN"]);
+        assert!(!resp.noun_counts.contains_key("WELD"));
+        assert!(candidates_for_group(&resp, "wall").is_empty());
+        assert!(candidates_for_group(&resp, "column").is_empty());
+    }
+
+    #[test]
+    fn nearest_clearance_exclude_nouns_also_applies_to_target_groups_mode() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.target_groups = Some("column".to_string());
+            params.exclude_nouns = Some("COLU".to_string());
+            params.radius = Some(10.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let column = candidates_for_group(&resp, "column");
+        assert_eq!(column.len(), 1);
+        assert_eq!(column[0].noun, "SCTN");
+    }
+
+    #[test]
+    fn nearest_clearance_group_by_noun_honors_explicit_negative_noun() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_mode = Some("bran_centerline".to_string());
+            params.source_refno = Some("1_100".to_string());
+            params.group_by = Some("noun".to_string());
+            params.target_nouns = Some("NBOX".to_string());
+            params.radius = Some(10.0);
+            do_nearest_clearance_query(params, Some(bran_with_members_fixture()))
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(group_names(&resp), vec!["NBOX"]);
+        assert_eq!(candidates_for_group(&resp, "NBOX")[0].refno, "1_601");
+    }
+
+    #[test]
+    fn nearest_clearance_group_by_noun_works_for_aabb_source_without_filters() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.group_by = Some("noun".to_string());
+            params.radius = Some(100.0);
+            params.max_per_group = Some(10);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(resp.distance_method, "aabb_clearance_mm");
+        // same_dbnum 默认范围：dbnum 2 的 WALL/COLU 不进来；源 EQUI 自身被排除。
+        assert_eq!(group_names(&resp), vec!["WALL", "PIPE", "PANE", "COLU"]);
+        assert_eq!(resp.excluded_self_members, 1);
+        assert!(!resp.noun_counts.contains_key("EQUI"));
+        let wall = candidates_for_group(&resp, "WALL");
+        assert_eq!(wall.len(), 2);
+        assert_eq!(wall[0].refno, "1_6");
+        assert_eq!(wall[1].refno, "1_3");
+        assert_eq!(resp.noun_counts.get("WALL"), Some(&2));
+        assert!(
+            wall[0].nearest.is_none(),
+            "aabb source has no centerline endpoints"
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_without_target_filters_requires_group_by_noun() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.radius = Some(100.0);
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(!resp.success);
+        let error = resp.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("target_nouns or target_groups") && error.contains("group_by=noun"),
+            "error should point at both remedies: {error}"
+        );
+    }
+
+    #[test]
+    fn nearest_clearance_rejects_unknown_group_by() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_nearest_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut params = base_nearest_params();
+            params.source_refno = Some("1_1".to_string());
+            params.target_groups = Some("wall".to_string());
+            params.group_by = Some("spec".to_string());
+            do_nearest_clearance_query(params, None)
+        });
+
+        assert!(!resp.success);
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("invalid group_by `spec` (expected target_groups or noun)")
+        );
+    }
+
+    #[test]
+    fn resolve_targeting_normalizes_group_by_and_exclude_nouns() {
+        let mut params = base_nearest_params();
+        params.group_by = Some(" Nouns ".to_string());
+        params.exclude_nouns = Some("weld, atta,WELD,".to_string());
+        let targeting = resolve_targeting(&params).unwrap();
+        assert_eq!(targeting.group_by, ClearanceGroupBy::Noun);
+        assert!(targeting.groups.is_empty());
+        assert!(targeting.noun_filter().is_none());
+        assert_eq!(
+            targeting.exclude_nouns,
+            vec!["ATTA".to_string(), "WELD".to_string()]
+        );
+
+        params.group_by = Some("target_groups".to_string());
+        assert!(
+            resolve_targeting(&params).is_err(),
+            "default mode still needs a filter"
+        );
+
+        params.target_groups = Some("wall".to_string());
+        let targeting = resolve_targeting(&params).unwrap();
+        assert_eq!(targeting.group_by, ClearanceGroupBy::TargetGroups);
+        assert_eq!(
+            targeting.sorted_target_nouns(),
+            vec!["GWALL", "PANE", "STWALL", "WALL"]
+        );
     }
 }

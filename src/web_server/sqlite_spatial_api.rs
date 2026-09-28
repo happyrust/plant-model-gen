@@ -151,7 +151,8 @@ pub struct SqliteSpatialQueryParams {
     pub nouns: Option<String>,
     /// 专业过滤（逗号分隔，如 "1,3"，空表示不过滤）
     pub spec_values: Option<String>,
-    /// 是否包含自身（mode=refno 时有效，默认 true）
+    /// 是否包含自身（默认 true）。mode=refno 时"自身"是源构件本身；
+    /// mode=bran_centerline 时是 BRAN + 全部 TUBI 段 + 全部成员构件（与 nearest-clearance 同口径）。
     pub include_self: Option<bool>,
     /// 是否包含负实体（默认 false）
     pub include_negative: Option<bool>,
@@ -222,6 +223,9 @@ pub struct SpatialQueryResult {
     /// 完整命中集合按专业分组的计数（不受分页影响）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<SpatialQuerySpecGroup>>,
+    /// 非致命问题（目前只有 `mode=bran_centerline` 预取成员表时会产生），查询照常完成。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
     pub error: Option<String>,
 }
 
@@ -487,6 +491,16 @@ impl PreparedBranSource {
             ..Default::default()
         }
     }
+
+    /// BRAN 自身在索引里的 id：全部 TUBI 段 + 全部成员构件（BRAN 本身由调用方按 `refno` 参数插入）。
+    /// 缺任何一类，"离 BRAN 最近的构件"就会被它自己占满。`nearest-clearance` 与 `/query` 共用。
+    fn own_index_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.centerline
+            .iter()
+            .map(|segment| &segment.refno)
+            .chain(self.member_refnos.iter())
+            .filter_map(|refno| refno_str_to_i64(&refno_enum_to_output_refno(refno)))
+    }
 }
 
 enum ClearanceSourceGeometry {
@@ -680,13 +694,27 @@ async fn fetch_bran_centerline_segments(
     Ok(segments)
 }
 
-/// 取 BRAN 的成员构件 refno（`pe.children`：ELBO / FLAN / VALV / ATTA / WELD / TEE …）。
+/// 取 BRAN 的成员构件 refno（ELBO / FLAN / VALV / ATTA / WELD / TEE …）。
+///
+/// 走 `<-pe_owner` 边，不读 `pe.children`：现场 `pe` 的 `children` 字段是 `NONE`
+/// （层级数据源已改为 pe_owner 边，见 `versioned_db::pe_owner_tree`），
+/// `aios_core::get_children_refnos` 在真库上恒返回空，成员排除会静默失效。
+/// 同胞顺序在这里无所谓，所以不带 `ORDER BY id`。
 ///
 /// TUBI 不是 PE 元素，不在这里；它们由 `tubi_relate` 的段 refno 覆盖。
 /// 用途只有一个：进 `self_ids`，避免"离 BRAN 最近的构件"被它自己的成员占满。
 async fn fetch_bran_member_refnos(branch_refno: RefnoEnum) -> anyhow::Result<Vec<RefnoEnum>> {
+    use aios_core::{SUL_DB, SurrealQueryExt};
+
     ensure_sqlite_spatial_surreal_context().await?;
-    let mut members = aios_core::get_children_refnos(branch_refno).await?;
+    let db_option = aios_core::get_db_option();
+    let sql = format!(
+        "USE NS `{}` DB `{}`;\nSELECT VALUE in FROM {}<-pe_owner;",
+        db_option.surreal_ns,
+        db_option.project_name,
+        branch_refno.to_pe_key()
+    );
+    let mut members: Vec<RefnoEnum> = SUL_DB.query_take(&sql, 1).await?;
     members.sort();
     members.dedup();
     Ok(members)
@@ -697,6 +725,12 @@ async fn prepare_bran_source(branch_refno: RefnoEnum) -> anyhow::Result<Prepared
     let centerline = fetch_bran_centerline_segments(branch_refno).await?;
     let mut prepared = PreparedBranSource::from_centerline(centerline);
     match fetch_bran_member_refnos(branch_refno).await {
+        // 有中心线段却一个成员都没有，多半是 pe_owner 边没建（存量站点要先
+        // `model-version rebuild-pe-owner`）。别让降级悄悄发生。
+        Ok(members) if members.is_empty() => prepared.warnings.push(
+            "BRAN 成员表为空（pe_owner 边缺失？），结果可能混入自身构件（TUBI 段仍已排除）"
+                .to_string(),
+        ),
         Ok(members) => prepared.member_refnos = members,
         Err(e) => prepared.warnings.push(format!(
             "BRAN 成员表获取失败，结果可能混入自身构件（TUBI 段仍已排除）: {e}"
@@ -982,6 +1016,7 @@ fn error_spatial_query_result(
         query_bbox,
         filter_options: None,
         groups: None,
+        warnings: None,
         error: Some(error.into()),
     }
 }
@@ -1088,6 +1123,7 @@ fn success_spatial_query_result(
         query_bbox,
         filter_options,
         groups,
+        warnings: None,
         error: None,
     }
 }
@@ -2091,7 +2127,9 @@ pub async fn api_sqlite_spatial_nearest_clearance(
 pub async fn api_sqlite_spatial_query(
     Query(params): Query<SqliteSpatialQueryParams>,
 ) -> Json<SpatialQueryResult> {
-    let prepared_centerline = if parse_mode(&params) == "bran_centerline" {
+    // 中心线 + 成员表一起预取（与 nearest-clearance 同一个 prepare_bran_source）：
+    // include_self=false 时 BRAN 自身、TUBI 段、成员构件才能整组剔掉，而不是只剔 BRAN 一个 id。
+    let prepared_bran = if parse_mode(&params) == "bran_centerline" {
         match params
             .refno
             .as_deref()
@@ -2099,8 +2137,8 @@ pub async fn api_sqlite_spatial_query(
             .filter(|value| !value.is_empty())
         {
             Some(refno) => match parse_refno_enum_for_source(refno) {
-                Ok(branch_refno) => match fetch_bran_centerline_segments(branch_refno).await {
-                    Ok(segments) => Some(segments),
+                Ok(branch_refno) => match prepare_bran_source(branch_refno).await {
+                    Ok(prepared) => Some(prepared),
                     Err(e) => {
                         return Json(error_spatial_query_result(
                             format!("fetch BRAN centerline failed: {e}"),
@@ -2132,7 +2170,7 @@ pub async fn api_sqlite_spatial_query(
 
     // 将 SQLite 阻塞 I/O 放入 blocking 线程池
     let result = tokio::task::spawn_blocking(move || {
-        do_spatial_query(params, fallback_refno_ids, prepared_centerline)
+        do_spatial_query(params, fallback_refno_ids, prepared_bran)
     })
     .await;
     match result {
@@ -2310,12 +2348,7 @@ fn do_nearest_clearance_query(
             );
         };
         self_ids.insert(id);
-        let Some(PreparedBranSource {
-            centerline,
-            member_refnos,
-            warnings: prepared_warnings,
-        }) = prepared_bran
-        else {
+        let Some(prepared) = prepared_bran else {
             return error_nearest_clearance_response(
                 "BRAN centerline was not prepared",
                 None,
@@ -2325,7 +2358,7 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         };
-        if centerline.is_empty() {
+        if prepared.centerline.is_empty() {
             return error_nearest_clearance_response(
                 "BRAN centerline has no segments",
                 None,
@@ -2335,19 +2368,14 @@ fn do_nearest_clearance_query(
                 distance_method,
             );
         }
-        warnings.extend(prepared_warnings);
         // 自身 = BRAN + 全部 TUBI 段 + 全部成员构件；缺任何一类，"最近的构件"就会被自己占满。
-        for segment in &centerline {
-            if let Some(segment_id) = refno_str_to_i64(&refno_enum_to_output_refno(&segment.refno))
-            {
-                self_ids.insert(segment_id);
-            }
-        }
-        for member in &member_refnos {
-            if let Some(member_id) = refno_str_to_i64(&refno_enum_to_output_refno(member)) {
-                self_ids.insert(member_id);
-            }
-        }
+        self_ids.extend(prepared.own_index_ids());
+        let PreparedBranSource {
+            centerline,
+            warnings: prepared_warnings,
+            ..
+        } = prepared;
+        warnings.extend(prepared_warnings);
         let bbox = centerline_bbox(&centerline).expect("non-empty centerline has bbox");
         let source = NearestClearanceSource {
             kind: "bran_centerline".to_string(),
@@ -2770,7 +2798,7 @@ fn query_aabbs_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<A
 fn do_spatial_query(
     params: SqliteSpatialQueryParams,
     fallback_refno_ids: Option<Vec<i64>>,
-    prepared_centerline: Option<Vec<BranCenterlineSegment>>,
+    prepared_bran: Option<PreparedBranSource>,
 ) -> SpatialQueryResult {
     let cached = match get_cached_index() {
         Ok(c) => c,
@@ -2785,15 +2813,18 @@ fn do_spatial_query(
     let mode = parse_mode(&params);
     let include_self = params.include_self.unwrap_or(true);
 
-    // 记住 refno 对应的 i64 id（用于 include_self 过滤）
-    let self_id: Option<i64> = if mode == "refno" && !include_self {
-        params
+    // include_self=false 时要剔掉的"自身"：refno 模式是它自己一个 id；
+    // bran_centerline 模式再加上全部 TUBI 段与成员构件（见下）。include_self=true 时集合为空。
+    let mut self_ids: HashSet<i64> = HashSet::new();
+    if !include_self && (mode == "refno" || mode == "bran_centerline") {
+        if let Some(id) = params
             .refno
             .as_deref()
             .and_then(|s| refno_str_to_i64(s.trim()))
-    } else {
-        None
-    };
+        {
+            self_ids.insert(id);
+        }
+    }
 
     let base_aabb = if mode == "position" {
         // position 模式：从 x, y, z, radius 构建 AABB
@@ -2826,7 +2857,7 @@ fn do_spatial_query(
                     cached,
                     vec![Aabb::new([x, y, z].into(), [x, y, z].into())],
                     r,
-                    self_id,
+                    self_ids,
                 );
             }
             _ => {
@@ -2837,20 +2868,34 @@ fn do_spatial_query(
             }
         }
     } else if mode == "bran_centerline" {
-        let Some(centerline) = prepared_centerline else {
+        let Some(prepared) = prepared_bran else {
             return error_spatial_query_result("BRAN centerline was not prepared", None);
         };
-        if centerline.is_empty() {
+        if prepared.centerline.is_empty() {
             return error_spatial_query_result("BRAN centerline has no segments", None);
         }
+        // 自身 = BRAN + 全部 TUBI 段 + 全部成员构件，口径与 nearest-clearance 一致；
+        // 否则半径内最近的一批全是它自己的管子和弯头，distance=0 排在最前。
+        if !include_self {
+            self_ids.extend(prepared.own_index_ids());
+        }
+        let PreparedBranSource {
+            centerline,
+            warnings,
+            ..
+        } = prepared;
         let search_distance = normalized_search_distance(params.distance, params.radius);
-        return query_by_target_geometry(
+        let mut result = query_by_target_geometry(
             params,
             cached,
             QueryTargetGeometry::BranCenterline(centerline),
             search_distance,
-            self_id,
+            self_ids,
         );
+        if result.success && !warnings.is_empty() {
+            result.warnings = Some(warnings);
+        }
+        return result;
     } else if mode == "refno" {
         let refno = params.refno.as_deref().unwrap_or("").trim();
         if refno.is_empty() {
@@ -2882,7 +2927,7 @@ fn do_spatial_query(
                 match query_aabbs_for_ids(&conn, ids) {
                     Ok(aabbs) if !aabbs.is_empty() => {
                         let distance = normalized_search_distance(params.distance, params.radius);
-                        return query_by_target_aabbs(params, cached, aabbs, distance, self_id);
+                        return query_by_target_aabbs(params, cached, aabbs, distance, self_ids);
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -2906,7 +2951,7 @@ fn do_spatial_query(
     };
 
     let distance = normalized_search_distance(params.distance, params.radius);
-    query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_id)
+    query_by_target_aabbs(params, cached, vec![base_aabb], distance, self_ids)
 }
 
 fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQueryResult {
@@ -2933,6 +2978,7 @@ fn empty_spatial_query_result(params: &SqliteSpatialQueryParams) -> SpatialQuery
             params.include_negative.unwrap_or(false),
         )),
         groups: Some(vec![]),
+        warnings: None,
         error: None,
     }
 }
@@ -3205,23 +3251,25 @@ fn query_by_target_aabbs(
     cached: &CachedIndex,
     target_aabbs: Vec<Aabb>,
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: HashSet<i64>,
 ) -> SpatialQueryResult {
     query_by_target_geometry(
         params,
         cached,
         QueryTargetGeometry::Aabbs(target_aabbs),
         search_distance,
-        self_id,
+        self_ids,
     )
 }
 
+/// `self_ids`：要从结果里剔掉的"自身"索引 id（refno 模式是源本身；bran_centerline 模式还包括
+/// 全部 TUBI 段与成员构件）。空集合 = 不剔。
 fn query_by_target_geometry(
     params: SqliteSpatialQueryParams,
     cached: &CachedIndex,
     target_geometry: QueryTargetGeometry,
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: HashSet<i64>,
 ) -> SpatialQueryResult {
     let (page, per_page) = resolve_pagination(&params);
     let hydrate_page = params.per_page_cap_override != Some(REFNOS_HARD_CAP);
@@ -3246,7 +3294,7 @@ fn query_by_target_geometry(
         &params,
         &query_regions,
         search_distance,
-        self_id,
+        &self_ids,
         is_sphere,
     );
 
@@ -3265,7 +3313,7 @@ fn query_by_target_geometry(
             &target_geometry,
             &query_regions,
             search_distance,
-            self_id,
+            &self_ids,
             is_sphere,
         )
     });
@@ -3284,7 +3332,7 @@ fn scan_spatial_results(
     target_geometry: &QueryTargetGeometry,
     query_regions: &[Aabb],
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: &HashSet<i64>,
     is_sphere: bool,
 ) -> Result<SpatialScanOutcome, SpatialQueryResult> {
     let generation = crate::sqlite_index::index_generation();
@@ -3335,11 +3383,9 @@ fn scan_spatial_results(
             aabb: candidate_aabb,
         } = candidate;
 
-        // include_self 过滤
-        if let Some(self_id) = self_id {
-            if id == self_id {
-                continue;
-            }
+        // include_self 过滤：refno 模式只有源本身；bran_centerline 模式还有全部 TUBI 段与成员构件
+        if self_ids.contains(&id) {
+            continue;
         }
 
         if !include_negative && is_negative_noun(&noun) {
@@ -3496,14 +3542,17 @@ fn scan_cache_generation_prefix() -> String {
 /// 「回填名称」，翻页还会在 TTL 内继续读到没有名称的那份快照。
 ///
 /// `preferred_db_prefix` 也要进键：它只由 `params.refno` 决定，而 `refno` 本身没有
-/// 进键（`self_id` 在 `include_self=true` 时是 None），否则两个包围盒完全相同、
+/// 进键（`self_ids` 在 `include_self=true` 时是空集），否则两个包围盒完全相同、
 /// 分属不同库的 refno 会共用快照，同距离时的「同库优先」排序会串。
+///
+/// `self_ids` 按排好序的整组哈希进键：bran_centerline 模式下它是 BRAN + 全部 TUBI 段 + 成员，
+/// 同一走廊 `include_self` 一真一假必须是两份快照。
 fn scan_cache_key(
     index_path: &Path,
     params: &SqliteSpatialQueryParams,
     regions: &[Aabb],
     search_distance: f32,
-    self_id: Option<i64>,
+    self_ids: &HashSet<i64>,
     is_sphere: bool,
 ) -> String {
     use std::hash::{Hash, Hasher};
@@ -3522,13 +3571,19 @@ fn scan_cache_key(
         }
     }
 
+    let mut self_hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut sorted_self_ids: Vec<i64> = self_ids.iter().copied().collect();
+    sorted_self_ids.sort_unstable();
+    sorted_self_ids.hash(&mut self_hasher);
+
     format!(
-        "{}{}|{:x}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}{}|{:x}|{}|{}:{:x}|{}|{}|{}|{}|{}|{}|{}|{}",
         scan_cache_generation_prefix(),
         index_path.display(),
         hasher.finish(),
         search_distance.to_bits(),
-        self_id.unwrap_or(0),
+        sorted_self_ids.len(),
+        self_hasher.finish(),
         is_sphere,
         params.nouns.as_deref().unwrap_or(""),
         params.spec_values.as_deref().unwrap_or(""),
@@ -4409,10 +4464,46 @@ fn do_spatial_stats() -> SpatialStatsResult {
 #[cfg(all(test, feature = "sqlite-index"))]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::sync::{MutexGuard, TryLockError};
+    use tempfile::TempDir;
 
+    /// 测试专用临时目录：从建目录起一直握着串行锁，直到用例结束才放。
+    ///
+    /// 索引版本号 `sqlite_index::index_generation()` 是进程级的，往 fixture 里写行会把它加一。
+    /// 另一条测试线程若恰好处在扫描与取页之间，就会看到「索引已改写」而整条查询报错、结果为空
+    /// ——并行跑时偶发的那几次失败就是这么来的。所以写 fixture 与跑查询必须互斥，
+    /// 锁不能只包住 `with_test_index` 那一段。
+    struct SerialTempDir {
+        // 先删目录再放锁：字段按声明顺序析构。
+        dir: TempDir,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl SerialTempDir {
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    fn serial_tempdir() -> SerialTempDir {
+        // 某个用例断言失败会让锁中毒；后面的用例照常拿锁，别让一处失败连坐一片。
+        let guard = test_guard()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SerialTempDir {
+            dir: tempfile::tempdir().unwrap(),
+            _guard: guard,
+        }
+    }
+
+    /// 把查询指向给定索引文件。调用方必须已经通过 `serial_tempdir()` 持有串行锁。
     fn with_test_index<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = test_guard().lock().unwrap();
+        match test_guard().try_lock() {
+            Err(TryLockError::WouldBlock) => {}
+            Ok(_) | Err(TryLockError::Poisoned(_)) => {
+                panic!("with_test_index 之前必须先用 serial_tempdir() 拿到串行锁")
+            }
+        }
         clear_test_index_path();
         set_test_index_path(path);
         let result = f();
@@ -4655,7 +4746,7 @@ mod tests {
     /// id 顺序先到先得、攒满就 break，于是留下的恰好全是最远的那些。
     #[test]
     fn truncated_results_keep_nearest_not_lowest_ids() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4716,7 +4807,7 @@ mod tests {
     /// UNKNOWN / 0 回退，而不是整行丢掉，也不是变成 NaN 包围盒。
     #[test]
     fn fetch_candidates_by_ids_batches_and_tolerates_missing_items() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4757,7 +4848,7 @@ mod tests {
     /// 回填名称之后再查，必须立刻看到新名称，不能在 TTL 内继续读改动前的快照。
     #[test]
     fn name_backfill_invalidates_paged_scan_snapshot() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4792,7 +4883,7 @@ mod tests {
 
     #[test]
     fn bbox_query_returns_refno_strings() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4849,7 +4940,7 @@ mod tests {
 
     #[test]
     fn bbox_query_returns_zero_spec_value_when_missing() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4888,7 +4979,7 @@ mod tests {
 
     #[test]
     fn position_query_defaults_to_sphere_filter() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4938,7 +5029,7 @@ mod tests {
 
     #[test]
     fn refno_query_defaults_to_sphere_filter_and_can_exclude_self() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -4998,7 +5089,7 @@ mod tests {
 
     #[test]
     fn spatial_query_excludes_negative_nouns_by_default() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5048,7 +5139,7 @@ mod tests {
 
     #[test]
     fn keyword_filter_matches_name_before_pagination() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5103,7 +5194,7 @@ mod tests {
 
     #[test]
     fn sort_and_spec_groups_are_global_not_page_scoped() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5212,7 +5303,7 @@ mod tests {
 
     #[test]
     fn response_reports_candidate_scale_and_truncation_flags() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5257,7 +5348,7 @@ mod tests {
 
     #[test]
     fn paging_reuses_scan_snapshot_and_keeps_slices_disjoint() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5357,7 +5448,7 @@ mod tests {
 
     #[test]
     fn keyword_filter_matches_refno_and_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5414,7 +5505,7 @@ mod tests {
 
     #[test]
     fn spatial_query_includes_negative_nouns_when_requested() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         let idx = SqliteAabbIndex::open(&db).unwrap();
         idx.init_schema().unwrap();
@@ -5471,7 +5562,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_refno_source_returns_wall_and_column_groups() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5499,7 +5590,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_point_source_returns_nearest_targets() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5523,7 +5614,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_radius_changes_returned_set() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5552,7 +5643,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_noun_filter_excludes_nearer_wrong_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5574,7 +5665,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_honors_same_dbnum_and_explicit_dbnums_scope() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5609,7 +5700,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_source_refno_not_found_returns_false() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5629,7 +5720,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_intersecting_aabb_distance_zero_and_intersects_true() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -5669,7 +5760,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_bran_centerline_corridor_excludes_far_whole_aabb_hit() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_centerline_corridor_test_index(&db);
 
@@ -5706,7 +5797,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_bran_centerline_supports_wall_and_column_groups() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_centerline_corridor_test_index(&db);
 
@@ -5810,7 +5901,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_bran_centerline_excludes_all_bran_members() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -5847,7 +5938,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_include_self_keeps_bran_members() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -5878,7 +5969,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_prepared_warnings_surface_in_response() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -5902,9 +5993,147 @@ mod tests {
         assert_eq!(resp.excluded_self_members, 2);
     }
 
+    fn bran_centerline_query_params(include_self: Option<bool>) -> SqliteSpatialQueryParams {
+        SqliteSpatialQueryParams {
+            mode: Some("bran_centerline".to_string()),
+            refno: Some("1_100".to_string()),
+            distance: Some(10.0),
+            include_self,
+            per_page: Some(100),
+            ..Default::default()
+        }
+    }
+
+    fn result_refnos(resp: &SpatialQueryResult) -> Vec<String> {
+        resp.results
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| item.refno.clone())
+            .collect()
+    }
+
+    /// `/query?mode=bran_centerline&include_self=false`：自身口径与 nearest-clearance 一致，
+    /// BRAN + TUBI 段 + 成员构件整组剔掉；同一走廊 `include_self` 缺省时它们照旧以 0 距离排在最前，
+    /// 两次查询打同一个索引，缓存键必须分开。
+    #[test]
+    fn spatial_query_bran_centerline_excludes_bran_tubi_and_members_when_include_self_false() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let (with_self, without_self) = with_test_index(&db, || {
+            let with_self = do_spatial_query(
+                bran_centerline_query_params(None),
+                None,
+                Some(bran_with_members_fixture()),
+            );
+            let without_self = do_spatial_query(
+                bran_centerline_query_params(Some(false)),
+                None,
+                Some(bran_with_members_fixture()),
+            );
+            (with_self, without_self)
+        });
+
+        assert!(with_self.success, "{:?}", with_self.error);
+        let refnos = result_refnos(&with_self);
+        for own in ["1_100", "1_301", "1_401", "1_402"] {
+            assert!(
+                refnos.contains(&own.to_string()),
+                "default include_self dropped {own}: {refnos:?}"
+            );
+        }
+        assert_eq!(
+            with_self.results.as_deref().unwrap_or_default()[0].distance,
+            Some(0.0)
+        );
+        assert!(with_self.warnings.is_none());
+
+        assert!(without_self.success, "{:?}", without_self.error);
+        let refnos = result_refnos(&without_self);
+        for own in ["1_100", "1_301", "1_401", "1_402"] {
+            assert!(
+                !refnos.contains(&own.to_string()),
+                "self member {own} leaked: {refnos:?}"
+            );
+        }
+        // 另一条管线的 WELD / FLAN 与墙柱不是自身，保留。
+        for other in ["1_502", "1_501", "1_201", "1_204", "1_203"] {
+            assert!(
+                refnos.contains(&other.to_string()),
+                "{other} missing: {refnos:?}"
+            );
+        }
+        assert_eq!(
+            without_self.total_count.unwrap() + 4,
+            with_self.total_count.unwrap()
+        );
+    }
+
+    /// `/query?mode=refno&include_self=false` 只剔源本身：自身集合从 Option 换成 HashSet 不能改老口径。
+    #[test]
+    fn spatial_query_refno_mode_still_excludes_only_source_itself() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            do_spatial_query(
+                SqliteSpatialQueryParams {
+                    mode: Some("refno".to_string()),
+                    refno: Some("1_100".to_string()),
+                    distance: Some(10.0),
+                    include_self: Some(false),
+                    per_page: Some(100),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        let refnos = result_refnos(&resp);
+        assert!(!refnos.contains(&"1_100".to_string()));
+        // TUBI / ELBO 不是 refno 模式的"自身"
+        assert!(refnos.contains(&"1_301".to_string()));
+        assert!(refnos.contains(&"1_401".to_string()));
+    }
+
+    /// 预取阶段的 warning（成员表取不到 / 为空）随 `/query` 响应一起返回，且不影响查询成功。
+    #[test]
+    fn spatial_query_bran_centerline_surfaces_prepared_warnings() {
+        let dir = serial_tempdir();
+        let db = dir.path().join("spatial_index.sqlite");
+        create_bran_members_test_index(&db);
+
+        let resp = with_test_index(&db, || {
+            let mut prepared = PreparedBranSource::from_centerline(centerline_fixture());
+            prepared.warnings.push("members unavailable".to_string());
+            do_spatial_query(
+                bran_centerline_query_params(Some(false)),
+                None,
+                Some(prepared),
+            )
+        });
+
+        assert!(resp.success, "{:?}", resp.error);
+        assert_eq!(
+            resp.warnings.as_deref(),
+            Some(&["members unavailable".to_string()][..])
+        );
+        let refnos = result_refnos(&resp);
+        // 成员表缺失：只剔 BRAN 与 TUBI 段，ELBO / WELD 成员仍在结果里
+        assert!(!refnos.contains(&"1_100".to_string()));
+        assert!(!refnos.contains(&"1_301".to_string()));
+        assert!(refnos.contains(&"1_401".to_string()));
+        assert!(refnos.contains(&"1_402".to_string()));
+    }
+
     #[test]
     fn nearest_clearance_group_by_noun_buckets_by_noun_and_orders_by_distance() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -5981,7 +6210,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_group_by_noun_max_per_group_applies_per_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -6010,7 +6239,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_group_by_noun_honors_target_filters_and_exclude_nouns() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -6044,7 +6273,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_exclude_nouns_also_applies_to_target_groups_mode() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -6067,7 +6296,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_group_by_noun_honors_explicit_negative_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_bran_members_test_index(&db);
 
@@ -6088,7 +6317,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_group_by_noun_works_for_aabb_source_without_filters() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -6120,7 +6349,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_without_target_filters_requires_group_by_noun() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
@@ -6141,7 +6370,7 @@ mod tests {
 
     #[test]
     fn nearest_clearance_rejects_unknown_group_by() {
-        let dir = tempdir().unwrap();
+        let dir = serial_tempdir();
         let db = dir.path().join("spatial_index.sqlite");
         create_nearest_test_index(&db);
 
